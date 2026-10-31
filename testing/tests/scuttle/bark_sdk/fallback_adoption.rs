@@ -14,8 +14,8 @@ use bark::vtxo::{ServerStatusAdoption, VtxoState, VtxoValidationError};
 use bitcoin::{FeeRate, Network, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin_ext::BlockDelta;
-use bitcoin_ext::rpc::RpcApi;
+use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
 use tokio::sync::{Notify, oneshot};
 use ark::vtxo::Full;
@@ -471,6 +471,8 @@ async fn trusted_pending_chain_outage(already_owned: bool) {
 struct HoldArkoorRegistration {
 	arrived: Arc<Mutex<Option<(PublicKey, oneshot::Sender<protos::RegisterVtxoTransactionsRequest>)>>>,
 	release: Arc<Notify>,
+	terminal_source: Arc<Mutex<Option<(VtxoId, oneshot::Sender<()>)>>>,
+	release_terminal_source: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -492,6 +494,27 @@ impl captaind::proxy::ArkRpcProxy for HoldArkoorRegistration {
 			self.release.notified().await;
 		}
 		Ok(upstream.register_vtxo_transactions(request).await?.into_inner())
+	}
+
+	async fn get_vtxos_status_by_ids(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxosStatusByIdsRequest)
+		-> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status>
+	{
+		let response = upstream.get_vtxos_status_by_ids(request).await?.into_inner();
+		let arrived = {
+			let mut gate = self.terminal_source.lock().unwrap();
+			if gate.as_ref().is_some_and(|(id, _)| response.vtxos.iter().any(|coin| coin.vtxo_id == id.to_bytes().to_vec())) {
+				let (id, arrived) = gate.take().unwrap();
+				let status = response.vtxos.iter().find(|coin| coin.vtxo_id == id.to_bytes().to_vec()).unwrap();
+				assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+				assert!(status.fallback_committed, "pause only a real authenticated fallback-terminal response");
+				Some(arrived)
+			} else { None }
+		};
+		if let Some(arrived) = arrived {
+			arrived.send(()).unwrap();
+			self.release_terminal_source.notified().await;
+		}
+		Ok(response)
 	}
 }
 
@@ -651,7 +674,28 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		}).await.expect("the actual refund must be confirmed before releasing the original registration");
 		Some(payout)
 	} else { None };
+	let terminal_source = if refund_before_release {
+		let (arrived, receiver) = oneshot::channel();
+		*gate.terminal_source.lock().unwrap() = Some((source.id(), arrived));
+		Some(receiver)
+	} else { None };
 	gate.release.notify_one();
+	let orphaned_confirmation = if let Some(arrived) = terminal_source {
+		tokio::time::timeout(Duration::from_secs(15), arrived).await.unwrap().unwrap();
+		let payout = confirmed_payout.as_ref().unwrap();
+		let confirmed = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(payout.compute_txid(), None)
+			.unwrap().unwrap().blockhash.unwrap();
+		// T0 was genuinely terminal. Process the real fork before releasing
+		// that unchanged old response; the following change query must see T1.
+		ctx.bitcoind().sync_client().invalidate_block(&confirmed).unwrap();
+		srv.bitcoind().sync_client().invalidate_block(&confirmed).unwrap();
+		let fork = bitcoin_ext::BlockRef { height: BlockHeight::new(ctx.bitcoind().get_block_count().await as u32),
+			hash: ctx.bitcoind().sync_client().get_best_block_hash().unwrap() };
+		crate::server_tests::expiry_test::wait_rebuilt(&db, fork, Duration::from_secs(30),
+			"the real payout fork must complete before signed change is queried").await;
+		gate.release_terminal_source.notify_one();
+		Some(confirmed)
+	} else { None };
 	let owner = match owner {
 		Some(owner) => {
 			let error = tokio::time::timeout(Duration::from_secs(15), payment.expect("live send driver"))
@@ -667,6 +711,30 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 			owner
 		},
 	};
+	if let Some(confirmation) = orphaned_confirmation {
+		assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent),
+			"the deliberately delayed T0 source response was terminal");
+		for change in &changes {
+			assert_eq!(owner.get_vtxo_by_id(change.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending),
+				"the fresh T1 signed-change response must observe the real reorg");
+			assert_eq!(owner.get_full_vtxo(change.id()).await.unwrap().serialize(), change.serialize());
+		}
+		assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
+			"a stale terminal source response cannot discard signed Registration while its change is Pending");
+		assert!(owner.spendable_vtxos().await.unwrap().is_empty());
+		assert_eq!(owner.balance().await.unwrap().total(), sat(0));
+		// Restore the SAME original six-confirmation branch: no extra fee,
+		// payment, funding or mined blocks are needed for the cleanup tail.
+		ctx.bitcoind().sync_client().reconsider_block(&confirmation).unwrap();
+		srv.bitcoind().sync_client().reconsider_block(&confirmation).unwrap();
+		let tip = bitcoin_ext::BlockRef { height: BlockHeight::new(ctx.bitcoind().get_block_count().await as u32),
+			hash: ctx.bitcoind().sync_client().get_best_block_hash().unwrap() };
+		crate::server_tests::expiry_test::wait_rebuilt(&db, tip, Duration::from_secs(30),
+			"the same original payout must regain canonical finality before cleanup").await;
+		owner.chain().invalidate_caches().await;
+		owner.sync_fallback_payouts().await.unwrap();
+		owner.sync_pending_arkoor_sends().await.unwrap();
+	}
 	owner.sync().await;
 	if refund_before_release {
 		assert!(owner.pending_arkoor_sends().await.unwrap().is_empty());
