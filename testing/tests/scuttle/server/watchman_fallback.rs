@@ -3192,10 +3192,12 @@ async fn sweep_offboard_forfeit(captaind_down: bool) {
 		assert_eq!(stored.vtxo.expiry_height(), source.expiry_height());
 		assert!(tip >= stored.vtxo.expiry_height());
 		assert_eq!(stored.vtxo.txout(), forfeit.output[0]);
-		let actual = client.get_tx_out(&forfeit_point.txid, forfeit_point.vout, Some(true)).unwrap().unwrap();
-		assert!(actual.confirmations >= 6);
-		assert_eq!(actual.value, stored.vtxo.amount());
-		assert_eq!(actual.script_pub_key.script().unwrap(), stored.vtxo.output_script_pubkey());
+		let actual = client.get_raw_transaction(&forfeit_point.txid, None).unwrap();
+		assert_eq!(actual, forfeit);
+		assert_canonical_watchman_tx(&ctx, &actual);
+		let actual_output = &actual.output[forfeit_point.vout as usize];
+		assert_eq!(actual_output.value, stored.vtxo.amount());
+		assert_eq!(actual_output.script_pubkey, stored.vtxo.output_script_pubkey());
 		let rounds_balance = match stopped_rounds_balance {
 			Some(balance) => balance,
 			None => srv.wallet_status().await.rounds.total_balance,
