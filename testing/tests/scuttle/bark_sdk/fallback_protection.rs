@@ -1,5 +1,7 @@
 //! A real server admission decision is not proof that the customer was paid.
 
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
@@ -9,8 +11,78 @@ use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
 
-use ark::ProtocolEncoding;
+use ark::{ProtocolEncoding, VtxoId};
 use ark_testing::{sat, TestContext};
+use ark_testing::daemon::captaind;
+use server_rpc::protos;
+
+/// Declared response faults AFTER the real server authenticated the known
+/// input and returned its actual Pending decision. No financial status is made up.
+#[derive(Clone, Default)]
+struct PendingStatusFault {
+	target: Arc<Mutex<Option<VtxoId>>>,
+	mode: Arc<AtomicU8>,
+	foreign_owner: Arc<Mutex<Vec<u8>>>,
+	single_faults: Arc<AtomicUsize>,
+	batch_faults: Arc<AtomicUsize>,
+}
+
+impl PendingStatusFault {
+	const MISSING: u8 = 1;
+	const FOREIGN: u8 = 2;
+}
+
+#[async_trait::async_trait]
+impl captaind::proxy::ArkRpcProxy for PendingStatusFault {
+	async fn get_vtxo_status(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxoStatusRequest)
+		-> Result<protos::GetVtxoStatusResponse, tonic::Status>
+	{
+		let target = *self.target.lock().unwrap();
+		let targeted = target.is_some_and(|id| request.vtxo_id == id.to_bytes().to_vec());
+		let mut response = upstream.get_vtxo_status(request).await?.into_inner();
+		let mode = self.mode.load(Ordering::SeqCst);
+		if targeted && mode != 0 {
+			assert_eq!(response.spend_state, protos::VtxoSpendState::FallbackPending as i32);
+			assert!(response.fallback_committed);
+			self.single_faults.fetch_add(1, Ordering::SeqCst);
+			if mode == Self::MISSING {
+				return Err(tonic::Status::not_found("declared missing known-Pending status response"));
+			}
+			assert_eq!(mode, Self::FOREIGN);
+			let foreign = self.foreign_owner.lock().unwrap().clone();
+			assert_ne!(response.owner_mailbox, foreign);
+			response.owner_mailbox = foreign;
+		}
+		Ok(response)
+	}
+
+	async fn get_vtxos_status_by_ids(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxosStatusByIdsRequest)
+		-> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status>
+	{
+		let target = *self.target.lock().unwrap();
+		let targeted = target.is_some_and(|id| request.vtxos.iter().any(|query| query.vtxo_id == id.to_bytes().to_vec()));
+		let mut response = upstream.get_vtxos_status_by_ids(request).await?.into_inner();
+		let mode = self.mode.load(Ordering::SeqCst);
+		if targeted && mode != 0 {
+			let id = target.unwrap().to_bytes().to_vec();
+			let index = response.vtxos.iter().position(|coin| coin.vtxo_id == id).expect("real server must return the known input");
+			assert_eq!(response.vtxos[index].spend_state, protos::VtxoSpendState::FallbackPending as i32);
+			assert!(response.vtxos[index].fallback_committed);
+			self.batch_faults.fetch_add(1, Ordering::SeqCst);
+			if mode == Self::MISSING {
+				response.vtxos.remove(index);
+				assert!(!response.missing_vtxo_ids.contains(&id));
+				response.missing_vtxo_ids.push(id);
+			} else {
+				assert_eq!(mode, Self::FOREIGN);
+				let foreign = self.foreign_owner.lock().unwrap().clone();
+				assert_ne!(response.vtxos[index].owner_mailbox, foreign);
+				response.vtxos[index].owner_mailbox = foreign;
+			}
+		}
+		Ok(response)
+	}
+}
 
 #[tokio::test]
 async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payment() {
@@ -18,7 +90,9 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
 		.watchmand().create().await;
-	let wallet = ctx.bark_sdk("owner", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
+	let fault = PendingStatusFault::default();
+	let proxy = srv.start_proxy_no_mailbox(fault.clone()).await;
+	let wallet = ctx.bark_sdk("owner", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.boarded(sat(100_000)).create().await;
 	let coin = wallet.spendable_vtxos().await.unwrap().remove(0);
 	let original = wallet.get_full_vtxo(coin.id()).await.unwrap();
@@ -73,6 +147,50 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().amount(), coin.amount());
 	assert_eq!(owed.total(), Amount::ZERO, "known committed principal is retained as signed coin/status, not another Ark amount");
+
+	// An omitted or foreign status cannot forget a commitment already learned
+	// from the actual allocation. Use the server's existing public key as a
+	// valid but foreign point; no extra wallet, key or money is introduced.
+	let foreign = wallet.require_ark_info().await.unwrap().mailbox_pubkey;
+	assert_ne!(foreign, wallet.mailbox_identifier().as_pubkey());
+	*fault.foreign_owner.lock().unwrap() = foreign.serialize().to_vec();
+	*fault.target.lock().unwrap() = Some(coin.id());
+	for mode in [PendingStatusFault::MISSING, PendingStatusFault::FOREIGN] {
+		fault.mode.store(mode, Ordering::SeqCst);
+		let single = fault.single_faults.load(Ordering::SeqCst);
+		let error = wallet.trust_and_adopt_server_vtxo_status(coin.id()).await.unwrap_err();
+		assert_eq!(fault.single_faults.load(Ordering::SeqCst), single + 1);
+		if mode == PendingStatusFault::MISSING {
+			assert_eq!(error.downcast_ref::<tonic::Status>().unwrap().code(), tonic::Code::NotFound);
+			assert!(format!("{error:#}").contains("declared missing known-Pending status response"));
+		} else {
+			assert!(format!("{error:#}").contains("server coin ownership does not match this mailbox"));
+		}
+		let batch = fault.batch_faults.load(Ordering::SeqCst);
+		let result = wallet.sync_fallback_payouts().await;
+		assert_eq!(fault.batch_faults.load(Ordering::SeqCst), batch + 1);
+		if mode == PendingStatusFault::MISSING {
+			// The existing batch API represents omission as an absent map entry.
+			// It is a non-decision, not an error or release of the known fence.
+			result.unwrap();
+		} else {
+			assert!(format!("{:#}", result.unwrap_err()).contains("server coin ownership does not match this mailbox"));
+		}
+		wallet.unlock_vtxos([coin.id()], None).await.unwrap();
+		let retained = client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap();
+		assert_eq!(retained.fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+		assert_eq!(retained.state, VtxoState::Locked { holder: None });
+		assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), original.serialize());
+		assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
+		assert!(wallet.lock_vtxos([coin.id()], None).await.is_err());
+		assert!(wallet.exit_mgr().start_exit_for_vtxos(&[coin.vtxo.clone()]).await.is_err());
+		assert_eq!(*wallet.exit_mgr().get_exit_vtxo(coin.id()).await.unwrap().state(), initial_exit);
+		assert_eq!(wallet.balance().await.unwrap().total(), Amount::ZERO);
+		assert_eq!(wallet.history().await.unwrap(), pending);
+	}
+	fault.mode.store(0, Ordering::SeqCst);
+	wallet.sync_fallback_payouts().await.unwrap();
+	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 
 	// A real subsidy now permits the existing unchanged payout to confirm.
 	let address = srv.watchmand().wait_wallet_address().await;
