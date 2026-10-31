@@ -3150,8 +3150,8 @@ async fn sweep_offboard_forfeit(captaind_down: bool) {
 	let stopped_rounds_balance = if captaind_down {
 		let balance = srv.wallet_status().await.rounds.total_balance;
 		srv.stop().await.unwrap();
-		// A real watchmand restart invalidates its old completed view. With
-		// captaind still down, no fresh paired acknowledgement can exist.
+		// A real watchmand restart invalidates its old completed view; it
+		// completes the new Core view independently while captaind stays down.
 		wm.stop().await.unwrap();
 		wm.start().await.unwrap();
 		wm.add_slog_handler(failures.clone());
@@ -3174,18 +3174,13 @@ async fn sweep_offboard_forfeit(captaind_down: bool) {
 		wm.wait_for_sync_height(tip).await;
 		assert_eq!(client.get_block_count().unwrap(), u64::from(tip.to_u32()));
 		let hash = client.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		if captaind_down {
-			assert!(db.read(async |tx| tx.expiry_view().await).await.unwrap().is_none(),
-				"stopped captaind must leave the customer view unavailable");
-		} else {
-			loop {
-				if db.read(async |tx| {
-					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-					Ok(view.processed.height == tip
-						&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
-				}).await.unwrap() { break; }
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
+		loop {
+			if db.read(async |tx| {
+				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
+				Ok(view.processed.height == tip
+					&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
+			}).await.unwrap() { break; }
+			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 		// The forfeit is Bare: its exclusive server key needs no invented Full path or customer allocation.
 		let stored = db.read(async |tx| tx.get_bare_vtxo_by_id(forfeit_id).await).await.unwrap();
