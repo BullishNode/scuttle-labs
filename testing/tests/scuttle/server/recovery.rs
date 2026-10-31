@@ -12,7 +12,7 @@ use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::Full;
 use server::database::Db;
 use server::recovery::{MAX_RECOVERY_RESPONSE_VTXO_BYTES, RECOVERY_VTXO_PAGE_SIZE};
-use server_rpc::protos;
+use server_rpc::{protos, RequestExt};
 
 use ark_testing::TestContext;
 

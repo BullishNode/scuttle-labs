@@ -51,7 +51,7 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 		Some(protos::VtxoSpendState::Spent), Some(protos::VtxoSpendState::Spent), Some(protos::VtxoSpendState::Spent), None];
 	let owner_mailboxes = [Some(mailbox.public_key()), Some(mailbox.public_key()), Some(foreign.public_key()),
 		Some(mailbox.public_key()), Some(mailbox.public_key()), None];
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes, "active-customer").await;
 
 	// An older matching customer must not beat a later active operator.
 	let replacement = db.write(async |tx| {
@@ -64,10 +64,10 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 		Ok(replacement)
 	}).await.unwrap();
 	let spent = [Some(protos::VtxoSpendState::Spent); 5].into_iter().chain([None]).collect::<Vec<_>>();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent, &owner_mailboxes).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent, &owner_mailboxes, "replacement-operator").await;
 	// Confirmed customer ownership wins even over that newer active row.
 	db.write(async |tx| { tx.execute("UPDATE expiry_allocation SET status='confirmed' WHERE id=$1", &[&allocation]).await?; Ok(()) }).await.unwrap();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes, "confirmed-customer").await;
 	// Without a confirmed row, active outranks newer inactive ownership.
 	db.write(async |tx| {
 		tx.execute("UPDATE expiry_allocation SET status='conflicted' WHERE id=$1", &[&allocation]).await?;
@@ -75,24 +75,91 @@ async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_order
 		tx.execute("UPDATE expiry_allocation_coin SET active=TRUE WHERE allocation_id=$1", &[&allocation]).await?;
 		Ok(())
 	}).await.unwrap();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &expected, &owner_mailboxes, "active-beats-inactive").await;
 	// Equal confirmation/active ranks choose the newest allocation, including
 	// an operator; filtering to customer matches before ordering is unsafe.
 	db.write(async |tx| { tx.execute("UPDATE expiry_allocation_coin SET active=FALSE WHERE allocation_id=$1", &[&allocation]).await?; Ok(()) }).await.unwrap();
-	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent, &owner_mailboxes).await;
+	assert_pending_statuses(&srv, &xpriv, &coins, &keys, &spent, &owner_mailboxes, "newest-inactive-operator").await;
+}
+
+// Test-only legacy response shapes retain retired tag 1000. The current
+// generated responses discard it, so their equality cannot detect an old
+// server disclosing owners. Optional bytes also detect an explicitly empty tag.
+#[derive(Clone, PartialEq, prost::Message, serde::Serialize)]
+struct LegacyPublicVtxo {
+	#[prost(bytes = "vec", tag = "1")]
+	vtxo: Vec<u8>,
+	#[prost(bytes = "vec", optional, tag = "1000")]
+	owner_mailbox: Option<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, prost::Message, serde::Serialize)]
+struct LegacyPublicVtxos {
+	#[prost(bytes = "vec", repeated, tag = "1")]
+	vtxos: Vec<Vec<u8>>,
+	#[prost(bytes = "vec", repeated, tag = "2")]
+	missing_vtxo_ids: Vec<Vec<u8>>,
+	#[prost(message, repeated, tag = "1000")]
+	owners: Vec<LegacyPublicVtxoOwner>,
+}
+
+#[derive(Clone, PartialEq, prost::Message, serde::Serialize)]
+struct LegacyPublicVtxoOwner {
+	#[prost(bytes = "vec", tag = "1000")]
+	vtxo_id: Vec<u8>,
+	#[prost(bytes = "vec", tag = "1001")]
+	owner_mailbox: Vec<u8>,
 }
 
 async fn assert_pending_statuses(
 	srv: &ark_testing::Captaind, xpriv: &Xpriv, coins: &[Vtxo<Full>], keys: &[Keypair],
 	expected: &[Option<protos::VtxoSpendState>], owner_mailboxes: &[Option<PublicKey>],
+	observation: &str,
 ) {
 	let mut rpc = srv.get_public_rpc().await;
+	let channel = tonic::transport::Channel::from_shared(srv.ark_url()).unwrap().connect().await.unwrap();
+	let mut public = tonic::client::Grpc::new(channel);
+	let mut single = Vec::new();
+	for coin in coins {
+		public.ready().await.unwrap();
+		let mut request = tonic::Request::new(protos::GetVtxoRequest { vtxo_id: coin.id().to_bytes().to_vec() });
+		request.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+		let response: LegacyPublicVtxo = public.unary(request,
+			tonic::codegen::http::uri::PathAndQuery::from_static("/bark_server.ArkService/GetVtxo"),
+			tonic_prost::ProstCodec::default()).await.unwrap().into_inner();
+		single.push(response);
+	}
+	let unknown = VtxoId::from_slice(&[0u8; 36]).unwrap();
+	assert!(coins.iter().all(|coin| coin.id() != unknown));
+	let mut ids = coins.iter().map(|coin| coin.id().to_bytes().to_vec()).collect::<Vec<_>>();
+	ids.push(ids[0].clone());
+	ids.insert(0, unknown.to_bytes().to_vec());
+	ids.push(unknown.to_bytes().to_vec());
+	public.ready().await.unwrap();
+	let mut request = tonic::Request::new(protos::GetVtxosByIdsRequest { vtxo_ids: ids.clone() });
+	request.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+	let full: LegacyPublicVtxos = public.unary(request,
+		tonic::codegen::http::uri::PathAndQuery::from_static("/bark_server.ArkService/GetVtxosByIds"),
+		tonic_prost::ProstCodec::default()).await.unwrap().into_inner();
+	// Retain BOTH actual decoded endpoint replies before either absence oracle,
+	// including the old-server RED. These are not synthetic or raw-wire bytes.
+	let evidence = std::fs::OpenOptions::new().write(true).create_new(true)
+		.open(srv.config().data_dir.join(format!("public-body-legacy-{observation}.json"))).unwrap();
+	serde_json::to_writer_pretty(evidence, &serde_json::json!({
+		"single_vtxo_ids": coins.iter().map(|coin| coin.id().to_bytes().to_vec()).collect::<Vec<_>>(),
+		"single_replies": &single, "batch_vtxo_ids": &ids, "batch_reply": &full,
+	})).unwrap();
+	for (coin, response) in coins.iter().zip(&single) {
+		assert_eq!(response.vtxo, coin.serialize(), "public lookup preserves the complete signed body");
+		assert!(response.owner_mailbox.is_none(), "public signed body discloses legacy mailbox tag 1000");
+	}
+	assert_eq!(full.vtxos, coins.iter().chain([&coins[0]]).map(ProtocolEncoding::serialize).collect::<Vec<_>>(),
+		"public batch preserves exact signed bodies, order and duplicates");
+	assert_eq!(full.missing_vtxo_ids, vec![unknown.to_bytes().to_vec()], "unknown ids are reported once");
+	assert!(full.owners.is_empty(), "public batch discloses legacy owner tag 1000");
 	let mut queries = Vec::new();
 	for (((coin, key), expected), owner) in coins.iter().zip(keys).zip(expected).zip(owner_mailboxes) {
 		let owner = owner.map(|key| key.serialize().to_vec()).unwrap_or_default();
-		let full = rpc.get_vtxo(protos::GetVtxoRequest { vtxo_id: coin.id().to_bytes().to_vec() }).await.unwrap().into_inner();
-		assert_eq!(full, protos::GetVtxoResponse { vtxo: coin.serialize() },
-			"public signed bodies carry no mailbox identity, including foreign coins");
 		let query = protos::VtxoStatusQuery { vtxo_id: coin.id().to_bytes().to_vec(),
 			attestation: VtxoStatusAttestation::new(coin.id(), key).serialize() };
 		let response = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
@@ -111,13 +178,6 @@ async fn assert_pending_statuses(
 	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest { vtxos: queries }).await.unwrap().into_inner();
 	let recovered = rpc.recover_vtxos_by_xpub(xpub_request(xpriv, srv.ark_info().await.server_pubkey, 0))
 		.await.unwrap().into_inner();
-	let mut ids = coins.iter().map(|coin| coin.id().to_bytes().to_vec()).collect::<Vec<_>>();
-	ids.push(ids[0].clone());
-	let full = rpc.get_vtxos_by_ids(protos::GetVtxosByIdsRequest { vtxo_ids: ids }).await.unwrap().into_inner();
-	assert_eq!(full, protos::GetVtxosByIdsResponse {
-		vtxos: coins.iter().chain([&coins[0]]).map(ProtocolEncoding::serialize).collect(),
-		missing_vtxo_ids: Vec::new(),
-	}, "public batch bodies preserve duplicates without disclosing mailbox identities");
 	for ((coin, expected), owner) in coins.iter().zip(expected).zip(owner_mailboxes) {
 		let owner = owner.map(|key| key.serialize().to_vec()).unwrap_or_default();
 		assert_eq!(batch.vtxos.iter().find(|entry| entry.vtxo_id == coin.id().to_bytes().to_vec()).map(|entry| entry.spend_state),
