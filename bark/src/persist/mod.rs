@@ -463,18 +463,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		Ok(())
 	}
 
-	/// Canonical receipts are revisited after reopen/status reads to reverse an
-	/// orphaned retirement. They contain no inferred action or ancestry graph.
-	async fn get_fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
-		bail!("persister does not support canonical fallback receipts")
-	}
-	async fn store_fallback_receipt(&self, _receipt: &crate::FallbackReceipt) -> anyhow::Result<()> {
-		bail!("persister does not support canonical fallback receipts")
-	}
-	async fn remove_fallback_receipt(&self, _id: VtxoId) -> anyhow::Result<()> {
-		bail!("persister does not support canonical fallback receipts")
-	}
-
 	/// Get the last revealed/used [Vtxo] key index.
 	///
 	/// Returns:
@@ -577,6 +565,7 @@ pub trait BarkPersister: Send + Sync + 'static {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
+		association: Option<&models::ReceiveAssociation>,
 	) -> anyhow::Result<()>;
 
 	/// Look up a settled lightning receive record by payment hash.
@@ -584,6 +573,16 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		payment_hash: PaymentHash,
 	) -> anyhow::Result<Option<SettledLightningReceive>>;
+
+	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
+		bail!("this persister does not support receive outcome rechecks")
+	}
+
+	async fn set_receive_fallback_status(&self, _hash: PaymentHash, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<()>
+	{
+		bail!("this persister does not support durable receive outcomes")
+	}
 
 	/// Store an entry indicating a [Vtxo] is being exited.
 	///
@@ -701,6 +700,14 @@ pub trait BarkPersister: Send + Sync + 'static {
 		-> anyhow::Result<WalletVtxo>
 	{
 		bail!("this persister does not support durable fallback outcomes")
+	}
+
+	/// Atomically retain a validated newly discovered body and its commitment.
+	/// A crash must not leave a terminal body without its recheck marker.
+	async fn store_fallback_vtxo(&self, _vtxo: &Vtxo<Full>, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		bail!("this persister does not support atomic fallback adoption")
 	}
 
 	/// Release `holder`'s lock on the given vtxo, transitioning it to

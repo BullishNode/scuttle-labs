@@ -163,9 +163,9 @@ impl ExitVtxo {
 		}
 
 		let vtxo = self.get_vtxo(&*wallet.inner.db).await?;
-		let receipts = wallet.inner.db.get_fallback_receipts().await
+		let commitments = crate::exit::fallback_commitments(&*wallet.inner.db).await
 			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
-		let observe_only = crate::exit::fallback_blocks_abortable_exit(&self.state, self.id(), &receipts)
+		let observe_only = crate::exit::fallback_blocks_abortable_exit(&self.state, self.id(), &commitments)
 			&& vtxo.state.kind() != crate::vtxo::VtxoStateKind::Spent;
 		if observe_only && matches!(tx_manager.sync_exit_tx(vtxo.point().txid).await?, TxStatus::NotFound) {
 			return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot progress an abortable exit".into() });

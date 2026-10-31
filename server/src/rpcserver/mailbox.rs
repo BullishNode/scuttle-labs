@@ -207,17 +207,11 @@ impl rpc::server::MailboxService for crate::Server {
 			self::badarg!("invalid mailbox authorization signature");
 		}
 		let limit = self.config.max_read_mailbox_items;
-		let cursor = req.fallback_cursor.as_deref().map(VtxoId::from_slice).transpose()
-			.badarg("invalid fallback receipt cursor")?;
-		let (entries_by_checkpoint, claims) = self.db.read(async |t| {
-			Ok((t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await?,
-				t.mailbox_fallback_claims(mailbox_id.as_pubkey(), cursor, limit).await?))
-		}).await.to_status()?;
+		let entries_by_checkpoint = self.db.read(async |t|
+			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await
+		).await.to_status()?;
 
 		let response = protos::mailbox_server::MailboxMessages {
-			have_more_fallback_claims: claims.len() >= limit,
-			fallback_cursor: claims.last().map(|claim| claim.vtxo_id.to_bytes().to_vec()),
-			fallback_claims: claims.iter().map(Into::into).collect(),
 			have_more: entries_by_checkpoint.len() >= limit,
 			messages: entries_by_checkpoint.into_iter().map(new_mailbox_msg).collect(),
 		};

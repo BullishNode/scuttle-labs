@@ -21,6 +21,7 @@ use bark::actions::lightning::receive::{
 };
 
 use crate::cli::fees::FeeSchedule;
+use crate::primitives::FallbackStatusInfo;
 use crate::exit::error::ExitError;
 use crate::exit::package::ExitTransactionPackage;
 use crate::exit::ExitState;
@@ -250,10 +251,6 @@ pub struct DebugInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct Balance {
-	/// Owned value awaiting settlement; included in pending, never spendable.
-	#[serde(default, rename = "awaiting_settlement_sat", with = "bitcoin::amount::serde::as_sat")]
-	#[cfg_attr(feature = "utoipa", schema(value_type = u64, required))]
-	pub awaiting_settlement: Amount,
 	/// Sats that are immediately spendable, either in-round or
 	/// out-of-round.
 	#[serde(rename = "spendable_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -323,7 +320,6 @@ impl From<bark::Balance> for Balance {
 		Balance {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,
-			awaiting_settlement: v.awaiting_settlement,
 			pending_in_round: v.pending_in_round,
 			pending_lightning_send: v.pending_lightning_send,
 			claimable_lightning_receive: v.claimable_lightning_receive,
@@ -343,10 +339,6 @@ impl From<bark::Balance> for Balance {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct BalanceSummary {
-	/// Owned value awaiting settlement; included in pending, never spendable.
-	#[serde(default, rename = "awaiting_settlement_sat", with = "bitcoin::amount::serde::as_sat")]
-	#[cfg_attr(feature = "utoipa", schema(value_type = u64, required))]
-	pub awaiting_settlement: Amount,
 	/// Sats that can be spent right now. See `spendable_sat` of [Balance].
 	#[serde(rename = "spendable_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
@@ -356,8 +348,7 @@ pub struct BalanceSummary {
 	#[serde(rename = "needs_refresh_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub needs_refresh: Amount,
-	/// Sats awaiting settlement or held by operations: `awaiting_settlement_sat`
-	/// plus the sum of the `pending_*_sat`
+	/// Sats held by operations: the sum of the `pending_*_sat`
 	/// fields of [Balance]. They either come back as spendable or leave the
 	/// wallet, for example to the on-chain wallet.
 	#[serde(rename = "pending_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -371,8 +362,7 @@ pub struct BalanceSummary {
 
 impl From<&Balance> for BalanceSummary {
 	fn from(v: &Balance) -> Self {
-		let pending = v.awaiting_settlement
-			+ v.pending_in_round
+		let pending = v.pending_in_round
 			+ v.pending_board
 			+ v.pending_arkoor_send
 			+ v.pending_lightning_send
@@ -382,7 +372,6 @@ impl From<&Balance> for BalanceSummary {
 		BalanceSummary {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,
-			awaiting_settlement: v.awaiting_settlement,
 			pending,
 			total: v.spendable + v.needs_refresh + pending,
 		}
@@ -400,7 +389,6 @@ impl From<bark::BalanceSummary> for BalanceSummary {
 		BalanceSummary {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,
-			awaiting_settlement: v.awaiting_settlement,
 			pending: v.pending,
 			total: v.total,
 		}
@@ -627,8 +615,10 @@ pub struct LightningReceiveInfo {
 	/// The payment hash linked to the lightning receive
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the receive
+	/// Lifecycle phase of the invoice; payout progress is `fallback_status`.
 	pub state: LightningReceiveStateKind,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fallback_status: Option<FallbackStatusInfo>,
 	/// The invoice string, if known.
 	pub invoice: String,
 	/// The payment preimage, if known.
@@ -671,10 +661,11 @@ impl LightningReceiveInfo {
 			LightningReceiveState::Settled(s) => LightningReceiveInfo {
 				payment_hash: s.payment_hash,
 				state: LightningReceiveStateKind::Settled,
+				fallback_status: s.association.as_ref().and_then(|claim| claim.fallback_status).map(Into::into),
 				invoice: s.invoice.to_string(),
 				payment_preimage: Some(s.preimage),
 				amount: s.amount,
-				htlc_vtxo_ids: vec![],
+				htlc_vtxo_ids: s.association.as_ref().map(|claim| claim.grant_ids.clone()).unwrap_or_default(),
 				settled_at: Some(s.settled_at),
 				preimage_revealed_at: None,
 				finished_at: Some(s.settled_at),
@@ -782,6 +773,7 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 		LightningReceiveInfo {
 			payment_hash: recv.payment_hash,
 			state,
+			fallback_status: recv.fallback_status.map(Into::into),
 			invoice: recv.invoice.to_string(),
 			payment_preimage: Some(recv.payment_preimage),
 			amount: recv.invoice.amount_milli_satoshis()
@@ -802,9 +794,8 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_awaiting_balance_counts_owned_value_once() {
+	fn ordinary_pending_balance_counts_each_bucket_once() {
 		let balance = Balance {
-			awaiting_settlement: Amount::from_sat(5_000),
 			spendable: Amount::from_sat(2_000),
 			needs_refresh: Amount::ZERO,
 			pending_lightning_send: Amount::ZERO,
@@ -812,16 +803,15 @@ mod test {
 			pending_in_round: Amount::ZERO,
 			pending_board: Amount::ZERO,
 			pending_arkoor_send: Amount::ZERO,
-			pending_offboard: Amount::ZERO,
+			pending_offboard: Amount::from_sat(5_000),
 			pending_exit: Amount::ZERO,
 		};
 		let summary = BalanceSummary::from(&balance);
 		assert_eq!(summary.spendable, Amount::from_sat(2_000));
-		assert_eq!(summary.awaiting_settlement, Amount::from_sat(5_000));
 		assert_eq!(summary.pending, Amount::from_sat(5_000));
 		assert_eq!(summary.total, Amount::from_sat(7_000));
 		let encoded = serde_json::to_value(&summary).unwrap();
-		assert_eq!(encoded["awaiting_settlement_sat"], 5_000);
+		assert!(encoded.get("awaiting_settlement_sat").is_none());
 	}
 
 	fn lightning_receive_base_json() -> serde_json::Value {

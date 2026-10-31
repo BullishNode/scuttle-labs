@@ -1160,10 +1160,11 @@ pub fn record_settled_lightning_receive(
 	preimage: Preimage,
 	invoice: &Bolt11Invoice,
 	amount: Amount,
+	association: Option<&crate::persist::models::ReceiveAssociation>,
 ) -> anyhow::Result<()> {
 	let query = "
-		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat)
-		VALUES (:payment_hash, :preimage, :invoice, :amount_sat)
+		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat, association)
+		VALUES (:payment_hash, :preimage, :invoice, :amount_sat, :association)
 		ON CONFLICT(payment_hash) DO NOTHING";
 	let mut statement = conn.prepare(query)?;
 	statement.execute(named_params! {
@@ -1171,7 +1172,15 @@ pub fn record_settled_lightning_receive(
 		":preimage": preimage.as_hex().to_string(),
 		":invoice": invoice.to_string(),
 		":amount_sat": amount.to_sat() as i64,
+		":association": association.map(serde_json::to_vec).transpose()?,
 	})?;
+	if let Some(expected) = association {
+		let stored = get_settled_lightning_receive(conn, payment_hash)?.context("settled receive disappeared")?
+			.association.context("settled receive has no original claim association")?;
+		ensure!((stored.key_index, &stored.claim_destination, &stored.grant_ids)
+			== (expected.key_index, &expected.claim_destination, &expected.grant_ids),
+			"settled receive claim association differs");
+	}
 	Ok(())
 }
 
@@ -1179,7 +1188,7 @@ pub fn get_settled_lightning_receive(
 	conn: &Connection,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<Option<SettledLightningReceive>> {
-	let query = "SELECT preimage, invoice, amount_sat, settled_at
+	let query = "SELECT preimage, invoice, amount_sat, settled_at, association
 		FROM bark_settled_lightning_receive WHERE payment_hash = :payment_hash";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
@@ -1196,7 +1205,33 @@ pub fn get_settled_lightning_receive(
 		.context("invalid invoice in bark_settled_lightning_receive")?;
 	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat")? as u64);
 	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
-	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
+	let association = row.get::<_, Option<Vec<u8>>>("association")?
+		.map(|raw| serde_json::from_slice(&raw)).transpose()?;
+	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at, association }))
+}
+
+pub fn fallback_lightning_receives(conn: &Connection) -> anyhow::Result<Vec<SettledLightningReceive>> {
+	let mut statement = conn.prepare("SELECT payment_hash FROM bark_settled_lightning_receive WHERE association IS NOT NULL ORDER BY payment_hash")?;
+	let hashes = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+	let mut ret = Vec::new();
+	for hash in hashes {
+		let recv = get_settled_lightning_receive(conn, hash.parse()?)?.context("known receive disappeared")?;
+		if recv.association.as_ref().is_some_and(|claim| claim.fallback_status.is_some()) { ret.push(recv); }
+	}
+	Ok(ret)
+}
+
+pub fn set_receive_fallback_status(conn: &mut Connection, hash: PaymentHash, status: crate::vtxo::FallbackStatus)
+	-> anyhow::Result<()>
+{
+	let tx = conn.transaction()?;
+	let mut association = get_settled_lightning_receive(&tx, hash)?.context("receive is not stored")?
+		.association.context("receive has no original claim association")?;
+	association.fallback_status = Some(status);
+	tx.execute("UPDATE bark_settled_lightning_receive SET association=?2 WHERE payment_hash=?1",
+		params![hash.to_string(), serde_json::to_vec(&association)?])?;
+	tx.commit()?;
+	Ok(())
 }
 
 

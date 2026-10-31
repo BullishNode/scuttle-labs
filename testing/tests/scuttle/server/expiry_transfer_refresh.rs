@@ -152,7 +152,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("canonical outputs must retire both original sources exactly once");
-	assert_eq!(returned.balance().await.unwrap().awaiting_settlement, Amount::ZERO);
+	assert!(returned.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status != Some(bark::vtxo::FallbackStatus::Pending)));
 	for _ in 0..2 { returned.sync_fallback_payouts().await.unwrap(); }
 	drop(returned);
 	let reopened = absent.client().await;

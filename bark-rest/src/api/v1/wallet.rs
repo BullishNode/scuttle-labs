@@ -587,12 +587,7 @@ pub async fn vtxos(
 		wallet.vtxos().await.context("Failed to get VTXOs")?
 	};
 
-	let awaiting = wallet.awaiting_settlement_vtxos().await?;
-	let vtxo_infos = wallet_vtxos.iter().map(|vtxo| {
-		let mut info = bark_json::primitives::WalletVtxoInfo::from(vtxo);
-		info.awaiting_settlement = awaiting.contains(&vtxo.id());
-		info
-	}).collect();
+	let vtxo_infos = wallet_vtxos.iter().map(bark_json::primitives::WalletVtxoInfo::from).collect();
 
 	Ok(axum::Json(vtxo_infos))
 }
@@ -624,8 +619,7 @@ pub async fn get_vtxo(
 	let wallet_vtxo = wallet.get_vtxo_by_id(vtxo_id).await
 		.not_found([vtxo_id], "VTXO not found")?;
 
-	let mut info = bark_json::primitives::WalletVtxoInfo::from(&wallet_vtxo);
-	info.awaiting_settlement = wallet.awaiting_settlement_vtxos().await?.contains(&vtxo_id);
+	let info = bark_json::primitives::WalletVtxoInfo::from(&wallet_vtxo);
 	Ok(axum::Json(info))
 }
 

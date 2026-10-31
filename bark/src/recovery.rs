@@ -235,11 +235,9 @@ impl Wallet {
 		// read. The scan ends when the server has no more messages.
 		let mut checkpoint = 0u64;
 		let mut iteration = 0usize;
-		let mut fallback_cursor = None;
 		loop {
 			iteration += 1;
 			let req = protos::mailbox_server::MailboxRequest {
-				fallback_cursor: fallback_cursor.clone(),
 				mailbox_id: mailbox_id.serialize(),
 				authorization: Some(auth.serialize()),
 				checkpoint,
@@ -249,8 +247,6 @@ impl Wallet {
 
 			debug!("Mailbox returned {} messages on recovery iteration {iteration}",
 				resp.messages.len());
-			let prev_fallback_cursor = fallback_cursor.clone();
-			fallback_cursor = self.process_mailbox_fallback_claims(&resp, fallback_cursor.as_deref()).await?;
 
 			let prev_checkpoint = checkpoint;
 			let mut candidates = Vec::new();
@@ -293,14 +289,14 @@ impl Wallet {
 			// One batch per page bounds the memory to what the server sends at once.
 			self.recover_candidates(report, candidates, gap_limit).await?;
 
-			if !resp.have_more && !resp.have_more_fallback_claims {
+			if !resp.have_more {
 				break;
 			}
 
 			// The server wants us to keep paging, but the checkpoint didn't
 			// advance, so the next request would be identical and we'd loop
 			// forever. Stop rather than spin on the same page.
-			if checkpoint == prev_checkpoint && fallback_cursor == prev_fallback_cursor {
+			if checkpoint == prev_checkpoint {
 				warn!("Mailbox recovery iteration {iteration} made no progress \
 					at checkpoint {checkpoint}; stopping");
 				break;
@@ -469,12 +465,12 @@ impl Wallet {
 		// The server is the authority on whether a vtxo was spent elsewhere,
 		// and recovery has nothing else to go on.
 		let queries = owned.iter().map(|(vtxo, keypair)| (vtxo.id(), keypair)).collect::<Vec<_>>();
-		let states = self.fetch_vtxo_spend_states(&queries).await?;
+		let states = self.fetch_vtxo_statuses(&queries).await?;
 
 		let vtxos = owned.into_iter().map(|(vtxo, _)| {
 			// The fetch logged why an answer is missing.
 			let adoption = match states.get(&vtxo.id()) {
-				Some(state) => ServerStatusAdoption::from_spend_state(*state),
+				Some((state, committed)) => ServerStatusAdoption::from_status(*state, *committed),
 				None => Err(anyhow::anyhow!("no answer from the server")),
 			};
 			(vtxo, adoption)
@@ -506,8 +502,8 @@ impl Wallet {
 						vtxo = completed;
 						let (_, key) = self.pubkey_keypair(&vtxo.user_pubkey()).await?
 							.context("recovered round key disappeared")?;
-						adoption = self.fetch_vtxo_spend_state(id, &key).await
-							.and_then(ServerStatusAdoption::from_spend_state);
+						adoption = self.fetch_vtxo_status(id, &key).await
+							.and_then(|(state, committed)| ServerStatusAdoption::from_status(state, committed));
 					},
 					Err(error) => {
 						warn!("Could not complete released recovery source {id}: {error:#}");
@@ -519,7 +515,7 @@ impl Wallet {
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),
-				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
+				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
 				// Finishing the flow the VTXO is stuck in is what decides where it
@@ -543,7 +539,7 @@ impl Wallet {
 		// vtxo as spendable again. A row from an earlier, failed attempt is
 		// forced along.
 		if !spent.is_empty() {
-			self.store_vtxos(spent.iter(), &VtxoState::Spent).await?;
+			self.store_vtxos_with_server_status(spent.iter()).await?;
 			self.trust_ordinary_spends(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
 			for vtxo in &spent {
 				debug!("Recovery vtxo {} already spent, skipping", vtxo.id());
@@ -598,7 +594,7 @@ impl Wallet {
 		}
 		// NB we don't use store_spendable_vtxos to avoid posting the vtxos again
 		if !recovered.is_empty() {
-			self.store_vtxos(recovered.iter(), &VtxoState::Spendable).await?;
+			self.store_vtxos_with_server_status(recovered.iter()).await?;
 			// A locked row from an earlier attempt without an answer is released.
 			self.unlock_vtxos(recovered.iter(), None).await?;
 			for vtxo in &recovered {
@@ -648,7 +644,8 @@ impl Wallet {
 	/// and no gap limit: the server scans a fixed range of key indices per
 	/// call, and we ask for the next range for as long as the server reports
 	/// that more VTXOs may follow. Each VTXO comes with its body and spend
-	/// state, so it needs no further request. Every index up to the highest
+	/// state; first storage rechecks status under the wallet lock after chain
+	/// validation. Every index up to the highest
 	/// one whose key matches its VTXO is stored as revealed, so the key lookups
 	/// of later scans resolve from the database.
 	///
@@ -672,6 +669,7 @@ impl Wallet {
 				authorization: auth.serialize(),
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
+			let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {
@@ -716,8 +714,8 @@ impl Wallet {
 					continue;
 				}
 				let adoption = match VtxoSpendState::try_from(entry.spend_state) {
-					Ok(state) => self.observe_server_vtxo_status(vtxo.id(), &entry.owner_mailbox, state, entry.fallback_claim).await
-						.and_then(ServerStatusAdoption::from_spend_state),
+					Ok(state) => self.observe_server_vtxo_status(vtxo.id(), &entry.owner_mailbox, state, entry.fallback_committed).await
+						.and_then(|state| ServerStatusAdoption::from_status(state, entry.fallback_committed)),
 					Err(_) => Err(anyhow::anyhow!("server returned an unknown spend state")),
 				};
 				vtxos.push((vtxo, adoption));
@@ -729,6 +727,7 @@ impl Wallet {
 				self.reveal_vtxo_keys_up_to(max_index).await
 					.context("failed to store recovered vtxo keys")?;
 			}
+			drop(history_guard);
 			self.store_recovered_vtxos(report, vtxos).await?;
 
 			// A server that moved neither past a key nor within one would have

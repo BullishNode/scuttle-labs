@@ -204,6 +204,12 @@ impl Db {
 			let bound: bool = conn.query_one(
 				"SELECT to_regclass('scuttle.coin_owner') IS NOT NULL \
 				 AND to_regclass('public.refinery_schema_history') IS NOT NULL \
+				 AND (SELECT COUNT(*)=4 FROM information_schema.columns WHERE table_schema='scuttle' \
+					AND table_name='owner_key' AND data_type='text' AND is_nullable='NO' \
+					AND column_name IN ('user_pubkey','mailbox_pk','blinded_id','joint_proof')) \
+				 AND (SELECT COUNT(*)=2 FROM information_schema.columns WHERE table_schema='scuttle' \
+					AND table_name='coin_owner' AND data_type='text' AND is_nullable='NO' \
+					AND column_name IN ('vtxo_id','mailbox_pk')) \
 				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
 					AND table_name='cln_xpay' AND column_name='signed_invoice' AND data_type='text') \
 				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
@@ -218,6 +224,20 @@ impl Db {
 				 AND tgrelid=to_regclass('public.vtxo') AND tgdeferrable AND tginitdeferred)", &[],
 			).await?.get(0);
 			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
+			let complete: bool = conn.query_one(
+				"SELECT COUNT(*)=14 FROM information_schema.tables WHERE table_schema='scuttle' \
+				 AND table_type='BASE TABLE' AND table_name IN ( \
+				 'owner_key','coin_owner','expiry_entitlement','expiry_cancelled_participation', \
+				 'expiry_chain_view','expiry_allocation','expiry_allocation_input','expiry_allocation_coin', \
+				 'expiry_allocation_payout','expiry_split_request','expiry_terminal_claim', \
+				 'expiry_lightning_receive_claim','expiry_hold','htlc_settlement_source')", &[],
+			).await?.get(0);
+			ensure!(complete, "incomplete Scuttle schema; use a fresh store");
+			let history: bool = conn.query_one(
+				"SELECT COUNT(*)=78 AND MIN(version)=0 AND MAX(version)=77 \
+				 FROM public.refinery_schema_history", &[],
+			).await?.get(0);
+			ensure!(history, "unrecognized upstream history; use a fresh Scuttle store");
 		}
 
 		embedded::migrations::runner()

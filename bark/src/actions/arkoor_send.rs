@@ -22,7 +22,7 @@ use crate::arkoor::{post_arkoor_to_mailboxes, split_change_amount, DeliveryOutco
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
-use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
+use crate::vtxo::VtxoLockHolder;
 
 /// How long to wait before re-attempting delivery in the
 /// [`Progress::Delivery`] park path.
@@ -55,7 +55,7 @@ impl ArkoorSend {
 	}
 
 	/// A committed refund is not successful delivery. Keep the original signed
-	/// checkpoint until the receipts actually retire every input on our chain.
+	/// checkpoint until authenticated status retires every original input.
 	async fn follow_fallback_registration(self, wallet: &Wallet) -> Advance<Self> {
 		match reconcile_fallback_registration(wallet, &self).await {
 			Ok(true) => Advance::Failed(FallbackRefusal::DecidedForFallback.into()),
@@ -121,8 +121,8 @@ impl WalletAction for ArkoorSend {
 			Progress::Registration {
 				movement_id, signed_destination_vtxos, signed_change_vtxos,
 			} => {
-				let receipts = wallet.inner.db.get_fallback_receipts().await.retry()?;
-				if receipts.iter().any(|receipt| self.input_vtxo_ids.iter().any(|id| receipt.affects(*id))) {
+				let inputs = wallet.inner.db.get_wallet_vtxos(&self.input_vtxo_ids).await.retry()?;
+				if inputs.iter().any(|coin| coin.fallback_status.is_some()) {
 					let send = ArkoorSend { progress: Progress::Registration {
 						movement_id, signed_destination_vtxos, signed_change_vtxos,
 					}, ..self };
@@ -213,7 +213,7 @@ impl WalletAction for ArkoorSend {
 			// the recipient can't spend via the server either. They CAN still
 			// emergency exit from the signed transaction chain we hold, so
 			// fall through to Delivery for unrelated rejections. A typed fallback
-			// decision instead needs its actual stage-selected receipts.
+			// decision instead needs its authenticated complete input status.
 			Progress::Registration {
 				movement_id, signed_destination_vtxos, signed_change_vtxos,
 			} => {
@@ -254,48 +254,15 @@ impl WalletAction for ArkoorSend {
 	}
 }
 
-/// Follow explicit stage-selected receipts, not input ancestry or a mailbox
-/// transport ACK. A partial claim cannot decide the entire send's outcome.
+/// The server aggregates every stage-selected portion onto the original
+/// authenticated inputs. Keep the original signed checkpoint and failed send
+/// intent; neither an ordinary Spent reply nor a delivery ACK settles it.
 async fn reconcile_fallback_registration(wallet: &Wallet, send: &ArkoorSend) -> anyhow::Result<bool> {
-	let Progress::Registration { movement_id, signed_destination_vtxos, signed_change_vtxos } = &send.progress
+	let Progress::Registration { movement_id, signed_change_vtxos, .. } = &send.progress
 		else { bail!("fallback registration requires the original signed checkpoint"); };
-	wallet.recheck_fallback_receipts().await?;
-	let mut receipts = wallet.inner.db.get_fallback_receipts().await?;
-	if signed_destination_vtxos.iter().chain(signed_change_vtxos)
-		.any(|output| !receipts.iter().any(|receipt| receipt.vtxo_id == output.id())) {
-		wallet.sync_mailbox_fallback_claims().await?;
-		receipts = wallet.inner.db.get_fallback_receipts().await?;
-	}
-	let mut matched = Vec::new();
-	for output in signed_destination_vtxos.iter().chain(signed_change_vtxos) {
-		let receipt = receipts.iter().find(|receipt| receipt.vtxo_id == output.id())
-			.context("signed arkoor output has no committed input-owner receipt")?;
-		ensure!(receipt.owner_mailbox == wallet.mailbox_keypair().public_key()
-			&& receipt.gross == output.amount()
-			&& send.input_vtxo_ids.iter().any(|id| receipt.source_vtxo_ids.contains(id)),
-			"fallback receipt does not refund this signed arkoor output to its input owner");
-		matched.push(receipt);
-	}
-	for id in &send.input_vtxo_ids {
-		let input = wallet.inner.db.get_wallet_vtxo(*id).await?.context("retained arkoor input is missing")?;
-		let gross = matched.iter().filter(|receipt| receipt.source_vtxo_ids.contains(id))
-			.try_fold(Amount::ZERO, |sum, receipt| sum.checked_add(receipt.gross).context("fallback input attribution overflow"))?;
-		ensure!(gross == input.amount(), "fallback receipts do not cover this arkoor input completely");
-	}
-	// Keep our real signed change without making a committed source spendable.
-	// The original destination bodies remain in the Registration checkpoint.
+	let terminal = wallet.fallback_inputs_terminal(&send.input_vtxo_ids).await?;
 	wallet.retain_fallback_pending(signed_change_vtxos).await?;
 	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
-	for id in &send.input_vtxo_ids {
-		let input = wallet.inner.db.get_wallet_vtxo(*id).await?.context("retained arkoor input is missing")?;
-		match input.state {
-			VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: ref holder }) } if holder == &send.id => {
-				wallet.inner.db.update_vtxo_state_checked(*id, VtxoState::Locked { holder: None }, &[VtxoStateKind::Locked]).await?;
-			},
-			VtxoState::Locked { holder: None } | VtxoState::Spent => {},
-			_ => bail!("committed arkoor input has another lifecycle owner"),
-		}
-	}
 	let current = wallet.inner.db.get_movement_by_id(*movement_id).await?;
 	if current.status != MovementStatus::Failed || current.effective_balance != bitcoin::SignedAmount::ZERO {
 		wallet.inner.movements.finish_movement_with_update(*movement_id, MovementStatus::Failed,
@@ -303,9 +270,7 @@ async fn reconcile_fallback_registration(wallet: &Wallet, send: &ArkoorSend) -> 
 				.produced_vtxos(signed_change_vtxos.iter().map(|coin| coin.id()))
 				.metadata([("fallback_refusal".into(), serde_json::json!("decided_for_fallback"))])).await?;
 	}
-	let latest = wallet.inner.db.get_fallback_receipts().await?;
-	Ok(matched.iter().all(|receipt| latest.iter().any(|current|
-		current.vtxo_id == receipt.vtxo_id && current.retired_block.is_some())))
+	Ok(terminal)
 }
 
 /// Build a fresh [`ArkoorSend`] in [`Progress::Cosigning`]

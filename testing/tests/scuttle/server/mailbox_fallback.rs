@@ -53,7 +53,6 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	assert_eq!(snapshot().await, before_refusal,
 		"an unknown recovery ID must not partially write hints or change ownership");
 	let messages = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
-			fallback_cursor: None,
 		mailbox_id: mailbox.serialize(), authorization: Some(authorization.clone()), checkpoint: 0,
 	}).await.unwrap().into_inner().messages;
 	assert_eq!(messages.len(), 1);
@@ -122,7 +121,6 @@ async fn mailbox_authorization_delivery_and_commit_notifications() {
 	let target = MailboxIdentifier::from_pubkey(target_key.public_key());
 	let authorization = MailboxAuthorization::new(&target_key, chrono::Local::now() + Duration::from_secs(300)).serialize();
 	let request = || protos::mailbox_server::MailboxRequest {
-			fallback_cursor: None,
 		mailbox_id: target.serialize(), authorization: Some(authorization.clone()), checkpoint: 0,
 	};
 	let blinded_id = target.to_blinded(server_key.public_key(), &coin_key).unwrap().serialize();

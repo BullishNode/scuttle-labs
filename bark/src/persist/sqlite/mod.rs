@@ -308,47 +308,16 @@ impl BarkPersister for SqliteClient {
 		Ok(coin)
 	}
 
-	async fn get_fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
-		let conn = self.connect()?;
-		let mut stmt = conn.prepare("SELECT receipt FROM bark_fallback_receipt ORDER BY vtxo_id")?;
-		let bytes = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?.collect::<Result<Vec<_>, _>>()?;
-		bytes.into_iter().map(|bytes| serde_json::from_slice(&bytes).map_err(Into::into)).collect()
-	}
-
-	async fn store_fallback_receipt(&self, receipt: &crate::FallbackReceipt) -> anyhow::Result<()> {
+	async fn store_fallback_vtxo(&self, vtxo: &Vtxo<Full>, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
 		let mut conn = self.connect()?;
 		let tx = conn.transaction()?;
-		let previous: Option<Vec<u8>> = tx.query_row("SELECT receipt FROM bark_fallback_receipt WHERE vtxo_id=?1",
-			[receipt.vtxo_id.to_string()], |row| row.get(0)).optional()?;
-		if let Some(previous) = previous {
-			let previous: crate::FallbackReceipt = serde_json::from_slice(&previous)?;
-			ensure!(previous.owner_mailbox == receipt.owner_mailbox && previous.gross == receipt.gross
-				&& previous.source_vtxo_ids == receipt.source_vtxo_ids, "immutable fallback receipt source differs");
-		}
-		let changed = tx.execute("INSERT INTO bark_fallback_receipt (vtxo_id,owner_mailbox,gross_sat,receipt)
-			VALUES(?1,?2,?3,?4) ON CONFLICT(vtxo_id) DO UPDATE SET receipt=excluded.receipt
-			WHERE bark_fallback_receipt.owner_mailbox=excluded.owner_mailbox AND bark_fallback_receipt.gross_sat=excluded.gross_sat",
-			rusqlite::params![receipt.vtxo_id.to_string(), receipt.owner_mailbox.to_string(),
-				i64::try_from(receipt.gross.to_sat())?, serde_json::to_vec(receipt)?])?;
-		ensure!(changed == 1, "immutable fallback receipt source differs");
+		query::store_vtxo_with_initial_state(&tx, vtxo, &VtxoState::Locked { holder: None })?;
+		let coin = query::set_vtxo_fallback_status(&tx, vtxo.id(), status)?;
 		tx.commit()?;
-		Ok(())
+		Ok(coin)
 	}
-
-	async fn remove_fallback_receipt(&self, id: VtxoId) -> anyhow::Result<()> {
-		self.connect()?.execute("DELETE FROM bark_fallback_receipt WHERE vtxo_id=?1", [id.to_string()])?;
-		Ok(())
-	}
-
-
-
-
-
-
-
-
-
-
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
 		let conn = self.connect()?;
@@ -426,9 +395,10 @@ impl BarkPersister for SqliteClient {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
+		association: Option<&crate::persist::models::ReceiveAssociation>,
 	) -> anyhow::Result<()> {
 		let conn = self.connect()?;
-		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount)
+		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount, association)
 	}
 
 	async fn get_settled_lightning_receive(
@@ -437,6 +407,14 @@ impl BarkPersister for SqliteClient {
 	) -> anyhow::Result<Option<SettledLightningReceive>> {
 		let conn = self.connect()?;
 		query::get_settled_lightning_receive(&conn, payment_hash)
+	}
+
+	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
+		query::fallback_lightning_receives(&self.connect()?)
+	}
+
+	async fn set_receive_fallback_status(&self, hash: PaymentHash, status: crate::vtxo::FallbackStatus) -> anyhow::Result<()> {
+		query::set_receive_fallback_status(&mut self.connect()?, hash, status)
 	}
 
 	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
@@ -590,23 +568,43 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_receipts_reopen_without_changing_wallet_records() {
-		let (path, conn) = in_memory_db();
+	fn fallback_outcomes_reopen_without_rewriting_upstream_history() {
+		let (path, mut conn) = in_memory_db();
 		let db = SqliteClient::open(&path).unwrap();
 		let history = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
 			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
 			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		// Persistence sentinels are deliberately not authenticated financial proofs.
-		conn.execute("INSERT INTO bark_fallback_receipt VALUES ('control',?1,10000,X'04')", ["02".repeat(33)]).unwrap();
+		let coin = &VTXO_VECTORS.board_vtxo;
+		let tx = conn.transaction().unwrap();
+		query::store_vtxo_with_initial_state(&tx, coin, &VtxoState::Spendable).unwrap();
+		query::set_vtxo_fallback_status(&tx, coin.id(), crate::vtxo::FallbackStatus::Pending).unwrap();
+		tx.commit().unwrap();
 		drop(db);
 		let _reopened = SqliteClient::open(&path).unwrap();
+		let stored = query::get_wallet_vtxo_by_id(&conn, coin.id()).unwrap().unwrap();
+		assert_eq!(stored.fallback_status, Some(crate::vtxo::FallbackStatus::Pending));
+		assert_eq!(stored.state, VtxoState::Locked { holder: None });
+		assert_eq!(query::get_full_vtxo_by_id(&conn, coin.id()).unwrap().unwrap().serialize(), coin.serialize());
 		let after = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
 			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
 			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		assert_eq!(after, history);
-		assert_eq!(conn.query_row("SELECT receipt FROM bark_fallback_receipt WHERE vtxo_id='control'", [],
-			|row| row.get::<_, Vec<u8>>(0)).unwrap(), vec![4]);
+		assert_eq!(history, after);
 	}
+
+	#[test]
+	fn receipt_bearing_wallet_is_refused_without_writes() {
+		let (path, conn) = in_memory_db();
+		let current = SqliteClient::open(&path).unwrap();
+		conn.execute("CREATE TABLE bark_fallback_receipt(vtxo_id TEXT PRIMARY KEY,receipt BLOB)", []).unwrap();
+		drop(current);
+		let before: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+		assert!(SqliteClient::open(&path).unwrap_err().to_string().contains("not a fresh Scuttle store"));
+		let after: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+		assert_eq!(before, after);
+		assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bark_fallback_receipt')", [],
+			|row| row.get::<_, bool>(0)).unwrap());
+	}
+
 
 	#[test]
 	fn registration_shaped_wallet_is_refused_even_with_mailbox_identity() {

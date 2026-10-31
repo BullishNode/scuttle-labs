@@ -219,12 +219,10 @@ enum VtxoSpendState {
 	VTXO_SPEND_STATE_UNREGISTERED = 4;
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
-	// Customer principal allocated for fallback. The client verifies the
-	// canonical payment before it retires this claim.
+	// A committed fallback decision has unresolved relevant portions.
 	reserved 6;
 	VTXO_SPEND_STATE_FALLBACK_PENDING = 1000;
-	// Terminal no-output policy result. The attached receipt carries the
-	// actual fee and forfeited amount; this is not a Bitcoin payment.
+	// Terminal policy result with no Bitcoin payout.
 	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 1001;
 }
 
@@ -237,7 +235,8 @@ message GetVtxoStatusRequest {
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
 	bytes owner_mailbox = 1000;
-	optional core.FallbackClaim fallback_claim = 1001;
+	reserved 1001;
+	bool fallback_committed = 1002;
 }
 
 message VtxoStatusQuery {
@@ -255,7 +254,8 @@ message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
 	bytes owner_mailbox = 1000;
-	optional core.FallbackClaim fallback_claim = 1001;
+	reserved 1001;
+	bool fallback_committed = 1002;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -290,7 +290,8 @@ message RecoveredVtxo {
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
 	bytes owner_mailbox = 1000;
-	optional core.FallbackClaim fallback_claim = 1001;
+	reserved 1001;
+	bool fallback_committed = 1002;
 }
 
 message RecoverVtxosByXpubResponse {

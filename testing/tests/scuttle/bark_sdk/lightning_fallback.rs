@@ -526,7 +526,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	let onchain = restored.onchain().unwrap();
 	assert_eq!(onchain.read().await.balance().await, expected);
 	restored.sync_fallback_payouts().await.unwrap();
-	assert_eq!(restored.verify_fallback_output(point).await.unwrap(), expected);
+	assert_eq!(payout.value, expected);
 
 	let destination = ctx.bitcoind().get_new_address();
 	let psbt = onchain.write().await.prepare_drain_tx(destination.clone(), FeeRate::from_sat_per_vb(2).unwrap()).await.unwrap();

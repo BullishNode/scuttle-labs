@@ -13,7 +13,7 @@ keep their original software and data.
 
 ## Wire contract
 
-The Scuttle protocol epoch is `1000`. Clients negotiate it through `Handshake`;
+The receipt-free Scuttle protocol epoch is `1001`. Epoch `1000` is refused. Clients negotiate it through `Handshake`;
 all other Ark and Mailbox methods except the bootstrap information request require
 the negotiated version. This includes recovery, status, streams and retry paths.
 The operator service uses the configured private administrative listener, never
@@ -93,48 +93,82 @@ network synchronization. Generate a joint link whenever deriving a spending key;
 transport the recipient's link for recipient outputs and the wallet's own link
 for board, change, self-round and HTLC-send outputs.
 
-Recovery and status responses carry `owner_mailbox`. Batch and mailbox responses
-bind each mailbox to a VTXO ID using `core.VtxoOwner`; request duplicates and
-response ordering do not change that association. A missing entry means ownership
-is unresolved, not that the requester owns the coin. Foreign ownership does not
-hide the signed body from its spending-key holder. Clients count a coin only when
-its established mailbox matches their own, including after seed recovery.
+Authenticated recovery, coin status and mailbox delivery carry `owner_mailbox`.
+Batch ownership entries bind the mailbox to its VTXO ID, independently of request
+duplicates or response order. A missing or foreign entry establishes no wallet
+ownership. Public `GetVtxo` and `GetVtxosByIds` return signed bodies without mailbox
+metadata; knowing an ID must not disclose the stable mailbox key.
 
-The existing authenticated status and mailbox surfaces carry explicit per-entitlement
-`core.FallbackClaim` receipts: entitlement ID, allocation ID, entitled mailbox, actual gross/fee/payout/
-forfeited amounts, parent/output locator and the server's canonical confirmation
-observation. The authenticated mailbox pages these independently of its message
-checkpoint, including on an empty-store restore. Explicit source and claim-output
-aliases come from the server's existing input-owner and collected-receive mappings;
-they do not change a coin's birth owner. Several allocated leaves may name one
-original input, while an unmaterialized recipient claim need not have a native
-VTXO row. Each entitlement counts once, and its aliases fence local operations
-without creating another coin or retiring a foreign mailbox's coin. No receipt
-or balance is inferred from a wallet operation graph.
-`FALLBACK_FORFEITED` is a terminal no-output policy result, not `Spent` or a
-Bitcoin payment. A zero-output receipt reports whether its attributable amount
-was consumed by fees or forfeited below dust.
+Coin status projects the existing economic resolver onto the original known
+right. It aggregates every relevant input-owner alias and split portion.
+`FALLBACK_PENDING` means at least one committed portion is unresolved, below six
+canonical confirmations, or not yet completely covered. All relevant portions
+must be terminal before retirement: any paid portion yields `Spent`; an entirely
+no-output result yields `FALLBACK_FORFEITED`. The commitment bit distinguishes a
+first-seen fallback-terminal coin from ordinary spent history. It is not a payout
+proof or a statement that the birth mailbox is the stage-entitled Bitcoin payee.
 
-An undecided held coin remains spendable, refreshable and exitable. A committed
-`FALLBACK_PENDING` claim is already fenced off-chain: wait for its canonical
-payout or a terminal forfeiture. A paid claim names its canonical output. The
-wallet independently requires six canonical confirmations and the actual
-mailbox-derived output script and value before retirement; the native Bitcoin
-account counts an aggregated output once. `Wallet::fallback_receipts` retains
-per-entitlement attribution, and history is keyed by entitlement rather than by a retry.
-The wallet does not infer a Lightning failure, refund or preimage from a payout. Revisit retired receipts on reopen and status
-reads; an orphaned receipt returns to pending, without a duplicate history credit.
+A collected receive with no final coin uses its existing invoice/hash status.
+The server binds the result to the actual subscription, complete original grant
+set and admitted destination. The hash-only response returns only the narrow
+outcome, never an unblinded mailbox key. The client retains its original claim
+destination and grant identities on the existing operation record; a provider
+must not adopt its recipient's positive Ark balance.
+
+Clients trust authenticated server outcome for Ark retirement. They no longer
+independently attribute or verify each entitlement's Bitcoin payout. There is no
+public claim model, claim feed, allocation cursor or client receipt ledger.
+Allocation IDs, source aliases, payout locators and per-leaf fee/principal splits
+remain internal server accounting. Bitcoin discovery, amounts, confirmations,
+spending and reorgs belong to the ordinary Bitcoin wallet. An unrelated deposit
+must not retire an Ark coin or imply a Lightning result.
+
+An undecided hold leaves the coin spendable, refreshable and exitable. A known
+commitment is persisted before release and remains fenced across ordinary holder
+cleanup, cancellation, status failures and reopen. Keep signed checkpoints until
+the exact operation is terminal; a refused offboard cannot become successful.
+Known fallback-terminal coin and receive identities are rechecked after reopen
+and sync. When the server is available after a reorg, authenticated status restores
+pending and keeps the fence, never spendability. While it is unavailable, the last
+known Ark commitment stays fenced; the client does not independently reconstruct
+Ark payout finality from Bitcoin outputs. Bitcoin sync still processes the output
+reorg independently.
+Unknown, missing, foreign or stale status cannot release a prior commitment.
+Already exposed exits keep their normal observation and cleanup paths.
+
+`fallback_status` on the existing coin or receive record is a status, not another
+spendable balance or a synthetic Bitcoin credit. Committed rights are excluded
+from ordinary Ark balance buckets. Original operation intent and its actual Ark
+result remain in normal history; no per-entitlement synthetic movement is made.
+The Bitcoin account counts each actual aggregated output once.
+
+The default product wallet uses the same seed and passphrase for separate Ark
+and BIP86 branches; its reserved account-zero external index-zero payout address
+is deliberately reused. Restoring that Bitcoin account must support actual
+account discovery, not just Taproot signing. An application-supplied external
+mailbox key is a different backup contract: the application must back up that
+signing key (or its separate seed/path), repeat the same identity at open, and
+integrate the corresponding Bitcoin discovery and spending account. Restoring
+only the Ark seed cannot recover an unrelated external mailbox key or its funds.
+No seed relationship is enforced by the protocol. Seed recovery does not promise
+discovery of every lost unfinished operation identifier; known operations remain
+queryable, and actual Bitcoin payouts remain independently discoverable.
 
 Release canceled-round inputs only after the authenticated cancellation for the
 exact participation, and only if no forfeit could have been exposed. Persist the
 cancellation before unlocking. An unknown round is not cancellation. A restore
 re-derives or imports the backed-up mailbox key and applies the same ownership and
-canonical-receipt rules.
+authenticated narrow-status rules.
 
 The initial release uses fresh matched Scuttle stores. It retains upstream
 migration payloads and runners unchanged; it does not upgrade funded registration-
-era Scuttle stores. Unrecognized, partial or incompatible stores are refused
-before writes instead of being silently repaired.
+era Scuttle stores or receipt-bearing wallet stores. Unrecognized, partial or incompatible
+SQL stores are refused before writes instead of being silently repaired. Server reopen requires the
+current Scuttle tables, the completed-view columns in the `scuttle` schema, and
+the intact upstream history through 77. Wallet reopen requires its existing coin
+outcome and receive-association columns and upstream history through 42. Old
+registration, dual-ack and wallet receipt layouts are not upgraded. These are
+matched fresh-store requirements, not a database repair or conversion service.
 
 
 ## Lightning dispatch continuity

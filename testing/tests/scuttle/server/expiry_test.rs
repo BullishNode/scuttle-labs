@@ -27,11 +27,10 @@ use server::database::Db;
 use server_rpc::protos;
 use tokio::process::Command;
 
-pub(super) fn fields(balance: &bark::Balance) -> [Amount; 10] {
+pub(super) fn fields(balance: &bark::Balance) -> [Amount; 9] {
 	[balance.spendable, balance.needs_refresh, balance.pending_lightning_send,
 		balance.claimable_lightning_receive, balance.pending_in_round, balance.pending_exit,
-		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard,
-		balance.awaiting_settlement]
+		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard]
 }
 
 pub(super) async fn rebuilt(ctx: &TestContext, srv: &Captaind, db: &Db) {
@@ -272,7 +271,7 @@ pub(super) fn canonical(ctx: &TestContext, tx: &Transaction) -> BlockRef {
 	BlockRef { height: BlockHeight::new(u32::try_from(header.height).unwrap()), hash }
 }
 
-pub(super) async fn wait_rebuilt(db: &Db, point: BlockRef, timeout: Duration, message: &str) -> i64 {
+pub(crate) async fn wait_rebuilt(db: &Db, point: BlockRef, timeout: Duration, message: &str) -> i64 {
 	tokio::time::timeout(timeout, async {
 		loop {
 			let generation = db.read(async |tx| {
@@ -423,7 +422,8 @@ pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch)
 		let output = &parent.output[point.vout as usize];
 		assert_eq!(output.script_pubkey, leaf.script);
 		assert_eq!(output.value, sat(leaf.group_payout));
-		assert_eq!(wallet.verify_fallback_output(point).await.unwrap(), output.value);
+		assert_eq!(wallet.get_vtxo_by_id(leaf.coin.id()).await.unwrap().fallback_status,
+			Some(bark::vtxo::FallbackStatus::Spent));
 	} else {
 		assert_eq!(leaf.group_payout, 0);
 		assert!(epoch.parents.values().all(|parent| parent.output.iter().all(|out| out.script_pubkey != leaf.script)));

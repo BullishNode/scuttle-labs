@@ -31,7 +31,7 @@
 //!   force-exit a freshly claimed VTXO
 //! * `4`: ppm fees round up to a satoshi instead of down; ppm expiry fees
 //!   are calculated on the exact total across all VTXOs
-//! * `1000`: Scuttle fork epoch; joint-owner fields use fork tags and all
+//! * `1001`: Receipt-free Scuttle fork epoch; joint-owner fields use fork tags and all
 //!   non-bootstrap Ark/Mailbox operations require the negotiated fork version
 
 #[cfg(all(any(target_os = "android", target_os = "ios"), feature = "tls-native-roots"))]

@@ -28,9 +28,6 @@ use crate::vtxo::{VtxoState, VtxoStateKind};
 /// as what a user owns, or use [Balance::summary] for exactly those numbers.
 #[derive(Debug, Clone)]
 pub struct Balance {
-	/// Owned coins awaiting an authoritative settlement result. They cannot
-	/// be spent or promised refreshable while that result is unknown.
-	pub awaiting_settlement: Amount,
 	/// Sats in VTXOs that can be spent right now, in an arkoor or lightning
 	/// payment, an offboard or a round.
 	pub spendable: Amount,
@@ -74,16 +71,16 @@ pub struct Balance {
 }
 
 impl Balance {
-	/// The sum of every field: all sats that belong to the wallet.
+	/// The tracked Ark balances. Committed fallback rights have a status;
+	/// actual Bitcoin payouts are accounted for by the Bitcoin wallet.
 	pub fn total(&self) -> Amount {
 		self.spendable + self.needs_refresh + self.pending()
 	}
 
-	/// The sats awaiting settlement or held by operations: everything except
+	/// The sats held by operations: everything except
 	/// [Balance::spendable] and [Balance::needs_refresh].
 	pub fn pending(&self) -> Amount {
-		self.awaiting_settlement
-			+ self.pending_in_round
+		self.pending_in_round
 			+ self.pending_board
 			+ self.pending_arkoor_send
 			+ self.pending_lightning_send
@@ -92,7 +89,7 @@ impl Balance {
 			+ self.pending_exit
 	}
 
-	/// Whether any sats await settlement or an operation in progress.
+	/// Whether an ordinary Ark operation is in progress.
 	pub fn has_pending(&self) -> bool {
 		self.pending() > Amount::ZERO
 	}
@@ -100,7 +97,6 @@ impl Balance {
 	/// The numbers to show a user, without the breakdown.
 	pub fn summary(&self) -> BalanceSummary {
 		BalanceSummary {
-			awaiting_settlement: self.awaiting_settlement,
 			spendable: self.spendable,
 			needs_refresh: self.needs_refresh,
 			pending: self.pending(),
@@ -114,8 +110,6 @@ impl Balance {
 /// and what the user owns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalanceSummary {
-	/// The awaiting-settlement subset of pending, not an additional total.
-	pub awaiting_settlement: Amount,
 	/// Sats that can be spent right now. See [Balance::spendable].
 	pub spendable: Amount,
 	/// Sats that need a refresh before they can be sent again. See
@@ -150,15 +144,11 @@ impl Wallet {
 			},
 		};
 
-		let receipts = self.inner.db.get_fallback_receipts().await?;
-		let pending_principal = receipts.iter().filter(|r| r.retired_block.is_none())
-			.map(|r| (r.vtxo_id, r.gross)).collect::<HashMap<_, _>>();
 		let vtxos = self.inner.db.get_vtxos_by_state(&[
 			VtxoStateKind::Spendable, VtxoStateKind::Locked, VtxoStateKind::Exited,
-		]).await?.into_iter().map(|v| (v.id(),v)).collect::<HashMap<_,_>>();
+		]).await?.into_iter().filter(|v| v.fallback_status.is_none()).map(|v| (v.id(),v)).collect::<HashMap<_,_>>();
 
 		let mut balance = Balance {
-			awaiting_settlement: Amount::ZERO,
 			spendable: Amount::ZERO,
 			needs_refresh: Amount::ZERO,
 			pending_in_round: Amount::ZERO,
@@ -173,7 +163,6 @@ impl Wallet {
 		for vtxo in vtxos.values().filter(|v| v.state == VtxoState::Spendable) {
 			// Without a tip only the depth can be judged; a tip of zero
 			// expires nothing.
-			if receipts.iter().any(|r| r.affects(vtxo.id())) { continue; }
 			if vtxo.needs_refresh(tip.unwrap_or(BlockHeight::ZERO), max_exit_depth) {
 				balance.needs_refresh += vtxo.amount();
 			} else {
@@ -181,17 +170,14 @@ impl Wallet {
 			}
 		}
 
-		// A committed source is counted once from its explicit attributable
-		// amount, never inferred by subtracting an ancestor or another action.
-		let mut counted = receipts.iter().flat_map(|r| r.affected_ids()).collect::<HashSet<_>>();
-		balance.awaiting_settlement = pending_principal.values().copied().sum();
+		let mut counted = HashSet::new();
 		for round in self.pending_round_states().await? {
 			let holder = round.state().lock_holder();
 			for input in round.state().locked_pending_inputs() {
 				let Some(vtxo) = vtxos.get(&input.id()) else { continue };
 				let held = matches!(&vtxo.state, VtxoState::Locked { holder: h } if *h == holder);
 				if held && counted.insert(vtxo.id()) {
-					balance.pending_in_round += principal(vtxo, &pending_principal);
+					balance.pending_in_round += vtxo.amount();
 				}
 			}
 		}
@@ -199,19 +185,19 @@ impl Wallet {
 		for action in self.inner.db.get_all_wallet_action_checkpoints().await? {
 			match &action {
 				WalletActionCheckpoint::LightningSend(a) => {
-					balance.pending_lightning_send += held_by(a, &vtxos, &mut counted, &pending_principal);
+					balance.pending_lightning_send += held_by(a, &vtxos, &mut counted);
 				},
 				WalletActionCheckpoint::LightningReceive(a) => {
-					balance.claimable_lightning_receive += held_by(a, &vtxos, &mut counted, &pending_principal);
+					balance.claimable_lightning_receive += held_by(a, &vtxos, &mut counted);
 				},
 				WalletActionCheckpoint::ArkoorSend(a) => {
-					balance.pending_arkoor_send += held_by(a, &vtxos, &mut counted, &pending_principal);
+					balance.pending_arkoor_send += held_by(a, &vtxos, &mut counted);
 				},
 				WalletActionCheckpoint::Board(a) => {
-					balance.pending_board += held_by(a, &vtxos, &mut counted, &pending_principal);
+					balance.pending_board += held_by(a, &vtxos, &mut counted);
 				},
 				WalletActionCheckpoint::Offboard(a) => {
-					balance.pending_offboard += held_by(a, &vtxos, &mut counted, &pending_principal);
+					balance.pending_offboard += held_by(a, &vtxos, &mut counted);
 				},
 			}
 		}
@@ -226,7 +212,7 @@ impl Wallet {
 			}
 			match vtxos.get(&exit.vtxo_id) {
 				Some(v) if v.state == VtxoState::Exited => {
-					if counted.insert(v.id()) { balance.pending_exit += principal(v, &pending_principal); }
+					if counted.insert(v.id()) { balance.pending_exit += v.amount(); }
 				},
 				Some(v) => warn!("Exit of VTXO {} has committed but the VTXO is {:?}",
 					exit.vtxo_id, v.state,
@@ -241,17 +227,12 @@ impl Wallet {
 	}
 }
 
-fn principal(coin: &WalletVtxo, pending: &HashMap<VtxoId, Amount>) -> Amount {
-	pending.get(&coin.id()).copied().unwrap_or_else(|| coin.amount())
-}
-
 /// The sats `action` holds: the locked VTXOs among the ones it reports,
 /// leaving out any already `counted` by another operation.
 fn held_by<A: WalletAction>(
 	action: &A,
 	vtxos: &HashMap<VtxoId, WalletVtxo>,
 	counted: &mut HashSet<VtxoId>,
-	pending_principal: &HashMap<VtxoId, Amount>,
 ) -> Amount {
 	let mut amount = Amount::ZERO;
 	for id in action.pending_balance_vtxo_ids() {
@@ -262,7 +243,7 @@ fn held_by<A: WalletAction>(
 		// A spent VTXO is not in the map: the action is done with it.
 		let Some(vtxo) = vtxos.get(&id) else { continue };
 		match vtxo.state {
-			VtxoState::Locked { .. } => amount += principal(vtxo, pending_principal),
+			VtxoState::Locked { .. } => amount += vtxo.amount(),
 			// An exit took it from the action; it counts in pending_exit.
 			VtxoState::Exited => {},
 			// Released by the action, or not locked by it yet.

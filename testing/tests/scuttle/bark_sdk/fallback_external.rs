@@ -246,10 +246,10 @@ async fn fallback_external_bip86_actual_payout_seed_restore_and_confirmed_spend(
 		(output.outpoint, output.txout)).collect::<BTreeMap<_, _>>();
 	assert_eq!(discovered, expected_inputs, "fresh seed discovery must find exactly the actual payout and legitimate board change");
 
-	assert_eq!(restored.verify_fallback_output(point).await.unwrap(), expected);
+	assert_eq!(discovered.get(&point), Some(&parent.output[point.vout as usize]));
 	let wrong_index = parent.output.iter().position(|output| output.script_pubkey != registration
 		&& output.value > Amount::ZERO).expect("the payout retains its operator fee separately") as u32;
-	assert!(restored.verify_fallback_output(OutPoint::new(parent.compute_txid(), wrong_index)).await.is_err(),
+	assert!(!discovered.contains_key(&OutPoint::new(parent.compute_txid(), wrong_index)),
 		"a canonical operator output cannot substitute for the registered customer's output");
 
 	assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "scuttle.fallback"));
@@ -491,7 +491,7 @@ async fn fallback_external_bip86_seed_restore_spends_actual_payout_while_history
 		let restored_impl = Arc::new(RwLock::new(restored_bdk));
 		let restored_app: Arc<RwLock<dyn OnchainWalletTrait>> = restored_impl.clone();
 		let restored_db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(fresh_ark_path).unwrap());
-		assert!(restored_db.get_fallback_receipts().await.unwrap().is_empty());
+		assert!(restored_db.get_all_vtxos().await.unwrap().is_empty());
 
 		let restored = Wallet::open(network, WalletSeed::new_from_seed(network, &ark_seed)
 		.with_external_mailbox_keypair(AppBip86Wallet::mailbox_keypair(network, &app_seed).unwrap()), config, OpenWalletArgs {
@@ -500,8 +500,10 @@ async fn fallback_external_bip86_seed_restore_spends_actual_payout_while_history
 		}).await.unwrap();
 		assert_eq!(restored.fallback_script(), registration);
 		srv.stop().await.unwrap();
-		restored.sync_fallback_payouts().await.unwrap();
-		assert_eq!(restored.verify_fallback_output(payout).await.unwrap(), expected);
+		let known_commitments = restored.all_vtxos().await.unwrap().into_iter().filter(|coin| coin.fallback_status.is_some()).count();
+		let observed = restored.sync_fallback_payouts().await;
+		assert_eq!(observed.is_err(), known_commitments > 0, "offline Ark status is not inferred from Bitcoin");
+		assert_eq!(paid_output.value, expected);
 		assert!(restored.history().await.unwrap().iter().all(|movement| movement.subsystem.name != "scuttle.fallback"));
 
 		restored_app.write().await.sync(restored.chain()).await.unwrap();

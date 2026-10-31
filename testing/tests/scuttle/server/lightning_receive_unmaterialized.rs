@@ -694,32 +694,21 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 			run_daemon: false, skip_recovery: true, ..Default::default()
 		}).await.unwrap();
 	returned.sync_fallback_payouts().await.unwrap();
-	let receipts = returned.fallback_receipts().await.unwrap();
-	assert_eq!(receipts.len(), 1);
-	let receipt = &receipts[0];
-	assert_eq!(receipt.vtxo_id, original.source.id());
-	assert_eq!(receipt.owner_mailbox.to_string(), recipient_mailbox);
-	assert_eq!(receipt.source_vtxo_ids, BTreeSet::from([original.promised.id()]));
-	assert_eq!((receipt.gross, receipt.fee, receipt.payout, receipt.forfeited),
-		(sat(100_000), sat(1_000), sat(99_000), sat(0)));
-	assert!(receipt.retired_block.is_some());
+	returned.sync_onchain().await.unwrap();
 	assert!(local.get_wallet_vtxo(original.promised.id()).await.unwrap().is_none());
 	assert!(local.get_wallet_vtxo(original.source.id()).await.unwrap().is_none());
 	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	let history = returned.history().await.unwrap();
-	assert_eq!(history.len(), 1, "an unmaterialized receive discovers only its actual fallback receipt");
-	assert_eq!(history[0].subsystem.name, "scuttle.fallback");
-	assert_eq!(history[0].status, bark::movement::MovementStatus::Successful);
-	assert_eq!(history[0].intended_balance, bitcoin::SignedAmount::ZERO);
-	assert_eq!(history[0].effective_balance, bitcoin::SignedAmount::ZERO,
-		"receipt discovery cannot debit Ark principal this wallet never held");
-	assert_eq!(history[0].offchain_fee, sat(1_000));
-	assert!(history[0].input_vtxos.is_empty() && history[0].output_vtxos.is_empty());
-	assert_eq!(history[0].metadata.get("fallback_receipt"), Some(&serde_json::to_value(receipt).unwrap()));
+	assert!(history.is_empty(), "an unseen right does not manufacture an Ark coin, receipt or debit");
+	let bitcoin = returned.onchain().unwrap();
+	assert_eq!(bitcoin.read().await.balance().await, sat(99_000),
+		"the original recipient's Bitcoin wallet discovers the actual canonical payout");
 	for _ in 0..2 {
 		returned.sync_fallback_payouts().await.unwrap();
-		assert_eq!(returned.fallback_receipts().await.unwrap(), receipts);
+		returned.sync_onchain().await.unwrap();
+		assert_eq!(bitcoin.read().await.balance().await, sat(99_000));
 		assert_eq!(returned.history().await.unwrap(), history);
+		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	}
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);

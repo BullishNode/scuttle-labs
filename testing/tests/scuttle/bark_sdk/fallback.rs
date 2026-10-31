@@ -110,7 +110,7 @@ async fn undecided_expired_source_can_reopen_offline_and_start_its_exit() {
 	assert!(!state.decided_for_fallback);
 	assert!(db.read(async |tx| Ok(tx.query_opt("SELECT id FROM expiry_entitlement WHERE vtxo_id=$1",
 		&[&source.id().to_string()]).await?)).await.unwrap().is_none());
-	assert!(wallet.fallback_receipts().await.unwrap().is_empty());
+	assert!(wallet.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 	drop(wallet);
 	srv.stop().await.unwrap();
 	let cached = bark::Wallet::open(Network::Regtest,
@@ -119,7 +119,7 @@ async fn undecided_expired_source_can_reopen_offline_and_start_its_exit() {
 			run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
 	assert_eq!(cached.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
 	assert_eq!(cached.balance().await.unwrap().needs_refresh, source.amount());
-	assert!(cached.fallback_receipts().await.unwrap().is_empty());
+	assert!(cached.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 	cached.exit_mgr().start_exit_for_vtxos(&[source.vtxo.clone()]).await.unwrap();
 	assert_eq!(cached.exit_mgr().get_exit_vtxo_ids().await, vec![source.id()]);
 }

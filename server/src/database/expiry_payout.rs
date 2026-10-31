@@ -20,7 +20,7 @@ use crate::watchman::readiness::INVENTORY_LIMITS;
 
 pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
 
-pub struct FallbackClaim {
+pub(crate) struct FallbackClaim {
 	pub vtxo_id: VtxoId,
 	pub source_vtxo_ids: BTreeSet<VtxoId>,
 	pub allocation_id: u64,
@@ -239,7 +239,7 @@ impl Tx<'_> {
 	/// Select the winning economic decision before filtering for customer claims.
 	/// The receipt describes that decision; it does not promote a pending parent
 	/// or replace the wallet's independent canonical-chain confirmation check.
-	pub async fn fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+	pub(crate) async fn fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let rows = self.query("SELECT c.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
 			c.payout_sat,c.forfeited_sat,a.sweep_txid,
@@ -339,24 +339,6 @@ impl Tx<'_> {
 			_ => {},
 		}
 		Ok(sources)
-	}
-
-	/// Independent receipt pagination cannot be hidden behind a mailbox
-	/// message checkpoint, including for an empty-store seed restore.
-	pub async fn mailbox_fallback_claims(&self, mailbox: PublicKey, cursor: Option<VtxoId>, limit: usize)
-		-> anyhow::Result<Vec<FallbackClaim>>
-	{
-		let cursor = cursor.map(|id| id.to_string());
-		let rows = self.query("SELECT w.vtxo_id FROM
-			(SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.owner_mailbox,c.disposition
-			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
-			JOIN expiry_allocation a ON a.id=c.allocation_id
-			ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) w
-			WHERE w.disposition='customer' AND w.owner_mailbox=$1 AND ($2::TEXT IS NULL OR w.vtxo_id>$2)
-			ORDER BY w.vtxo_id LIMIT $3", &[&mailbox.to_string(), &cursor, &i64::try_from(limit)?]).await?;
-		let ids = rows.iter().map(|row| row.get::<_, &str>(0).parse()).collect::<Result<Vec<VtxoId>, _>>()?;
-		let mut claims = self.fallback_claims(&ids).await?;
-		ids.into_iter().map(|id| claims.remove(&id).context("mailbox receipt winner changed")).collect()
 	}
 
 	/// Select the winning allocation before matching its actual customer. An

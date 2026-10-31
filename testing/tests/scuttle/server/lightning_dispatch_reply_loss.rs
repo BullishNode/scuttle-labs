@@ -857,7 +857,6 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			let mut finished = Vec::new();
 			for page_number in 0..32 {
 				let page = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
-			fallback_cursor: None,
 					mailbox_id: mailbox.mailbox().serialize(), authorization: Some(mailbox.serialize()), checkpoint,
 				}).await.unwrap().into_inner();
 				for item in page.messages {
@@ -1666,7 +1665,6 @@ async fn assert_no_success_in_sender_mailbox(
 	let mut finished = 0;
 	for _ in 0..32 {
 		let page = rpc.read_mailbox(protos::mailbox_server::MailboxRequest {
-			fallback_cursor: None,
 			mailbox_id: auth.mailbox().serialize(), authorization: Some(auth.serialize()), checkpoint,
 		}).await.unwrap().into_inner();
 		for message in page.messages {

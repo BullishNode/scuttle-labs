@@ -60,6 +60,8 @@ pub enum ServerStatusAdoption {
 	Spendable,
 	/// The server considers the VTXO spent.
 	Spent,
+	/// Terminal fallback first discovered during recovery or import.
+	FallbackSpent,
 	/// Allocated customer principal awaiting independent payout verification.
 	FallbackPending,
 	/// Canonical terminal policy result with no Bitcoin payout output.
@@ -71,6 +73,10 @@ pub enum ServerStatusAdoption {
 }
 
 impl ServerStatusAdoption {
+	pub(crate) fn from_status(state: VtxoSpendState, committed: bool) -> anyhow::Result<Self> {
+		if committed && state == VtxoSpendState::Spent { Ok(Self::FallbackSpent) }
+		else { Self::from_spend_state(state) }
+	}
 	/// Errors when the server gave no usable answer.
 	///
 	/// Matched exhaustively (no catch-all) so a new spend state forces an
@@ -126,9 +132,9 @@ impl Wallet {
 	) -> anyhow::Result<()> {
 		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
 		let ids = vtxos.into_iter().map(|v| v.vtxo_id()).collect::<Vec<_>>();
-		let receipts = self.inner.db.get_fallback_receipts().await?;
-		ensure!(!ids.iter().any(|id| receipts.iter().any(|r| r.affects(*id))),
-			"a committed fallback source cannot be locked for another operation");
+		for id in &ids {
+			ensure!(!self.has_fallback_commitment(*id).await?, "a committed fallback source cannot be locked for another operation");
+		}
 		self.set_vtxo_states(
 			ids, &VtxoState::Locked { holder }, &[VtxoStateKind::Spendable],
 		).await
@@ -148,7 +154,7 @@ impl Wallet {
 		vtxo: &Vtxo<Full>,
 		holder: &Option<VtxoLockHolder>,
 	) -> anyhow::Result<bool> {
-		if self.inner.db.get_fallback_receipts().await?.iter().any(|r| r.affects(vtxo.id())) { return Ok(false); }
+		if self.has_fallback_commitment(vtxo.id()).await? { return Ok(false); }
 		let stored = self.inner.db.get_wallet_vtxo(vtxo.id()).await
 			.with_context(|| format!("error querying vtxo {}", vtxo.id()))?;
 		Ok(match stored {
@@ -321,33 +327,40 @@ impl Wallet {
 		&self,
 		vtxos: impl IntoIterator<Item = &'a Vtxo<Full>> + Clone,
 	) -> anyhow::Result<()> {
-		// Knowledge of the coin key alone does not establish mailbox ownership.
-		// Check the authenticated state before any positive storage.
-		let mut available = Vec::new();
-		let mut spent = Vec::new();
-		let mut pending = Vec::new();
-		for vtxo in vtxos.clone() {
-			let key = self.get_vtxo_key(vtxo).await?;
-			match self.fetch_vtxo_spend_state(vtxo.id(), &key).await? {
-				VtxoSpendState::Spendable | VtxoSpendState::Unregistered => available.push(vtxo),
-				VtxoSpendState::Spent => spent.push(vtxo),
-				VtxoSpendState::FallbackPending | VtxoSpendState::FallbackForfeited => pending.push(vtxo),
-				_ => bail!("new output is not yet released by its authenticated server"),
-			}
-		}
-		self.store_vtxos(available, &VtxoState::Spendable).await?;
-		self.store_vtxos(spent, &VtxoState::Spent).await?;
-		self.store_vtxos(pending, &VtxoState::Locked { holder: None }).await?;
-		for vtxo in vtxos.clone() {
-			if let Some(receipt) = self.inner.db.get_fallback_receipts().await?.into_iter().find(|r| r.affects(vtxo.id())) {
-				self.observe_fallback_claim(receipt).await?;
-			}
-		}
+		self.store_vtxos_with_server_status(vtxos.clone()).await?;
+
 		// Post vtxo IDs to server for recovery (non-critical, just log errors)
 		if let Err(e) = self.post_recovery_vtxo_ids(vtxos.into_iter().map(|v| v.id())).await {
 			error!("Failed to post recovery vtxo IDs to server: {:#}", e);
 		}
 
+		Ok(())
+	}
+
+	/// Authenticated first storage without posting another recovery hint. Keep
+	/// request, adoption and body/marker write under the same wallet lock.
+	pub(crate) async fn store_vtxos_with_server_status<'a>(
+		&self, vtxos: impl IntoIterator<Item = &'a Vtxo<Full>> + Clone,
+	) -> anyhow::Result<()> {
+		// Validate every owner/status before any positive storage. A new
+		// fallback body and its recheck marker are persisted atomically.
+		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
+		let mut states = Vec::new();
+		for vtxo in vtxos.clone() {
+			let key = self.get_vtxo_key(vtxo).await?;
+			let (state, committed) = self.fetch_vtxo_status_locked(vtxo.id(), &key).await?;
+			if committed { self.validate_vtxo(vtxo).await?; }
+			ensure!(committed || matches!(state, VtxoSpendState::Spendable | VtxoSpendState::Unregistered | VtxoSpendState::Spent),
+				"new output is not yet released by its authenticated server");
+			states.push((vtxo, state, committed));
+		}
+		for (vtxo, state, committed) in states {
+			if committed {
+				self.inner.db.store_fallback_vtxo(vtxo, FallbackStatus::try_from(state)?).await?;
+			} else {
+				self.store_vtxos([vtxo], &if state == VtxoSpendState::Spent { VtxoState::Spent } else { VtxoState::Spendable }).await?;
+			}
+		}
 		Ok(())
 	}
 
@@ -409,7 +422,7 @@ impl Wallet {
 			.with_context(|| format!("error querying vtxo {vtxo_id}"))?
 			.with_context(|| format!("vtxo {vtxo_id} is not in this wallet"))?;
 
-		let committed = self.inner.db.get_fallback_receipts().await?.iter().any(|receipt| receipt.affects(vtxo_id));
+		let committed = stored.fallback_status.is_some();
 		if stored.state.kind() == VtxoStateKind::Locked
 			&& !(matches!(&stored.state, VtxoState::Locked { holder: None }) && committed) {
 			warn!("Cannot trust and adopt server state for {vtxo_id}. \
@@ -434,7 +447,7 @@ impl Wallet {
 			ServerStatusAdoption::Spent => {
 				self.trust_ordinary_spends(&[vtxo_id]).await?;
 			},
-			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::Forfeited => {
+			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited => {
 				let coin = self.get_full_vtxo(vtxo_id).await?;
 				self.validate_vtxo(&coin).await?;
 				self.retain_fallback_pending(&[coin]).await?;
@@ -458,9 +471,8 @@ impl Wallet {
 		holder: Option<VtxoLockHolder>,
 	) -> anyhow::Result<()> {
 		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-		let receipts = self.inner.db.get_fallback_receipts().await?;
 		for v in vtxos {
-			if receipts.iter().any(|r| r.affects(v.vtxo_id())) { continue; }
+			if self.has_fallback_commitment(v.vtxo_id()).await? { continue; }
 			self.inner.db.release_vtxo_lock(v.vtxo_id(), holder.as_ref()).await?;
 		}
 		Ok(())

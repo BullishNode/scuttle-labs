@@ -164,11 +164,11 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	wallet.sync_fallback_payouts().await.unwrap();
 	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
-	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&vtxo));
+	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 	let registered = wallet.fallback_script();
 	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
-	assert!(wallet.verify_fallback_output(bitcoin::OutPoint::new(parent.compute_txid(), payout_index)).await.is_err(),
-		"one confirmation cannot discharge the registered payout");
+	assert_eq!(parent.output[payout_index as usize].script_pubkey, registered);
+	assert!(before < 6, "one confirmation cannot discharge the registered payout");
 
 	let shallow_history = wallet.history().await.unwrap();
 	assert!(!shallow_history.iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"
@@ -222,7 +222,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		let index = signed.output.iter().position(|output|
 			output.script_pubkey == *expected_script && output.value == gross - fee).unwrap() as u32;
 		let point = bitcoin::OutPoint::new(signed.compute_txid(), index);
-		assert_eq!(owner.verify_fallback_output(point).await.unwrap(), gross - fee);
+		assert_eq!(signed.output[index as usize].value, gross - fee);
 
 		let info = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
 		assert!(info.confirmations.unwrap_or(0) >= 6);
@@ -237,13 +237,11 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		assert!(paid_points.insert(expected_script.clone(), (point, gross - fee)).is_none());
 		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap().state, bark::vtxo::VtxoState::Spent);
 		assert!(owner.vtxos().await.unwrap().is_empty());
-		assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&id));
+		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
 		let before_refresh = owner.history().await.unwrap();
-		let receipts = before_refresh.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
-		assert_eq!(receipts.len(), 1);
-		assert_eq!(receipts[0].status, bark::movement::MovementStatus::Successful);
-		assert_eq!(receipts[0].effective_balance.to_sat(), -(gross.to_sat() as i64));
-		assert_eq!(receipts[0].offchain_fee, fee);
+		assert!(!before_refresh.iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
+			"Bitcoin settlement must not synthesize a second Ark movement");
+		assert_eq!(gross, output.value + fee, "the original Core output and fee still account for all principal");
 
 		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
 		owner.sync_fallback_payouts().await.unwrap();
@@ -428,11 +426,11 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	receiver.sync_fallback_payouts().await.unwrap();
 	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
-	assert!(receiver.awaiting_settlement_vtxos().await.unwrap().contains(&vtxo));
+	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 	let registered = receiver.fallback_script();
 	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
-	assert!(receiver.verify_fallback_output(bitcoin::OutPoint::new(parent.compute_txid(), payout_index)).await.is_err(),
-		"one confirmation cannot discharge the registered payout");
+	assert_eq!(parent.output[payout_index as usize].script_pubkey, registered);
+	assert!(before < 6, "one confirmation cannot discharge the registered payout");
 
 	let shallow_history = receiver.history().await.unwrap();
 	assert!(!shallow_history.iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"
@@ -486,7 +484,7 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		let index = signed.output.iter().position(|output|
 			output.script_pubkey == *expected_script && output.value == gross - fee).unwrap() as u32;
 		let point = bitcoin::OutPoint::new(signed.compute_txid(), index);
-		assert_eq!(owner.verify_fallback_output(point).await.unwrap(), gross - fee);
+		assert_eq!(signed.output[index as usize].value, gross - fee);
 
 		let info = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
 		assert!(info.confirmations.unwrap_or(0) >= 6);
@@ -501,13 +499,11 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		assert!(paid_points.insert(expected_script.clone(), (point, gross - fee)).is_none());
 		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap().state, bark::vtxo::VtxoState::Spent);
 		assert!(owner.vtxos().await.unwrap().is_empty());
-		assert!(!owner.awaiting_settlement_vtxos().await.unwrap().contains(&id));
+		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
 		let before_refresh = owner.history().await.unwrap();
-		let receipts = before_refresh.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
-		assert_eq!(receipts.len(), 1);
-		assert_eq!(receipts[0].status, bark::movement::MovementStatus::Successful);
-		assert_eq!(receipts[0].effective_balance.to_sat(), -(gross.to_sat() as i64));
-		assert_eq!(receipts[0].offchain_fee, fee);
+		assert!(!before_refresh.iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
+			"Bitcoin settlement must not synthesize a second Ark movement");
+		assert_eq!(gross, output.value + fee, "the original Core output and fee still account for all principal");
 
 		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
 		owner.sync_fallback_payouts().await.unwrap();

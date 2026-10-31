@@ -2501,8 +2501,8 @@ impl Wallet {
 		// inferred ancestry or fallback snapshot can release another holder.
 		for id in &input_ids {
 			let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
-			ensure!(!self.inner.db.get_fallback_receipts().await?.iter().any(|r| r.vtxo_id == *id),
-				"released input has a committed fallback claim");
+			ensure!(stored.fallback_status.is_none(),
+				"released input has a committed fallback outcome");
 			match stored.state {
 				VtxoState::Locked { holder: None } => {
 					ensure!(self.inner.db.retire_vtxo_lock(*id, None).await?, "released input acquired another holder");

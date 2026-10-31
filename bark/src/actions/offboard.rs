@@ -396,9 +396,12 @@ impl WalletAction for Offboard {
 			},
 			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, movement_id, .. } => {
 				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
-					// This is an admission fence, not proof of payment or
-					// a lost session. Retain the full checkpoint and its holder
-					// while returning the refusal to the caller.
+					if or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await) {
+						or_retry!(self, fail_offboard_movement(wallet, &self).await);
+						return Advance::Failed(error);
+					}
+					// Unknown or incomplete status preserves the signed checkpoint
+					// and holder. The original offboard never becomes successful.
 					return Advance::Park {
 						state: self, wake_after: Some(CONFIRMATION_POLL_INTERVAL),
 						error: Some(error),

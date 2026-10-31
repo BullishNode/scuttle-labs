@@ -567,31 +567,25 @@ impl Bark {
 			&self.run(["vtxos", "--all", "--no-sync"]).await,
 		).expect("retained vtxos");
 
-		let awaiting = vtxos.iter().filter(|coin| coin.awaiting_settlement)
+		let commitments = vtxos.iter().filter(|coin| coin.fallback_status.is_some())
 			.map(|coin| coin.id).collect::<std::collections::HashSet<_>>();
 		let mut paths = Vec::new();
-		if !awaiting.is_empty() {
+		if !commitments.is_empty() {
 			for coin in &vtxos {
 				if coin.state != VtxoStateInfo::Spent {
 					paths.push((coin.id, self.raw_vtxo(coin.id).await.ancestor_ids()));
 				}
 			}
 		}
-		let principal = crate::balance::retained_principal(&vtxos, &awaiting, &paths);
+		let principal = crate::balance::retained_principal(&vtxos, &commitments, &paths);
 		let spendable_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
 			&& coin.state == VtxoStateInfo::Spendable)
-			.map(|coin| principal[&coin.id]).sum::<Amount>();
-		let awaiting_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
-			&& (coin.state == VtxoStateInfo::Spendable && awaiting.contains(&coin.id)))
 			.map(|coin| principal[&coin.id]).sum::<Amount>();
 		let locked_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
 			&& matches!(coin.state, VtxoStateInfo::Locked { .. }))
 			.map(|coin| principal[&coin.id]).sum::<Amount>();
 
-		assert_eq!(balance.awaiting_settlement, awaiting_vtxos,
-			"{}: unpaid owned principal stays awaiting settlement: {balance:?}", self.name,
-		);
-		assert_eq!(balance.spendable + balance.needs_refresh + balance.awaiting_settlement, spendable_vtxos,
+		assert_eq!(balance.spendable + balance.needs_refresh, spendable_vtxos,
 			"{}: spendable and needs_refresh must equal the spendable VTXOs: {balance:?}",
 			self.name,
 		);
@@ -606,7 +600,7 @@ impl Bark {
 			self.name,
 		);
 		let summary = json::cli::BalanceSummary::from(&balance);
-		assert_eq!(summary.pending, pending_locked + balance.pending_exit + balance.awaiting_settlement,
+		assert_eq!(summary.pending, pending_locked + balance.pending_exit,
 			"{}: the summary's pending must be the sum of the pending fields: {balance:?}", self.name,
 		);
 		assert_eq!(summary.total, balance.spendable + balance.needs_refresh + summary.pending,

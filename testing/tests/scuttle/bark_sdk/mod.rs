@@ -8,9 +8,9 @@ mod lightning;
 mod lightning_receive_binding;
 mod round;
 
-/// Projection of explicit receipts for assertions; it writes no client state.
-fn fallback_receipt_ids(receipts: Vec<bark::FallbackReceipt>, retired: bool) -> std::collections::BTreeSet<ark::VtxoId> {
-	receipts.into_iter().filter(|receipt| receipt.retired_block.is_some() == retired)
-		.flat_map(|receipt| std::iter::once(receipt.vtxo_id).chain(receipt.source_vtxo_ids))
-		.collect()
+/// Projection of authenticated statuses on actual retained coins; no ancestry or payout ledger.
+fn fallback_status_ids(coins: Vec<bark::WalletVtxo>, terminal: bool) -> std::collections::BTreeSet<ark::VtxoId> {
+	coins.into_iter().filter(|coin| coin.fallback_status.is_some_and(|status|
+		(status != bark::vtxo::FallbackStatus::Pending) == terminal))
+		.map(|coin| coin.id()).collect()
 }

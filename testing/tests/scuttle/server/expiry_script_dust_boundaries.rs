@@ -24,7 +24,7 @@ use server::database::Db;
 use server_rpc::protos;
 
 async fn balances(wallet: &Wallet, spendable: Amount) {
-	let mut expected = [Amount::ZERO; 10];
+	let mut expected = [Amount::ZERO; 9];
 	expected[0] = spendable;
 	assert_eq!(fields(&wallet.balance().await.unwrap()), expected);
 	assert!(wallet.exit_mgr().list_all(false, false).await.unwrap().is_empty(),

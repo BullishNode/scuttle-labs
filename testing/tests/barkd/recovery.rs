@@ -1240,11 +1240,11 @@ async fn recovered_wallet_stores_spent_vtxos_on_the_servers_word() {
 	assert!(invalid_board.validate(&funding_tx).is_err(), "the proxy must invalidate the stored body");
 	let balance = recovered.bark_balance().await;
 	assert_eq!([
-		balance.spendable, balance.needs_refresh, balance.awaiting_settlement,
+		balance.spendable, balance.needs_refresh,
 		balance.pending_board, balance.pending_in_round, balance.pending_arkoor_send,
 		balance.pending_offboard, balance.pending_lightning_send,
 		balance.claimable_lightning_receive, balance.pending_exit,
-	], [Amount::ZERO; 10], "an unvalidated body must not invent any balance");
+	], [Amount::ZERO; 9], "an unvalidated body must not invent any balance");
 
 	// A distinct fresh restore uses the real signed bodies, without the proxy.
 	// The original daemon remains alive throughout both restores.
@@ -1274,10 +1274,10 @@ async fn recovered_wallet_stores_spent_vtxos_on_the_servers_word() {
 	let balance = control.bark_balance().await;
 	assert_eq!(balance.spendable, change_amount);
 	assert_eq!([
-		balance.needs_refresh, balance.awaiting_settlement, balance.pending_board,
+		balance.needs_refresh, balance.pending_board,
 		balance.pending_in_round, balance.pending_arkoor_send, balance.pending_offboard,
 		balance.pending_lightning_send, balance.claimable_lightning_receive, balance.pending_exit,
-	], [Amount::ZERO; 9]);
+	], [Amount::ZERO; 8]);
 	assert_eq!(recipient.bark_balance().await.spendable + balance.spendable, board_body.amount());
 }
 

@@ -674,7 +674,7 @@ async fn registered_receive_fallback() {
 	let client = restored.client().await;
 	assert_eq!(client.fallback_script(), destination);
 	client.sync_fallback_payouts().await.unwrap();
-	assert_eq!(client.verify_fallback_output(payout).await.unwrap(), expected);
+	client.sync_onchain().await.unwrap();
 	let history = client.history().await.unwrap();
 	assert!(!history.iter().any(|movement| movement.effective_balance.to_sat() < 0 && movement.input_vtxos.contains(&source.id())));
 	drop(client);

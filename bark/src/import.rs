@@ -110,6 +110,7 @@ impl Wallet {
 		let keypairs = self.find_vtxo_keypairs(user_pubkeys, gap_limit).await
 			.context("error scanning the vtxo key space")?;
 
+		let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut fallback_pending = Vec::new();
 		let mut to_store = Vec::with_capacity(pending.len());
 		for vtxo in &pending {
@@ -135,12 +136,15 @@ impl Wallet {
 			return Ok(ids);
 		}
 
-		let rows = to_store.iter().map(|(v, s)| (*v, s)).collect::<Vec<_>>();
+		let rows = to_store.iter().filter(|(coin, _)| !fallback_pending.iter().any(|pending| pending.id() == coin.id()))
+			.map(|(v, s)| (*v, s)).collect::<Vec<_>>();
 		self.inner.db.store_vtxos(&rows).await
 			.context("failed to store imported VTXOs")?;
-		let spent = to_store.iter().filter(|(_, state)| *state == VtxoState::Spent)
+		let spent = to_store.iter().filter(|(coin, state)| *state == VtxoState::Spent
+			&& !fallback_pending.iter().any(|pending| pending.id() == coin.id()))
 			.map(|(vtxo, _)| vtxo.id()).collect::<Vec<_>>();
 		self.trust_ordinary_spends(&spent).await?;
+		drop(history_guard);
 		self.retain_fallback_pending(&fallback_pending).await?;
 
 		for (vtxo, state) in &to_store {
@@ -167,13 +171,13 @@ impl Wallet {
 		}
 
 		let id = vtxo.id();
-		let spend_state = self.fetch_vtxo_spend_state(id, keypair).await?;
-		let adoption = ServerStatusAdoption::from_spend_state(spend_state)
+		let (spend_state, committed) = self.fetch_vtxo_status_locked(id, keypair).await?;
+		let adoption = ServerStatusAdoption::from_status(spend_state, committed)
 			.with_context(|| format!("cannot decide the state of vtxo {id}"))?;
 		Ok(match adoption {
 			ServerStatusAdoption::Spendable => (VtxoState::Spendable, false),
 			ServerStatusAdoption::Spent => (VtxoState::Spent, false),
-			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::Forfeited => (VtxoState::Locked { holder: None }, true),
+			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited => (VtxoState::Locked { holder: None }, true),
 			ServerStatusAdoption::InFlight(state) =>
 				return Err(ImportVtxoError::InFlight { id, state }),
 		})

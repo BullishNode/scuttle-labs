@@ -150,9 +150,9 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		let refreshes = current_history.iter().filter(|entry| entry.subsystem.name == "bark.round").collect::<Vec<_>>();
 		assert_eq!(refreshes.len(), 1);
 		assert_eq!(refreshes[0].id, movement);
-		let receipts = database.get_fallback_receipts().await.unwrap();
-		assert!(receipts.iter().any(|r| r.affects(source.id()) && r.retired_block.is_some()));
-		assert!(!receipts.iter().any(|r| r.affects(source.id()) && r.retired_block.is_none()));
+		let receipts = database.get_all_vtxos().await.unwrap();
+		assert!(receipts.iter().any(|r| r.id() == source.id() && r.fallback_status == Some(bark::vtxo::FallbackStatus::Spent)));
+		assert!(!receipts.iter().any(|r| r.id() == source.id() && r.fallback_status == Some(bark::vtxo::FallbackStatus::Pending)));
 		assert_eq!(source.amount() - sat(1_000) - paid.value, Amount::ZERO,
 			"the canonical 99,000-sat output and 1,000-sat charge leave no forfeited principal");
 		wallet.sync_onchain().await.unwrap();
@@ -600,25 +600,29 @@ async fn assert_refresh_held(
 
 async fn assert_refresh_balance(
 	wallet: &Wallet, spendable: Amount, needs_refresh: Amount,
-	pending_in_round: Amount, awaiting_settlement: Amount,
+	pending_in_round: Amount, fallback_principal: Amount,
 ) {
 	wallet.chain().invalidate_caches().await;
 	let balance = wallet.balance().await.unwrap();
-	let expected = [awaiting_settlement, spendable, needs_refresh, pending_in_round,
+	let expected = [spendable, needs_refresh, pending_in_round,
 		Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO];
 	assert_eq!([
-		balance.awaiting_settlement, balance.spendable, balance.needs_refresh, balance.pending_in_round,
+		balance.spendable, balance.needs_refresh, balance.pending_in_round,
 		balance.pending_lightning_send, balance.claimable_lightning_receive, balance.pending_exit,
 		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard,
-	], expected, "the fixture principal must occupy exactly its expected balance bucket");
+	], expected, "the remaining Ark principal must occupy exactly its expected balance bucket");
+	// This fixture has one original source, no source/change aliases. Its
+	// known Pending body retains principal without inventing another balance.
+	assert_eq!(wallet.all_vtxos().await.unwrap().iter()
+		.filter(|coin| coin.fallback_status == Some(bark::vtxo::FallbackStatus::Pending))
+		.map(|coin| coin.amount()).sum::<Amount>(), fallback_principal);
 	let total = expected.into_iter().sum::<Amount>();
 	assert_eq!(balance.total(), total);
-	assert_eq!(balance.pending(), pending_in_round + awaiting_settlement);
+	assert_eq!(balance.pending(), pending_in_round);
 	let summary = balance.summary();
 	assert_eq!(summary.spendable, spendable);
 	assert_eq!(summary.needs_refresh, needs_refresh);
-	assert_eq!(summary.awaiting_settlement, awaiting_settlement);
-	assert_eq!(summary.pending, pending_in_round + awaiting_settlement);
+	assert_eq!(summary.pending, pending_in_round);
 	assert_eq!(summary.total, total);
 }
 
@@ -687,13 +691,8 @@ async fn retained_claim_write_failure(receipt_write: bool) {
 			else { fault.unlock_hits.load(Ordering::SeqCst) }, 1);
 		assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
 		assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().state, VtxoState::Spendable);
-		let receipts = database.get_fallback_receipts().await.unwrap();
-		assert_eq!(receipts.iter().any(|r| r.affects(coin.id())), !receipt_write);
-		assert!(receipts.iter().all(|r| r.retired_block.is_none()));
-		if !receipt_write {
-			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-			assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, Amount::ZERO, sat(100_000)).await;
-		}
+		assert!(database.get_all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()),
+			"both former receipt/source fault selectors now fail the single atomic known-coin write");
 		// No payment/exit is attempted after the failed persistence operation.
 		// Reopen the same store and retry only authenticated observation.
 		drop(wallet);
@@ -710,13 +709,13 @@ async fn retained_claim_write_failure(receipt_write: bool) {
 		wallet.validate_vtxo(&signed).await.unwrap();
 		assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 		assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, Amount::ZERO, sat(100_000)).await;
-		let receipts = database.get_fallback_receipts().await.unwrap();
-		assert_eq!(receipts.len(), 1);
-		assert!(receipts[0].affects(coin.id()) && receipts[0].retired_block.is_none());
-		let history = wallet.history().await.unwrap();
-		assert_eq!(history.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").count(), 1);
-		assert!(history.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
-			.all(|movement| movement.status == MovementStatus::Pending && movement.effective_balance.to_sat() == 0));
+		let committed = database.get_all_vtxos().await.unwrap().into_iter()
+			.filter(|coin| coin.fallback_status.is_some()).collect::<Vec<_>>();
+		assert_eq!(committed.len(), 1);
+		assert_eq!(committed[0].id(), coin.id());
+		assert_eq!(committed[0].fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+		assert!(!wallet.history().await.unwrap().iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
+			"a status write does not add an Ark receipt movement");
 	})).await.expect("receipt persistence failures retain the source and retry only observation");
 }
 
@@ -831,7 +830,7 @@ async fn recover_released_refresh(history: ReleasedHistory) {
 		}
 		assert!(fresh.pending_round_states().await.unwrap().is_empty());
 		assert_eq!(fresh.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spent);
-		assert!(fresh.awaiting_settlement_vtxos().await.unwrap().is_empty());
+		assert!(super::fallback_status_ids(fresh.all_vtxos().await.unwrap(), false).is_empty());
 		assert!(!fresh.history().await.unwrap().iter().any(|movement| movement.subsystem.name == "scuttle.fallback"));
 		match history {
 			ReleasedHistory::ForeignHolder => {

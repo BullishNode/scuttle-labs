@@ -198,6 +198,7 @@ impl BarkPersister for Dummy {
 		_preimage: Preimage,
 		_invoice: &Bolt11Invoice,
 		_amount: bitcoin::Amount,
+		_association: Option<&bark::persist::models::ReceiveAssociation>,
 	) -> anyhow::Result<()> {
 		Ok(())
 	}

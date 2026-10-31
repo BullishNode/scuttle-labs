@@ -399,7 +399,6 @@ mod config;
 mod daemon;
 mod fallback;
 pub use fallback::FallbackRefusal;
-pub use fallback::payouts::FallbackReceipt;
 mod fees;
 mod import;
 mod lightning;
@@ -1362,10 +1361,18 @@ impl Wallet {
 				.context("failed to instantiate platform default persister")?
 		};
 
+		// Decode the current coin/operation formats once at open, before any
+		// property or server-key write. Do not put this full-record read on
+		// read_properties, which is also used in ordinary payment processing.
+		let coins = db.get_all_vtxos().await?.len();
+		let actions = db.get_all_wallet_action_checkpoints().await?.len();
+		let receives = db.fallback_lightning_receives().await?.len();
 		let mut created_now = false;
 		let properties = if let Some(p) = db.read_properties().await? {
 			p
 		} else if args.create_if_not_exists {
+			ensure!(coins == 0 && actions == 0 && receives == 0,
+				"partial wallet state requires a fresh store");
 			Self::create(
 				network, &seed, &config, &*db, &*lock_manager, args.create_without_server,
 			).await.context("error creating new wallet")?;
@@ -1427,12 +1434,6 @@ impl Wallet {
 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 			round_secret_nonces: RoundSecretNonces::new(),
 		})};
-
-		// Revisit previously paid receipts even on a manual-mode reopen. A
-		// temporary chain outage keeps their existing commitment, never a refund.
-		if let Err(error) = ret.recheck_fallback_receipts().await {
-			warn!("Fallback receipts await canonical recheck after open: {error:#}");
-		}
 
 		ret.inner.exit.load().await
 			.context("error loading exit system after opening wallet")?;
@@ -1659,6 +1660,21 @@ impl Wallet {
 		vtxo_id: VtxoId,
 		keypair: &Keypair,
 	) -> anyhow::Result<VtxoSpendState> {
+		Ok(self.fetch_vtxo_status(vtxo_id, keypair).await?.0)
+	}
+
+	pub(crate) async fn fetch_vtxo_status(&self, vtxo_id: VtxoId, keypair: &Keypair)
+		-> anyhow::Result<(VtxoSpendState, bool)>
+	{
+		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
+		self.fetch_vtxo_status_locked(vtxo_id, keypair).await
+	}
+
+	/// Caller retains FallbackHistory from before the request through adoption
+	/// and any first-seen body/marker write using the returned status.
+	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair)
+		-> anyhow::Result<(VtxoSpendState, bool)>
+	{
 		let (mut srv, _) = self.require_server().await?;
 		let attestation = VtxoStatusAttestation::new(vtxo_id, keypair);
 		let resp = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
@@ -1669,7 +1685,8 @@ impl Wallet {
 		let state = VtxoSpendState::try_from(resp.spend_state).map_err(|_| anyhow::anyhow!(
 			"server returned unknown spend state {} for vtxo {vtxo_id}; this wallet may need updating", resp.spend_state,
 		))?;
-		self.observe_server_vtxo_status(vtxo_id, &resp.owner_mailbox, state, resp.fallback_claim).await
+		let state = self.observe_server_vtxo_status(vtxo_id, &resp.owner_mailbox, state, resp.fallback_committed).await?;
+		Ok((state, resp.fallback_committed))
 	}
 
 	/// Ask the server for the spend state of every VTXO in `queries`, in
@@ -1684,6 +1701,13 @@ impl Wallet {
 		&self,
 		queries: &[(VtxoId, &Keypair)],
 	) -> anyhow::Result<HashMap<VtxoId, VtxoSpendState>> {
+		Ok(self.fetch_vtxo_statuses(queries).await?.into_iter().map(|(id,(state,_))| (id,state)).collect())
+	}
+
+	pub(crate) async fn fetch_vtxo_statuses(&self, queries: &[(VtxoId, &Keypair)])
+		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
+	{
+		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut ret = HashMap::with_capacity(queries.len());
 		if queries.is_empty() {
 			return Ok(ret);
@@ -1723,8 +1747,8 @@ impl Wallet {
 					"server returned an unrequested or duplicate status");
 				match VtxoSpendState::try_from(status.spend_state) {
 					Ok(state) => {
-						let state = self.observe_server_vtxo_status(id, &status.owner_mailbox, state, status.fallback_claim).await?;
-						ret.insert(id, state);
+						let state = self.observe_server_vtxo_status(id, &status.owner_mailbox, state, status.fallback_committed).await?;
+						ret.insert(id, (state, status.fallback_committed));
 					},
 					Err(_) => warn!(
 						"server returned unknown spend state {} for vtxo {id}; this wallet may \
@@ -1839,8 +1863,7 @@ impl Wallet {
 	/// Returns all spendable vtxos
 	pub async fn spendable_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
 		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
-		let receipts = self.inner.db.get_fallback_receipts().await?;
-		vtxos.retain(|vtxo| !receipts.iter().any(|receipt| receipt.affects(vtxo.id())));
+		vtxos.retain(|vtxo| vtxo.fallback_status.is_none());
 		Ok(vtxos)
 	}
 

@@ -164,7 +164,6 @@ impl Wallet {
 		let mailbox_id = auth.mailbox();
 
 		let mut req = tonic::IntoRequest::into_request(protos::mailbox_server::MailboxRequest {
-			fallback_cursor: None,
 			mailbox_id: mailbox_id.serialize(),
 			authorization: Some(auth.serialize()),
 			checkpoint: checkpoint,
@@ -309,12 +308,10 @@ impl Wallet {
 		let expiry = chrono::Local::now() + std::time::Duration::from_secs(10 * 60);
 		let auth = self.mailbox_authorization(expiry);
 		let mailbox_id = auth.mailbox();
-		let mut fallback_cursor = None;
 
 		loop {
 			let checkpoint = self.get_mailbox_checkpoint().await?;
 			let mailbox_req = protos::mailbox_server::MailboxRequest {
-				fallback_cursor: fallback_cursor.clone(),
 				mailbox_id: mailbox_id.serialize(),
 				authorization: Some(auth.serialize()),
 				checkpoint,
@@ -323,7 +320,6 @@ impl Wallet {
 			let mailbox_resp = srv.mailbox_client.read_mailbox(mailbox_req).await
 				.context("error fetching mailbox")?.into_inner();
 			debug!("Ark server has {} mailbox messages for us", mailbox_resp.messages.len());
-			fallback_cursor = self.process_mailbox_fallback_claims(&mailbox_resp, fallback_cursor.as_deref()).await?;
 
 			for mailbox_msg in mailbox_resp.messages {
 				if self.process_mailbox_message(mailbox_msg).await.is_break() {
@@ -334,47 +330,12 @@ impl Wallet {
 				}
 			}
 
-			if !mailbox_resp.have_more && !mailbox_resp.have_more_fallback_claims {
+			if !mailbox_resp.have_more {
 				break;
 			}
 		}
 
 		Ok(())
-	}
-
-	/// Poll only explicit decisions using the same authenticated mailbox API.
-	/// Ignored message pages never advance the ordinary mailbox checkpoint.
-	pub(crate) async fn sync_mailbox_fallback_claims(&self) -> anyhow::Result<()> {
-		let (mut srv, _) = self.require_server().await?;
-		let auth = self.mailbox_authorization(chrono::Local::now() + std::time::Duration::from_secs(10 * 60));
-		let mut cursor = None;
-		loop {
-			let page = srv.mailbox_client.read_mailbox(protos::mailbox_server::MailboxRequest {
-				mailbox_id: auth.mailbox().serialize(), authorization: Some(auth.serialize()),
-				checkpoint: self.get_mailbox_checkpoint().await?, fallback_cursor: cursor.clone(),
-			}).await?.into_inner();
-			cursor = self.process_mailbox_fallback_claims(&page, cursor.as_deref()).await?;
-			if !page.have_more_fallback_claims { break; }
-		}
-		Ok(())
-	}
-
-	pub(crate) async fn process_mailbox_fallback_claims(&self, page: &protos::mailbox_server::MailboxMessages,
-		cursor: Option<&[u8]>) -> anyhow::Result<Option<Vec<u8>>>
-	{
-		let mut previous = cursor.map(VtxoId::from_slice).transpose()?.map(|id| id.to_string());
-		let mut last = None;
-		for raw in &page.fallback_claims {
-			let id = VtxoId::from_slice(&raw.vtxo_id)?;
-			let text = id.to_string();
-			ensure!(previous.as_ref().is_none_or(|previous| text > *previous), "fallback receipt page did not advance");
-			self.observe_fallback_claim(crate::FallbackReceipt::from_proto(id, raw.clone())?).await?;
-			previous = Some(text);
-			last = Some(id.to_bytes().to_vec());
-		}
-		ensure!(page.fallback_cursor == last, "fallback receipt cursor differs from its page");
-		ensure!(!page.have_more_fallback_claims || last.is_some(), "empty fallback receipt page has more results");
-		Ok(last.or_else(|| cursor.map(<[u8]>::to_vec)))
 	}
 
 	/// Turn raw byte arrays into VTXOs, then validate them.
@@ -578,9 +539,9 @@ impl Wallet {
 		let mut current = Vec::new();
 		for coin in new_vtxos {
 			let key = self.get_vtxo_key(&coin).await?;
-			let state = self.fetch_vtxo_spend_state(coin.id(), &key).await?;
+			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
 			if state == protos::VtxoSpendState::Spent
-				&& !self.inner.db.get_fallback_receipts().await?.iter().any(|r| r.affects(coin.id())) {
+				&& !committed {
 				self.store_vtxos([&coin], &VtxoState::Spent).await?;
 				continue;
 			}

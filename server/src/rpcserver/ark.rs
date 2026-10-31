@@ -187,11 +187,11 @@ impl rpc::server::ArkService for Server {
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
 
-		let (vtxo_state, fallback, owners, claims, outcomes) = self.db.read(async |t| {
+		let (vtxo_state, fallback, owners, outcomes) = self.db.read(async |t| {
 			let state = t.get_server_vtxo_by_id(id).await?;
 			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?, t.fallback_claims(&[id]).await?,
+			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?,
 				t.fallback_outcomes(&[id]).await?))
 		}).await.to_status()?;
 
@@ -213,7 +213,7 @@ impl rpc::server::ArkService for Server {
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
 			spend_state: fallback_spend_state(spend_state, outcomes.get(&id)) as i32,
 			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
-			fallback_claim: claims.get(&id).filter(|_| fallback.contains(&id)).map(Into::into),
+			fallback_committed: outcomes.contains_key(&id),
 		}))
 	}
 
@@ -272,12 +272,12 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback, owners, claims, outcomes) = self.db.read(async |t| {
+		let (states, fallback, owners, outcomes) = self.db.read(async |t| {
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
 			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
 				.collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
-			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?, t.fallback_claims(&ids).await?,
+			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?,
 				t.fallback_outcomes(&ids).await?))
 		}).await.to_status()?;
 
@@ -309,7 +309,7 @@ impl rpc::server::ArkService for Server {
 				vtxo_id: id.to_bytes().to_vec(),
 				spend_state: fallback_spend_state(*spend_state, outcomes.get(&id)) as i32,
 				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
-				fallback_claim: claims.get(&id).filter(|_| fallback.contains(&id)).map(Into::into),
+				fallback_committed: outcomes.contains_key(&id),
 			});
 		}
 
@@ -373,8 +373,8 @@ impl rpc::server::ArkService for Server {
 		// not found.
 		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
 		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (fallback, owners, claims, outcomes) = self.db.read(async |t| Ok((
-			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?, t.fallback_claims(&ids).await?,
+		let (fallback, owners, outcomes) = self.db.read(async |t| Ok((
+			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
 			t.fallback_outcomes(&ids).await?,
 		))).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
@@ -384,7 +384,7 @@ impl rpc::server::ArkService for Server {
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
 				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
-				fallback_claim: claims.get(&v.vtxo.id()).filter(|_| fallback.contains(&v.vtxo.id())).map(Into::into),
+				fallback_committed: outcomes.contains_key(&v.vtxo.id()),
 			})
 		}).collect();
 

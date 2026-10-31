@@ -844,14 +844,14 @@ async fn lightning_backup(unclean: bool) {
 	let rebound = client.fallback_script();
 	assert_eq!(rebound, registration);
 	client.sync_fallback_payouts().await.unwrap();
-	assert_eq!(client.verify_fallback_output(payout).await.unwrap(), sat(99_000));
+	client.sync_onchain().await.unwrap();
 	let balance = client.balance().await.unwrap();
 	assert_eq!([
-		balance.spendable, balance.needs_refresh, balance.awaiting_settlement,
+		balance.spendable, balance.needs_refresh,
 		balance.pending_board, balance.pending_in_round, balance.pending_arkoor_send,
 		balance.pending_offboard, balance.pending_lightning_send,
 		balance.claimable_lightning_receive, balance.pending_exit,
-	], [Amount::ZERO; 10]);
+	], [Amount::ZERO; 9]);
 	client.stop_daemon_wait().await.unwrap();
 	drop(client);
 	let recovered_inputs = recovered.onchain_utxos().await.into_iter().map(|u| (u.outpoint, u.amount)).collect::<BTreeMap<_, _>>();

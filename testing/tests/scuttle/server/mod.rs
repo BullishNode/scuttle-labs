@@ -33,7 +33,7 @@ mod expiry_script_dust_boundaries;
 mod expiry_send_claim;
 mod expiry_send_claim_receipts;
 mod expiry_split;
-mod expiry_test;
+pub(crate) mod expiry_test;
 mod expiry_three_owner_forwarding;
 mod expiry_tiny_payout_grouping;
 mod expiry_transfer_refresh;

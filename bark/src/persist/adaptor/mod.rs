@@ -118,8 +118,8 @@ pub mod partition {
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
 
-	// 18..=20 belonged to refused registration-era stores.
-	pub const FALLBACK_RECEIPT: u8 = 21;
+	// Retired registration/receipt formats. Never reuse these partitions.
+	pub const LEGACY_SCUTTLE: std::ops::RangeInclusive<u8> = 18..=21;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -452,6 +452,10 @@ impl<S: StorageAdaptor> StorageAdaptorWrapper<S> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	async fn init_wallet(&self, properties: &WalletProperties) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		for old in partition::LEGACY_SCUTTLE {
+			ensure!(lock.get_all(old).await?.is_empty(), "old Scuttle state requires a fresh store");
+		}
 		let record = Record::from_data(
 			partition::PROPERTIES,
 			// NB: a single set of properties is stored, so no need for primary key
@@ -459,11 +463,15 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None,
 			properties,
 		)?;
-		self.inner.write().await.put(record).await
+		lock.put(record).await
 	}
 
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
-		match self.inner.read().await.get(partition::PROPERTIES, &[]).await? {
+		let lock = self.inner.read().await;
+		for old in partition::LEGACY_SCUTTLE {
+			ensure!(lock.get_all(old).await?.is_empty(), "old Scuttle state requires a fresh store");
+		}
+		match lock.get(partition::PROPERTIES, &[]).await? {
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
@@ -885,6 +893,22 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		Ok(coin.to_wallet_vtxo()?)
 	}
 
+	async fn store_fallback_vtxo(&self, vtxo: &Vtxo<Full>, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut lock = self.inner.write().await;
+		let mut coin = get_vtxo(&*lock, vtxo.id()).await?.unwrap_or_else(|| SerdeVtxo {
+			vtxo: vtxo.clone(), states: vec![VtxoState::Locked { holder: None }],
+			registered: false, fallback_status: None,
+		});
+		let state = status.state_for(coin.current_state().context("fallback source has no state")?);
+		if coin.current_state() != Some(&state) { coin.states.push(state.clone()); }
+		coin.fallback_status = Some(status);
+		let sk = sort::vtxo_sort_key(state.kind(), coin.vtxo.expiry_height().to_u32(), coin.vtxo.amount());
+		lock.put(Record::from_data(partition::VTXO, &vtxo.id().to_bytes(), Some(sk), &coin)?).await?;
+		Ok(coin.to_wallet_vtxo()?)
+	}
+
 	async fn release_vtxo_lock(
 		&self,
 		vtxo_id: VtxoId,
@@ -1039,38 +1063,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 
 
 
-	async fn get_fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
-		self.inner.read().await.get_all(partition::FALLBACK_RECEIPT).await?
-			.into_iter().map(|record| record.to_data()).collect()
-	}
-
-	async fn store_fallback_receipt(&self, receipt: &crate::FallbackReceipt) -> anyhow::Result<()> {
-		let mut guard = self.inner.write().await;
-		let id = receipt.vtxo_id.to_bytes();
-		if let Some(previous) = guard.get(partition::FALLBACK_RECEIPT, &id).await? {
-			let previous: crate::FallbackReceipt = previous.to_data()?;
-			ensure!(previous.owner_mailbox == receipt.owner_mailbox && previous.gross == receipt.gross
-				&& previous.source_vtxo_ids == receipt.source_vtxo_ids,
-				"immutable fallback receipt source differs");
-		}
-		guard.put(Record::from_data(partition::FALLBACK_RECEIPT, &id, None, receipt)?).await
-	}
-
-	async fn remove_fallback_receipt(&self, id: VtxoId) -> anyhow::Result<()> {
-		self.inner.write().await.delete(partition::FALLBACK_RECEIPT, &id.to_bytes()).await.map(|_| ())
-	}
-
-
-
-
-
-
-
-
-
-
-
-
 	async fn get_public_key_idx(&self, public_key: &PublicKey) -> anyhow::Result<Option<u32>> {
 		match self.inner.read().await
 			.get(partition::PUBLIC_KEY, &public_key.serialize()[..]).await?
@@ -1185,11 +1177,19 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
+		association: Option<&crate::persist::models::ReceiveAssociation>,
 	) -> anyhow::Result<()> {
 		let key = payment_hash.to_byte_array();
 
 		let mut lock = self.inner.write().await;
-		if lock.get(partition::SETTLED_LIGHTNING_RECEIVE, &key).await?.is_some() {
+		if let Some(record) = lock.get(partition::SETTLED_LIGHTNING_RECEIVE, &key).await? {
+			if let Some(expected) = association {
+				let stored = record.to_data::<SettledLightningReceive>()?.association
+					.context("settled receive has no original claim association")?;
+				ensure!((stored.key_index, &stored.claim_destination, &stored.grant_ids)
+					== (expected.key_index, &expected.claim_destination, &expected.grant_ids),
+					"settled receive claim association differs");
+			}
 			return Ok(());
 		}
 		let settled = SettledLightningReceive {
@@ -1198,6 +1198,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			invoice: invoice.clone(),
 			amount,
 			settled_at: chrono::Local::now(),
+			association: association.cloned(),
 		};
 		let record = Record::from_data(partition::SETTLED_LIGHTNING_RECEIVE, &key, None, &settled)?;
 		lock.put(record).await
@@ -1213,6 +1214,26 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
+	}
+
+	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
+		let records = self.inner.read().await.get_all(partition::SETTLED_LIGHTNING_RECEIVE).await?;
+		let mut ret = Vec::new();
+		for record in records {
+			let recv: SettledLightningReceive = record.to_data()?;
+			if recv.association.as_ref().is_some_and(|claim| claim.fallback_status.is_some()) { ret.push(recv); }
+		}
+		Ok(ret)
+	}
+
+	async fn set_receive_fallback_status(&self, hash: PaymentHash, status: crate::vtxo::FallbackStatus) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		let mut record = lock.get(partition::SETTLED_LIGHTNING_RECEIVE, &hash.to_byte_array()).await?
+			.context("receive is not stored")?;
+		let mut recv: SettledLightningReceive = record.to_data()?;
+		recv.association.as_mut().context("receive has no original claim association")?.fallback_status = Some(status);
+		record.data = serde_json::to_vec(&recv)?;
+		lock.put(record).await
 	}
 
 

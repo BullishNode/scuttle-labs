@@ -1,6 +1,5 @@
-//! Joint output authorization and canonical fallback receipts.
+//! Joint output authorization and authenticated fallback status.
 
-pub(crate) mod payouts;
 mod refusal;
 mod sync;
 mod reconcile;
@@ -33,13 +32,6 @@ impl Wallet {
 	/// BIP86 destination of the exact mailbox identity checked at open.
 	pub fn fallback_script(&self) -> ScriptBuf {
 		ark::fallback::payout_script(self.mailbox_keypair().public_key())
-	}
-
-	/// Current committed claims, including explicit no-output forfeitures and
-	/// previously paid receipts retained for canonical reorg checks.
-	pub async fn fallback_receipts(&self) -> anyhow::Result<Vec<crate::FallbackReceipt>> {
-		self.recheck_fallback_receipts().await?;
-		self.inner.db.get_fallback_receipts().await
 	}
 
 	/// Authorize with this wallet's mailbox key and an actual coin key from its keystore.

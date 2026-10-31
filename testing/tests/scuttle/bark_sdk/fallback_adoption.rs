@@ -41,14 +41,15 @@ async fn mnemonic(ctx: &TestContext, name: &str) -> bip39::Mnemonic {
 	bip39::Mnemonic::from_str(text.trim()).unwrap()
 }
 
-async fn reopen(ctx: &TestContext, name: &str, srv: &captaind::Captaind) -> Wallet {
+pub(super) async fn reopen(ctx: &TestContext, name: &str, srv: &captaind::Captaind) -> Wallet {
 	// The harness deliberately reallocates listener ports after stop/start.
 	// Reopen the existing databases against its current endpoint.
 	let mnemonic = mnemonic(ctx, name).await;
 	let db = Arc::new(SqliteClient::open(ctx.datadir.join(name).join("db.sqlite")).unwrap());
 	let onchain = OnchainWallet::load_or_create(Network::Regtest, mnemonic.to_seed(""), db.clone()).await.unwrap();
-	let mut cfg = ctx.bark_default_cfg(srv, Some(ctx.bitcoind()));
-	config(&mut cfg);
+	let mut cfg: bark::Config = toml::from_str(&tokio::fs::read_to_string(
+		ctx.datadir.join(name).join("config.toml")).await.unwrap()).unwrap();
+	cfg.server_address = srv.ark_url();
 	Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic), cfg, OpenWalletArgs {
 		persister: Some(db), onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), run_daemon: false, ..Default::default()
 	}).await.unwrap()
@@ -179,12 +180,7 @@ async fn unseen_paid_mailbox(recover_spent_first: bool) {
 		returned.sync_fallback_payouts().await.unwrap();
 		for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
 		let history = returned.history().await.unwrap();
-		assert_eq!(history.len(), 2);
-		assert!(history.iter().all(|movement| movement.subsystem.name == "scuttle.fallback"
-			&& movement.status == bark::movement::MovementStatus::Successful
-			&& movement.intended_balance == bitcoin::SignedAmount::ZERO
-			&& movement.effective_balance == bitcoin::SignedAmount::ZERO
-			&& movement.input_vtxos.is_empty() && movement.output_vtxos.is_empty()));
+		assert!(history.is_empty(), "unknown paid rights do not create an Ark receipt movement");
 		let report = returned.recover_vtxos(ids.iter().copied(), None).await.unwrap();
 		assert!(report.is_complete());
 		assert!(report.recovered().is_empty());
@@ -202,20 +198,20 @@ async fn unseen_paid_mailbox(recover_spent_first: bool) {
 	assert!(returned.spendable_vtxos().await.unwrap().is_empty());
 	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	let history = returned.history().await.unwrap();
-	assert_eq!(history.len(), if recover_spent_first { 2 } else { 4 });
+	assert_eq!(history.len(), if recover_spent_first { 0 } else { 2 });
 	let incoming = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
 	assert_eq!(incoming.len(), if recover_spent_first { 0 } else { 2 });
 	assert!(incoming.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful
 		&& movement.input_vtxos.is_empty() && movement.offchain_fee == sat(0)));
-	let receipts = history.iter().filter(|movement| movement.subsystem.name == "scuttle.fallback").collect::<Vec<_>>();
-	assert_eq!(receipts.len(), 2);
-	assert!(receipts.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful));
-	assert_eq!(receipts.iter().map(|movement| movement.offchain_fee).sum::<bitcoin::Amount>(), sat(1_000));
-	assert_eq!(receipts.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(),
-		if recover_spent_first { 0 } else { -20_000 });
+	assert!(!history.iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
+		"ordinary Bitcoin payouts do not add an Ark retirement ledger");
 	assert_eq!(history.iter().flat_map(|movement| movement.output_vtxos.iter().copied()).collect::<BTreeSet<_>>(),
 		if recover_spent_first { BTreeSet::new() } else { ids.iter().copied().collect() });
-	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 0);
+	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(),
+		if recover_spent_first { 0 } else { 20_000 }, "retain ordinary receive history without a synthetic fallback debit");
+	returned.sync_onchain().await.unwrap();
+	// The canonical output total19k and cumulative fee1k were proved above.
+	assert_eq!(paid + sat(1_000), sat(20_000));
 	for _ in 0..2 {
 		if recover_spent_first { returned.sync_fallback_payouts().await.unwrap(); } else { returned.sync().await; }
 		assert_eq!(returned.history().await.unwrap(), history);
@@ -268,8 +264,8 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
 	assert!(restored.spendable_vtxos().await.unwrap().is_empty());
-	assert!(restored.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
-	assert!(super::fallback_receipt_ids(db.get_fallback_receipts().await.unwrap(), true).is_empty());
+	assert!(super::fallback_status_ids(restored.all_vtxos().await.unwrap(), false).contains(&coin.id()));
+	assert!(super::fallback_status_ids(db.get_all_vtxos().await.unwrap(), true).is_empty());
 	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.effective_balance.to_sat() == 0), "fresh restore must not invent an earlier Ark debit");
 	let paid = ctx.bark_sdk("paid", &srv).cfg(config)
@@ -278,7 +274,9 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	assert!(restored.exit_mgr().get_exit_vtxo(coin.id()).await.is_none());
 	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	assert_eq!(restored.balance().await.unwrap().awaiting_settlement, coin.amount(), "the explicit customer claim remains unpaid");
+	assert_eq!(restored.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().amount(), coin.amount());
+	assert_eq!(restored.balance().await.unwrap().total(), sat(0), "a known fallback commitment is a status, not another Ark balance");
 
 	// Verify the registered payout in both independently restored databases.
 	srv.start().await.unwrap();
@@ -302,13 +300,16 @@ async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registere
 	restored.sync_fallback_payouts().await.unwrap();
 	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.effective_balance.to_sat() == 0), "another restore must not invent an earlier Ark debit");
-	ctx.generate_blocks(6).await;
-	srv.stop().await.unwrap();
+	let confirmed = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(confirmed).await;
+	srv.watchmand().wait_for_sync_height(confirmed).await;
 	paid.chain().invalidate_caches().await;
 	paid.sync_fallback_payouts().await.unwrap();
+	srv.stop().await.unwrap();
+	assert!(paid.sync_fallback_payouts().await.is_err(), "offline observation cannot infer an authenticated Ark status");
 	let paid_db = SqliteClient::open(ctx.datadir.join("paid/db.sqlite")).unwrap();
 	assert_eq!(paid_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(super::fallback_receipt_ids(paid_db.get_fallback_receipts().await.unwrap(), true).contains(&coin.id()));
+	assert!(super::fallback_status_ids(paid_db.get_all_vtxos().await.unwrap(), true).contains(&coin.id()));
 	let transaction = ctx.bitcoind().await_transaction(payout).await;
 	assert!(transaction.output.iter().any(|output| output.script_pubkey == script && output.value == sat(99_000)));
 }
@@ -327,13 +328,13 @@ async fn ordinary_spent_history_uses_upstream_trust_and_retains_only_change() {
 	let db = SqliteClient::open(ctx.datadir.join("restored/db.sqlite")).unwrap();
 	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
 	assert_eq!(restored.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(!restored.awaiting_settlement_vtxos().await.unwrap().contains(&source.id()));
+	assert!(!super::fallback_status_ids(restored.all_vtxos().await.unwrap(), false).contains(&source.id()));
 	assert_eq!(restored.balance().await.unwrap().total(), sat(40_000));
-	assert_eq!(restored.balance().await.unwrap().awaiting_settlement, sat(0));
+	assert!(super::fallback_status_ids(restored.all_vtxos().await.unwrap(), false).is_empty());
 	restored.dangerous_drop_vtxo(source.id()).await.unwrap();
 	restored.import_vtxo(&signed, bark::ImportVtxoArgs::default()).await.unwrap();
 	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!super::fallback_receipt_ids(db.get_fallback_receipts().await.unwrap(), false).contains(&source.id()));
+	assert!(!super::fallback_status_ids(db.get_all_vtxos().await.unwrap(), false).contains(&source.id()));
 	restored.sync_fallback_payouts().await.unwrap();
 	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
 	assert_eq!(restored.balance().await.unwrap().total(), sat(40_000));
@@ -431,13 +432,14 @@ async fn trusted_pending_chain_outage(already_owned: bool) {
 	assert!(matches!(error.downcast_ref::<VtxoValidationError>(),
 		Some(VtxoValidationError::Chain(_) | VtxoValidationError::AnchorNotFound)));
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(super::fallback_receipt_ids(database.get_fallback_receipts().await.unwrap(), true).is_empty());
+	assert!(super::fallback_status_ids(database.get_all_vtxos().await.unwrap(), true).is_empty());
 	let balance = wallet.balance().await.unwrap();
 	assert_eq!(balance.spendable, bitcoin::Amount::ZERO);
 	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-	assert_eq!(balance.awaiting_settlement, sat(100_000), "only the authentic committed receipt supplies pending principal");
-	assert_eq!(balance.total(), sat(100_000));
-	assert!(wallet.awaiting_settlement_vtxos().await.unwrap().contains(&coin.id()));
+	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().amount(), sat(100_000));
+	assert_eq!(balance.total(), sat(0), "committed principal remains in the retained signed coin/status, outside Ark balances");
+	assert!(super::fallback_status_ids(wallet.all_vtxos().await.unwrap(), false).contains(&coin.id()));
 	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 	assert!(wallet.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 		.all(|movement| movement.status == bark::movement::MovementStatus::Pending && movement.effective_balance.to_sat() == 0));
@@ -460,9 +462,9 @@ async fn trusted_pending_chain_outage(already_owned: bool) {
 	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
 	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 	let balance = wallet.balance().await.unwrap();
-	assert_eq!(balance.awaiting_settlement, sat(100_000));
-	assert_eq!(balance.total(), sat(100_000));
-	assert!(super::fallback_receipt_ids(database.get_fallback_receipts().await.unwrap(), true).is_empty());
+	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+	assert_eq!(balance.total(), sat(0), "committed principal remains in the retained signed coin/status, outside Ark balances");
+	assert!(super::fallback_status_ids(database.get_all_vtxos().await.unwrap(), true).is_empty());
 }
 
 #[derive(Clone, Default)]
@@ -610,10 +612,10 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 			assert!(matches!(error, ImportVtxoError::Invalid { source: VtxoValidationError::Invalid(_), .. }));
 			assert!(history_db.get_wallet_vtxo(change.id()).await.unwrap().is_none());
 		}
-		assert_eq!(history.balance().await.unwrap().awaiting_settlement, sat(40_000));
+		assert_eq!(history.balance().await.unwrap().total(), sat(0), "an unsigned body cannot invent a known coin or principal");
 		assert_eq!(history.balance().await.unwrap().spendable, sat(0));
 		assert!(history.spendable_vtxos().await.unwrap().is_empty());
-		assert!(history_db.get_fallback_receipts().await.unwrap().iter().all(|receipt| receipt.retired_block.is_none()));
+		assert!(history_db.get_all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 		assert!(history.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
 			.all(|movement| movement.status == bark::movement::MovementStatus::Pending));
 		history.stop_daemon_wait().await.unwrap();
@@ -725,28 +727,21 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, own_state);
 	}
 	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, own_state);
-	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, pending_amount);
-	assert_eq!(owner.balance().await.unwrap().total(), pending_amount, "the original input is counted once until actual retirement");
+	assert_eq!(owner.balance().await.unwrap().total(), sat(0), "known committed inputs are status-only, not new Ark balance");
 	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-	assert_eq!(owner.awaiting_settlement_vtxos().await.unwrap().contains(&source.id()), !refund_before_release);
-	let claims = owner.fallback_receipts().await.unwrap();
-	assert_eq!(claims.iter().map(|receipt| receipt.gross).sum::<bitcoin::Amount>(), source.amount());
-	assert!(claims.iter().all(|receipt| receipt.owner_mailbox == owner.mailbox_keypair().public_key()
-		&& receipt.source_vtxo_ids.contains(&source.id())));
-	assert!(claims.iter().all(|receipt| receipt.retired_block.is_some() == refund_before_release));
-	let mut cursor = None;
-	let mut paged = BTreeSet::new();
-	loop {
-		let page = db.read(async |tx| tx.mailbox_fallback_claims(owner.mailbox_keypair().public_key(), cursor, 1).await).await.unwrap();
-		if page.is_empty() { break; }
-		assert_eq!(page.len(), 1);
-		assert!(paged.insert(page[0].vtxo_id));
-		cursor = Some(page[0].vtxo_id);
+	assert_eq!(super::fallback_status_ids(owner.all_vtxos().await.unwrap(), false).contains(&source.id()), !refund_before_release);
+	assert_eq!(pending_amount, if refund_before_release { sat(0) } else { source.amount() });
+	let source_status = if refund_before_release { bark::vtxo::FallbackStatus::Spent } else { bark::vtxo::FallbackStatus::Pending };
+	assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(source_status));
+	assert_eq!(owner.get_full_vtxo(source.id()).await.unwrap().amount(), source.amount());
+	// The source-to-change relation and exact leaf owner/status were checked
+	// through authenticated single/batch/xpub RPC above, not a claim feed.
+	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
+	for change in &changes {
+		assert_eq!(owner.get_vtxo_by_id(change.id()).await.unwrap().fallback_status, Some(source_status));
 	}
-	assert_eq!(paged, leaves.iter().map(|coin| coin.id()).collect());
-	assert!(db.read(async |tx| tx.mailbox_fallback_claims(recipient.mailbox_keypair().public_key(), None, 1).await).await.unwrap().is_empty());
 	recipient.sync_fallback_payouts().await.unwrap();
-	assert!(recipient.fallback_receipts().await.unwrap().is_empty());
+	assert!(recipient.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
 	let payout = match confirmed_payout { Some(payout) => payout, None => confirm_refund().await };
 	owner.chain().invalidate_caches().await;
@@ -756,13 +751,13 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		"actual canonical retirement permits removal of the protected checkpoint");
 	for change in &changes {
 		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-		assert!(super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), true).contains(&change.id()));
+		assert!(super::fallback_status_ids(local.get_all_vtxos().await.unwrap(), true).contains(&change.id()));
 	}
-	assert_eq!(owner.balance().await.unwrap().awaiting_settlement, sat(0));
+	assert!(super::fallback_status_ids(owner.all_vtxos().await.unwrap(), false).is_empty());
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0));
 	let history = owner.history().await.unwrap();
-	assert_eq!(history.iter().map(|movement| movement.effective_balance).sum::<bitcoin::SignedAmount>(), bitcoin::SignedAmount::ZERO,
-		"one 100k board and one 100k fallback retirement conserve the wallet history");
+	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 100_000,
+		"ordinary board history stays intact without a synthetic BTC payout debit");
 	let sends = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
 	assert_eq!(sends.len(), 1);
 	assert_eq!(sends[0].status, bark::movement::MovementStatus::Failed);
@@ -929,8 +924,8 @@ async fn expired_status_retirement(paused: bool) {
 	}
 	for _ in 0..2 { stale.sync_fallback_payouts().await.unwrap(); }
 	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), false).contains(&source.id()));
-	assert!(!super::fallback_receipt_ids(local.get_fallback_receipts().await.unwrap(), true).contains(&source.id()));
+	assert!(!super::fallback_status_ids(local.get_all_vtxos().await.unwrap(), false).contains(&source.id()));
+	assert!(!super::fallback_status_ids(local.get_all_vtxos().await.unwrap(), true).contains(&source.id()));
 	assert_eq!(stale.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
 	assert_eq!(stale.balance().await.unwrap().total(), sat(40_000));
 	for id in change_ids {
@@ -975,7 +970,7 @@ async fn real_multidevice_authenticated_sync() {
 	Box::pin(older.sync()).await;
 	assert_eq!(older_db.get_wallet_vtxo(original.id()).await.unwrap().unwrap().state, VtxoState::Spent);
 	assert_eq!(older.balance().await.unwrap().spendable, sat(40_000));
-	assert_eq!(older.balance().await.unwrap().awaiting_settlement, sat(0));
+	assert!(super::fallback_status_ids(older.all_vtxos().await.unwrap(), false).is_empty());
 	assert_eq!(older.balance().await.unwrap().total(), sat(40_000), "the spent original cannot add another 100k");
 	assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(),
 		intermediate.iter().map(|coin| coin.id()).collect());
@@ -1005,10 +1000,10 @@ async fn real_multidevice_authenticated_sync() {
 	}
 	assert_eq!(older.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<BTreeSet<_>>(), current_ids);
 	assert_eq!(older.balance().await.unwrap().spendable, sat(30_000));
-	assert_eq!(older.balance().await.unwrap().awaiting_settlement, sat(0));
+	assert!(super::fallback_status_ids(older.all_vtxos().await.unwrap(), false).is_empty());
 	assert_eq!(older.balance().await.unwrap().total(), sat(30_000), "original, middle and grandchild are one current principal cut");
-	assert!(older.fallback_receipts().await.unwrap().is_empty());
-	assert!(older.awaiting_settlement_vtxos().await.unwrap().is_empty());
+	assert!(older.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
+	assert!(super::fallback_status_ids(older.all_vtxos().await.unwrap(), false).is_empty());
 	Box::pin(source.sync()).await;
 	assert_eq!(source.balance().await.unwrap().total(), sat(170_000));
 	assert_eq!(source.balance().await.unwrap().total() + older.balance().await.unwrap().total(), sat(200_000));

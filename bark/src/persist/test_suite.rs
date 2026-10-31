@@ -63,7 +63,6 @@ macro_rules! bark_persister_tests {
 		$crate::persist::test_suite::bark_persister_tests!(@tests $setup,
 			test_init_and_read_properties,
 			test_external_mailbox_public_identity_roundtrip,
-			test_fallback_receipt_binding_is_immutable,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
 
@@ -631,6 +630,12 @@ pub async fn test_fallback_status_keeps_commitment_and_exit_state(db: &impl Bark
 		assert_eq!(preserved.state, VtxoState::Exited, "an exposed exit keeps its ordinary observation lifecycle");
 		assert_eq!(preserved.fallback_status, Some(status));
 	}
+	let discovered = &VTXO_VECTORS.round2_vtxo;
+	let adopted = db.store_fallback_vtxo(discovered, FallbackStatus::Spent).await.unwrap();
+	assert_eq!(adopted.state, VtxoState::Spent);
+	assert_eq!(adopted.fallback_status, Some(FallbackStatus::Spent),
+		"a first-seen terminal body must not exist without its durable recheck marker");
+	assert_eq!(db.get_full_vtxo(discovered.id()).await.unwrap().unwrap().serialize(), discovered.serialize());
 }
 
 /// Insert retries cannot erase an owned lock, remove a recovery registration,
@@ -1048,14 +1053,31 @@ pub async fn test_settled_lightning_receive_record_and_get(db: &impl BarkPersist
 	let preimage = test_preimage();
 	let invoice = test_bolt11();
 	let amount = Amount::from_sat(12_345);
+	let association = crate::persist::models::ReceiveAssociation {
+		key_index: 7, claim_destination: None, grant_ids: vec![VTXO_VECTORS.board_vtxo.id()],
+		fallback_status: Some(FallbackStatus::Pending),
+	};
 
-	db.record_settled_lightning_receive(hash, preimage, &invoice, amount).await.unwrap();
+	db.record_settled_lightning_receive(hash, preimage, &invoice, amount, Some(&association)).await.unwrap();
 
 	let stored = db.get_settled_lightning_receive(hash).await.expect("get").expect("present");
 	assert_eq!(stored.payment_hash, hash, "payment hash round-trip");
 	assert_eq!(stored.preimage, preimage, "preimage round-trip");
 	assert_eq!(stored.invoice, invoice, "invoice round-trip");
 	assert_eq!(stored.amount, amount, "amount round-trip");
+	assert_eq!(stored.association, Some(association.clone()));
+	db.set_receive_fallback_status(hash, FallbackStatus::Spent).await.unwrap();
+	let retired = db.get_settled_lightning_receive(hash).await.unwrap().unwrap();
+	assert_eq!(retired.association.as_ref().unwrap().fallback_status, Some(FallbackStatus::Spent));
+	assert_eq!(retired.settled_at, stored.settled_at);
+	assert_eq!(db.fallback_lightning_receives().await.unwrap(), vec![retired.clone()]);
+	let changed = crate::persist::models::ReceiveAssociation { key_index: 8, ..association.clone() };
+	assert!(db.record_settled_lightning_receive(hash, preimage, &invoice, amount, Some(&changed)).await.is_err());
+	assert_eq!(db.get_settled_lightning_receive(hash).await.unwrap().unwrap(), retired);
+	db.set_receive_fallback_status(hash, FallbackStatus::Pending).await.unwrap();
+	let reorg = db.get_settled_lightning_receive(hash).await.unwrap().unwrap();
+	assert_eq!(reorg.association.as_ref().unwrap().fallback_status, Some(FallbackStatus::Pending));
+	assert_eq!(reorg.association.as_ref().unwrap().grant_ids, association.grant_ids);
 }
 
 pub async fn test_settled_lightning_receive_record_is_idempotent(db: &impl BarkPersister) {
@@ -1063,11 +1085,11 @@ pub async fn test_settled_lightning_receive_record_is_idempotent(db: &impl BarkP
 	let preimage = test_preimage();
 	let invoice = test_bolt11();
 
-	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(12_345))
+	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(12_345), None)
 		.await.unwrap();
 
 	// A second record with a different amount must be a no-op: the original row wins.
-	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(999))
+	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(999), None)
 		.await.expect("second record should be a no-op");
 
 	let stored = db.get_settled_lightning_receive(hash).await.unwrap().expect("row still present");
@@ -1252,28 +1274,4 @@ pub async fn test_exit_child_tx_roundtrip(db: &impl BarkPersister) {
 		Some((replacement_tx, ExitTxOrigin::Mempool)),
 		"store_exit_child_tx should replace the child of an existing exit",
 	);
-}
-
-/// Receipt updates may revisit confirmation, but cannot move a source to a
-/// different mailbox or invent a larger attributable balance.
-pub async fn test_fallback_receipt_binding_is_immutable(db: &impl BarkPersister) {
-	let mailbox = Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
-	let receipt = crate::FallbackReceipt {
-		vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(),
-		source_vtxo_ids: std::collections::BTreeSet::from([ark::test_util::VTXO_VECTORS.board_vtxo.id()]), allocation_id: 1,
-		owner_mailbox: mailbox.public_key(), gross: Amount::from_sat(10_000),
-		fee: Amount::from_sat(1_000), payout: Amount::from_sat(9_000), forfeited: Amount::ZERO,
-		transaction_id: None, output_index: Some(0), confirmed_block: None, retired_block: None,
-	};
-	assert!(db.get_fallback_receipts().await.unwrap().is_empty());
-	db.store_fallback_receipt(&receipt).await.unwrap();
-	assert_eq!(db.get_fallback_receipts().await.unwrap(), vec![receipt.clone()]);
-	let mut changed = receipt.clone();
-	changed.owner_mailbox = Keypair::from_seckey_slice(&ark::SECP, &[8; 32]).unwrap().public_key();
-	assert!(db.store_fallback_receipt(&changed).await.is_err());
-	changed = receipt.clone(); changed.gross += Amount::ONE_SAT;
-	assert!(db.store_fallback_receipt(&changed).await.is_err());
-	changed = receipt.clone(); changed.source_vtxo_ids.clear();
-	assert!(db.store_fallback_receipt(&changed).await.is_err());
-	assert_eq!(db.get_fallback_receipts().await.unwrap(), vec![receipt]);
 }

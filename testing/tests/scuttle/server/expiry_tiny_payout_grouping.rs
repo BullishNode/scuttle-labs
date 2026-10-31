@@ -328,12 +328,13 @@ async fn tiny_group() {
 	// the two fee-only contributors must remain payable-group members.
 	let returned = Box::pin(recipient_cli.client()).await;
 	returned.sync_fallback_payouts().await.unwrap();
-	assert_eq!(returned.verify_fallback_output(tiny_point).await.unwrap(), sat(500));
+	returned.sync_onchain().await.unwrap();
+	assert_eq!(parents[&tiny_point.txid].output[tiny_point.vout as usize].value, sat(500));
 	for id in &recipient_ids {
 		assert_eq!(returned.get_vtxo_by_id(*id).await.unwrap().state, VtxoState::Spent);
 	}
 	let history = fallback_history(returned.history().await.unwrap(), &recipient_before);
-	assert_eq!(fields(&returned.balance().await.unwrap()), [Amount::ZERO; 10]);
+	assert_eq!(fields(&returned.balance().await.unwrap()), [Amount::ZERO; 9]);
 	for _ in 0..2 {
 		returned.sync_fallback_payouts().await.unwrap();
 		assert_eq!(fallback_history(returned.history().await.unwrap(), &recipient_before), history);
@@ -343,11 +344,11 @@ async fn tiny_group() {
 	let reopened = Box::pin(recipient_cli.client()).await;
 	reopened.sync_fallback_payouts().await.unwrap();
 	assert_eq!(fallback_history(reopened.history().await.unwrap(), &recipient_before), history);
-	assert_eq!(fields(&reopened.balance().await.unwrap()), [Amount::ZERO; 10]);
+	assert_eq!(fields(&reopened.balance().await.unwrap()), [Amount::ZERO; 9]);
 	let sender_returned = Box::pin(sender_cli.client()).await;
 	sender_returned.sync_fallback_payouts().await.unwrap();
 	let _sender_history = fallback_history(sender_returned.history().await.unwrap(), &sender_before);
-	assert_eq!(fields(&sender_returned.balance().await.unwrap()), [Amount::ZERO; 10]);
+	assert_eq!(fields(&sender_returned.balance().await.unwrap()), [Amount::ZERO; 9]);
 	sender_returned.stop_daemon_wait().await.unwrap();
 	reopened.stop_daemon_wait().await.unwrap();
 }

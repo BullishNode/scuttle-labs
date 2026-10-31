@@ -75,15 +75,14 @@ impl captaind::proxy::ArkRpcProxy for LoseCommittedFinish {
 	}
 }
 
-fn balance_fields(balance: &bark::Balance) -> [Amount; 10] {
+fn balance_fields(balance: &bark::Balance) -> [Amount; 9] {
 	[balance.spendable, balance.needs_refresh, balance.pending_lightning_send,
 		balance.claimable_lightning_receive, balance.pending_in_round, balance.pending_exit,
-		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard,
-		balance.awaiting_settlement]
+		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard]
 }
 
 async fn assert_ark_balance(wallet: &Wallet, spendable: Amount, pending_offboard: Amount) {
-	let mut expected = [Amount::ZERO; 10];
+	let mut expected = [Amount::ZERO; 9];
 	expected[0] = spendable;
 	expected[8] = pending_offboard;
 	assert_eq!(balance_fields(&wallet.balance().await.unwrap()), expected);

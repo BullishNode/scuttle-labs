@@ -217,8 +217,8 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			srv.watchmand().stop().await.unwrap();
 			srv.stop().await.unwrap();
 			wallet.sync_pending_offboards().await.unwrap();
-			assert_eq!(wallet.offboard_checkpoint(&prepared.id).await.unwrap(), None,
-				"independent payment must finish the superseded intent even while Ark is unavailable");
+			assert_eq!(wallet.offboard_checkpoint(&prepared.id).await.unwrap(), Some(prepared.clone()),
+				"without a fresh authenticated input status, retain the cancelled intent rather than infer from Bitcoin");
 			assert_eq!(wallet_db.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spent);
 			assert_eq!(wallet.get_full_vtxo(id).await.unwrap(), signed, "payment must retain signed recovery material");
 			let history = wallet.history().await.unwrap();
@@ -231,12 +231,16 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			let confirmed = rpc.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().unwrap();
 			rpc.invalidate_block(&confirmed.blockhash.unwrap()).unwrap();
 			wallet.chain().invalidate_caches().await;
-			wallet.sync_fallback_payouts().await.unwrap();
+			assert!(wallet.sync_fallback_payouts().await.is_err());
+			wallet.sync_onchain().await.unwrap();
 			assert!(wallet.exit_mgr().get_exit_vtxo(id).await.is_none(), "fallback reconciliation must retain upstream exit scheduling");
 			assert_eq!(wallet.get_full_vtxo(id).await.unwrap(), signed);
 			let pending = wallet.balance().await.unwrap();
-			assert_eq!(pending.awaiting_settlement, coin.amount());
-			assert_eq!(pending.total(), coin.amount());
+			assert_eq!(wallet_db.get_wallet_vtxo(id).await.unwrap().unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
+			assert_eq!(pending.total(), bitcoin::Amount::ZERO);
+			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
+			assert!(wallet.lock_vtxos([id], None).await.is_err());
+			assert_eq!(signed.amount(), coin.amount());
 			let history = wallet.history().await.unwrap();
 			let cancelled = history.iter().find(|entry| entry.id == movement).unwrap();
 			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);

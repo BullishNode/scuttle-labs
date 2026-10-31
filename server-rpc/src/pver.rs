@@ -40,4 +40,4 @@ pub const PROTOCOL_VERSION_HASHLOCK_CLAUSES: u64 = 5;
 
 /// Scuttle's fixed fork wire epoch. Upstream and older fork clients must not
 /// interpret joint-owner fields, scoped status or fork spend states as upstream.
-pub const PROTOCOL_VERSION_SCUTTLE: u64 = 1000;
+pub const PROTOCOL_VERSION_SCUTTLE: u64 = 1001;

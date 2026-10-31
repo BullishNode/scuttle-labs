@@ -24,8 +24,8 @@ CREATE TABLE expiry_cancelled_participation (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Chain-derived decisions are invalid until both processes acknowledge their
--- successful sync cycles and the rebuild verifies the current database tips.
+-- Only watchmand publishes a completed chain view after its listeners commit.
+-- Restart and rollback invalidate it before any dependent financial decision.
 CREATE TABLE expiry_chain_view (
 	id SMALLINT PRIMARY KEY CHECK (id = 1),
 	generation BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
