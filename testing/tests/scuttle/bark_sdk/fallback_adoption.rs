@@ -10,7 +10,7 @@ use bark::{ImportVtxoError, OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::persist::adaptor::StorageAdaptorWrapper;
-use bark::vtxo::{ServerStatusAdoption, VtxoState, VtxoValidationError};
+use bark::vtxo::{ServerStatusAdoption, VtxoLockHolder, VtxoState, VtxoValidationError};
 use bitcoin::{FeeRate, Network, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::secp256k1::PublicKey;
@@ -573,11 +573,11 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
 	assert_eq!(received.amount(), sat(60_000));
 	let local = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
-	assert!(local.get_all_wallet_action_checkpoints().await.unwrap().iter().any(|action| {
-		let bark::actions::WalletActionCheckpoint::ArkoorSend(action) = action else { return false; };
-		let bark::actions::arkoor_send::Progress::Registration { signed_change_vtxos, .. } = &action.progress else { return false; };
-		signed_change_vtxos == &changes
-	}), "the resumed wallet retains genuine signed change in its durable action");
+	let original_action_id = local.get_all_wallet_action_checkpoints().await.unwrap().iter().find_map(|action| {
+		let bark::actions::WalletActionCheckpoint::ArkoorSend(action) = action else { return None; };
+		let bark::actions::arkoor_send::Progress::Registration { signed_change_vtxos, .. } = &action.progress else { return None; };
+		(signed_change_vtxos == &changes).then_some(action.id.clone())
+	}).expect("the resumed wallet retains genuine signed change in its durable action");
 	let checkpoint = serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap();
 	let (owner, payment) = if reopen_wallet {
 		// Cancel only the inline driver. Its already persisted Registration
@@ -794,7 +794,10 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 			.unwrap().spend_state, own_status as i32);
 		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, own_state);
 	}
-	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, own_state);
+	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state,
+		if refund_before_release { VtxoState::Spent } else {
+			VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: original_action_id }) }
+		});
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0), "known committed inputs are status-only, not new Ark balance");
 	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
 	assert_eq!(super::fallback_status_ids(owner.all_vtxos().await.unwrap(), false).contains(&source.id()), !refund_before_release);
