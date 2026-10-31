@@ -260,9 +260,17 @@ impl WalletAction for ArkoorSend {
 async fn reconcile_fallback_registration(wallet: &Wallet, send: &ArkoorSend) -> anyhow::Result<bool> {
 	let Progress::Registration { movement_id, signed_change_vtxos, .. } = &send.progress
 		else { bail!("fallback registration requires the original signed checkpoint"); };
-	let terminal = wallet.fallback_inputs_terminal(&send.input_vtxo_ids).await?;
+	// Refresh originals, then retain/adopt change before assessing current
+	// markers. A reorg between those requests can make only the latter Pending.
+	wallet.fallback_inputs_terminal(&send.input_vtxo_ids).await?;
 	wallet.retain_fallback_pending(signed_change_vtxos).await?;
 	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
+	let mut terminal = true;
+	for id in send.input_vtxo_ids.iter().copied().chain(signed_change_vtxos.iter().map(|coin| coin.id())) {
+		let coin = wallet.inner.db.get_wallet_vtxo(id).await?.context("fallback input or signed change is missing")?;
+		terminal &= coin.fallback_status.context("fallback input or signed change has no commitment")?
+			!= crate::vtxo::FallbackStatus::Pending;
+	}
 	let current = wallet.inner.db.get_movement_by_id(*movement_id).await?;
 	if current.status != MovementStatus::Failed || current.effective_balance != bitcoin::SignedAmount::ZERO {
 		wallet.inner.movements.finish_movement_with_update(*movement_id, MovementStatus::Failed,
