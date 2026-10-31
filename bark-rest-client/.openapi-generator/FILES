@@ -119,6 +119,7 @@ docs/ExitVtxoSweptState.md
 docs/ExitsApi.md
 docs/FallbackInfo.md
 docs/FallbackRefusalError.md
+docs/FallbackStatusInfo.md
 docs/FeeEstimateQuery.md
 docs/FeeEstimateResponse.md
 docs/FeeInfo.md
@@ -337,6 +338,7 @@ src/models/exit_vtxo_already_spent_state.rs
 src/models/exit_vtxo_swept_state.rs
 src/models/fallback_info.rs
 src/models/fallback_refusal_error.rs
+src/models/fallback_status_info.rs
 src/models/fee_estimate_query.rs
 src/models/fee_estimate_response.rs
 src/models/fee_info.rs

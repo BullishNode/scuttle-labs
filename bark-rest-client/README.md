@@ -222,6 +222,7 @@ Class | Method | HTTP request | Description
  - [ExitVtxoSweptState](docs/ExitVtxoSweptState.md)
  - [FallbackInfo](docs/FallbackInfo.md)
  - [FallbackRefusalError](docs/FallbackRefusalError.md)
+ - [FallbackStatusInfo](docs/FallbackStatusInfo.md)
  - [FeeEstimateQuery](docs/FeeEstimateQuery.md)
  - [FeeEstimateResponse](docs/FeeEstimateResponse.md)
  - [FeeInfo](docs/FeeInfo.md)

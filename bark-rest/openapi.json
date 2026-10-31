@@ -3825,7 +3825,6 @@
         "type": "object",
         "description": "The different balances of a Bark wallet.\n\n`spendable_sat` counts the spendable VTXOs, `needs_refresh_sat` the ones\nthat have to be refreshed before they can be sent again, and every other\nfield what an operation in progress holds, so the fields never overlap.\n\nSee [BalanceSummary] for the totals to show a user.\n\nAll amounts are in sats.",
         "required": [
-          "awaiting_settlement_sat",
           "spendable_sat",
           "needs_refresh_sat",
           "pending_lightning_send_sat",
@@ -3837,12 +3836,6 @@
           "pending_exit_sat"
         ],
         "properties": {
-          "awaiting_settlement_sat": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Owned value awaiting settlement; included in pending, never spendable.",
-            "minimum": 0
-          },
           "claimable_lightning_receive_sat": {
             "type": "integer",
             "format": "int64",
@@ -5981,6 +5974,14 @@
           }
         }
       },
+      "FallbackStatusInfo": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "spent",
+          "forfeited"
+        ]
+      },
       "FeeEstimateQuery": {
         "type": "object",
         "description": "Query parameters for fee estimates that only require an amount.",
@@ -6306,6 +6307,16 @@
             "description": "The amount of the lightning receive, if known.",
             "minimum": 0
           },
+          "fallback_status": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FallbackStatusInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "finished_at": {
             "type": [
               "string",
@@ -6364,7 +6375,7 @@
           },
           "state": {
             "$ref": "#/components/schemas/LightningReceiveStateKind",
-            "description": "Lifecycle phase of the receive"
+            "description": "Lifecycle phase of the invoice; payout progress is `fallback_status`."
           }
         }
       },
@@ -7892,9 +7903,16 @@
               "state"
             ],
             "properties": {
-              "awaiting_settlement": {
-                "type": "boolean",
-                "description": "The expired coin is excluded from new operations pending an\nauthoritative server decision or in-flight operation settlement."
+              "fallback_status": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/FallbackStatusInfo",
+                    "description": "Last authenticated fallback outcome; this is not another balance."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
               },
               "state": {
                 "$ref": "#/components/schemas/VtxoStateInfo",
