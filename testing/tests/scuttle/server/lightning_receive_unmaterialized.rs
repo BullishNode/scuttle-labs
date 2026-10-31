@@ -771,7 +771,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let grant = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
 	assert_eq!(grant.state, VtxoState::Spent);
 	assert_eq!(grant.fallback_status, Some(FallbackStatus::Spent));
-	assert_eq!(grant.vtxo.serialize(), original.source.serialize());
+	assert_eq!(provider.get_full_vtxo(original.source.id()).await.unwrap().serialize(), original.source.serialize());
 	assert!(provider_db.get_wallet_vtxo(original.promised.id()).await.unwrap().is_none());
 	assert_eq!(provider.balance().await.unwrap().total(), sat(0));
 	provider.sync_onchain().await.unwrap();
