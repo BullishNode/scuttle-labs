@@ -363,6 +363,15 @@ impl WalletAction for Offboard {
 				if let Some(progress) = adopted_progress {
 					return adopted(Offboard { progress, ..self });
 				}
+				// A lost finish session can re-enter prepare after fallback won.
+				// Only the authenticated terminal outcome for every original
+				// input permits cleanup; the old tx adoption check above wins.
+				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback)
+					&& or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await)
+				{
+					or_retry!(self, fail_offboard_movement(wallet, &self).await);
+					return Advance::Failed(error);
+				}
 				if rejection_proves_inputs_spendable(&error) {
 					// The server rejected the request itself (e.g. the fee
 					// rate we committed to went stale), which it only does

@@ -3,9 +3,11 @@ use std::time::Duration;
 
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::Preimage;
-use ark::VtxoPolicy;
+use ark::{ProtocolEncoding, VtxoPolicy};
 use ark_testing::{btc, sat, TestContext};
+use bark::{OpenWalletArgs, WalletSeed};
 use bark::actions::offboard::Progress;
+use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::vtxo::{VtxoLockHolder, VtxoState};
 use ark_testing::daemon::captaind::{self, ArkClient};
@@ -247,6 +249,99 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
 			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
 			assert_eq!(history.iter().map(|entry| entry.effective_balance.to_sat()).sum::<i64>(), native_balance);
+
+			// Keep the offline cut above unchanged. Bring back the SAME server
+			// and wallet stores; listener ports are intentionally reassigned.
+			let allocations = db.read(async |tx| Ok(tx.query("
+				SELECT a.id,a.sweep_tx,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat
+				FROM expiry_allocation a
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+				JOIN expiry_entitlement e ON e.id=c.entitlement_id
+				WHERE e.vtxo_id=$1 ORDER BY a.id
+			", &[&id.to_string()]).await?.into_iter().map(|row|
+				(row.get::<_, i64>(0),row.get::<_, Vec<u8>>(1),row.get::<_, i64>(2),
+				 row.get::<_, i64>(3),row.get::<_, i64>(4),row.get::<_, i64>(5))).collect::<Vec<_>>())).await.unwrap();
+			assert_eq!(allocations.len(), 1);
+			assert_eq!((allocations[0].2,allocations[0].3,allocations[0].4,allocations[0].5), (100_000,1_000,99_000,0));
+			wallet.stop_daemon_wait().await.unwrap();
+			drop(wallet);
+			srv.start().await.unwrap();
+			srv.watchmand().start().await.unwrap();
+			super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+			let retry_gate = HoldFinish {
+				arrived: Arc::new(Mutex::new(None)), release: Arc::new(Notify::new()),
+				response: Arc::new(Mutex::new(None)),
+			};
+			let retry_proxy = srv.start_proxy_no_mailbox(retry_gate.clone()).await;
+			let mnemonic: bip39::Mnemonic = tokio::fs::read_to_string(ctx.datadir.join("owner/mnemonic"))
+				.await.unwrap().trim().parse().unwrap();
+			let onchain = OnchainWallet::load_or_create(bitcoin::Network::Regtest,
+				mnemonic.to_seed(""), Arc::new(wallet_db.clone())).await.unwrap();
+			let mut config: bark::Config = toml::from_str(&tokio::fs::read_to_string(
+				ctx.datadir.join("owner/config.toml")).await.unwrap()).unwrap();
+			config.server_address = retry_proxy.ark_url();
+			let wallet = bark::Wallet::open(bitcoin::Network::Regtest,
+				WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &mnemonic), config,
+				OpenWalletArgs { persister: Some(Arc::new(wallet_db.clone())),
+					onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))), run_daemon: false,
+					..Default::default() }).await.unwrap();
+			assert_eq!(wallet.fallback_script(), destination);
+			wallet.sync_fallback_payouts().await.unwrap();
+			assert_eq!(wallet.get_vtxo_by_id(id).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+			assert_eq!(wallet.offboard_checkpoint(&prepared.id).await.unwrap(), Some(prepared.clone()));
+			wallet.sync_pending_offboards().await.unwrap();
+			let unknown = retry_gate.response.lock().unwrap().clone().unwrap().unwrap_err();
+			assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
+			assert!(unknown.message().contains("unknown offboard txid"));
+			let retry = wallet.offboard_checkpoint(&prepared.id).await.unwrap().unwrap();
+			assert!(matches!(&retry.progress, Progress::ReadyForOffboard { prior_txid: Some(prior), .. } if *prior == offboard_txid));
+			let mut expected_retry = prepared.clone();
+			expected_retry.progress = retry.progress.clone();
+			assert_eq!(retry, expected_retry, "session loss must retain the exact original intent and committed fee");
+			wallet.sync_pending_offboards().await.unwrap();
+			assert_eq!(wallet.offboard_checkpoint(&prepared.id).await.unwrap(), Some(retry));
+			assert_eq!(wallet_db.get_movement_by_id(movement).await.unwrap().status, bark::movement::MovementStatus::Canceled);
+			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
+
+			// Reconsider the ORIGINAL confirmation branch: no new funding,
+			// payment, fee or mining is needed to restore this same parent to N6.
+			rpc.reconsider_block(&confirmed.blockhash.unwrap()).unwrap();
+			super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+			wallet.chain().invalidate_caches().await;
+			wallet.sync_fallback_payouts().await.unwrap();
+			assert_eq!(wallet.get_vtxo_by_id(id).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
+			let mempool = ctx.bitcoind().sync_client().get_raw_mempool().unwrap();
+			wallet.sync_pending_offboards().await.unwrap();
+			assert!(wallet.offboard_checkpoint(&prepared.id).await.unwrap().is_none(),
+				"authenticated terminal fallback must finish the superseded offboard after its session was lost");
+			let failed = wallet_db.get_movement_by_id(movement).await.unwrap();
+			assert_eq!(failed.status, bark::movement::MovementStatus::Failed);
+			assert_eq!(failed.effective_balance, bitcoin::SignedAmount::ZERO);
+			assert_eq!(failed.offchain_fee, bitcoin::Amount::ZERO);
+			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
+			assert!(wallet.lock_vtxos([id], None).await.is_err());
+			assert_eq!(wallet_db.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spent);
+			assert_eq!(wallet.get_full_vtxo(id).await.unwrap().serialize(), signed.serialize());
+			let history = wallet.history().await.unwrap();
+			assert_eq!(history.iter().map(|entry| entry.effective_balance.to_sat()).sum::<i64>(), native_balance);
+			wallet.sync_pending_offboards().await.unwrap();
+			wallet.sync_fallback_payouts().await.unwrap();
+			assert_eq!(wallet.history().await.unwrap(), history, "terminal offboard cleanup is idempotent");
+			assert_eq!(ctx.bitcoind().sync_client().get_raw_mempool().unwrap(), mempool);
+			assert_eq!(ctx.bitcoind().get_received_by_address(&offboard_address), bitcoin::Amount::ZERO);
+			let paid = rpc.get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
+			assert!(paid.confirmations >= 6);
+			assert_eq!(paid.value, sat(99_000));
+			let after = db.read(async |tx| Ok(tx.query("
+				SELECT a.id,a.sweep_tx,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat
+				FROM expiry_allocation a
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+				JOIN expiry_entitlement e ON e.id=c.entitlement_id
+				WHERE e.vtxo_id=$1 ORDER BY a.id
+			", &[&id.to_string()]).await?.into_iter().map(|row|
+				(row.get::<_, i64>(0),row.get::<_, Vec<u8>>(1),row.get::<_, i64>(2),
+				 row.get::<_, i64>(3),row.get::<_, i64>(4),row.get::<_, i64>(5))).collect::<Vec<_>>())).await.unwrap();
+			assert_eq!(after, allocations, "recovery must retain one original allocation, immutable parent and fee");
 		}
 
 	}
