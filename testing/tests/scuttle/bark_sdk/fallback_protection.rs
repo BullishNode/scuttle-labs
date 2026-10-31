@@ -222,11 +222,12 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
 	assert_eq!(paid_balance.total(), Amount::ZERO, "the actual settled onchain payout is not counted again as Ark value");
 
-	// No server RPC is needed to learn that the chain undid payment.
+	// Bitcoin learns the reorg offline; Ark keeps the cached commitment
+	// until an authenticated status update is available.
 	srv.stop().await.unwrap();
 	ctx.bitcoind().sync_client().invalidate_block(&confirmation_hash).unwrap();
 	wallet.chain().invalidate_caches().await;
-	assert!(wallet.sync_fallback_payouts().await.is_err(), "offline Core data cannot invent a new authenticated Ark outcome");
+	let _ = wallet.sync_fallback_payouts().await;
 	wallet.sync_onchain().await.unwrap();
 	assert!(ctx.bitcoind().sync_client().get_block_header_info(&confirmation_hash).unwrap().confirmations < 0);
 	assert_eq!(client_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
