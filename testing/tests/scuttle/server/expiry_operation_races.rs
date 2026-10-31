@@ -5,6 +5,7 @@ use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::Preimage;
 use ark::{ProtocolEncoding, VtxoPolicy};
 use ark_testing::{btc, sat, TestContext};
+use ark_testing::context::ToArkUrl;
 use bark::{OpenWalletArgs, WalletSeed};
 use bark::actions::offboard::Progress;
 use bark::onchain::OnchainWallet;
