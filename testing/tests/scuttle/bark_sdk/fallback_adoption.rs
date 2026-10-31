@@ -910,13 +910,17 @@ async fn expired_status_retirement(paused: bool) {
 		let source_id = source.id();
 		let refresh = tokio::spawn(async move { refreshing.build_refresh_participation([source_id]).await });
 		tokio::time::timeout(Duration::from_secs(15), gate.arrived.notified()).await.unwrap();
-		// A separate authenticated status request retires the original while
-		// its batch reply is still outstanding. The later missing reply cannot
-		// undo that newer ordinary decision or manufacture another 60k claim.
-		assert_eq!(stale.trust_and_adopt_server_vtxo_status(source.id()).await.unwrap(),
-			Some(bark::vtxo::ServerStatusAdoption::Spent));
+		// Ordinary retirement waits for the paused refresh to release History.
+		// Its missing reply cannot manufacture another 60k claim, and the
+		// following authenticated decision must still retire the original.
+		let retiring = stale.clone();
+		let retirement = tokio::spawn(async move {
+			retiring.trust_and_adopt_server_vtxo_status(source_id).await
+		});
 		gate.release.notify_one();
 		assert!(tokio::time::timeout(Duration::from_secs(15), refresh).await.unwrap().unwrap().unwrap().is_none());
+		assert_eq!(tokio::time::timeout(Duration::from_secs(15), retirement).await.unwrap().unwrap().unwrap(),
+			Some(bark::vtxo::ServerStatusAdoption::Spent));
 		assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
 	} else {
 		assert!(stale.build_refresh_participation([source.id()]).await.unwrap().is_none());
