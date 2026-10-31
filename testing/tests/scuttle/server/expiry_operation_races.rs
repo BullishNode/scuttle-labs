@@ -315,10 +315,10 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			wallet.sync_pending_offboards().await.unwrap();
 			assert!(wallet.offboard_checkpoint(&prepared.id).await.unwrap().is_none(),
 				"authenticated terminal fallback must finish the superseded offboard after its session was lost");
-			let failed = wallet_db.get_movement_by_id(movement).await.unwrap();
-			assert_eq!(failed.status, bark::movement::MovementStatus::Failed);
-			assert_eq!(failed.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(failed.offchain_fee, bitcoin::Amount::ZERO);
+			let cancelled = wallet_db.get_movement_by_id(movement).await.unwrap();
+			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
+			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
+			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
 			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 			assert!(wallet.lock_vtxos([id], None).await.is_err());
 			assert_eq!(wallet_db.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spent);

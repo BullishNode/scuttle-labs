@@ -366,11 +366,14 @@ impl WalletAction for Offboard {
 				// A lost finish session can re-enter prepare after fallback won.
 				// Only the authenticated terminal outcome for every original
 				// input permits cleanup; the old tx adoption check above wins.
-				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback)
-					&& or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await)
-				{
-					or_retry!(self, fail_offboard_movement(wallet, &self).await);
-					return Advance::Failed(error);
+				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
+					let movement = or_retry!(self, get_or_create_movement(
+						wallet, &self, offboard_vtxo_ids, iter::empty::<VtxoId>(),
+					).await);
+					or_retry!(self, cancel_superseded_movement(wallet, movement).await);
+					if or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await) {
+						return Advance::Failed(error);
+					}
 				}
 				if rejection_proves_inputs_spendable(&error) {
 					// The server rejected the request itself (e.g. the fee
@@ -405,8 +408,10 @@ impl WalletAction for Offboard {
 			},
 			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, movement_id, .. } => {
 				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
+					// The refused intent is canceled even while its financial
+					// claim still needs the signed checkpoint and holder.
+					or_retry!(self, cancel_superseded_movement(wallet, *movement_id).await);
 					if or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await) {
-						or_retry!(self, fail_offboard_movement(wallet, &self).await);
 						return Advance::Failed(error);
 					}
 					// Unknown or incomplete status preserves the signed checkpoint
@@ -1086,4 +1091,18 @@ async fn fail_offboard_movement(
 		MovementUpdate::new().effective_balance(SignedAmount::ZERO),
 	).await.context("failed to mark offboard movement as failed").retry()?;
 	Ok(())
+}
+
+/// A refused offboard is a failed intent even while its input's financial
+/// claim still needs protection. Cancelling its history entry releases no lock.
+async fn cancel_superseded_movement(wallet: &Wallet, movement: MovementId) -> anyhow::Result<()> {
+	let current = wallet.inner.db.get_movement_by_id(movement).await?;
+	if current.status == MovementStatus::Canceled && current.effective_balance == SignedAmount::ZERO
+		&& current.offchain_fee == Amount::ZERO
+		&& current.metadata.get("superseded_by_fallback") == Some(&serde_json::Value::Bool(true)) { return Ok(()); }
+	wallet.inner.movements.finish_movement_with_update(
+		movement, MovementStatus::Canceled,
+		MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO)
+			.metadata([("superseded_by_fallback".into(), serde_json::Value::Bool(true))]),
+	).await.context("failed to reconcile the superseded offboard movement")
 }
