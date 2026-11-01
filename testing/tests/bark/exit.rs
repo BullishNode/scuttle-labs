@@ -658,7 +658,20 @@ async fn exit_revoked_lightning_payment() {
 
 #[tokio::test]
 async fn bark_should_exit_a_pending_board() {
-	let ctx = TestContext::new("exit/bark_should_exit_a_pending_board").await;
+	pending_board_exit(false).await;
+}
+
+#[tokio::test]
+async fn bark_should_exit_a_pending_board_offline() {
+	pending_board_exit(true).await;
+}
+
+async fn pending_board_exit(offline: bool) {
+	let ctx = TestContext::new(if offline {
+		"exit/bark_should_exit_a_pending_board_offline"
+	} else {
+		"exit/bark_should_exit_a_pending_board"
+	}).await;
 
 	#[derive(Clone)]
 	struct InvalidSigProxy;
@@ -701,6 +714,13 @@ async fn bark_should_exit_a_pending_board() {
 	assert_eq!(board_mvt.output_vtxos.len(), 1);
 	assert_eq!(board_mvt.exited_vtxos.len(), 0);
 	assert_eq!(board_mvt.time.completed_at.is_some(), false);
+
+	if offline {
+		let mut rpc = srv.get_public_rpc().await;
+		srv.stop().await.unwrap();
+		assert!(rpc.get_ark_info(protos::Empty {}).await.is_err(),
+			"stopped server must no longer provide board registration metadata");
+	}
 
 	// Bring the board near to its expiry
 	let board_vtxo = bark.vtxos().await.first().cloned().unwrap();
