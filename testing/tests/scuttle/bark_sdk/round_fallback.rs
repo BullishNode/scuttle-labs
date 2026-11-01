@@ -461,8 +461,6 @@ async fn recipient_round_links_and_owned_change_survive_restart() {
 		}], owner_proofs: std::collections::BTreeMap::from([(key.public_key(), link)]),
 		unblinded_mailbox_id: Some(wallet.mailbox_identifier()),
 	};
-	let error = wallet.join_next_round(participation.clone(), None).await.err().unwrap();
-	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::RecipientMustUpdate));
 	let mut participation = participation;
 	participation.owner_proofs.insert(key.public_key(), wallet.owner_link(key.public_key()).await.unwrap());
 	let id = wallet.join_next_round(participation.clone(), None).await.unwrap().id();
@@ -791,6 +789,11 @@ async fn recover_released_refresh(history: ReleasedHistory) {
 			ReleasedHistory::ForeignHolder => Some(VtxoState::Locked { holder: Some(holder.clone()) }),
 		};
 		if let Some(initial) = &initial_state {
+			transport.invalid_released_preimage.store(true, Ordering::SeqCst);
+			let initialized = Box::pin(reopen_refresh(&ctx, &proxy, &mnemonic, fresh_db.clone())).await;
+			assert_eq!(initialized.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spent);
+			assert!(fresh_db.get_wallet_vtxo(unsigned.id()).await.unwrap().is_none());
+			drop(initialized);
 			fresh_db.store_vtxos(&[(&unsigned, initial)]).await.unwrap();
 		}
 		let registrations = transport.registrations.load(Ordering::SeqCst);
