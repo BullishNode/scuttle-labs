@@ -661,7 +661,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	let operator_rows=db.read(async |tx| Ok(tx.query("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid \
 		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='operator'",
-		&[&b.id().to_string()]).await?.into_iter().map(|row|(row.get::<_,i64>(0),row.get::<_,i64>(1),
+		&[&received.id().to_string()]).await?.into_iter().map(|row|(row.get::<_,i64>(0),row.get::<_,i64>(1),
 			row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,String>(4))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(operator_rows,vec![(100_000,0,0,0,parent.compute_txid().to_string())]);
 	let confirmed=ctx.generate_blocks(6).await;
