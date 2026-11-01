@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use tokio::sync::broadcast;
 use bitcoin::Amount;
+use bitcoin::amount::CheckedSum;
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 use tracing::{error, info, trace, warn};
@@ -229,7 +230,8 @@ impl Server {
 
 		let payment_hash = requested_policy.payment_hash;
 
-		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount).sum::<Amount>();
+		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount)
+			.checked_sum().badarg("HTLC amount overflow")?;
 		check_max_amount("lightning send", htlc_amount, self.config.max_ln_send_amount)?;
 
 		// Held for the whole call, so no other call decides on this payment
