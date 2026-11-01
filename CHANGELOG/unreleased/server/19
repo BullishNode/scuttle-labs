@@ -1,0 +1,15 @@
+- Keep watchman spend and successor updates atomic and retryable.
+  Split progress reuses its current database transaction and accounts for the
+  previous child fee when it replaces a package.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)
+- Keep Lightning retries tied to their recorded inputs and invoice.
+  Report admission errors to callers. Cancel a receive and its linked attempt
+  in one transaction.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)
+- Keep recovery mailbox hints free of owner metadata.
+  Cached receive grant retries no longer write owner bindings. Round undo
+  removes the owner projections for its deleted outputs.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)
+- Preserve the cached forfeit nonce for concurrent retries.
+  Reject overflowing Lightning HTLC output totals as invalid requests.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)
