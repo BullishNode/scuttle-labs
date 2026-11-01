@@ -425,7 +425,11 @@ impl Wallet {
 			errors.push(PaymentMethodParsingError::NetworkMismatch);
 		}
 
-		let offer_amount = offer.amount().map(|a| a.to_bitcoin_amount().unwrap());
+		let offer_amount = offer.amount().and_then(|amount| {
+			let amount = amount.to_bitcoin_amount();
+			if amount.is_none() { errors.push(PaymentMethodParsingError::Unsupported); }
+			amount
+		});
 		match (offer_amount, uri_amount) {
 			(Some(offer_amount), Some(amount)) => {
 				if offer_amount != amount {
@@ -651,7 +655,7 @@ impl Wallet {
 
 			return Some(PaymentRequest {
 				label: None,
-				amount: offer.amount().map(|a| a.to_bitcoin_amount().unwrap()),
+				amount: offer.amount().and_then(|a| a.to_bitcoin_amount()),
 				message: offer.description().map(|d| d.to_string()),
 				options: vec![details],
 			});
@@ -1088,5 +1092,59 @@ mod test {
 		let reparsed = BarkBip321Uri::from_str(&upper).unwrap();
 		assert_eq!(reparsed, uri);
 		assert_eq!(reparsed.extensions().ark()[0].inner(), &addr);
+	}
+}
+
+#[cfg(test)]
+mod source_review_currency_counterpart {
+	use super::*;
+	#[test]
+	fn currency_offer_is_rejected_without_panic() {
+		// Public currency fixture from pinned lightning 0.2.2 offer parsing tests.
+		let text = "lno1qcp4256ypqpzwyq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
+		let offer = Offer::from_str(text).expect("valid pinned upstream offer fixture");
+		assert!(matches!(offer.amount(), Some(ark::lightning::OfferAmount::Currency { .. })));
+		let details = Wallet::details_for_offer(&offer, Network::Bitcoin, None);
+		assert!(!details.errors.is_empty(), "unsupported currency should be reported, never panic");
+	}
+}
+
+#[cfg(test)]
+mod offer_currency_tests {
+	use super::*;
+
+	// Public accepted-offer vectors from pinned lightning 0.2.2.
+	const CURRENCY: &str = "lno1qcp4256ypqpzwyq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
+	const BITCOIN: &str = "lno1pqpzwyq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
+	const AMOUNTLESS: &str = "lno1zcss9mk8y3wkklfvevcrszlmu23kfrxh49px20665dqwmn4p72pksese";
+
+	#[test]
+	fn currency_offer_payload_and_bip321_option_are_unsupported() {
+		for text in [CURRENCY.to_string(), format!("lightning:{CURRENCY}")] {
+			let payload = strip_prefix_ignore_ascii_case(&text, "lightning:").unwrap_or(&text);
+			let request = Wallet::parse_lightning_payload(Network::Bitcoin, payload).unwrap();
+			assert_eq!(request.amount, None, "currency is not an amount of bitcoin");
+			assert_eq!(request.options[0].errors, vec![PaymentMethodParsingError::Unsupported]);
+			assert!(request.default_option().is_none());
+		}
+		let uri = BarkBip321Uri::from_str(&format!("bitcoin:?lno={CURRENCY}&amount=0.00000001")).unwrap();
+		let details = Wallet::details_for_offer(uri.lno()[0].inner(), Network::Bitcoin, uri.amount().copied());
+		assert_eq!(details.errors, vec![PaymentMethodParsingError::Unsupported]);
+	}
+
+	#[test]
+	fn bitcoin_and_amountless_offer_parsing_keeps_amount_rules() {
+		let request = Wallet::parse_lightning_payload(Network::Bitcoin, BITCOIN).unwrap();
+		let expected = request.amount.expect("the Bitcoin offer has a bitcoin amount");
+		assert!(request.options[0].errors.is_empty());
+		assert!(request.default_option().is_some());
+		let offer = Offer::from_str(BITCOIN).unwrap();
+		let different = expected + Amount::from_sat(1);
+		assert_eq!(Wallet::details_for_offer(&offer, Network::Bitcoin, Some(different)).errors,
+			vec![PaymentMethodParsingError::AmountMismatch { expected, got: different }]);
+		let amountless = Wallet::parse_lightning_payload(Network::Bitcoin, AMOUNTLESS).unwrap();
+		assert_eq!(amountless.amount, None);
+		assert!(amountless.options[0].errors.is_empty());
+		assert!(amountless.default_option().is_some());
 	}
 }
