@@ -302,8 +302,7 @@ impl ExitInner {
 
 	/// Initializes pending exits and refreshes the chain view of their transaction packages.
 	async fn refresh_tx_state(&mut self) -> anyhow::Result<()> {
-		let mut exit_vtxos = std::mem::take(&mut self.exit_vtxos);
-		for exit in &mut exit_vtxos {
+		for exit in &mut self.exit_vtxos {
 			if !exit.is_initialized() {
 				match exit.initialize(&mut self.tx_manager, &*self.persister).await {
 					Ok(()) => continue,
@@ -313,7 +312,6 @@ impl ExitInner {
 				}
 			}
 		}
-		self.exit_vtxos = exit_vtxos;
 		let commitments = fallback_commitments(&*self.persister).await?;
 		let mut blocked = HashSet::new();
 		let mut allowed = HashSet::new();
@@ -759,10 +757,10 @@ impl Exit {
 		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut guard = self.inner.write().await;
 		guard.refresh_tx_state().await?;
-		let mut exit_vtxos = std::mem::take(&mut guard.exit_vtxos);
-		let mut exit_statuses = Vec::with_capacity(exit_vtxos.len());
+		let inner = &mut *guard;
+		let mut exit_statuses = Vec::with_capacity(inner.exit_vtxos.len());
 
-		for ev in exit_vtxos.iter_mut() {
+		for ev in inner.exit_vtxos.iter_mut() {
 			if !ev.is_initialized() {
 				warn!("Skipping progress of uninitialized unilateral exit {}", ev.id());
 				continue;
@@ -772,7 +770,7 @@ impl Exit {
 			let pre_state = ev.state().clone();
 			let error = match ev.progress(
 				wallet,
-				&mut guard.tx_manager,
+				&mut inner.tx_manager,
 				true,
 			).await {
 				Ok(_) => None,
@@ -791,7 +789,7 @@ impl Exit {
 
 			let state_changed = ev.state() != &pre_state;
 			Self::reconcile_vtxo_and_movement(
-				wallet, &guard.movement_manager, ev, state_changed,
+				wallet, &inner.movement_manager, ev, state_changed,
 			).await;
 
 			if !matches!(ev.state(), ExitState::Claimed(..)) {
@@ -803,7 +801,6 @@ impl Exit {
 			}
 		}
 
-		guard.exit_vtxos = exit_vtxos;
 		Ok(Some(exit_statuses))
 	}
 
@@ -863,8 +860,8 @@ impl Exit {
 		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut guard = self.inner.write().await;
 		guard.refresh_tx_state().await?;
-		let mut exit_vtxos = std::mem::take(&mut guard.exit_vtxos);
-		for exit in &mut exit_vtxos {
+		let inner = &mut *guard;
+		for exit in &mut inner.exit_vtxos {
 			if !exit.is_initialized() {
 				warn!("Skipping progress of uninitialized unilateral exit {}", exit.id());
 				continue;
@@ -872,16 +869,15 @@ impl Exit {
 
 			let pre_state = exit.state().clone();
 			if let Err(e) = exit.progress(
-				wallet, &mut guard.tx_manager, true,
+				wallet, &mut inner.tx_manager, true,
 			).await {
 				error!("Error syncing exit for VTXO {}: {}", exit.id(), e);
 			}
 			let state_changed = exit.state() != &pre_state;
 			Self::reconcile_vtxo_and_movement(
-				wallet, &guard.movement_manager, exit, state_changed,
+				wallet, &inner.movement_manager, exit, state_changed,
 			).await;
 		}
-		guard.exit_vtxos = exit_vtxos;
 		Ok(())
 	}
 
