@@ -850,6 +850,197 @@ async fn intra_ark_invoice_expiry_after_grant_does_not_allow_revoke() {
 		{board_amount}");
 }
 
+/// A real timeout's failed linked-attempt write must not commit a canceled
+/// subscription. Repeating the native cancel then finishes the original pair.
+#[tokio::test]
+async fn intra_ark_timeout_cancel_rolls_back_linked_attempt_failure() {
+	require_bark_version!(> "0.5.0");
+	const LATCH_CLASS: i32 = 0x5343544c;
+	const LATCH_OBJECT: i32 = 15;
+	const SNAPSHOT: &str = "SELECT jsonb_build_object(
+		'subscription',(SELECT to_jsonb(s) FROM lightning_htlc_subscription s WHERE s.id=$1),
+		'attempt',(SELECT to_jsonb(a) FROM lightning_payment_attempt a WHERE a.id=$2),
+		'hold',(SELECT to_jsonb(h) FROM cln_hold h WHERE h.payment_hash=$3),
+		'sources',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.vtxo_id) FROM vtxo v WHERE v.vtxo_id=ANY($4)),
+		'htlcs',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM htlc_vtxo h JOIN vtxo v ON v.id=h.id WHERE v.vtxo_id=ANY($4)),
+		'links',(SELECT jsonb_agg(to_jsonb(l) ORDER BY l.vtxo_id) FROM lightning_payment_attempt_htlc_vtxo l WHERE l.lightning_payment_attempt_id=$2),
+		'subscription_history',(SELECT count(*) FROM lightning_htlc_subscription_history WHERE id=$1),
+		'attempt_history',(SELECT count(*) FROM lightning_payment_attempt_history WHERE id=$2),
+		'mailbox',(SELECT jsonb_agg(to_jsonb(m) ORDER BY m.id) FROM mailbox m WHERE m.payment_hash=$3),
+		'wal',(SELECT count(*) FROM htlc_settlement WHERE payment_hash=$3),
+		'xpay',(SELECT count(*) FROM cln_xpay WHERE payment_hash=$3))::TEXT";
+	let ctx = TestContext::new("server/intra_ark_timeout_cancel_rolls_back_linked_attempt_failure").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let payer = ctx.bark_sdk("payer", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
+		.boarded(sat(100_000)).create().await;
+	let receiver = ctx.bark_sdk("receiver", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	payer.stop_daemon_wait().await.unwrap();
+	receiver.stop_daemon_wait().await.unwrap();
+	let invoice = receiver.bolt11_invoice(sat(10_000), None, None).await.unwrap();
+	let hash = PaymentHash::from(&invoice);
+	Box::pin(payer.pay_lightning_invoice(invoice.clone(), None, false)).await.unwrap();
+	srv.wait_for_lightning_receive_accepted(hash).await;
+	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
+	assert_eq!(sub.status, server::database::ln::LightningHtlcSubscriptionStatus::Accepted);
+	assert!(sub.accepted_at.is_some());
+	assert!(sub.htlc_vtxos.is_empty(), "no recipient grant or preimage claim is requested");
+	let attempt = db.read(async |tx| tx.get_lightning_payment_attempt_by_subscription_id(sub.id).await).await.unwrap().unwrap();
+	assert_eq!(attempt.status, server::database::ln::LightningPaymentStatus::Requested);
+	assert_eq!(attempt.lightning_htlc_subscription_id, Some(sub.id));
+	assert_eq!(attempt.payment_hash, hash);
+	assert_eq!(attempt.lightning_node_id, sub.lightning_node_id);
+	assert_eq!(attempt.amount_msat, sat(10_000).to_msat());
+	assert_eq!(attempt.user_fee, Some(Amount::ZERO));
+	let send = payer.lightning_send_checkpoint(hash).await.unwrap().unwrap();
+	let bark::actions::lightning::pay::Progress::PaymentInitiated(checkpoint) = &send.progress else {
+		panic!("the payer must retain its original initiated request");
+	};
+	assert_eq!(send.payment_amount, sat(10_000));
+	assert_eq!(send.fee, Amount::ZERO);
+	let sources = srv.htlc_vtxos(hash).await;
+	assert!(!sources.is_empty());
+	assert!(sources.iter().all(|source| source.direction() == HtlcDirection::Incoming
+		&& source.htlc.offchain_resolution.is_none() && source.htlc.chain_resolution.is_none()
+		&& source.vtxo.oor_spent_txid.is_none()));
+	assert_eq!(sources.iter().map(|source| source.vtxo.vtxo.amount()).sum::<Amount>(), sat(10_000));
+	assert_eq!(sources.iter().map(|source| source.vtxo.vtxo_id).collect::<HashSet<_>>(),
+		checkpoint.vtxo_ids.iter().copied().collect::<HashSet<_>>());
+	for source in &sources {
+		assert_eq!(payer.get_full_vtxo(source.vtxo.vtxo_id).await.unwrap(), source.vtxo.vtxo);
+		assert_eq!(payer.get_vtxo_key(&source.vtxo.vtxo).await.unwrap().public_key(), source.vtxo.vtxo.user_pubkey());
+		let funding = ctx.bitcoind().await_transaction(source.vtxo.vtxo.chain_anchor().txid).await;
+		source.vtxo.vtxo.validate(&funding).unwrap();
+	}
+	let source_ids = sources.iter().map(|source| source.vtxo.vtxo_id.to_string()).collect::<Vec<_>>();
+	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM cln_xpay WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+	// Intra-Ark promotion already cancels the native invoice. The timeout
+	// must still perform its genuine repeated cancel, not a fabricated state.
+	wait_for_cln_hold_status(&db, hash, "cancelled").await;
+	let mut hold = lightning.internal.hold_client().await;
+	let native = hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
+		.await.unwrap().into_inner().invoices;
+	assert_eq!(native.len(), 1);
+	assert_eq!(native[0].state(), hold::InvoiceState::Cancelled);
+	let before = db.read(async |tx| Ok(tx.query_one(SNAPSHOT, &[&sub.id, &attempt.id, &hash.to_string(), &source_ids])
+		.await?.get::<_, String>(0))).await.unwrap();
+	let (failure_tx, mut failure_rx) = tokio::sync::mpsc::unbounded_channel();
+	srv.add_stdout_handler(move |line: &str| {
+		if let Ok(record) = server_log::parse_record(line) {
+			if record.message == "Hold invoice timeout handling failed; will retry independently"
+				&& record.extra.get("subscription_id").and_then(|value| value.as_i64()) == Some(sub.id)
+				&& record.extra.get("error").and_then(|value| value.as_str())
+					.is_some_and(|error| error.contains("ISSUE15 linked-attempt failure update")) {
+				let _ = failure_tx.send(()); return true;
+			}
+		}
+		false
+	});
+	let mut canceled = srv.subscribe_log::<LightningReceiveCanceled>();
+	db.write(async |tx| {
+		tx.batch_execute(&format!("CREATE SEQUENCE issue15_cancel_once;
+			CREATE FUNCTION issue15_cancel_failure() RETURNS trigger AS $$
+			BEGIN
+			  IF NEW.id={id} AND OLD.status='requested' AND NEW.status='failed' THEN
+			    IF nextval('issue15_cancel_once')=1 THEN
+			      RAISE EXCEPTION 'ISSUE15 linked-attempt failure update';
+			    END IF;
+			    PERFORM pg_advisory_xact_lock({LATCH_CLASS},{LATCH_OBJECT});
+			  END IF;
+			  RETURN NEW;
+			END; $$ LANGUAGE plpgsql;
+			CREATE TRIGGER issue15_cancel_failure BEFORE UPDATE ON lightning_payment_attempt
+			FOR EACH ROW EXECUTE FUNCTION issue15_cancel_failure();", id=attempt.id)).await?;
+		Ok(())
+	}).await.unwrap();
+	// Keep only the normal retry behind an existing PG advisory latch. The
+	// first UPDATE raises and rolls back; no financial row is edited by us.
+	db.write(async |gate| {
+		gate.query_one("SELECT pg_advisory_xact_lock($1,$2)", &[&LATCH_CLASS, &LATCH_OBJECT]).await?;
+		failure_rx.recv().wait_millis(40_000).await.unwrap();
+		let event = async {
+			loop {
+				let event = canceled.recv().await.unwrap();
+				if event.payment_hash == hash { break event; }
+			}
+		}.wait_millis(5_000).await;
+		assert_eq!(event.reason, "htlc vtxo setup timed out");
+		assert!(!invoice.is_expired());
+		let after = gate.query_one(SNAPSHOT, &[&sub.id, &attempt.id, &hash.to_string(), &source_ids])
+			.await?.get::<_, String>(0);
+		let calls = gate.query_one("SELECT last_value FROM issue15_cancel_once", &[]).await?.get::<_, i64>(0);
+		let observed_native = hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
+			.await.unwrap().into_inner().invoices;
+		std::fs::write(ctx.datadir.join("issue15-cancel-fault-cut.json"), serde_json::to_vec_pretty(&serde_json::json!({
+			"subscription_id": sub.id, "attempt_id": attempt.id, "payment_hash": hash.to_string(),
+			"before": serde_json::from_str::<serde_json::Value>(&before).unwrap(),
+			"after": serde_json::from_str::<serde_json::Value>(&after).unwrap(),
+			"actual_timeout_reason": event.reason, "failed_update_calls": calls,
+			"native_hold_states": observed_native.iter().map(|invoice| format!("{:?}", invoice.state())).collect::<Vec<_>>(),
+		}))?).unwrap();
+		assert_eq!(observed_native, native);
+		assert_eq!(after, before, "the failed LPA write must roll back the entire linked cancellation");
+		assert_eq!(payer.lightning_send_checkpoint(hash).await.unwrap().unwrap().progress, send.progress);
+		assert_eq!(payer.balance().await.unwrap().spendable, sat(90_000));
+		assert_eq!(payer.balance().await.unwrap().pending_lightning_send, sat(10_000));
+		assert_eq!(receiver.balance().await.unwrap().total(), Amount::ZERO);
+		Ok(())
+	}).await.unwrap();
+	wait_for_subscription_status(&db, hash, "canceled").await;
+	let failed = db.read(async |tx| tx.get_lightning_payment_attempt_by_id(attempt.id).await).await.unwrap().unwrap();
+	assert_eq!(failed.status, server::database::ln::LightningPaymentStatus::Failed);
+	assert_eq!(failed.lightning_htlc_subscription_id, Some(sub.id));
+	assert_eq!(failed.error.as_deref(), Some("htlc vtxo setup timed out"));
+	assert!(db.read(async |tx| Ok(tx.query_one("SELECT last_value FROM issue15_cancel_once", &[])
+		.await?.get::<_, i64>(0))).await.unwrap() >= 2);
+	wait_for_cln_hold_status(&db, hash, "cancelled").await;
+	db.write(async |tx| { tx.batch_execute("DROP TRIGGER issue15_cancel_failure ON lightning_payment_attempt;
+		DROP FUNCTION issue15_cancel_failure(); DROP SEQUENCE issue15_cancel_once;").await?; Ok(()) }).await.unwrap();
+	Box::pin(payer.check_lightning_payment(hash, true)).wait_millis(30_000).await.unwrap();
+	assert!(payer.lightning_send_checkpoint(hash).await.unwrap().is_none());
+	assert!(!payer.is_invoice_paid(hash).await.unwrap());
+	let balance = payer.balance().await.unwrap();
+	assert_eq!(balance.spendable, sat(100_000));
+	assert_eq!(balance.pending(), Amount::ZERO);
+	assert_eq!(balance.total(), sat(100_000));
+	assert_eq!(receiver.balance().await.unwrap().total(), Amount::ZERO);
+	let coins = payer.spendable_vtxos().await.unwrap();
+	assert_eq!(coins.iter().map(|coin| coin.amount()).sum::<Amount>(), sat(100_000));
+	for coin in coins {
+		let full = payer.get_full_vtxo(coin.id()).await.unwrap();
+		let funding = ctx.bitcoind().await_transaction(full.chain_anchor().txid).await;
+		full.validate(&funding).unwrap();
+		assert_eq!(payer.get_vtxo_key(&full).await.unwrap().public_key(), full.user_pubkey());
+		let registered = db.read(async |tx| tx.get_user_vtxo_by_id(full.id()).await).await.unwrap();
+		assert_eq!(registered.vtxo, full);
+		assert_eq!(registered.spend_state, server::database::SpendState::Spendable);
+	}
+	let history = payer.history().await.unwrap();
+	let movement = history.iter().find(|movement| movement.id == checkpoint.movement_id).unwrap();
+	assert_eq!(movement.status, bark::movement::MovementStatus::Failed);
+	assert_eq!(movement.effective_balance.to_sat(), 0);
+	assert_eq!(movement.offchain_fee, Amount::ZERO);
+	assert_eq!(movement.input_vtxos.iter().copied().collect::<HashSet<_>>(), send.input_vtxo_ids.iter().copied().collect::<HashSet<_>>());
+	for source in &sources {
+		let refunded = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, source.vtxo.vtxo_id).await)
+			.await.unwrap().unwrap();
+		assert_eq!(refunded.htlc.offchain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Revoked));
+		assert_eq!(payer.get_vtxo_by_id(source.vtxo.vtxo_id).await.unwrap().state, bark::vtxo::VtxoState::Spent);
+	}
+	Box::pin(payer.sync()).await;
+	assert_eq!(payer.balance().await.unwrap().spendable, sat(100_000));
+	assert_eq!(payer.history().await.unwrap(), history);
+	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM lightning_payment_attempt WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM cln_xpay WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+}
+
 /// A granted intra-ark receive whose payee withholds the preimage is
 /// canceled as soon as its HTLC-recv vtxos expire, even though its invoice is
 /// still valid. The payer is refunded only after every issued grant closes
