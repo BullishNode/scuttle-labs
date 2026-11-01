@@ -1003,3 +1003,528 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 		assert!(original.htlc.offchain_resolution.is_none(), "neither absent sender source is fictitiously revoked");
 	}
 }
+
+/// A real pending native obligation must not stop an earlier independent payout.
+/// Only actual receiver cancellation/channel release permits its later refund.
+#[tokio::test]
+async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once() {
+	tokio::time::timeout(
+		Duration::from_secs(180),
+		Box::pin(async move {
+			let ctx = TestContext::new("server/pending_unrelated_offline_refund").await;
+			let lightning = ctx.new_lightning_setup("lightningd").await;
+			let srv = ctx
+				.captaind("server")
+				.lightningd(&lightning.internal)
+				.no_vtxo_pool()
+				.funded(btc(10))
+				.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(400))
+				.watchmand()
+				.create()
+				.await;
+			let customer = ctx
+				.bark_sdk("earlier-owner", &srv)
+				.cfg(|cfg| cfg.daemon_manual_sync = true)
+				.funded(sat(200_000))
+				.boarded(sat(100_000))
+				.create()
+				.await;
+			customer.stop_daemon_wait().await.unwrap();
+			let coins = customer.spendable_vtxos().await.unwrap();
+			assert_eq!(coins.len(), 1);
+			let earlier = customer.get_full_vtxo(coins[0].id()).await.unwrap();
+			let earlier_destination = customer.fallback_script();
+			let earlier_mailbox = customer.mailbox_identifier();
+			assert_eq!(earlier.amount(), sat(100_000));
+
+			// Age the earlier backing BEFORE any native payment exists. The later
+			// source uses the same400-block lifetime, not a different fee/expiry policy.
+			let before_source = earlier.expiry_height().to_u32().checked_sub(64).unwrap();
+			assert!((ctx.bitcoind().get_block_count().await as u32) < before_source);
+			while (ctx.bitcoind().get_block_count().await as u32) < before_source {
+				let count = (before_source - ctx.bitcoind().get_block_count().await as u32).min(50);
+				ctx.generate_blocks(count).await;
+			}
+			let sender = ctx
+				.bark_sdk("later-owner", &srv)
+				.cfg(|cfg| cfg.daemon_manual_sync = true)
+				.funded(sat(200_000))
+				.boarded(sat(100_000))
+				.create()
+				.await;
+			sender.stop_daemon_wait().await.unwrap();
+			let coins = sender.spendable_vtxos().await.unwrap();
+			assert_eq!(coins.len(), 1);
+			let input = sender.get_full_vtxo(coins[0].id()).await.unwrap();
+			let key = sender.get_vtxo_key(&input).await.unwrap();
+			let destination = sender.fallback_script();
+			let mailbox = sender.mailbox_identifier();
+			assert_ne!(mailbox, earlier_mailbox);
+			assert_ne!(destination, earlier_destination);
+			let preimage = Preimage::random();
+			let hash = preimage.compute_payment_hash();
+			let admission_tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+			let deadline = admission_tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
+			let source = super::expiry_send_claim::signed_leaf(
+				&ctx,
+				&srv,
+				&sender,
+				input,
+				VtxoPolicy::new_server_htlc_send(key.public_key(), hash, deadline),
+			)
+			.await;
+			assert_eq!(source.amount(), sat(100_000));
+			assert_ne!(source.chain_anchor(), earlier.chain_anchor());
+			assert!(admission_tip < earlier.expiry_height());
+			assert!(earlier.expiry_height() < source.expiry_height());
+			assert!(deadline < source.expiry_height());
+			let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+			for (wallet, coin, owner) in [(&sender, &source, mailbox), (&customer, &earlier, earlier_mailbox)] {
+				let funding = ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
+				coin.validate(&funding).unwrap();
+				let proof = wallet.owner_link(coin.user_pubkey()).await.unwrap();
+				assert_eq!(proof.verify_joint(bitcoin::Network::Regtest, &srv.mailbox_keypair(), coin.user_pubkey()).unwrap(), owner);
+				db.read(async |tx| {
+					assert_eq!(tx.get_user_vtxo_by_id(coin.id()).await?.vtxo.serialize(), coin.serialize());
+					assert!(matches!(tx.expiry_owner(coin.user_pubkey()).await?,
+					server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == owner.as_pubkey()));
+					Ok(())
+				})
+				.await
+				.unwrap();
+			}
+			// Keep the original single100k fee subsidy. The first payout's N6
+			// confirms its fee change before the second payout needs that custody.
+			let fee_address = srv.watchmand().wait_wallet_address().await;
+			assert_ne!(fee_address.script_pubkey(), destination);
+			assert_ne!(fee_address.script_pubkey(), earlier_destination);
+			let sponsor = ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
+			let sponsor_tx = ctx.bitcoind().await_transaction(sponsor).await;
+			assert_eq!(
+				sponsor_tx
+					.output
+					.iter()
+					.filter(|output| output.script_pubkey == fee_address.script_pubkey() && output.value == sat(100_000))
+					.count(),
+				1
+			);
+			ctx.generate_blocks(2).await;
+			let invoice = lightning
+				.external
+				.hold_client()
+				.await
+				.invoice(hold::InvoiceRequest {
+					payment_hash: hash.to_vec(),
+					amount_msat: 90_000_000,
+					description: Some(hold::invoice_request::Description::Memo("pending isolation then offline refund".into())),
+					min_final_cltv_expiry: Some(220),
+					expiry: Some(3600),
+					routing_hints: vec![],
+				})
+				.await
+				.unwrap()
+				.into_inner()
+				.bolt11;
+			lightning.sync().await;
+			srv.get_public_rpc()
+				.await
+				.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+					invoice,
+					payment_amount_sat: 90_000,
+					htlc_vtxo_ids: vec![source.id().to_bytes().to_vec()],
+					mailbox_id: None,
+					retry_for_secs: Some(5),
+				})
+				.await
+				.unwrap();
+			lightning.external.wait_for_hold_invoice_accepted(hash).await;
+			let payer = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
+			let receiver = lightning.external.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
+			assert_ne!(payer.id, receiver.id);
+			let attempt = db
+				.read(async |tx| {
+					let rows = tx
+						.query(
+							"SELECT a.id,a.amount_msat,n.pubkey FROM lightning_payment_attempt a \
+				JOIN lightning_node n ON n.id=a.lightning_node_id WHERE a.payment_hash=$1",
+							&[&hash.to_string()],
+						)
+						.await?;
+					assert_eq!(rows.len(), 1);
+					assert_eq!(rows[0].get::<_, i64>("amount_msat"), 90_000_000);
+					assert_eq!(rows[0].get::<_, Vec<u8>>("pubkey"), payer.id);
+					let id = rows[0].get::<_, i64>("id");
+					let linked = tx
+						.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo WHERE lightning_payment_attempt_id=$1", &[&id])
+						.await?;
+					assert_eq!(linked.len(), 1);
+					assert_eq!(linked[0].get::<_, String>(0), source.id().to_string());
+					Ok(id)
+				})
+				.await
+				.unwrap();
+			let label = attempt.to_string();
+			let peer_parts = async || {
+				let tip = ctx.bitcoind().get_block_count().await as u32;
+				let mut both = Vec::new();
+				for (node, outgoing) in [(&lightning.internal, true), (&lightning.external, false)] {
+					let channels = node
+						.grpc_client()
+						.await
+						.list_peer_channels(cln_rpc::ListpeerchannelsRequest { id: None, short_channel_id: None, channel_id: None })
+						.await
+						.unwrap()
+						.into_inner()
+						.channels;
+					assert_eq!(channels.len(), 1);
+					assert_eq!(channels[0].state(), cln_rpc::ChannelState::ChanneldNormal);
+					let matching = channels[0].htlcs.iter().filter(|part| part.payment_hash == hash.to_vec()).collect::<Vec<_>>();
+					assert!(!matching.is_empty());
+					assert!(matching.iter().all(|part| part.expiry > tip
+						&& part.direction()
+							== if outgoing {
+								cln_rpc::listpeerchannels_channels_htlcs::ListpeerchannelsChannelsHtlcsDirection::Out
+							} else {
+								cln_rpc::listpeerchannels_channels_htlcs::ListpeerchannelsChannelsHtlcsDirection::In
+							}));
+					assert_eq!(matching.iter().map(|part| part.amount_msat.as_ref().unwrap().msat).sum::<u64>(), 90_000_000);
+					let mut ids = matching.iter().map(|part| (part.id, part.expiry)).collect::<Vec<_>>();
+					ids.sort_unstable();
+					both.push(ids);
+				}
+				both
+			};
+			let pending_cut = async || {
+				let history = super::expiry_send_claim::send_history(&lightning.internal, hash).await;
+				assert!(!history.0.is_empty());
+				assert!(history.0.iter().all(|part| part.label.as_deref() == Some(label.as_str())
+					&& part.status() == cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Pending
+					&& part.created_index > 0
+					&& part.payment_preimage.is_none()));
+				assert_eq!(
+					history.0.iter().map(|part| (part.groupid, part.partid)).collect::<std::collections::BTreeSet<_>>().len(),
+					history.0.len()
+				);
+				assert_eq!(history.0.iter().map(|part| part.groupid).collect::<std::collections::BTreeSet<_>>().len(), 1);
+				assert_eq!(history.0.iter().map(|part| part.amount_msat.as_ref().unwrap().msat).sum::<u64>(), 90_000_000);
+				assert_eq!(history.0.iter().map(|part| part.amount_sent_msat.as_ref().unwrap().msat).sum::<u64>(), 90_000_000);
+				assert_eq!(history.1.len(), 1);
+				assert_eq!(history.1[0].label.as_deref(), Some(label.as_str()));
+				assert_eq!(history.1[0].status(), cln_rpc::listpays_pays::ListpaysPaysStatus::Pending);
+				assert_eq!(history.1[0].amount_msat.as_ref().unwrap().msat, 90_000_000);
+				assert_eq!(history.1[0].amount_sent_msat.as_ref().unwrap().msat, 90_000_000);
+				assert!(history.1[0].created_index.unwrap() > 0);
+				assert!(history.1[0].preimage.is_none());
+				db.read(async |tx| {
+					assert!(
+						tx.query_one("SELECT status NOT IN ('failed','succeeded') FROM lightning_payment_attempt WHERE id=$1", &[&attempt])
+							.await?
+							.get::<_, bool>(0)
+					);
+					assert_eq!(
+						tx.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1", &[&source.id().to_string()])
+							.await?
+							.get::<_, i64>(0),
+						0
+					);
+					assert!(tx.get_htlc_settlement_by_payment_hash(hash).await?.is_none());
+					Ok(())
+				})
+				.await
+				.unwrap();
+				let status = srv
+					.get_public_rpc()
+					.await
+					.check_lightning_payment(protos::CheckLightningPaymentRequest {
+						hash: hash.to_vec(),
+						wait: false,
+						htlc_vtxo_ids: vec![source.id().to_bytes().to_vec()],
+					})
+					.await
+					.unwrap()
+					.into_inner();
+				assert_eq!(status.htlc_vtxo_ids, vec![source.id().to_bytes().to_vec()]);
+				assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Pending(_))));
+				let anchor = source.chain_anchor();
+				let funding = ctx.bitcoind().await_transaction(anchor.txid).await;
+				let backing = ctx.bitcoind().sync_client().get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().unwrap();
+				assert_eq!(backing.value, source.amount());
+				assert_eq!(backing.script_pub_key.script().unwrap(), funding.output[anchor.vout as usize].script_pubkey);
+				(history, peer_parts().await)
+			};
+			let initial = pending_cut().await;
+			let native_deadline = initial.1.iter().flatten().map(|(_, expiry)| *expiry).min().unwrap();
+			assert!(earlier.expiry_height().to_u32() + 1 + 6 < native_deadline);
+			tokio::fs::write(
+				ctx.datadir.join("pending-before-unrelated.json"),
+				serde_json::to_vec_pretty(&serde_json::json!({
+					"attempt":attempt,"hash":hash.to_string(),"label":label,"payer":payer.id,"receiver":receiver.id,
+					"actual_height":ctx.bitcoind().get_block_count().await,"native_future_htlcs":initial.1,
+					"source":source.id().to_string(),"source_expiry":source.expiry_height().to_u32(),
+					"earlier_source":earlier.id().to_string(),"earlier_expiry":earlier.expiry_height().to_u32(),
+					"actual_native_status":format!("{:?}",initial.0.1[0].status()),
+					"actual_parts":initial.0.0.iter().map(|part|(part.id,part.groupid,part.partid,part.created_index)).collect::<Vec<_>>(),
+					"actual_amount_msat":initial.0.0.iter().map(|part|part.amount_msat.as_ref().unwrap().msat).sum::<u64>(),
+					"fee_sponsor":sponsor.to_string(),
+				}))
+				.unwrap(),
+			)
+			.await
+			.unwrap();
+			// Original clients remain absent from here through BOTH actual payouts.
+			drop(sender);
+			drop(customer);
+			let absent_height = ctx.bitcoind().get_block_count().await;
+			let payout = async |coin: &Vtxo<Full>, script: &bitcoin::ScriptBuf, owner: &str| {
+				let mut prefixes = coin.transactions().map(|step| step.tx.compute_txid()).collect::<std::collections::BTreeSet<_>>();
+				tokio::time::timeout(Duration::from_secs(30), async {
+					loop {
+						let rows = db
+							.read(async |tx| {
+								Ok(tx
+									.query(
+										"SELECT c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_tx \
+						FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+						JOIN expiry_allocation a ON a.id=c.allocation_id \
+						WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+										&[&coin.id().to_string()],
+									)
+									.await?)
+							})
+							.await
+							.unwrap();
+						assert!(rows.len() <= 1);
+						if let Some(row) = rows.first() {
+							assert_eq!(row.get::<_, String>("owner_mailbox"), owner);
+							assert_eq!(row.get::<_, String>("user_pubkey"), coin.user_pubkey().to_string());
+							assert_eq!(row.get::<_, String>("spk"), script.to_hex_string());
+							for (field, expected) in
+								[("gross_sat", 100_000i64), ("fee_sat", 1_000), ("payout_sat", 99_000), ("forfeited_sat", 0)]
+							{
+								assert_eq!(row.get::<_, i64>(field), expected);
+							}
+							let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
+							let rightful = parent.output.iter().filter(|output| &output.script_pubkey == script).collect::<Vec<_>>();
+							assert_eq!(rightful.len(), 1);
+							assert_eq!(rightful[0].value, sat(99_000));
+							assert!(parent.output.iter().all(|output| &output.script_pubkey == script
+								|| (output.script_pubkey != destination && output.script_pubkey != earlier_destination)));
+							if ctx.bitcoind().sync_client().get_raw_transaction(&parent.compute_txid(), None).ok().as_ref() == Some(&parent)
+							{
+								if let Some((child, fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) {
+									assert!(fee > 0 && fee < 100_000);
+									assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
+									assert!(
+										child.output.iter().all(
+											|output| output.script_pubkey != destination && output.script_pubkey != earlier_destination
+										)
+									);
+									return (parent, child);
+								}
+							}
+						}
+						if let Some(txid) =
+							ctx.bitcoind().sync_client().get_raw_mempool().unwrap().into_iter().find(|id| prefixes.contains(id))
+						{
+							assert!(prefixes.remove(&txid));
+							ctx.generate_blocks(srv.watchmand().config().watchman.progress_grace_period.to_u32() + 1).await;
+							super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+						}
+						tokio::time::sleep(Duration::from_millis(50)).await;
+					}
+				})
+				.await
+				.expect("ordinary offline payout must be admitted without another sponsor or client")
+			};
+			let tip = ctx.bitcoind().get_block_count().await as u32;
+			ctx.generate_blocks(earlier.expiry_height().to_u32() + 1 - tip).await;
+			super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+			let first = payout(&earlier, &earlier_destination, &earlier_mailbox.as_pubkey().to_string()).await;
+			ctx.generate_blocks(6).await;
+			super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+			super::expiry_test::canonical(&ctx, &first.0);
+			super::expiry_test::canonical(&ctx, &first.1);
+			let output_index = first
+				.0
+				.output
+				.iter()
+				.position(|output| output.script_pubkey == earlier_destination && output.value == sat(99_000))
+				.unwrap();
+			let core = ctx.bitcoind().sync_client();
+			let actual = core.get_tx_out(&first.0.compute_txid(), output_index as u32, Some(true)).unwrap().unwrap();
+			assert!(actual.confirmations >= 6);
+			assert_eq!(actual.value, sat(99_000));
+			assert_eq!(actual.script_pub_key.script().unwrap(), earlier_destination);
+			let after_first = pending_cut().await;
+			assert!(
+				after_first == initial,
+				"unrelated N6 payout must leave every native part/group and both peers' future HTLC identities unchanged"
+			);
+			tokio::fs::write(
+				ctx.datadir.join("pending-after-unrelated-N6.json"),
+				serde_json::to_vec_pretty(&serde_json::json!({
+					"attempt":attempt,"hash":hash.to_string(),"label":label,
+					"actual_native_status":format!("{:?}",after_first.0.1[0].status()),
+					"actual_amount_msat":after_first.0.0.iter().map(|part|part.amount_msat.as_ref().unwrap().msat).sum::<u64>(),
+					"actual_height":ctx.bitcoind().get_block_count().await,"native_future_htlcs":after_first.1,
+					"earlier_parent":first.0.compute_txid().to_string(),"earlier_payout_sat":actual.value.to_sat(),
+				}))
+				.unwrap(),
+			)
+			.await
+			.unwrap();
+
+			lightning.external.hold_client().await.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
+			let failed = tokio::time::timeout(Duration::from_secs(30), async {
+				loop {
+					let history = super::expiry_send_claim::send_history(&lightning.internal, hash).await;
+					let native_failed = !history.0.is_empty()
+						&& history.0.iter().all(|part| part.status() == cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Failed)
+						&& history.1.len() == 1
+						&& history.1[0].status() == cln_rpc::listpays_pays::ListpaysPaysStatus::Failed;
+					let recorded = db
+						.read(async |tx| {
+							Ok(tx
+								.query_one(
+									"SELECT status='failed' AND final_amount_msat=0 FROM lightning_payment_attempt WHERE id=$1",
+									&[&attempt],
+								)
+								.await?
+								.get::<_, bool>(0))
+						})
+						.await
+						.unwrap();
+					if native_failed && recorded {
+						assert!(
+							history.0.iter().all(|part| part.label.as_deref() == Some(label.as_str()) && part.payment_preimage.is_none())
+						);
+						assert_eq!(history.1[0].label.as_deref(), Some(label.as_str()));
+						assert!(history.1[0].preimage.is_none());
+						assert_eq!(history.1[0].amount_sent_msat.as_ref().unwrap().msat, 0);
+						assert_eq!(
+							history.0.iter().map(|part| (part.id, part.groupid, part.partid, part.created_index)).collect::<Vec<_>>(),
+							initial.0.0.iter().map(|part| (part.id, part.groupid, part.partid, part.created_index)).collect::<Vec<_>>()
+						);
+						assert_eq!(history.0.iter().map(|part| part.amount_msat.as_ref().unwrap().msat).sum::<u64>(), 90_000_000);
+						break history;
+					}
+					tokio::time::sleep(Duration::from_millis(50)).await;
+				}
+			})
+			.await
+			.expect("ordinary receiver cancel must produce genuine same-attempt native failure");
+			let released = tokio::time::timeout(Duration::from_secs(20), async {
+				loop {
+					let mut matching = Vec::new();
+					for node in [&lightning.internal, &lightning.external] {
+						let channels = node
+							.grpc_client()
+							.await
+							.list_peer_channels(cln_rpc::ListpeerchannelsRequest { id: None, short_channel_id: None, channel_id: None })
+							.await
+							.unwrap()
+							.into_inner()
+							.channels;
+						assert_eq!(channels.len(), 1);
+						assert_eq!(channels[0].state(), cln_rpc::ChannelState::ChanneldNormal);
+						matching.push(channels[0].htlcs.iter().filter(|part| part.payment_hash == hash.to_vec()).count());
+					}
+					if matching.iter().all(|count| *count == 0) {
+						break matching;
+					}
+					tokio::time::sleep(Duration::from_millis(50)).await;
+				}
+			})
+			.await
+			.expect("both native peers must actually release the matching HTLCs");
+			assert!((ctx.bitcoind().get_block_count().await as u32) < deadline.to_u32());
+			tokio::fs::write(
+				ctx.datadir.join("native-release-before-maturity.json"),
+				serde_json::to_vec_pretty(&serde_json::json!({
+					"attempt":attempt,"hash":hash.to_string(),"label":label,
+					"actual_native_status":format!("{:?}",failed.1[0].status()),
+					"actual_amount_sent_msat":failed.1[0].amount_sent_msat.as_ref().unwrap().msat,
+					"actual_matching_peer_htlcs":released,"actual_height":ctx.bitcoind().get_block_count().await,
+					"source_expiry":source.expiry_height().to_u32(),"contract_expiry":deadline.to_u32(),
+				}))
+				.unwrap(),
+			)
+			.await
+			.unwrap();
+			assert_eq!(
+				db.read(async |tx| Ok(tx
+					.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1", &[&source.id().to_string()])
+					.await?
+					.get::<_, i64>(0)))
+					.await
+					.unwrap(),
+				0
+			);
+			let target = source.expiry_height().to_u32().max(deadline.to_u32()) + 1;
+			while (ctx.bitcoind().get_block_count().await as u32) < target {
+				let count = (target - ctx.bitcoind().get_block_count().await as u32).min(50);
+				ctx.generate_blocks(count).await;
+			}
+			super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+			let second = payout(&source, &destination, &mailbox.as_pubkey().to_string()).await;
+			assert_ne!(first.0.compute_txid(), second.0.compute_txid());
+			assert!(first.0.input.iter().all(|a| second.0.input.iter().all(|b| a.previous_output != b.previous_output)));
+			ctx.generate_blocks(6).await;
+			super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+			let expected =
+				std::collections::BTreeMap::from([(earlier_destination.clone(), sat(99_000)), (destination.clone(), sat(99_000))]);
+			let mut paid = std::collections::BTreeMap::new();
+			let mut paid_by_script = std::collections::BTreeMap::new();
+			for (parent, child) in [&first, &second] {
+				super::expiry_test::canonical(&ctx, parent);
+				super::expiry_test::canonical(&ctx, child);
+				for (vout, output) in parent.output.iter().enumerate().filter(|(_, output)| expected.contains_key(&output.script_pubkey)) {
+					let point = bitcoin::OutPoint::new(parent.compute_txid(), vout as u32);
+					let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
+					assert!(actual.confirmations >= 6);
+					assert_eq!(actual.value, output.value);
+					assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
+					assert!(paid.insert(point, output.value).is_none());
+					assert!(paid_by_script.insert(output.script_pubkey.clone(), output.value).is_none());
+				}
+			}
+			assert_eq!(paid_by_script, expected);
+			let miner_fees = super::expiry_test::actual_fee(&ctx, &first.1).await + super::expiry_test::actual_fee(&ctx, &second.1).await;
+			assert!(miner_fees > bitcoin::Amount::ZERO && miner_fees < sat(100_000));
+			assert_eq!(paid.values().copied().sum::<bitcoin::Amount>(), sat(198_000));
+			assert_eq!(sat(200_000), paid.values().copied().sum::<bitcoin::Amount>() + sat(2_000));
+			for _ in 0..2 {
+				ctx.generate_blocks(6).await;
+				super::expiry_test::rebuilt(&ctx, &srv, &db).await;
+				let mut actual = std::collections::BTreeMap::new();
+				for height in absent_height + 1..=ctx.bitcoind().get_block_count().await {
+					for tx in core.get_block(&core.get_block_hash(height).unwrap()).unwrap().txdata {
+						for (vout, output) in
+							tx.output.iter().enumerate().filter(|(_, output)| expected.contains_key(&output.script_pubkey))
+						{
+							assert!(actual.insert(bitcoin::OutPoint::new(tx.compute_txid(), vout as u32), output.value).is_none());
+						}
+					}
+				}
+				assert_eq!(actual, paid, "neither obligation may pay twice, including spent historical outputs");
+				for txid in core.get_raw_mempool().unwrap() {
+					let tx = core.get_raw_transaction(&txid, None).unwrap();
+					assert!(tx.output.iter().all(|output| !expected.contains_key(&output.script_pubkey)));
+				}
+				for (point, value) in &paid {
+					let output = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
+					assert!(output.confirmations >= 6);
+					assert_eq!(&output.value, value);
+				}
+				assert!(super::expiry_send_claim::send_history(&lightning.internal, hash).await == failed);
+				assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+			}
+			let stored = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, source.id()).await).await.unwrap().unwrap();
+			assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1",
+				&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
+			assert_eq!(stored.htlc.resolution(), None, "automatic fallback must not fabricate a cooperative revocation");
+		}),
+	)
+	.await
+	.expect("nativePending isolation, normal release and offline fallback must fit180s");
+}

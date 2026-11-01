@@ -601,7 +601,7 @@ async fn send_claim_does_not_block_ordinary_progression() {
 	}).await.expect("ordinary refund progression exceeded 180 seconds");
 }
 
-async fn send_history(node: &Lightningd, hash: PaymentHash) -> (Vec<cln_rpc::ListsendpaysPayments>, Vec<cln_rpc::ListpaysPays>) {
+pub(super) async fn send_history(node: &Lightningd, hash: PaymentHash) -> (Vec<cln_rpc::ListsendpaysPayments>, Vec<cln_rpc::ListpaysPays>) {
 	let mut rpc = node.grpc_client().await;
 	let mut parts = rpc.list_send_pays(cln_rpc::ListsendpaysRequest::default()).await.unwrap().into_inner()
 		.payments.into_iter().filter(|part| part.payment_hash == hash.to_vec()).collect::<Vec<_>>();
