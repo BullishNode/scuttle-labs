@@ -650,7 +650,8 @@ impl Wallet {
 	///
 	/// Returns `Ok(false)` when the server doesn't offer the rpc.
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
-		let (mut srv, ark_info) = self.require_server().await?;
+		let (mut srv, ark_info) = self.require_server_with_deadline(
+			Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT)).await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
 
 		let mut start_index = 0u32;
@@ -669,7 +670,8 @@ impl Wallet {
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
 			let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
+			let deadline = Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT);
+			let resp = match Self::server_read(deadline, srv.client.recover_vtxos_by_xpub(req)).await? {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {
 					info!("Server doesn't support VTXO recovery by xpub: {}", status.message());

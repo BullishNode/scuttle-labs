@@ -430,11 +430,13 @@ pub use self::vtxo::WalletVtxo;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
+use bark_runtime::Instant;
 use bip39::Mnemonic;
 use bitcoin::{Amount, Network, OutPoint};
 use bitcoin::bip32::{self, ChildNumber, Fingerprint};
@@ -485,6 +487,7 @@ const BARK_PURPOSE_INDEX: u32 = 350;
 const VTXO_KEYS_INDEX: u32 = 0;
 /// Derivation index used to generate keypair for the recovery mailbox
 const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
+const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MISSING_SERVER_TRANSPORT_HELP: &str =
 	"This build of bark-wallet does not include an Ark server transport backend. Enable feature `bark-wallet/native` or `bark-wallet/wasm-web` to use server-backed wallet functionality.";
 
@@ -1531,19 +1534,36 @@ impl Wallet {
 			.context("Failed to connect to Ark server")
 	}
 
+	/// Only the remote/transport read awaits use this deadline. Callers must
+	/// keep validation, local persistence and adoption outside this future.
+	async fn server_read<T>(deadline: Option<Instant>, read: impl Future<Output = T>) -> anyhow::Result<T> {
+		if let Some(deadline) = deadline {
+			let remaining = deadline.saturating_duration_since(Instant::now());
+			ensure!(!remaining.is_zero(), "Ark server read deadline elapsed");
+			bark_runtime::timeout(remaining, read).await.context("Ark server read deadline elapsed")
+		} else {
+			Ok(read.await)
+		}
+	}
+
 	async fn require_server(&self) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		let existing = { self.inner.server.read().await.clone() };
+		self.require_server_with_deadline(None).await
+	}
+
+	async fn require_server_with_deadline(&self, deadline: Option<Instant>) -> anyhow::Result<(ServerConnection, ArkInfo)> {
+		let existing = { Self::server_read(deadline, self.inner.server.read()).await?.clone() };
 		let conn = if let Some(connection) = existing {
 			connection
 		} else {
-			let mut server = self.inner.server.write().await;
+			let mut server = Self::server_read(deadline, self.inner.server.write()).await?;
 			if let Some(connection) = server.as_ref() {
 				connection.clone()
 			} else {
 				let network = self.properties().await?.network;
-				let mut connection = Self::connect_to_server(&self.inner.config, network).await
+				let mut connection = Self::server_read(deadline,
+					Self::connect_to_server(&self.inner.config, network)).await?
 					.context("You should be connected to Ark server to perform this action")?;
-				let ark_info = connection.ark_info().await;
+				let ark_info = Self::server_read(deadline, connection.ark_info()).await?;
 				check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
 				self.check_and_store_server_keys(&ark_info).await?;
 				*server = Some(connection.clone());
@@ -1551,7 +1571,7 @@ impl Wallet {
 			}
 		};
 
-		let ark_info = conn.ark_info().await;
+		let ark_info = Self::server_read(deadline, conn.ark_info()).await?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
 		self.check_and_store_server_keys(&ark_info).await?;
 
@@ -1559,18 +1579,19 @@ impl Wallet {
 	}
 
 	pub async fn refresh_server(&self) -> anyhow::Result<()> {
+		let deadline = Some(Instant::now() + SERVER_READ_TIMEOUT);
 		// Remove the cached connection before refreshing it. On failure or
 		// cancellation, future callers must connect and authenticate again.
-		let mut server = self.inner.server.write().await;
+		let mut server = Self::server_read(deadline, self.inner.server.write()).await?;
 		let mut connection = if let Some(connection) = server.take() {
 			connection
 		} else {
 			let properties = self.properties().await?;
-			Self::connect_to_server(&self.inner.config, properties.network).await?
+			Self::server_read(deadline, Self::connect_to_server(&self.inner.config, properties.network)).await??
 		};
 
-		connection.check_connection().await?;
-		let ark_info = connection.ark_info().await;
+		Self::server_read(deadline, connection.check_connection()).await??;
+		let ark_info = Self::server_read(deadline, connection.ark_info()).await?;
 		ark_info.fees.validate().context("invalid fee schedule")?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
 		self.check_and_store_server_keys(&ark_info).await?;
@@ -1667,20 +1688,20 @@ impl Wallet {
 		-> anyhow::Result<(VtxoSpendState, bool)>
 	{
 		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		self.fetch_vtxo_status_locked(vtxo_id, keypair).await
+		self.fetch_vtxo_status_locked(vtxo_id, keypair, Instant::now() + SERVER_READ_TIMEOUT).await
 	}
 
 	/// Caller retains FallbackHistory from before the request through adoption
 	/// and any first-seen body/marker write using the returned status.
-	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair)
+	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair, deadline: Instant)
 		-> anyhow::Result<(VtxoSpendState, bool)>
 	{
-		let (mut srv, _) = self.require_server().await?;
+		let (mut srv, _) = self.require_server_with_deadline(Some(deadline)).await?;
 		let attestation = VtxoStatusAttestation::new(vtxo_id, keypair);
-		let resp = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+		let resp = Self::server_read(Some(deadline), srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
 			vtxo_id: vtxo_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
-		}).await.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
+		})).await?.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
 
 		let state = VtxoSpendState::try_from(resp.spend_state).map_err(|_| anyhow::anyhow!(
 			"server returned unknown spend state {} for vtxo {vtxo_id}; this wallet may need updating", resp.spend_state,
@@ -1708,12 +1729,13 @@ impl Wallet {
 		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
 	{
 		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
+		let deadline = Instant::now() + SERVER_READ_TIMEOUT;
 		let mut ret = HashMap::with_capacity(queries.len());
 		if queries.is_empty() {
 			return Ok(ret);
 		}
 
-		let (mut srv, _) = self.require_server().await?;
+		let (mut srv, _) = self.require_server_with_deadline(Some(deadline)).await?;
 		for chunk in queries.chunks(MAX_NB_VTXO_IDS) {
 			let req = protos::GetVtxosStatusByIdsRequest {
 				vtxos: chunk.iter().map(|(id, keypair)| protos::VtxoStatusQuery {
@@ -1721,9 +1743,13 @@ impl Wallet {
 					attestation: VtxoStatusAttestation::new(*id, keypair).serialize(),
 				}).collect(),
 			};
-			let resp = match srv.client.get_vtxos_status_by_ids(req).await {
-				Ok(resp) => resp.into_inner(),
-				Err(e) => {
+			let resp = match Self::server_read(Some(deadline), srv.client.get_vtxos_status_by_ids(req)).await {
+				Err(error) => {
+					warn!("Stopping status reads with {} answers retained: {:#}", ret.len(), error);
+					break;
+				},
+				Ok(Ok(resp)) => resp.into_inner(),
+				Ok(Err(e)) => {
 					warn!("Could not fetch the status of {} vtxos from server: {:#}", chunk.len(), e);
 					continue;
 				},

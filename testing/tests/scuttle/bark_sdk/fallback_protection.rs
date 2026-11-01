@@ -30,6 +30,7 @@ struct PendingStatusFault {
 impl PendingStatusFault {
 	const MISSING: u8 = 1;
 	const FOREIGN: u8 = 2;
+	const STALLED: u8 = 3;
 }
 
 #[async_trait::async_trait]
@@ -45,6 +46,7 @@ impl captaind::proxy::ArkRpcProxy for PendingStatusFault {
 			assert_eq!(response.spend_state, protos::VtxoSpendState::FallbackPending as i32);
 			assert!(response.fallback_committed);
 			self.single_faults.fetch_add(1, Ordering::SeqCst);
+			if mode == Self::STALLED { std::future::pending::<()>().await; }
 			if mode == Self::MISSING {
 				return Err(tonic::Status::not_found("declared missing known-Pending status response"));
 			}
@@ -69,6 +71,7 @@ impl captaind::proxy::ArkRpcProxy for PendingStatusFault {
 			assert_eq!(response.vtxos[index].spend_state, protos::VtxoSpendState::FallbackPending as i32);
 			assert!(response.vtxos[index].fallback_committed);
 			self.batch_faults.fetch_add(1, Ordering::SeqCst);
+			if mode == Self::STALLED { std::future::pending::<()>().await; }
 			if mode == Self::MISSING {
 				response.vtxos.remove(index);
 				assert!(!response.missing_vtxo_ids.contains(&id));
@@ -148,29 +151,33 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().amount(), coin.amount());
 	assert_eq!(owed.total(), Amount::ZERO, "known committed principal is retained as signed coin/status, not another Ark amount");
 
-	// An omitted or foreign status cannot forget a commitment already learned
+	// An omitted, foreign or stalled status cannot forget a commitment already learned
 	// from the actual allocation. Use the server's existing public key as a
 	// valid but foreign point; no extra wallet, key or money is introduced.
 	let foreign = wallet.require_ark_info().await.unwrap().mailbox_pubkey;
 	assert_ne!(foreign, wallet.mailbox_identifier().as_pubkey());
 	*fault.foreign_owner.lock().unwrap() = foreign.serialize().to_vec();
 	*fault.target.lock().unwrap() = Some(coin.id());
-	for mode in [PendingStatusFault::MISSING, PendingStatusFault::FOREIGN] {
+	let checkpoints = serde_json::to_vec(&client_db.get_all_wallet_action_checkpoints().await.unwrap()).unwrap();
+	for mode in [PendingStatusFault::MISSING, PendingStatusFault::FOREIGN, PendingStatusFault::STALLED] {
 		fault.mode.store(mode, Ordering::SeqCst);
 		let single = fault.single_faults.load(Ordering::SeqCst);
-		let error = wallet.trust_and_adopt_server_vtxo_status(coin.id()).await.unwrap_err();
+		let error = tokio::time::timeout(Duration::from_secs(15),
+			wallet.trust_and_adopt_server_vtxo_status(coin.id())).await.unwrap().unwrap_err();
 		assert_eq!(fault.single_faults.load(Ordering::SeqCst), single + 1);
 		if mode == PendingStatusFault::MISSING {
 			assert_eq!(error.downcast_ref::<tonic::Status>().unwrap().code(), tonic::Code::NotFound);
 			assert!(format!("{error:#}").contains("declared missing known-Pending status response"));
+		} else if mode == PendingStatusFault::STALLED {
+			assert!(format!("{error:#}").contains("Ark server read deadline elapsed"));
 		} else {
 			assert!(format!("{error:#}").contains("server coin ownership does not match this mailbox"));
 		}
 		let batch = fault.batch_faults.load(Ordering::SeqCst);
-		let result = wallet.sync_fallback_payouts().await;
+		let result = tokio::time::timeout(Duration::from_secs(15), wallet.sync_fallback_payouts()).await.unwrap();
 		assert_eq!(fault.batch_faults.load(Ordering::SeqCst), batch + 1);
-		if mode == PendingStatusFault::MISSING {
-			// The existing batch API represents omission as an absent map entry.
+		if mode != PendingStatusFault::FOREIGN {
+			// The existing batch API represents omission or timeout as an absent map entry.
 			// It is a non-decision, not an error or release of the known fence.
 			result.unwrap();
 		} else {
@@ -187,6 +194,7 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 		assert_eq!(*wallet.exit_mgr().get_exit_vtxo(coin.id()).await.unwrap().state(), initial_exit);
 		assert_eq!(wallet.balance().await.unwrap().total(), Amount::ZERO);
 		assert_eq!(wallet.history().await.unwrap(), pending);
+		assert_eq!(serde_json::to_vec(&client_db.get_all_wallet_action_checkpoints().await.unwrap()).unwrap(), checkpoints);
 	}
 	fault.mode.store(0, Ordering::SeqCst);
 	wallet.sync_fallback_payouts().await.unwrap();

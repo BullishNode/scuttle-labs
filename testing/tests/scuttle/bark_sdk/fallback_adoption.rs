@@ -909,6 +909,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 struct MissingExpiredStatus {
 	target: Arc<Mutex<Option<VtxoId>>>,
 	paused: Arc<AtomicBool>,
+	stall_handshake: Arc<AtomicBool>,
 	calls: Arc<AtomicUsize>,
 	arrived: Arc<Notify>,
 	release: Arc<Notify>,
@@ -916,6 +917,16 @@ struct MissingExpiredStatus {
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for MissingExpiredStatus {
+	async fn handshake(&self, upstream: &mut captaind::ArkClient, request: protos::HandshakeRequest)
+		-> Result<protos::HandshakeResponse, tonic::Status>
+	{
+		if self.stall_handshake.load(Ordering::SeqCst) {
+			self.arrived.notify_one();
+			self.release.notified().await;
+		}
+		Ok(upstream.handshake(request).await?.into_inner())
+	}
+
 	async fn get_vtxos_status_by_ids(
 		&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxosStatusByIdsRequest,
 	) -> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status> {
@@ -934,16 +945,28 @@ impl captaind::proxy::ArkRpcProxy for MissingExpiredStatus {
 
 #[tokio::test]
 async fn skipped_spent_refresh_does_not_invent_pending_principal() {
-	Box::pin(expired_status_retirement(false)).await;
+	Box::pin(expired_status_retirement(false, false, false)).await;
 }
 
 #[tokio::test]
 async fn paused_expired_status_cannot_reverse_concurrent_ordinary_retirement() {
-	Box::pin(expired_status_retirement(true)).await;
+	Box::pin(expired_status_retirement(true, false, false)).await;
 }
 
-async fn expired_status_retirement(paused: bool) {
-	let name = if paused { "bark_sdk/paused_expired_status_retirement" }
+#[tokio::test]
+async fn stalled_status_read_releases_history_for_unrelated_exit() {
+	Box::pin(expired_status_retirement(true, true, false)).await;
+}
+
+#[tokio::test]
+async fn stalled_refresh_releases_status_waiter_and_local_exit() {
+	Box::pin(expired_status_retirement(true, true, true)).await;
+}
+
+async fn expired_status_retirement(paused: bool, time_out: bool, refresh_lock: bool) {
+	let name = if refresh_lock { "bark_sdk/stalled_refresh_history_waiter" }
+		else if time_out { "bark_sdk/stalled_status_unrelated_exit" }
+		else if paused { "bark_sdk/paused_expired_status_retirement" }
 		else { "bark_sdk/skipped_spent_expired_refresh" };
 	let ctx = TestContext::new(name).await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
@@ -979,20 +1002,64 @@ async fn expired_status_retirement(paused: bool) {
 	if paused {
 		let refreshing = stale.clone();
 		let source_id = source.id();
+		let server_refresh = if refresh_lock {
+			gate.stall_handshake.store(true, Ordering::SeqCst);
+			let wallet = stale.clone();
+			let task = tokio::spawn(async move { wallet.refresh_server().await });
+			tokio::time::timeout(Duration::from_secs(15), gate.arrived.notified()).await.unwrap();
+			Some(task)
+		} else { None };
 		let refresh = tokio::spawn(async move { refreshing.build_refresh_participation([source_id]).await });
-		tokio::time::timeout(Duration::from_secs(15), gate.arrived.notified()).await.unwrap();
-		// Ordinary retirement waits for the paused refresh to release History.
-		// Its missing reply cannot manufacture another 60k claim, and the
-		// following authenticated decision must still retire the original.
-		let retiring = stale.clone();
-		let retirement = tokio::spawn(async move {
-			retiring.trust_and_adopt_server_vtxo_status(source_id).await
-		});
-		gate.release.notify_one();
-		assert!(tokio::time::timeout(Duration::from_secs(15), refresh).await.unwrap().unwrap().unwrap().is_none());
-		assert_eq!(tokio::time::timeout(Duration::from_secs(15), retirement).await.unwrap().unwrap().unwrap(),
-			Some(bark::vtxo::ServerStatusAdoption::Spent));
-		assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+		if !refresh_lock {
+			tokio::time::timeout(Duration::from_secs(15), gate.arrived.notified()).await.unwrap();
+		}
+		if time_out {
+			// This genuine unrelated change exit needs History and responsive Core,
+			// but no Ark RPC. Do not release the stalled handler to let it finish.
+			let change = changes[0].clone();
+			stale.exit_mgr().start_exit_for_vtxos(&[change.vtxo.clone()]).await.unwrap();
+			let history = stale.history().await.unwrap();
+			let checkpoints = serde_json::to_vec(&local.get_all_wallet_action_checkpoints().await.unwrap()).unwrap();
+			let prior = local.get_wallet_vtxo(source_id).await.unwrap().unwrap();
+			let mempool = ctx.bitcoind().sync_client().get_raw_mempool().unwrap();
+			let exiting = stale.clone();
+			let exit = tokio::spawn(async move { exiting.sync_exits().await });
+			tokio::time::timeout(Duration::from_secs(15), exit).await.unwrap().unwrap().unwrap();
+			let result = tokio::time::timeout(Duration::from_secs(15), refresh).await.unwrap().unwrap();
+			if refresh_lock {
+				assert!(result.is_err(), "connection/handshake timeout remains an error");
+				assert!(tokio::time::timeout(Duration::from_secs(15), server_refresh.unwrap()).await.unwrap().unwrap().is_err());
+			} else {
+				assert!(result.unwrap().is_none(), "a timed-out batch returns no invented answer");
+			}
+			assert_eq!(stale.history().await.unwrap(), history);
+			assert_eq!(serde_json::to_vec(&local.get_all_wallet_action_checkpoints().await.unwrap()).unwrap(), checkpoints);
+			assert_eq!(local.get_wallet_vtxo(source_id).await.unwrap().unwrap().state, prior.state);
+			assert_eq!(stale.get_full_vtxo(source_id).await.unwrap().serialize(), signed.serialize());
+			assert_eq!(ctx.bitcoind().sync_client().get_raw_mempool().unwrap(), mempool,
+				"observation of the unrelated exit must not publish a fee/package");
+			assert!(stale.exit_mgr().get_exit_vtxo(change.id()).await.unwrap().state().is_cancelable());
+			stale.exit_mgr().cancel_exit(change.id()).await.unwrap();
+			gate.paused.store(false, Ordering::SeqCst);
+			gate.stall_handshake.store(false, Ordering::SeqCst);
+			gate.release.notify_waiters();
+			stale.refresh_server().await.unwrap();
+			assert_eq!(stale.trust_and_adopt_server_vtxo_status(source_id).await.unwrap(),
+				Some(bark::vtxo::ServerStatusAdoption::Spent));
+		} else {
+			// Ordinary retirement waits for the paused refresh to release History.
+			// Its missing reply cannot manufacture another 60k claim, and the
+			// following authenticated decision must still retire the original.
+			let retiring = stale.clone();
+			let retirement = tokio::spawn(async move {
+				retiring.trust_and_adopt_server_vtxo_status(source_id).await
+			});
+			gate.release.notify_one();
+			assert!(tokio::time::timeout(Duration::from_secs(15), refresh).await.unwrap().unwrap().unwrap().is_none());
+			assert_eq!(tokio::time::timeout(Duration::from_secs(15), retirement).await.unwrap().unwrap().unwrap(),
+				Some(bark::vtxo::ServerStatusAdoption::Spent));
+			assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
+		}
 	} else {
 		assert!(stale.build_refresh_participation([source.id()]).await.unwrap().is_none());
 		assert_eq!(gate.calls.load(Ordering::SeqCst), 0, "an already spent source must never be queried");

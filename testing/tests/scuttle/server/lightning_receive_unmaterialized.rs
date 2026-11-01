@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ark::{ProtocolEncoding, ServerVtxo, Vtxo};
@@ -37,10 +37,22 @@ struct ReceiveGate {
 	claims: Arc<AtomicUsize>,
 	registrations: Arc<AtomicUsize>,
 	posts: Arc<AtomicUsize>,
+	stall_status: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for ReceiveGate {
+	async fn check_lightning_receive(&self, upstream: &mut ArkClient, request: protos::CheckLightningReceiveRequest)
+		-> Result<protos::CheckLightningReceiveResponse, tonic::Status>
+	{
+		let response = upstream.check_lightning_receive(request).await?.into_inner();
+		if self.stall_status.load(Ordering::SeqCst) {
+			assert_eq!(response.fallback_spend_state, Some(protos::VtxoSpendState::Spent as i32));
+			std::future::pending::<()>().await;
+		}
+		Ok(response)
+	}
+
 	async fn prepare_lightning_receive_claim(&self, upstream: &mut ArkClient,
 		request: protos::PrepareLightningReceiveClaimRequest,
 	) -> Result<protos::PrepareLightningReceiveClaimResponse, tonic::Status> {
@@ -724,7 +736,8 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let provider_db = Arc::new(SqliteClient::open(ctx.datadir.join("provider/db.sqlite")).unwrap());
 	let mut provider_cfg: bark::Config = toml::from_str(&tokio::fs::read_to_string(
 		ctx.datadir.join("provider/config.toml")).await.unwrap()).unwrap();
-	provider_cfg.server_address = srv.ark_url();
+	let returned_proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
+	provider_cfg.server_address = returned_proxy.address.clone();
 	let reopen_provider = async || {
 		let onchain = OnchainWallet::load_or_create(bitcoin::Network::Regtest,
 			provider_seed.to_seed(""), provider_db.clone()).await.unwrap();
@@ -752,6 +765,22 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let before_retirement = provider.history().await.unwrap();
 	assert_eq!(before_retirement.len(), 1);
 	assert_eq!(before_retirement[0].id, movement);
+	// Stall only the authenticated remote read. Its timeout must not retire
+	// the signed receive checkpoint, change the holder or publish history.
+	let grant_before = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
+	let body_before = provider.get_full_vtxo(original.source.id()).await.unwrap().serialize();
+	gate.stall_status.store(true, Ordering::SeqCst);
+	let error = tokio::time::timeout(Duration::from_secs(15), provider.try_claim_lightning_receive(hash, false))
+		.await.unwrap().unwrap_err();
+	assert!(format!("{error:#}").contains("Ark server read deadline elapsed"));
+	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap() == Some(checkpoint.clone()));
+	let grant_after = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
+	assert_eq!(grant_after.state, grant_before.state);
+	assert_eq!(grant_after.fallback_status, grant_before.fallback_status);
+	assert_eq!(provider.get_full_vtxo(original.source.id()).await.unwrap().serialize(), body_before);
+	assert!(provider.history().await.unwrap() == before_retirement);
+	assert!(provider_db.get_settled_lightning_receive(hash).await.unwrap().is_none());
+	gate.stall_status.store(false, Ordering::SeqCst);
 	let outcome = provider.try_claim_lightning_receive(hash, false).await.unwrap();
 	let LightningReceiveState::Settled(retired) = outcome else {
 		panic!("the existing same-invoice/grants terminal status must retire this checkpoint");
