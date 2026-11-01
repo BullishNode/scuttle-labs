@@ -7,9 +7,12 @@ use axum::http::{HeaderMap, header};
 use axum::routing::post;
 use axum::Router;
 
+use ark::ProtocolEncoding;
+
 use bitcoincore_rpc::RpcApi;
 
-use bark::WalletNotification;
+use bark::{OpenWalletArgs, Wallet, WalletNotification, WalletSeed};
+use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::exit::{ExitError, ExitState};
 use bark::movement::{Movement, MovementId, MovementStatus};
 use bitcoin_ext::BlockHeight;
@@ -606,6 +609,168 @@ async fn finished_exit_does_not_change_on_sync() {
 			assert_ne!(movement.id, movement_id, "the exit movement must not be updated again");
 		}
 	}
+}
+
+// The two fresh worlds independently exercise stable runtime reconciliation and
+// public-open reconciliation: repairing one must not conceal the other's gap.
+async fn terminal_exit_history_retries_after_sqlite_fault(reopen: bool) {
+	let name = if reopen { "terminal_exit_history_retries_on_public_reopen" }
+		else { "terminal_exit_history_retries_on_stable_progress" };
+	let ctx = TestContext::new(format!("bark_sdk/{name}")).await;
+	let srv = ctx.captaind("server").create().await;
+	let mut wallet = ctx.bark_sdk("bark", &srv)
+		.cfg(|c| c.daemon_manual_sync = true).boarded(sat(400_000)).create().await;
+	let receiver = ctx.bark_sdk("bark2", &srv)
+		.cfg(|c| c.daemon_manual_sync = true).create().await;
+	wallet.stop_daemon_wait().await.unwrap();
+	receiver.stop_daemon_wait().await.unwrap();
+	let config = wallet.config().clone();
+	let onchain = wallet.onchain().expect("the original board wallet has an onchain wallet");
+	let datadir = ctx.datadir.join("bark");
+	let mnemonic: bip39::Mnemonic = tokio::fs::read_to_string(datadir.join("mnemonic"))
+		.await.unwrap().parse().unwrap();
+	let db = SqliteClient::open(datadir.join("db.sqlite")).unwrap();
+	let conn = rusqlite::Connection::open(datadir.join("db.sqlite")).unwrap();
+	let [boarded] = wallet.vtxos().await.unwrap().try_into().expect("one original board");
+	let source_id = boarded.id();
+	let original = wallet.get_full_vtxo(source_id).await.unwrap();
+	let anchor = original.chain_anchor();
+	let funding = ctx.bitcoind().await_transaction(anchor.txid).await;
+	let funding_output = funding.output[anchor.vout as usize].clone();
+	let core = ctx.bitcoind().sync_client();
+	let unspent = core.get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().unwrap();
+	assert!(unspent.confirmations > 0);
+	assert_eq!(unspent.value, funding_output.value);
+	assert_eq!(unspent.script_pub_key.script().unwrap(), funding_output.script_pubkey);
+
+	// The original supported race: queue first, then really spend through Arkoor
+	// before exit progression. No terminal state or financial row is injected.
+	wallet.exit_mgr().start_exit_for_entire_wallet().await.unwrap();
+	let movement_id = wallet.exit_mgr().get_exit_vtxo(source_id).await.unwrap()
+		.movement_id().expect("the queued exit has its own movement");
+	let pending = db.get_movement_by_id(movement_id).await.unwrap();
+	assert_eq!(pending.status, MovementStatus::Pending);
+	assert!(pending.time.completed_at.is_none());
+	conn.execute_batch(&format!("CREATE TRIGGER issue32_reject_exit_completion \
+		BEFORE UPDATE ON bark_movements \
+		WHEN OLD.id = {} AND OLD.status = 'pending' AND NEW.status = 'canceled' \
+		BEGIN SELECT RAISE(ABORT, 'issue32 native exit completion rejected'); END;", movement_id.0)).unwrap();
+	let send_id = wallet.send_arkoor_payment(&receiver.new_address().await.unwrap(), sat(100_000)).await.unwrap();
+	receiver.sync().await;
+	assert_eq!(receiver.balance().await.unwrap().total(), sat(100_000));
+	assert_eq!(wallet.balance().await.unwrap().total(), sat(300_000));
+	let mut notifications = wallet.subscribe_notifications();
+	wallet.progress_exits().await.unwrap();
+	let terminal = db.get_exit_vtxo_entry(&source_id).await.unwrap().unwrap();
+	let failed_history = db.get_movement_by_id(movement_id).await.unwrap();
+	tokio::fs::write(ctx.datadir.join("terminal-exit-history-cut.json"),
+		serde_json::to_vec_pretty(&serde_json::json!({
+			"terminal": terminal, "movement_before": pending, "movement_after": failed_history,
+		})).unwrap()).await.unwrap();
+	assert!(matches!(&terminal.state, ExitState::VtxoAlreadySpent(_)), "{:?}", terminal.state);
+	assert_eq!(terminal.movement_id, Some(movement_id));
+	assert_eq!(failed_history, pending, "the real terminal state must outlive its failed history write");
+	assert_eq!(wallet.get_full_vtxo(source_id).await.unwrap().serialize(), original.serialize());
+	wallet.progress_exits().await.unwrap();
+	assert_eq!(db.get_exit_vtxo_entry(&source_id).await.unwrap().unwrap(), terminal);
+	assert_eq!(db.get_movement_by_id(movement_id).await.unwrap(), pending);
+	while let Some(Some(n)) = futures::FutureExt::now_or_never(notifications.next()) {
+		if let WalletNotification::MovementUpdated { movement } = n {
+			assert_ne!(movement.id, movement_id, "failed completion must not notify success");
+		}
+	}
+
+	if reopen {
+		// Keep the same real fault on first public open: load must report the
+		// failure, not silently omit the finished exit and return stale history.
+		drop(wallet);
+		let outcome = Wallet::open(bitcoin::Network::Regtest,
+			WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &mnemonic), config.clone(),
+			OpenWalletArgs { datadir: Some(datadir.clone()), onchain: Some(onchain.clone()), run_daemon: false, ..Default::default() }).await;
+		let error = match outcome { Ok(unexpected) => { drop(unexpected); None }, Err(e) => Some(format!("{e:#}")) };
+		tokio::fs::write(ctx.datadir.join("terminal-exit-public-open.json"),
+			serde_json::to_vec_pretty(&serde_json::json!({"error": error})).unwrap()).await.unwrap();
+		assert!(error.as_deref().is_some_and(|e| e.contains("issue32 native exit completion rejected")),
+			"public open must expose the real completion failure: {error:?}");
+		assert_eq!(db.get_exit_vtxo_entry(&source_id).await.unwrap().unwrap(), terminal);
+		assert_eq!(db.get_movement_by_id(movement_id).await.unwrap(), pending);
+		conn.execute_batch("DROP TRIGGER issue32_reject_exit_completion;").unwrap();
+		wallet = Wallet::open(bitcoin::Network::Regtest,
+			WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &mnemonic), config.clone(),
+			OpenWalletArgs { datadir: Some(datadir.clone()), onchain: Some(onchain.clone()), run_daemon: false, ..Default::default() }).await.unwrap();
+		assert!(wallet.exit_mgr().get_exit_vtxo(source_id).await.is_none(), "finished records stay untracked");
+		// Completion happens before open returns, so its notification is not observed here.
+		notifications = wallet.subscribe_notifications();
+	} else {
+		conn.execute_batch("DROP TRIGGER issue32_reject_exit_completion;").unwrap();
+		// The state is identical and already terminal. No new state transition
+		// may be needed to retry the original movement's failed completion.
+		wallet.progress_exits().await.unwrap();
+	}
+	let finished = db.get_movement_by_id(movement_id).await.unwrap();
+	let mut expected = pending.clone();
+	expected.status = MovementStatus::Canceled;
+	expected.time.completed_at = finished.time.completed_at;
+	assert!(finished.time.completed_at.is_some());
+	assert_eq!(finished, expected, "only the existing business status and completion time change");
+	assert_eq!(find_movement(&wallet, movement_id).await, finished);
+	assert_eq!(db.get_exit_vtxo_entry(&source_id).await.unwrap().unwrap(), terminal);
+	let mut completions = 0;
+	while let Some(Some(n)) = futures::FutureExt::now_or_never(notifications.next()) {
+		if let WalletNotification::MovementUpdated { movement } = n {
+			if movement.id == movement_id { assert_eq!(movement, finished); completions += 1; }
+		}
+	}
+	assert_eq!(completions, if reopen { 0 } else { 1 });
+	let history = wallet.history().await.unwrap();
+	let send = history.iter().find(|m| m.id == send_id).unwrap();
+	assert_eq!(send.status, MovementStatus::Successful);
+	assert_eq!(send.effective_balance, -sat(100_000).to_signed().unwrap());
+	assert_eq!(send.offchain_fee, sat(0));
+	assert_eq!(send.input_vtxos, vec![source_id]);
+	let recipient_history = receiver.history().await.unwrap();
+	assert_eq!(recipient_history.len(), 1);
+	assert_eq!(recipient_history[0].status, MovementStatus::Successful);
+	assert_eq!(recipient_history[0].effective_balance, sat(100_000).to_signed().unwrap());
+	assert_eq!(recipient_history[0].offchain_fee, sat(0));
+	ctx.generate_blocks(2).await;
+	wallet.sync().await;
+	wallet.progress_exits().await.unwrap();
+	assert_eq!(wallet.history().await.unwrap(), history);
+	assert_eq!(db.get_exit_vtxo_entry(&source_id).await.unwrap().unwrap(), terminal);
+	while let Some(Some(n)) = futures::FutureExt::now_or_never(notifications.next()) {
+		if let WalletNotification::MovementUpdated { movement } = n { assert_ne!(movement.id, movement_id); }
+	}
+	drop(wallet);
+	let wallet = Wallet::open(bitcoin::Network::Regtest,
+		WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &mnemonic), config,
+		OpenWalletArgs { datadir: Some(datadir), onchain: Some(onchain), run_daemon: false, ..Default::default() }).await.unwrap();
+	assert_eq!(wallet.history().await.unwrap(), history, "another public open must not finish twice");
+	assert_eq!(db.get_exit_vtxo_entry(&source_id).await.unwrap().unwrap(), terminal);
+	assert_eq!(wallet.balance().await.unwrap().total(), sat(300_000));
+	assert_eq!(receiver.balance().await.unwrap().total(), sat(100_000));
+	assert_eq!(receiver.history().await.unwrap(), recipient_history);
+	assert_eq!(wallet.get_full_vtxo(source_id).await.unwrap().serialize(), original.serialize());
+	let unspent = core.get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().unwrap();
+	assert_eq!(unspent.value, funding_output.value);
+	assert_eq!(unspent.script_pub_key.script().unwrap(), funding_output.script_pubkey);
+	assert_eq!(ctx.bitcoind().await_transaction(anchor.txid).await, funding);
+	let mempool = core.get_raw_mempool().unwrap();
+	assert!(!original.transactions().any(|step| mempool.contains(&step.tx.compute_txid())),
+		"history repair must not publish this canceled exit");
+	assert_eq!(history.iter().filter(|m| m.id == movement_id).count(), 1);
+	assert_eq!(history.iter().filter(|m| m.status == MovementStatus::Successful)
+		.map(|m| m.effective_balance).sum::<bitcoin::SignedAmount>(), sat(300_000).to_signed().unwrap());
+}
+
+#[tokio::test]
+async fn terminal_exit_history_retries_on_stable_progress() {
+	Box::pin(terminal_exit_history_retries_after_sqlite_fault(false)).await;
+}
+
+#[tokio::test]
+async fn terminal_exit_history_retries_on_public_reopen() {
+	Box::pin(terminal_exit_history_retries_after_sqlite_fault(true)).await;
 }
 
 /// Dropping one public progress future during a real historical-block read
