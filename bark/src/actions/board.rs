@@ -307,17 +307,6 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 		return Ok(Advance::Done);
 	}
 
-	// A previous drive already observed a confirmed double-spend of a funding
-	// tx input and marked the vtxo spent (see the `Fatal` arm below), but was
-	// interrupted before tearing the board down: finish the teardown.
-	if vtxo.state.kind() == VtxoStateKind::Spent {
-		wallet.inner.movements.finish_movement_with_update(
-			board.movement_id, MovementStatus::Failed,
-			MovementUpdate::new().effective_balance(SignedAmount::ZERO),
-		).await.context("failed to finalize double-spent board movement").retry()?;
-		return Ok(Advance::Done);
-	}
-
 	let mut last_park_error = None;
 	let anchor = vtxo.chain_anchor();
 	let confs = match wallet.inner.chain.tx_status(anchor.txid).await {
@@ -355,6 +344,12 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	};
 
 	if confs.is_some_and(|c| c >= required.to_u32()) {
+		// Completion can outlive checkpoint removal and the coin can then be
+		// spent normally. Require current funding confirmation too: an old
+		// successful movement must not hide a funding conflict after a reorg.
+		if wallet.inner.db.get_movement_by_id(board.movement_id).await.retry()?.status == MovementStatus::Successful {
+			return Ok(Advance::Done);
+		}
 		// Attempt registration inline. A failure here (the server can't see
 		// enough confirmations yet, or refuses) is not terminal: leave the vtxo
 		// Locked and retry next drive, exactly like the old loop. The funding tx
