@@ -866,8 +866,11 @@ impl Watchman {
 		//TODO(stevenroose) adapt feerate to how close the deadline is
 		let (anchor, _) = progress_tx.fee_anchor().context("progress tx has no fee anchor")?;
 		let fees = if let Some(child) = bcd::get_mempool_spending_tx(&self.bitcoind, anchor).await? {
-			let (current_package_fee, _) = payout::mempool_child_fee(&self.bitcoind, child).await?
+			let (current_package_fee, weight) = payout::mempool_child_fee(&self.bitcoind, child).await?
 				.context("progress fee child left the mempool")?;
+			if current_package_fee >= (progress_tx.weight() + weight) * fee_rate {
+				return Ok(());
+			}
 			MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
 		} else {
 			MakeCpfpFees::Effective(fee_rate)
