@@ -160,8 +160,11 @@ async fn lightning_rejection_refunds_only_its_source() {
 		let native_pays = payer.list_pays(cln_rpc::ListpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().pays;
+		// Native xpay overlays Pending on old failed groups while this same hash is active.
+		let mut expected_rejected_pays = rejected_pays.clone();
+		expected_rejected_pays[0].status = cln_rpc::listpays_pays::ListpaysPaysStatus::Pending as i32;
 		assert_eq!(native_pays.iter().filter(|pay| pay.label.as_deref() == Some(rejected_label.as_str()))
-			.cloned().collect::<Vec<_>>(), rejected_pays);
+			.cloned().collect::<Vec<_>>(), expected_rejected_pays);
 		let aggregate = native_pays.iter().filter(|pay| pay.label.as_deref() == Some(label.as_str())).collect::<Vec<_>>();
 		assert_eq!(native_pays.len(), rejected_pays.len() + aggregate.len());
 		assert_eq!(aggregate.len(), 1);
