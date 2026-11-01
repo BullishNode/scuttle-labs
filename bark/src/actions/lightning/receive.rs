@@ -592,6 +592,13 @@ async fn prepare_lightning_receive_htlcs(
 		.collect::<Result<Vec<_>, _>>()
 		.context("invalid htlc vtxos from server").abort()?;
 
+	// Sort for a deterministic checkpoint and require distinct collateral.
+	let mut vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
+	vtxo_ids.sort();
+	if vtxo_ids.windows(2).any(|ids| ids[0] == ids[1]) {
+		abort!("Server returned duplicate HTLC VTXO IDs");
+	}
+
 	// Sanity-check the vtxos.
 	let mut htlc_amount = Amount::ZERO;
 	for vtxo in &vtxos {
@@ -689,10 +696,6 @@ async fn prepare_lightning_receive_htlcs(
 		&vtxos,
 		Some(VtxoLockHolder::Action { id: recv.id() }),
 	).await.retry()?;
-
-	// Sort for a deterministic checkpoint (the server may return them in any order).
-	let mut vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
-	vtxo_ids.sort();
 
 	Ok(Htlcs { vtxo_ids, movement_id })
 }
