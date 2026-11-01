@@ -210,7 +210,6 @@ impl<'a> PaymentAttemptHandler<'a> {
 				} else {
 					end_xpay(t, attempt, outcome).await?;
 				}
-					t.clear_lightning_dispatch_holds(attempt.id).await?;
 			}
 
 			// Only mark linked HTLC-send vtxos as ln-spent once the attempt

@@ -48,8 +48,8 @@ async fn upsert_vtxo() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Create a few dummy vtxo's
@@ -72,8 +72,8 @@ async fn lightning_invoice() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let dummy_public_key = PublicKey::from_str("038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354")
 		.expect("Failed to create dummy pubkey");
@@ -98,8 +98,8 @@ async fn integration() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let integration_second = db.write(async |t| t.store_integration("second").await).await.unwrap();
 	assert_ne!(integration_second.id, 0);
@@ -223,8 +223,8 @@ async fn block_database_crud() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	// Construct some mock block refs
 	let hash1 = bitcoin::BlockHash::from_str("0000000000000000000670ab57e8c1a4637b22d1d56e4c2837d08ec9a61e7777").unwrap();
@@ -292,8 +292,8 @@ async fn get_virtual_transaction_not_found() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	// Create a txid without inserting it
 	let tx = Transaction {
@@ -316,8 +316,8 @@ async fn get_first_unsigned_virtual_transaction() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Create 3 transactions with different txids
@@ -384,8 +384,8 @@ async fn upsert_vtxos_with_txid() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Create vtxos using VTXO_VECTORS
@@ -418,8 +418,8 @@ async fn block_table_independence() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	// Create test blocks with different hashes at the same height
 	let hash_captaind = bitcoin::BlockHash::from_str("000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f").unwrap();
@@ -486,8 +486,8 @@ async fn ban_vtxo() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Insert a vtxo
@@ -542,8 +542,8 @@ async fn pending_sweeps() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	// Initially empty
 	let sweeps = db.read(async |t| t.fetch_pending_sweeps().await).await.unwrap();
@@ -607,8 +607,8 @@ async fn postgres_offboards() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -666,8 +666,8 @@ async fn nursery_txs() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let tx = Transaction {
 		version: bitcoin::transaction::Version::non_standard(42),
@@ -744,8 +744,8 @@ async fn ephemeral_tweaks() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(
 		"038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354"
@@ -780,8 +780,8 @@ async fn vtxo_mailbox() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -835,8 +835,8 @@ async fn store_vtxos_in_mailbox_empty() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -852,8 +852,8 @@ async fn store_vtxos_in_mailbox_duplicate() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -895,8 +895,8 @@ async fn store_vtxo_ids_in_mailbox_duplicate() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -941,8 +941,8 @@ async fn mailbox_page_returns_whole_batch() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -977,8 +977,8 @@ async fn vtxo_pool() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo1 = PoolVtxo::new(VTXO_VECTORS.board_vtxo.clone());
@@ -1021,8 +1021,8 @@ async fn watchman_frontier() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Store the vtxo row that the frontier columns hang off of
@@ -1078,8 +1078,8 @@ async fn watchman_reorg() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -1104,8 +1104,8 @@ async fn watchman_get_vtxos_by_txid() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -1134,8 +1134,8 @@ async fn watchman_unfrontiered_funding_txids() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// No vtxos → no unfrontiered txids
@@ -1164,8 +1164,8 @@ async fn round_queries_empty() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let tx = Transaction {
@@ -1190,8 +1190,8 @@ async fn round_participation() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// Insert a vtxo to use as an input
@@ -1263,8 +1263,8 @@ async fn round_participation_supersedes_on_same_input() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -1309,8 +1309,8 @@ async fn round_participation_forfeited_at() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -1371,8 +1371,8 @@ async fn set_forfeit_transactions_is_idempotent() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// We will create a few vtxos, all pubkey policy: htlc vtxos are
@@ -1513,8 +1513,8 @@ async fn set_forfeit_transactions_rejects_non_round_spent_vtxo() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -1576,8 +1576,8 @@ async fn round_participation_same_vtxo_multiple_pending() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -1621,8 +1621,8 @@ async fn lightning_payment_attempt_lifecycle() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1681,8 +1681,8 @@ async fn lightning_payment_attempt_with_error() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1722,8 +1722,8 @@ async fn lightning_payment_attempt_error_survives_until_failed() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1778,8 +1778,8 @@ async fn lightning_payment_attempt_stores_protocol_fee() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -1850,8 +1850,8 @@ async fn cln_xpay_success_ends_the_attempt() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -1883,8 +1883,8 @@ async fn cln_xpay_ends_only_once() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -1913,8 +1913,8 @@ async fn one_pending_xpay_per_payment_hash() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -1940,8 +1940,8 @@ async fn end_pending_xpay_by_payment_hash() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -1983,8 +1983,8 @@ async fn cln_xpay_stores_the_user_agent() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -2021,8 +2021,8 @@ async fn cln_hold_lifecycle() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -2085,8 +2085,8 @@ async fn cln_hold_cancel_recorded_once() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -2148,8 +2148,8 @@ async fn backfill_cln_hold_from_htlc_subscriptions() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -2240,8 +2240,8 @@ async fn lightning_generated_invoice_and_htlc_subscription() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -2334,8 +2334,8 @@ async fn get_integration_token_config() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	let integration = db.write(async |t| t.store_integration("test_integration").await).await.unwrap();
 
@@ -2363,8 +2363,8 @@ async fn wallet_changeset() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	// Empty aggregate changeset
 	let cs = db.read(async |t| t.read_aggregate_changeset(WalletKind::Rounds).await).await.unwrap();
@@ -2393,8 +2393,8 @@ async fn round_participation_mailbox() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -2442,8 +2442,8 @@ async fn lightning_receive_notification_mailbox_duplicate() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -2483,8 +2483,8 @@ async fn lightning_send_finished_mailbox_notification() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let mailbox_id = MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
@@ -2541,8 +2541,8 @@ async fn htlc_vtxo_chain_resolution_cleared_above_fork_height() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
@@ -2578,8 +2578,8 @@ async fn htlc_vtxo_chain_resolution_kept_at_fork_height() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());

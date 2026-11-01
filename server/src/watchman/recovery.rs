@@ -74,7 +74,6 @@ impl Tx<'_> {
 					WHERE expiry_terminal_claim.txid=EXCLUDED.txid AND expiry_terminal_claim.height=EXCLUDED.height AND expiry_terminal_claim.hash=EXCLUDED.hash",
 					&[&id, &txid.to_string(), &i64::from(block.block_ref.height), &block.block_ref.hash.to_string()]).await?;
 				ensure!(changed == 1, "expiry entitlement has conflicting canonical terminal claims");
-				self.clear_expiry_hold(vtxo.id()).await?;
 			}
 		}
 		self.reconcile_expiry_allocations(&allocations, block.block_ref).await

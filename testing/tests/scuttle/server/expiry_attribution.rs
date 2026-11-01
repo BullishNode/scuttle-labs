@@ -41,7 +41,7 @@ impl Owner {
 		let server = srv.mailbox_keypair();
 		assert_eq!(server.public_key(), srv.ark_info().await.mailbox_pubkey);
 		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &self.mailbox, &key).unwrap();
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		assert_eq!(db.write(async |tx| tx.verify_owner_link(&server, key.public_key(), &link, Network::Regtest).await)
 			.await.unwrap(), self.mailbox.public_key());
 		link
@@ -133,7 +133,7 @@ async fn assert_paid(ctx: &TestContext, srv: &Captaind, owner: &Owner, coin: &Vt
 async fn assert_paid_to_owner(
 	ctx: &TestContext, srv: &Captaind, owner: &Owner, coin: &Vtxo<Full>, owner_key: PublicKey,
 ) {
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let parent = tokio::time::timeout(Duration::from_secs(45), async {
 		for _ in 0..24 {
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
@@ -188,7 +188,7 @@ async fn expiry_owner_finds_key_without_mailbox() {
 	let owner = Owner::new(&ctx);
 
 	let coin = board(&ctx, &srv, &owner, owner.key(500)).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM mailbox WHERE vtxo_id=$1",
 		&[&coin.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	expire(&ctx, &srv, coin.expiry_height()).await;
@@ -285,7 +285,7 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	assert_eq!(refund.amount(), sat(100_000));
 	assert_eq!(refund.policy(), &VtxoPolicy::new_pubkey(refund_key.public_key()));
 	refund.validate(&funding).unwrap();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let stored = db.read(async |tx| tx.get_bare_vtxo_by_id(refund.id()).await).await.unwrap();
 	assert_eq!(stored.spend_state, server::database::SpendState::Unregistered);
 	assert!(db.read(async |tx| tx.get_virtual_transaction_by_txid(refund.point().txid).await)
@@ -306,7 +306,7 @@ async fn expiry_owner_is_available_after_joint_admission_without_registration() 
 	let key = owner.key(500);
 	let server = srv.mailbox_keypair();
 	let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &owner.mailbox, &key).unwrap();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_eq!(db.write(async |tx| tx.verify_owner_link(&server, key.public_key(), &link, Network::Regtest).await).await.unwrap(), owner.mailbox.public_key());
 	assert_eq!(db.read(async |tx| tx.expiry_owner(key.public_key()).await).await.unwrap(),
 		Attribution::Owned { mailbox_pk: owner.mailbox.public_key(), spk: owner.script.clone() });

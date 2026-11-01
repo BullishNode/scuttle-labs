@@ -104,7 +104,7 @@ async fn undecided_expired_source_can_reopen_offline_and_start_its_exit() {
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
-	let db = server::database::Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let state = db.read(async |tx| tx.get_user_vtxo_by_id(source.id()).await).await.unwrap();
 	assert_eq!(state.spend_state, server::database::SpendState::Spendable);
 	assert!(!state.decided_for_fallback);

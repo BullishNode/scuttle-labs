@@ -186,7 +186,7 @@ async fn failed_swap_during_restart() {
 	drop(client);
 	drop(wallet);
 	// Original sender stays absent from here; no revocation or payment retry.
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT a.id FROM lightning_payment_attempt a WHERE a.payment_hash=$1", &[&hash.to_string()],
 	).await?)).await.unwrap();
 	let attempt: i64 = row.get("id");

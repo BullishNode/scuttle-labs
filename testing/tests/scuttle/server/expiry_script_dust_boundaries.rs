@@ -197,7 +197,7 @@ async fn boundaries(family: Family) {
 	assert!(!ordinary.is_empty() && ordinary.keys().all(|point| point.txid == root.txid && *point != root));
 	let board_fee = actual_fee(&ctx, &board).await;
 	assert_eq!(sat(100_000) + ordinary.values().copied().sum::<Amount>() + board_fee, sat(200_000));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let apps = (0..3).map(|index| Application::new(&ctx, family, index)).collect::<Vec<_>>();
 	let mut recipients = Vec::new();
 	for app in &apps { recipients.push(Box::pin(app.open(&ctx, &srv, true)).await); }

@@ -60,7 +60,7 @@ pub(super) async fn await_decision(ctx: &TestContext, srv: &captaind::Captaind, 
 	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let database = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let database = Db::connect(&srv.config().postgres).await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let exists = database.read(async |tx| Ok(tx.query_opt(
@@ -105,7 +105,7 @@ async fn unseen_paid_mailbox(recover_spent_first: bool) {
 	for _ in 0..2 {
 		sender.send_arkoor_payment(&address, sat(10_000)).await.unwrap();
 	}
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let rows = db.read(async |tx| tx.get_vtxos_by_policy_page(address.policy(), None, 3).await).await.unwrap();
 	assert_eq!(rows.len(), 2);
 	let ids = rows.iter().map(|row| row.vtxo_id).collect::<Vec<_>>();
@@ -588,7 +588,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		drop(owner);
 		(None, None)
 	} else { (Some(owner), Some(payment)) };
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let ids = leaves.iter().map(|coin| coin.id().to_string()).collect::<Vec<_>>();
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;

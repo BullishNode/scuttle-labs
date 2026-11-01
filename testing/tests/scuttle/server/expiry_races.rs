@@ -18,8 +18,8 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 	let mut ctx = TestContext::new_minimal("expiry/tree_write_races").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&cfg).await.unwrap();
+	let db = Db::connect(&cfg).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	db.write(async |t| t.upsert_vtxos([&coin]).await).await.unwrap();
@@ -105,8 +105,8 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 	let mut ctx = TestContext::new_minimal("expiry/pending_exchange_cancellation").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&cfg).await.unwrap();
+	let db = Db::connect(&cfg).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let old = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	let other = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
@@ -164,7 +164,7 @@ async fn expiry_cancelled_native_refresh_status_never_releases_preimage() {
 	let wallet = ctx.bark("wallet", &srv).funded(ark_testing::sat(500_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, ark_testing::sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let (part, hash, inputs) = db.read(async |t| {
 		let row = t.query_one("

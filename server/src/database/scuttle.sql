@@ -140,13 +140,6 @@ $$;
 CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo
 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION scuttle.require_customer_coin_owner();
 
-CREATE TABLE expiry_hold (
-	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),
-	reason TEXT NOT NULL,
-	first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 CREATE TABLE htlc_settlement_source (
 	settlement_id BIGINT NOT NULL REFERENCES public.htlc_settlement(id),
 	kind TEXT NOT NULL CHECK (kind IN ('attempt', 'receive', 'onchain', 'unknown')),

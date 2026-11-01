@@ -1,5 +1,5 @@
 use ark_testing::util::ToAltString;
-use bitcoin::{Network, Txid};
+use bitcoin::{Txid};
 use bitcoin::secp256k1::{rand, Keypair};
 use chrono::{DateTime, Local};
 use bitcoin::hashes::Hash;
@@ -22,8 +22,8 @@ async fn test_db(name: &str) -> (TestContext, Db) {
 	let mut ctx = TestContext::new_minimal(&format!("postgresd/tree/{}", name)).await;
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::super::register_vector_owners(&db).await;
 	(ctx, db)
 }

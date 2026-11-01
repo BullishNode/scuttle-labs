@@ -118,9 +118,6 @@ enum RpcCommand {
 	/// Observe an existing Lightning attempt on its recorded online node.
 	#[command()]
 	ReconcileLightningAttempt { attempt_id: i64 },
-	/// List unresolved expiry holds on the private operator listener.
-	#[command()]
-	ExpiryHolds,
 	/// Report server wallet status
 	#[command()]
 	Wallet,
@@ -404,7 +401,7 @@ async fn inner_main() -> anyhow::Result<()> {
 		}
 		Command::Drain { address } => {
 			info!("Running with config: {:#?}", cfg);
-			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
+			let db = server::database::Db::connect(&cfg.postgres).await?;
 			let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
 
 			let seed = server::wallet::read_mnemonic_from_datadir(&cfg.data_dir)?.to_seed("");
@@ -430,7 +427,7 @@ async fn inner_main() -> anyhow::Result<()> {
 			println!("{}", server::wallet::read_mnemonic_from_datadir(&cfg.data_dir)?);
 		}
 		Command::Data { cmd } => {
-			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
+			let db = server::database::Db::connect(&cfg.postgres).await?;
 			match cmd {
 				DataCommand::FixBoardExpiryPolicy => {
 					let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
@@ -453,7 +450,7 @@ async fn inner_main() -> anyhow::Result<()> {
 		}
 		Command::Integration { cmd } => {
 			info!("Running with config: {:#?}", cfg);
-			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
+			let db = server::database::Db::connect(&cfg.postgres).await?;
 			match cmd {
 				IntegrationCommand::Add {
 					integration_name,
@@ -612,7 +609,7 @@ async fn inner_main() -> anyhow::Result<()> {
 			}
 		},
 		Command::UndoRound { funding_txid, dangerous, force } => {
-			let db = server::database::Db::connect(&cfg.postgres, cfg.network).await?;
+			let db = server::database::Db::connect(&cfg.postgres).await?;
 			let round_id = ark::rounds::RoundId::new(funding_txid);
 
 			if !force {
@@ -700,19 +697,6 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 				"payment_hash": ark::lightning::PaymentHash::from_slice(&response.payment_hash)?.to_string(),
 				"status": response.status,
 			}))?;
-			println!();
-		},
-		RpcCommand::ExpiryHolds => {
-			let mut rpc = rpc::admin::ScuttleServiceClient::connect(endpoint)
-				.await.context("failed to connect to operator rpc")?;
-			let mut request = tonic::Request::new(protos::Empty {});
-			request.set_pver(rpc::pver::PROTOCOL_VERSION_SCUTTLE);
-			let response = rpc.list_expiry_holds(request).await?.into_inner();
-			let holds = response.holds.into_iter().map(|hold| Ok(serde_json::json!({
-				"vtxo_id": VtxoId::from_slice(&hold.vtxo_id)?.to_string(), "reason": hold.reason,
-				"first_seen": hold.first_seen, "last_seen": hold.last_seen,
-			}))).collect::<anyhow::Result<Vec<_>>>()?;
-			serde_json::to_writer_pretty(std::io::stdout(), &holds)?;
 			println!();
 		},
 		RpcCommand::Wallet => {

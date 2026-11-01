@@ -58,7 +58,7 @@ async fn expiry_transferred_refresh_replacement_survives_old_backing_settlement(
 	assert!(replacement.expiry_height() > old.expiry_height());
 	let funding = ctx.bitcoind().await_transaction(replacement.chain_anchor().txid).await;
 	replacement.validate(&funding).expect("the accepted replacement needs a genuine fully signed Core-backed path");
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let accepted = db.read(async |tx| Ok(tx.query_one("
 		SELECT EXISTS(
 			SELECT 1

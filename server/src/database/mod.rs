@@ -13,7 +13,6 @@ pub(crate) mod expiry_guard;
 pub mod expiry_inventory;
 pub mod expiry_chain;
 pub mod expiry_decision;
-pub mod expiry_hold;
 pub mod expiry_ownership;
 pub mod expiry_payout;
 pub(crate) mod expiry_lightning;
@@ -162,7 +161,6 @@ pub enum MailboxPayload {
 #[derive(Clone)]
 pub struct Db {
 	pool: Pool<ConnectionManager>,
-	network: bitcoin::Network,
 }
 
 impl Db {
@@ -220,17 +218,18 @@ impl Db {
 					AND table_name='expiry_chain_view' AND column_name='processed_hash' AND data_type='text') \
 				 AND to_regclass('public.expiry_sync_ack') IS NULL \
 				 AND to_regclass('scuttle.expiry_sync_ack') IS NULL \
+				 AND to_regclass('scuttle.expiry_hold') IS NULL \
 				 AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='customer_coin_owner' \
 				 AND tgrelid=to_regclass('public.vtxo') AND tgdeferrable AND tginitdeferred)", &[],
 			).await?.get(0);
 			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
 			let complete: bool = conn.query_one(
-				"SELECT COUNT(*)=14 FROM information_schema.tables WHERE table_schema='scuttle' \
+				"SELECT COUNT(*)=13 FROM information_schema.tables WHERE table_schema='scuttle' \
 				 AND table_type='BASE TABLE' AND table_name IN ( \
 				 'owner_key','coin_owner','expiry_entitlement','expiry_cancelled_participation', \
 				 'expiry_chain_view','expiry_allocation','expiry_allocation_input','expiry_allocation_coin', \
 				 'expiry_allocation_payout','expiry_split_request','expiry_terminal_claim', \
-				 'expiry_lightning_receive_claim','expiry_hold','htlc_settlement_source')", &[],
+				 'expiry_lightning_receive_claim','htlc_settlement_source')", &[],
 			).await?.get(0);
 			ensure!(complete, "incomplete Scuttle schema; use a fresh store");
 			let history: bool = conn.query_one(
@@ -320,16 +319,16 @@ impl Db {
 		Ok(())
 	}
 
-	pub async fn connect(config: &PostgresConfig, network: bitcoin::Network) -> anyhow::Result<Self> {
+	pub async fn connect(config: &PostgresConfig) -> anyhow::Result<Self> {
 		let pool = Self::pool_connect(&config.name, config).await?;
 
-		let db = Db { pool, network };
+		let db = Db { pool };
 		db.run_migrations().await?;
 
 		Ok(db)
 	}
 
-	pub async fn create(config: &PostgresConfig, network: bitcoin::Network) -> anyhow::Result<Self> {
+	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
 		info!("Checking if a database exists...");
 		let connect = Self::raw_connect(config).await;
 
@@ -347,7 +346,7 @@ impl Db {
 			conn.execute(&statement, &[]).await?;
 		}
 
-		Self::connect(config, network).await
+		Self::connect(config).await
 	}
 
 	/// Check out a raw pooled connection, below the [Db::read]/[Db::write]
@@ -412,7 +411,7 @@ impl Db {
 			.read_only(read_only)
 			.start().await
 			.context("unable to start db tx")?;
-		let tx = Tx { inner: &pgtx, network: self.network };
+		let tx = Tx { inner: &pgtx };
 		let ret = f(&tx).await;
 		if read_only {
 			// We want to commit read queries regardless of error because it's the
@@ -448,7 +447,6 @@ impl Db {
 /// A managed postgres DB transaction
 pub struct Tx<'t> {
 	inner: &'t tokio_postgres::Transaction<'t>,
-	network: bitcoin::Network,
 }
 
 impl<'t> std::ops::Deref for Tx<'t> {

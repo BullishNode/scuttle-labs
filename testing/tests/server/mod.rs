@@ -1139,7 +1139,7 @@ async fn arkoor_caps_inputs_before_loading_vtxos() {
 	}).collect::<Vec<_>>();
 
 	// with the vtxo table locked, any lookup of the inputs would hang
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mut conn = db.raw_conn().await.unwrap();
 	let tx = conn.transaction().await.unwrap();
 	tx.batch_execute("LOCK TABLE vtxo IN ACCESS EXCLUSIVE MODE").await.unwrap();
@@ -2768,7 +2768,7 @@ async fn undo_round() {
 	let funding_txid = finished.txid;
 	info!("Round finished with funding txid: {}", funding_txid);
 
-	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let round_id = ark::rounds::RoundId::new(funding_txid);
 	let tree = db.read(async |tx| tx.get_round(round_id).await).await.unwrap().unwrap().into_cached_tree().unwrap();
 	let outputs = tree.output_vtxos().collect::<Vec<_>>();
@@ -2904,7 +2904,7 @@ async fn scheduled_height_must_not_poison_round_loading() {
 		cfg.round_interval = Duration::from_secs(10_000_000);
 		cfg.fees.refresh.base_fee = Amount::ZERO;
 	}).create().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 
 	// No vtxo or signature is needed: with no inputs and outputs nothing is checked,
 	// and u32::MAX would be stored as -1 in the INTEGER column.
@@ -2941,7 +2941,7 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	let wallet = bark.client().await;
 	let (_, input_key) = wallet.pubkey_keypair(&input.user_pubkey()).await
 		.unwrap().expect("participant owns the input");
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 
 	let mut rpc = srv.get_public_rpc().await;
 	let mut admin = srv.get_round_rpc().await;

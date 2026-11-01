@@ -35,7 +35,7 @@ async fn register_vector_owners(db: &server::database::Db) {
 /// Standalone protocol actors authenticate their real key and destination.
 async fn test_owner_link(srv: &Captaind, key: &Keypair) -> OwnerLink {
 	let config = srv.config().postgres.clone();
-	let db = server::database::Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&config).await.unwrap();
 	let server = srv.mailbox_keypair();
 	register_test_owners(&db, &server, key, &[*key]).await;
 	OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), key, key).unwrap()
@@ -47,7 +47,7 @@ async fn signed_package(
 	srv: &Captaind, wallets: &[&Wallet], mut package: protos::ArkoorPackageCosignRequest,
 ) -> protos::ArkoorPackageCosignRequest {
 	let config = srv.config().postgres.clone();
-	let db = server::database::Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&config).await.unwrap();
 	let mut links = std::collections::BTreeMap::new();
 	for output in package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
 		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();

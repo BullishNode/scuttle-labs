@@ -10,7 +10,7 @@ use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
 use ark_testing::daemon::captaind::WalletAdminClient;
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
-use bitcoin::{Amount, BlockHash, Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, TxOutExt};
@@ -396,7 +396,7 @@ async fn partial_conflict_reorg() {
 	wallet.start_exit_vtxos([exiting.id()]).await;
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(exiting.expiry_height().to_u32() + 1 - height).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let coins = vec![exiting.id().to_string(), untouched.id().to_string()];
 	let (original_id, original) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {

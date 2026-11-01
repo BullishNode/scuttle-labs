@@ -184,7 +184,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	}
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().is_some(),
 		"both native attempts must still share one actual physical incoming root");
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_stored_grant_ancestry(&db, &grants).await;
 	// Grant closure is funded independently of the later customer refund.
 	let fee_address = srv.watchmand().wait_wallet_address().await;

@@ -246,7 +246,7 @@ async fn restored_finish() {
 		assert!(output.confirmations >= 6);
 	}
 	let observation_height = ctx.bitcoind().get_block_count().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let derived = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
 	assert_eq!(derived, binding);
 	let error = wallet.offboard_vtxos([source], destination.clone()).await.unwrap_err();

@@ -545,14 +545,14 @@ impl Server {
 				match t.source_settlement(payment_hash, *source).await? {
 					crate::database::ln::SourceSettlement::Funded => return badarg!("invoice has already been paid"),
 					crate::database::ln::SourceSettlement::Unknown => {
-						t.hold_unknown_settlement(*source).await?;
+						t.warn_unknown_settlement(*source);
 						unknown = true;
 					},
 					crate::database::ln::SourceSettlement::NotSettled | crate::database::ln::SourceSettlement::Disjoint => {},
 				}
 			}
-			// Commit the durable alarm/hold without releasing any funds, then
-			// return the refusal outside this transaction.
+			// Release no funds when settlement is unknown; return the
+			// refusal outside this transaction.
 			if unknown { return Ok(true); }
 			// Also refuse when the hash settled through any other source. That
 			// keeps such a source held instead of refunding it cooperatively.

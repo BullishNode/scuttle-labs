@@ -4,7 +4,7 @@
 async fn recovery_pending_customer_uses_immutable_mailbox_after_allocation_ordering() {
 	let ctx = TestContext::new("server/recovery_pending_customer_ordering").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let xpriv = dummy_xpriv(NetworkKind::Test);
 	let keys = (0_u32..6).map(|index| xpriv.derive_priv(&SECP, &[index.into()]).unwrap().to_keypair(&SECP))
 		.collect::<Vec<_>>();

@@ -49,10 +49,9 @@ impl Tx<'_> {
 		match self.try_prepare_expiry_coin(fact, funding, view).await {
 			Ok(coin) => Ok(coin),
 			Err(error) => {
-				// Handle this terminal inside its transaction. An aborted SQL
-				// transaction cannot persist this hold and still propagates failure.
+				// Database failures still propagate; an invalid terminal remains held.
 				if database_failure(&error) { return Err(error); }
-				self.record_expiry_hold(fact.state.vtxo_id, "terminal_ownership_invalid").await?;
+				self.observe_expiry_hold(fact.state.vtxo_id, "terminal_ownership_invalid");
 				warn!(vtxo_id = %fact.state.vtxo_id, error = %format!("{error:#}"), "Invalid terminal ownership remains held");
 				Ok(PreparedCoin::Hold)
 			},
@@ -75,7 +74,7 @@ impl Tx<'_> {
 						Some(VerifiedPayee { mailbox: mailbox_pk, script: spk })
 					},
 					Attribution::Unresolved => {
-						self.record_expiry_hold(ownership.id, "owner_binding_unresolved").await?;
+						self.observe_expiry_hold(ownership.id, "owner_binding_unresolved");
 						warn!(vtxo_id = %ownership.id, "Expiry owner binding is missing or inconsistent; holding principal");
 						return Ok(PreparedCoin::Hold);
 					},
@@ -84,9 +83,9 @@ impl Tx<'_> {
 			OwnershipDisposition::Operator => None,
 			OwnershipDisposition::Unresolved(reason) => {
 				if ownership.settlement_integrity_hold {
-					self.hold_settlement_integrity(ownership.id, reason).await?;
+					self.warn_settlement_integrity(ownership.id, reason);
 				} else {
-					self.record_expiry_hold(ownership.id, reason).await?;
+					self.observe_expiry_hold(ownership.id, reason);
 				}
 				debug!(vtxo_id = %ownership.id, reason, "Expiry settlement remains unresolved");
 				return Ok(if ownership.needs_chain_progress {
@@ -292,16 +291,19 @@ impl Watchman {
 	/// A failed signed-path preparation cannot stop unrelated outputs. This
 	/// catches only split preparation, never a financial allocation transaction.
 	async fn request_held_expiry_split(&self, view: ExpiryViewToken, root: &ServerVtxo, reason: &str) -> anyhow::Result<()> {
-		self.db.write(async |tx| tx.record_expiry_hold(root.id(), reason).await).await?;
+		slog!(ExpiryHoldObserved, vtxo_id: root.id(), reason: reason.to_owned());
 		self.db.write(async |tx| {
 			match tx.request_expiry_split(view, root).await {
-				Ok(true) => tx.record_expiry_hold(root.id(), "output_requires_split").await,
+				Ok(true) => {
+					tx.observe_expiry_hold(root.id(), "output_requires_split");
+					Ok(())
+				},
 				Ok(false) => Ok(()),
 				Err(error) => {
 					// Database failures propagate; only a proof/preparation refusal
 					// can leave this output held while the cursor continues.
 					if database_failure(&error) { return Err(error); }
-					tx.record_expiry_hold(root.id(), reason).await?;
+					tx.observe_expiry_hold(root.id(), reason);
 					warn!(vtxo_id = %root.id(), error = %format!("{error:#}"), "Signed expiry split remains unavailable; other outputs continue");
 					Ok(())
 				},

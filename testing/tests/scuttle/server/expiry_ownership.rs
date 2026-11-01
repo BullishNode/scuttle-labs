@@ -4,6 +4,7 @@ use ark::{ProtocolEncoding, VtxoPolicy};
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::RpcApi;
 use server_rpc::protos;
+use server_log::ExpiryHoldObserved;
 
 use ark_testing::{btc, sat, TestContext};
 use std::time::Duration;
@@ -17,7 +18,7 @@ async fn expiry_abandoned_registered_send_needs_no_client_refund() {
 }
 
 #[tokio::test]
-async fn held_coin_is_listed_and_cleared_on_decision() {
+async fn held_coin_is_alarmed_before_decision() {
 	abandoned_registered_send(true, false).await;
 }
 
@@ -26,9 +27,9 @@ async fn expiry_completed_watchman_rejects_new_send_while_captain_lags() {
 	abandoned_registered_send(false, true).await;
 }
 
-async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
+async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 	let name = if lagged_captain { "server/expiry_completed_watchman_lagged_captain" }
-		else if check_holds { "server/held_coin_is_listed_and_cleared_on_decision" }
+		else if check_alarms { "server/held_coin_is_alarmed_before_decision" }
 		else { "server/expiry_abandoned_registered_send" };
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -44,6 +45,7 @@ async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
 		builder.watchmand_cfg(|cfg| cfg.watchman.sweep_interval = std::time::Duration::from_secs(3600))
 			.create().await
 	};
+	let mut alarms = check_alarms.then(|| srv.watchmand().subscribe_log::<ExpiryHoldObserved>());
 	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let wallet = sender.client().await;
@@ -65,7 +67,7 @@ async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
 	let response = ark::arkoor::package::ArkoorPackageCosignResponse::try_from(response).unwrap();
 	let htlcs = builder.user_cosign(&[key], response).unwrap().build_signed_vtxos();
 	wallet.register_vtxo_transactions_with_server(&htlcs).await.unwrap();
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let htlc = &htlcs[0];
 	assert!(input.expiry_height() < deadline);
 	let cut = async || {
@@ -176,18 +178,16 @@ async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
 		fact, &funding, expired, Some(expired),
 	).await).await.unwrap();
 	assert!(matches!(pending.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
-	if check_holds {
+	if check_alarms {
 		tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
-				let holds = db.read(async |tx| tx.list_expiry_holds().await).await.unwrap();
-				if let Some(hold) = holds.iter().find(|hold| hold.vtxo_id == htlc.id()) {
-					assert_eq!(hold.reason, "Lightning settlement pending");
-					assert!(hold.last_seen >= hold.first_seen);
+				let alarm = alarms.as_mut().unwrap().recv().await.expect("expiry alarm stream closed");
+				if alarm.vtxo_id == htlc.id() {
+					assert_eq!(alarm.reason, "Lightning settlement pending");
 					break;
 				}
-				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
-		}).await.expect("the genuine unresolved source must have a durable hold before its deadline");
+		}).await.expect("the genuine unresolved source must be alarmed before its deadline");
 	}
 	let tip = ctx.generate_blocks(deadline.to_u32() + 1 - expired.to_u32()).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
@@ -208,7 +208,7 @@ async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
 	// background allocation may already have recorded the spend fence.
 	let upstream = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, htlc.id()).await).await.unwrap().unwrap();
 	assert_eq!(upstream.htlc.resolution(), None);
-	if check_holds {
+	if check_alarms {
 		tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
 				let decided = db.read(async |tx| Ok(tx.query_one("SELECT EXISTS(SELECT 1 FROM expiry_entitlement e \
@@ -216,13 +216,11 @@ async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
 					WHERE e.vtxo_id=$1 AND c.active AND a.status<>'conflicted')", &[&htlc.id().to_string()]).await?
 					.get::<_, bool>(0))).await.unwrap();
 				if decided {
-					assert!(!db.read(async |tx| tx.list_expiry_holds().await).await.unwrap()
-						.iter().any(|hold| hold.vtxo_id == htlc.id()));
 					break;
 				}
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
-		}).await.expect("the ordinary matured-source decision must clear its hold atomically");
+		}).await.expect("the ordinary matured source must acquire an actual allocation");
 	}
 }
 
@@ -236,7 +234,7 @@ async fn expiry_cancelled_unclaimed_output_keeps_owner_after_participation_remov
 	let wallet = ctx.bark("wallet", &srv).funded(sat(500_000)).create().await;
 	let originals = wallet.board_and_confirm_and_register(&ctx, sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let (participation, hash, leaf) = db.read(async |t| {
 		let row = t.query_one("
 			SELECT id, unlock_hash, forfeited_at IS NOT NULL AS forfeited

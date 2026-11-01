@@ -37,7 +37,7 @@ async fn expiry_actual_partial_exit_conflict_regroups_after_restart() {
 	wallet.start_exit_vtxos([exiting.id()]).await;
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(exiting.expiry_height().to_u32() + 1 - height).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (original_id, original) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,a.sweep_tx \

@@ -433,7 +433,6 @@ impl Watchman {
 			let mut cursor = self.expiry_cursor.lock().await;
 			*cursor = self.expiry_readiness_pass(view, *cursor).await?;
 		}
-		crate::telemetry::set_expiry_hold_count(self.db.read(async |t| t.expiry_hold_count().await).await?);
 		// Expired customer backing never reaches upstream's drain-only builder.
 		self.process_expiry_payouts(view).await?;
 		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;

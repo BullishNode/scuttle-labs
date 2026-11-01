@@ -66,7 +66,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 	let controller = control.client().await;
 	controller.sync_pending_rounds().await.unwrap();
 	drop(controller);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let forfeit_rows = db.read(async |tx| Ok(tx.query("SELECT amount FROM vtxo \
 		WHERE anchor_point=$1 AND spend_state='round-forfeit' ORDER BY vtxo_id", &[&original.chain_anchor().to_string()]).await?)).await.unwrap();
 	assert_eq!(forfeit_rows.len(), 2, "the native refresh must really accept both change-input forfeits");

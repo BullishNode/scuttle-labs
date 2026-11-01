@@ -82,7 +82,7 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 		}),
 	};
 	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres).await.unwrap();
 	let mut rpc = srv.get_public_rpc().await;
 	assert!(db.read(async |tx| Ok(tx.query_opt("SELECT user_pubkey FROM owner_key WHERE user_pubkey=$1",
 		&[&recipient_key.to_string()]).await?)).await.unwrap().is_none());

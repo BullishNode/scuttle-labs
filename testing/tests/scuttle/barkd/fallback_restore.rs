@@ -97,7 +97,7 @@ async fn fallback_payout_history_and_seed_restore() {
 		"the refused send must release its temporary input lock");
 	assert_eq!(barkd.get_vtxo_encoded(&coin.vtxo.id.to_string()).await.encoded, original);
 	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres).await.unwrap();
 	assert_eq!(db.read(async |tx| Ok(tx.query_one(
 		"SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1", &[&hash.to_string()],
 	).await?.get::<_, i64>(0))).await.unwrap(), 0, "a fenced coin must not dispatch a payment");

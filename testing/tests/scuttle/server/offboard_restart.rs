@@ -103,7 +103,7 @@ async fn interrupted_offboard() {
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&sponsor, sponsor_vout as u32, Some(true))
 		.unwrap().unwrap().confirmations >= 2);
 	let observation_height = ctx.bitcoind().get_block_count().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mailbox = wallet.mailbox_identifier().as_pubkey();
 	let derived = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
 	assert_eq!(derived, fallback);

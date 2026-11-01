@@ -138,7 +138,7 @@ async fn cold_backup() {
 	original.watchmand().stop().await.unwrap();
 	original.stop().await.unwrap();
 	// Capture the final committed changesets after both product processes stop.
-	let db = Db::connect(&server_config.postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&server_config.postgres).await.unwrap();
 	assert_eq!(db.read(async |tx| tx.expiry_owner(owner_key).await).await.unwrap(),
 		server::database::expiry_attribution::Attribution::Owned { mailbox_pk: mailbox, spk: registration.clone() });
 	let ownership_before = db.read(async |tx| {
@@ -185,7 +185,7 @@ async fn cold_backup() {
 	let config = helper.into_config(&server_config.postgres.name);
 	assert_eq!(config.name, server_config.postgres.name);
 	assert_ne!(config.port, server_config.postgres.port);
-	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&config).await.unwrap();
 	let restored_changesets = db.read(async |tx| Ok(tx.query("SELECT id,content FROM wallet_changeset WHERE kind='watchman' ORDER BY id", &[])
 		.await?.into_iter().map(|row| (row.get::<_, i64>(0), row.get::<_, Vec<u8>>(1))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(restored_changesets, changesets, "physical restore must retain the actual watch-wallet journal");

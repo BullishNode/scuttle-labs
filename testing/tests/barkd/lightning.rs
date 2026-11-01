@@ -15,7 +15,7 @@ use ark::mailbox::MailboxIdentifier;
 use ark::vtxo::Full;
 use bark_rest_client::apis::{lightning_api, Error};
 use bark_rest_client::models::{LightningInvoiceForAddressRequest, LightningPayRequest};
-use bitcoin::{Amount, Network};
+use bitcoin::{Amount};
 use server::database::Db;
 use server::database::expiry_attribution::Attribution;
 
@@ -139,7 +139,7 @@ async fn pay_with_retry_for() {
 
 	let max = srv.config().cln_xpay_max_retry_for.as_secs();
 	let config = barkd.client_config();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to server db");
+	let db = Db::connect(&srv.config().postgres).await.expect("connect to server db");
 
 	// Above the maximum is capped to it.
 	let pay_invoice = lightning.external.invoice(Some(btc(0.1)), "pay", "pay").await;

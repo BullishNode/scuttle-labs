@@ -97,7 +97,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	assert!(height < ready.expiry_height().to_u32());
 	let expired = ctx.generate_blocks(ready.expiry_height().to_u32() + 1 - height).await;

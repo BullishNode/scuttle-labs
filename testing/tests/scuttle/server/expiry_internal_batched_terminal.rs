@@ -112,7 +112,7 @@ async fn batched_terminal(reorg: bool) {
 	let grant_ids = grants.iter().map(|grant|grant.id().to_string()).collect::<BTreeSet<_>>();
 	let originals = sources.iter().map(|source|source.id().to_string()).collect::<Vec<_>>();
 	let paid_ids = originals[..2].to_vec();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let scope = db.read(async |t| {
 		let rows = t.query("SELECT a.id,a.lightning_htlc_subscription_id AS subscription_id FROM lightning_payment_attempt a \
 			WHERE a.payment_hash=$1 AND a.lightning_htlc_subscription_id IS NOT NULL",&[&hash.to_string()]).await?;

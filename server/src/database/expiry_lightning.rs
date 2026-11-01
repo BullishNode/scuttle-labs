@@ -108,7 +108,7 @@ impl Tx<'_> {
 
 	/// Keep a complete existing source scope, without inferring from hash siblings.
 	/// Called under source/settlement locks in a write transaction so unknown
-	/// provenance commits its alarmed hold even though the status stays Pending.
+	/// provenance emits an alarm even though the status stays Pending.
 	pub(crate) async fn lightning_payment_outcome(
 		&self, hash: PaymentHash, source_ids: &[VtxoId],
 	) -> anyhow::Result<Option<LightningPaymentOutcome>> {
@@ -145,7 +145,7 @@ impl Tx<'_> {
 				SourceSettlement::Funded => any_funded = true,
 				SourceSettlement::NotSettled | SourceSettlement::Disjoint => all_funded = false,
 				SourceSettlement::Unknown => {
-					self.hold_unknown_settlement(*source).await?;
+					self.warn_unknown_settlement(*source);
 					unknown = true;
 				},
 			}

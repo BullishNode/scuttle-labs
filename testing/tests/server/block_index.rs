@@ -97,8 +97,8 @@ async fn test_block_index_basic_sync() {
 	// Initializes the postgres database and connects to it
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	// Initializes a bitcoind and creates a client
 	ctx.init_central_bitcoind().await;
@@ -246,8 +246,8 @@ async fn test_block_index_reorg_retry() {
 	ctx.init_central_postgres().await;
 	let mut postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 	postgres_cfg.max_connections = 1;
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
 	ctx.init_central_bitcoind().await;
 	let bitcoind = ctx.bitcoind().sync_client();
@@ -343,8 +343,8 @@ async fn block_index_rollback_publication_order(publication_wins: bool) {
 	// One holder, one blocked contender, one independent observer. The
 	// separately retained pool1/cache-retry case has a different purpose.
 	postgres_cfg.max_connections = 3;
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&postgres_cfg).await.unwrap();
+	let db = Db::connect(&postgres_cfg).await.unwrap();
 	ctx.init_central_bitcoind().await;
 	let core = ctx.bitcoind().sync_client();
 	let birthday = core.deep_tip().unwrap();

@@ -277,7 +277,7 @@ async fn pay_hold_refused() {
 			let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;
 			srv.wait_for_sync_height(expired).await;
 			srv.watchmand().wait_for_sync_height(expired).await;
-			let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+			let db = Db::connect(&srv.config().postgres).await.unwrap();
 			let (parent, child) = tokio::time::timeout(Duration::from_secs(60), async {
 				// Confirm only real signed prefixes when the ordinary watchman publishes them,
 				// then honor its configured grace before expecting the next signed step.
@@ -652,7 +652,7 @@ async fn pay_with_retry_for() {
 	// The server keeps the time on the attempt, which the xpay monitor waits
 	// out before reconciling it. 0 makes a single attempt, and a time above
 	// the maximum is capped to it.
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to server db");
+	let db = Db::connect(&srv.config().postgres).await.expect("connect to server db");
 	let one_sec = Duration::from_secs(1);
 	for (retry_for, expected) in [
 		(Duration::ZERO, Duration::ZERO),

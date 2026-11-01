@@ -284,7 +284,6 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 						notifications.push((checkpoint, preimage.compute_payment_hash()));
 					}
 					t.register_vtxo_spend(id, height, txid).await?;
-					t.clear_completed_split_hold(id, txid).await?;
 					if let Some(resolution) = resolution {
 						htlc_vtxo::set_htlc_vtxo_chain_resolution(t, id, resolution, height).await?;
 					}

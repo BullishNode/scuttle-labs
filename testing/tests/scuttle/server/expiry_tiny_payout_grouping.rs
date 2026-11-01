@@ -8,7 +8,7 @@ use ark::{ProtocolEncoding, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
 use bark::movement::Movement;
 use bark::vtxo::VtxoState;
-use bitcoin::{Amount, Network, OutPoint, Transaction, Txid};
+use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockDelta, BlockRef, TxOutExt};
@@ -72,7 +72,7 @@ async fn tiny_group() {
 	let recipient_mailbox = recipient.mailbox_identifier();
 	assert_ne!(sender_binding, recipient_binding);
 	assert!(recipient_binding.minimal_non_dust() <= sat(500));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	for (mailbox, binding) in [(sender_mailbox, &sender_binding), (recipient_mailbox, &recipient_binding)] {
 		assert_eq!(*binding, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 	}

@@ -8,10 +8,11 @@ use ark_testing::{btc, sat, TestContext};
 use ark_testing::context::LightningPaymentSetup;
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::plugins::hold;
 use server::database::Db;
+use server_log::{XpayRpcCalled, XpayRpcReturned};
 use server_rpc::protos;
 
 /// Grant delivery must leave every signed ancestor durable on the
@@ -169,6 +170,8 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		Some((native_tip, server_tip))
 	} else { None };
 	let dispatched_invoice = invoice.clone();
+	let mut xpay_called = no_channel.then(|| srv.subscribe_log::<XpayRpcCalled>());
+	let mut xpay_returned = no_channel.then(|| srv.subscribe_log::<XpayRpcReturned>());
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![id.to_bytes().to_vec()],
 		mailbox_id: None, retry_for_secs: Some(5),
@@ -177,14 +180,20 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		lightning.external.wait_for_hold_invoice_accepted(hash).await;
 		receiver.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
 	}
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
-	let attempt = tokio::time::timeout(Duration::from_secs(30), async {
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let (attempt, native_call) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id FROM lightning_payment_attempt a \
 				JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
 				WHERE a.payment_hash=$1 AND l.vtxo_id=$2 AND a.status='failed'",
 				&[&hash.to_string(), &id.to_string()]).await?)).await.unwrap();
-			if let Some(row) = row { break row.get::<_, i64>("id"); }
+			if let Some(row) = row {
+				let call = if no_channel {
+					Some((xpay_called.as_mut().unwrap().recv().await.expect("xpay call log missing"),
+						xpay_returned.as_mut().unwrap().recv().await.expect("xpay reply log missing")))
+				} else { None };
+				break (row.get::<_, i64>("id"), call);
+			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("actual CLN dispatch never reached upstream Failed");
@@ -200,6 +209,7 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		assert!(native.is_empty(), "the no-channel case must exercise a genuine zero-part reply");
 		let row = db.read(async |t| Ok(t.query_one("SELECT x.id,x.lightning_node_id,x.label,x.payment_hash, \
 			x.payment_amount_msat,x.max_routing_fee_msat,x.status::TEXT,x.error_code,a.error, \
+			x.signed_invoice,x.dispatch_count,x.htlc_expiry,a.retry_for_secs, \
 			a.lightning_node_id AS attempt_node,n.pubkey FROM cln_xpay x \
 			JOIN lightning_payment_attempt a ON a.id=$1 JOIN lightning_node n ON n.id=x.lightning_node_id \
 			WHERE x.label=$2", &[&attempt, &attempt.to_string()]).await?)).await.unwrap();
@@ -209,33 +219,27 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		assert_eq!(row.get::<_, &str>("payment_hash"), hash.to_string());
 		assert_eq!(row.get::<_, i64>("payment_amount_msat"), 90_000_000);
 		assert_eq!(row.get::<_, i64>("lightning_node_id"), row.get::<_, i64>("attempt_node"));
-		let receipt: serde_json::Value = serde_json::from_str(row.get::<_, &str>("error")).unwrap();
-		assert_eq!(receipt["native_completion"], "cln-26.06.6-slow-xpay-noroute-v1");
-		assert_eq!(receipt["code"], 205);
-		assert_eq!(receipt["attempt_id"], attempt.to_string());
-		assert_eq!(receipt["payment_hash"], hash.to_string());
-		assert_eq!(receipt["lightning_node_id"], row.get::<_, i64>("lightning_node_id"));
-		assert_eq!(receipt["request"]["invstring"], dispatched_invoice);
-		assert_eq!(receipt["request"]["label"], attempt.to_string());
-		assert_eq!(receipt["request"]["maxfee_msat"], row.get::<_, Option<i64>>("max_routing_fee_msat").unwrap());
-		assert_eq!(receipt["request"]["retry_for"], 5);
-		assert_eq!(receipt["slow_mode"]["config"], "xpay-slow-mode");
-		assert_eq!(receipt["slow_mode"]["value_bool"], true);
-		assert_eq!(receipt["slow_mode"]["dynamic"], true);
-		assert_eq!(receipt["slow_mode"]["transient"], false);
-		assert!(receipt["native_reply"].as_str().unwrap().starts_with(
-			"Error calling method Xpay: RpcError { code: Some(205), message: "));
+		let (called, returned) = native_call.unwrap();
+		assert_eq!(called.payment_hash, hash);
+		assert_eq!(returned.payment_hash, hash);
+		assert_eq!(called.invoice, dispatched_invoice);
+		assert_eq!(called.payment_amount, sat(90_000));
+		assert_eq!(called.max_routing_fee.to_msat(),
+			u64::try_from(row.get::<_, Option<i64>>("max_routing_fee_msat").unwrap()).unwrap());
+		assert_eq!(row.get::<_, Option<&str>>("signed_invoice"), Some(dispatched_invoice.as_str()));
+		assert_eq!(row.get::<_, Option<i64>>("dispatch_count"), Some(1));
+		assert_eq!(row.get::<_, Option<i32>>("retry_for_secs"), Some(5));
+		let native_error = returned.error.as_deref().expect("NoRoute must return a native error");
+		assert_eq!(row.get::<_, &str>("error"), native_error);
+		assert!(native_error.contains("Error calling method Xpay: RpcError { code: Some(205), message: "));
 		let info = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
 		assert_eq!(info.version, "v26.06.6");
-		assert_eq!(receipt["version"], info.version);
-		assert_eq!(receipt["network"], info.network);
-		let node = bitcoin::secp256k1::PublicKey::from_slice(&info.id).unwrap();
-		assert_eq!(receipt["node_pubkey"], node.to_string());
+		assert_eq!(info.network, srv.config().network.to_string());
 		assert_eq!(row.get::<_, Vec<u8>>("pubkey"), info.id);
 		if let Some((native_tip, server_tip)) = lagged_tip {
 			assert_eq!(info.blockheight, native_tip);
-			let maxdelay = receipt["request"]["maxdelay"].as_u64().unwrap();
-			let recorded_deadline = receipt["original_htlc_expiry"].as_u64().unwrap();
+			let maxdelay = u64::from(called.max_delay);
+			let recorded_deadline = u64::try_from(row.get::<_, Option<i32>>("htlc_expiry").unwrap()).unwrap();
 			assert!(u64::from(server_tip.to_u32()) + maxdelay <= recorded_deadline);
 			assert!(u64::from(native_tip) + maxdelay < recorded_deadline,
 				"a genuinely lagging native tip must not enlarge the relative delay");
@@ -352,7 +356,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
 	drop(rpc); // No second prepare, cooperative revoke, claim or wallet return.
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (attempt, subscription) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,a.lightning_htlc_subscription_id AS subscription_id FROM lightning_payment_attempt a \
@@ -531,7 +535,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 	assert_eq!(grants.len(), if expose_small_grant { 3 } else if large_cover { 1 } else { 2 },
 		"admission must retain the standard existing cover, including the normal two-grant control");
 	assert_eq!(grants.iter().map(|g| g.amount()).sum::<bitcoin::Amount>(), sat(invoice_amount));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_stored_grant_ancestry(&db, &grants).await;
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	if expose_small_grant {
@@ -870,7 +874,7 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 	}
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().is_some(),
 		"both native attempts must still share one actual physical incoming root");
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_stored_grant_ancestry(&db, &grants).await;
 	drop(sender);
 	drop(recipient);
@@ -1072,7 +1076,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			assert!(admission_tip < earlier.expiry_height());
 			assert!(earlier.expiry_height() < source.expiry_height());
 			assert!(deadline < source.expiry_height());
-			let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+			let db = Db::connect(&srv.config().postgres).await.unwrap();
 			for (wallet, coin, owner) in [(&sender, &source, mailbox), (&customer, &earlier, earlier_mailbox)] {
 				let funding = ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
 				coin.validate(&funding).unwrap();

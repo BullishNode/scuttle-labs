@@ -99,7 +99,7 @@ async fn interrupted_forwarding() {
 	assert!(gate.accepted.lock().unwrap().is_empty(), "no mailbox message may reach upstream while blocked");
 	assert!(!delivery.vtxos.is_empty());
 	assert_eq!(delivery.vtxos.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), expected);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	for coin in &delivery.vtxos {
 		assert_eq!(coin.policy(), address.policy());
 		provider.validate_vtxo(coin).await.unwrap();

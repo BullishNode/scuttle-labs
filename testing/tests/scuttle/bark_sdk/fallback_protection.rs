@@ -106,7 +106,7 @@ async fn fallback_unfunded_decision_keeps_exit_material_until_actual_chain_payme
 	assert!(initial_exit.is_cancelable());
 	let exit_txids = original.transactions().map(|step| step.tx.compute_txid()).collect::<std::collections::BTreeSet<_>>();
 	let registration = wallet.fallback_script();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
@@ -293,7 +293,7 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			if db.read(async |tx| Ok(tx.query_opt("SELECT id FROM expiry_entitlement WHERE vtxo_id=$1",

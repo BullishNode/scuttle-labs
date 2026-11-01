@@ -48,8 +48,8 @@ ordinary spending, refresh or emergency exit. Existing Lightning and round
 restrictions still apply. A committed fallback claim is already fenced
 off-chain and must wait for its canonical payout or terminal forfeiture.
 
-- Run `captaind rpc expiry-holds` to list held VTXOs and the reason for each.
-- Monitor the `expiry_holds` gauge.
+- Monitor warning and error logs for held VTXO IDs and unresolved reasons.
+  Warnings may repeat while a reason remains unresolved.
 - A Lightning node that is not online while it has open payments or receives
   logs an error on every node check. Those payments stay open until the node
   is back.
