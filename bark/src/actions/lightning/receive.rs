@@ -883,7 +883,7 @@ async fn deliver_lightning_receive(
 		MovementStatus::Successful,
 		MovementUpdate::new()
 			.effective_balance(SignedAmount::ZERO)
-			.sent_to([MovementDestination::ark(destination.clone(), delivered)]),
+			.replace_sent_on([MovementDestination::ark(destination.clone(), delivered)]),
 	).await.context("failed to finish lightning receive movement").retry()?;
 
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
