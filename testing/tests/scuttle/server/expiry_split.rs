@@ -37,16 +37,23 @@ async fn payout(db: &Db, id: ark::VtxoId) -> Transaction {
 /// its SQL checks; both daemon progression and subsequent payouts are automatic.
 #[tokio::test]
 async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
-	Box::pin(mixed_split(false)).await;
+	Box::pin(mixed_split(false, false)).await;
 }
 
 #[tokio::test]
 async fn mempool_pinned_root_is_fee_bumped() {
-	Box::pin(mixed_split(true)).await;
+	Box::pin(mixed_split(true, false)).await;
 }
 
-async fn mixed_split(pin: bool) {
-	let ctx = TestContext::new(if pin { "server/mempool_pinned_root_is_fee_bumped" }
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn split_frontier_survives_crash_before_successor_commit() {
+	Box::pin(mixed_split(false, true)).await;
+}
+
+async fn mixed_split(pin: bool, crash_successor: bool) {
+	let ctx = TestContext::new(if crash_successor { "server/split_frontier_successor_commit_crash" }
+		else if pin { "server/mempool_pinned_root_is_fee_bumped" }
 		else { "server/expiry_requested_mixed_split" }).await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand()
@@ -157,7 +164,13 @@ async fn mixed_split(pin: bool) {
 	// period to pass. Waiting in wall-clock time cannot advance this policy.
 	ctx.generate_blocks(1 + srv.watchmand().config().watchman.progress_grace_period.to_u32()).await;
 	ctx.bitcoind().await_transaction(checkpoint.compute_txid()).await;
-	let progressed = ctx.generate_blocks(1).await;
+	let progressed = {
+		#[cfg(target_os = "linux")]
+		if crash_successor { crash_during_successor_registration(&ctx, &srv, &db, &checkpoint).await }
+		else { ctx.generate_blocks(1).await }
+		#[cfg(not(target_os = "linux"))]
+		{ assert!(!crash_successor); ctx.generate_blocks(1).await }
+	};
 	srv.wait_for_sync_height(progressed).await;
 	srv.watchmand().wait_for_sync_height(progressed).await;
 	assert!(!db.read(async |t| t.list_expiry_holds().await).await.unwrap().iter()
@@ -207,6 +220,119 @@ async fn mixed_split(pin: bool) {
 	ctx.generate_blocks(6).await;
 	let output_index = second.output.iter().position(|o| o.script_pubkey == destination).unwrap() as u32;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&second.compute_txid(), output_index, Some(true)).unwrap().unwrap().confirmations >= 6);
+}
+
+
+/// Crash only the owned watchmand while a real nonfunding successor's first
+/// frontier write is blocked. No business row or timestamp is manufactured.
+#[cfg(target_os = "linux")]
+async fn crash_during_successor_registration(
+	ctx: &TestContext,
+	srv: &ark_testing::Captaind,
+	db: &Db,
+	checkpoint: &Transaction,
+) -> BlockHeight {
+	const CLASS: i32 = 0x45583343;
+	const OBJECT: i32 = 1;
+	let txid = checkpoint.compute_txid();
+	assert!(ctx.bitcoind().sync_client().get_mempool_entry(&txid).is_ok(),
+		"the original signed checkpoint must still await its first confirmation");
+	assert_eq!(checkpoint.input.len(), 1);
+	let parent = ark::VtxoId::from(checkpoint.input[0].previous_output);
+	let target = db.read(async |tx| Ok(tx.query_one("SELECT v.vtxo_id,v.amount,t.signed_tx,t.is_funding \
+		FROM vtxo v JOIN virtual_transaction t ON t.txid=v.vtxo_txid \
+		WHERE v.vtxo_txid=$1 AND v.frontier_at IS NULL AND v.onchain_spent_txid IS NULL \
+		ORDER BY v.vtxo_id LIMIT 1", &[&txid.to_string()]).await?)).await.unwrap();
+	assert!(!target.get::<_, bool>("is_funding"));
+	assert_eq!(deserialize::<Transaction>(target.get("signed_tx")).unwrap(), *checkpoint);
+	let id = target.get::<_, &str>("vtxo_id").parse::<ark::VtxoId>().unwrap();
+	assert_eq!(id.to_point().txid, txid);
+	assert_eq!(target.get::<_, i64>("amount") as u64, checkpoint.output[id.to_point().vout as usize].value.to_sat());
+	let original_parent = db.read(async |tx| Ok(tx.query_one("SELECT frontier_at IS NOT NULL AS tracked, \
+		onchain_spent_txid FROM vtxo WHERE vtxo_id=$1", &[&parent.to_string()]).await?)).await.unwrap();
+	assert!(original_parent.get::<_, bool>("tracked"));
+	assert!(original_parent.get::<_, Option<String>>("onchain_spent_txid").is_none());
+	db.write(async |tx| {
+		tx.batch_execute(&format!("CREATE FUNCTION ex3_hold_successor_frontier() RETURNS trigger AS $$
+			BEGIN
+			  IF NEW.vtxo_id='{id}' AND OLD.frontier_at IS NULL AND NEW.frontier_at IS NOT NULL THEN
+			    PERFORM pg_advisory_xact_lock({CLASS},{OBJECT});
+			  END IF;
+			  RETURN NEW;
+			END; $$ LANGUAGE plpgsql;
+			CREATE TRIGGER ex3_hold_successor_frontier BEFORE UPDATE OF frontier_at ON vtxo
+			FOR EACH ROW EXECUTE FUNCTION ex3_hold_successor_frontier();")).await?;
+		Ok(())
+	}).await.unwrap();
+	let (old_child, writer, height) = db.write(async |tx| {
+		tx.query_one("SELECT pg_advisory_xact_lock($1,$2)", &[&CLASS,&OBJECT]).await?;
+		let blocker = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get::<_, i32>(0);
+		let height = ctx.generate_blocks(1).await;
+		let writer = tokio::time::timeout(Duration::from_secs(15), async {
+			loop {
+				tx.query_one("SELECT pg_stat_clear_snapshot()", &[]).await?;
+				let rows = tx.query("SELECT DISTINCT a.pid,a.backend_start FROM pg_stat_activity a JOIN pg_locks l ON l.pid=a.pid \
+					WHERE a.datname=current_database() AND a.query LIKE '%SET frontier_at = NOW(), updated_at = NOW()%' \
+					AND NOT l.granted AND l.locktype='advisory' AND l.classid::BIGINT=$1 AND l.objid::BIGINT=$2 \
+					AND l.objsubid=2 AND $3=ANY(pg_blocking_pids(a.pid))",
+					&[&i64::from(CLASS),&i64::from(OBJECT),&blocker]).await?;
+				assert!(rows.len() <= 1);
+				if let Some(row) = rows.first() {
+					break Ok::<_, anyhow::Error>((row.get::<_, i32>(0),row.get::<_, chrono::DateTime<chrono::Utc>>(1)));
+				}
+				tokio::time::sleep(Duration::from_millis(20)).await;
+			}
+		}).await.expect("the actual successor registration did not reach its PG latch")?;
+		let paused = srv.watchmand().pause_native().await?;
+		let old_child = paused.identity().clone();
+		let killed = srv.watchmand().crash_stop().await;
+		drop(paused);
+		killed?;
+		Ok((old_child, writer, height))
+	}).await.unwrap();
+	// Release the test's advisory lock only after the client was killed/reaped.
+	// The interrupted PG transaction must then abort on its closed connection.
+	tokio::time::timeout(Duration::from_secs(15), async {
+		loop {
+			let alive = db.read(async |tx| Ok(tx.query_opt("SELECT 1 FROM pg_stat_activity \
+				WHERE pid=$1 AND backend_start=$2", &[&writer.0,&writer.1]).await?.is_some())).await.unwrap();
+			if !alive { break; }
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+	}).await.expect("the exact interrupted backend must release its transaction before restart");
+	let cut = db.read(async |tx| Ok(tx.query_one("SELECT p.onchain_spent_txid,p.onchain_spent_height, \
+		c.frontier_at IS NOT NULL AS child_registered FROM vtxo p,vtxo c \
+		WHERE p.vtxo_id=$1 AND c.vtxo_id=$2", &[&parent.to_string(),&id.to_string()]).await?)).await.unwrap();
+	let parent_spent = cut.get::<_, Option<String>>("onchain_spent_txid");
+	let parent_height = cut.get::<_, Option<i32>>("onchain_spent_height");
+	let registered = cut.get::<_, bool>("child_registered");
+	let hash = ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap();
+	assert!(ctx.bitcoind().sync_client().get_block(&hash).unwrap().txdata.contains(checkpoint));
+	tokio::fs::write(ctx.datadir.join("frontier-cold-cut.json"), serde_json::to_vec_pretty(&serde_json::json!({
+		"parent":parent.to_string(),"successor":id.to_string(),"checkpoint":txid.to_string(),
+		"height":height.to_u32(),"hash":hash.to_string(),"parent_spent_txid":parent_spent,
+		"parent_spent_height":parent_height,"child_registered":registered,
+		"blocked_pg_backend":writer,"killed_watchmand":old_child,
+	})).unwrap()).await.unwrap();
+	assert!(parent_spent.is_none() && parent_height.is_none(), "uncommitted successor registration must not leave a committed spent parent");
+	assert!(!registered);
+	db.write(async |tx| {
+		tx.batch_execute("DROP TRIGGER ex3_hold_successor_frontier ON vtxo; DROP FUNCTION ex3_hold_successor_frontier();").await?;
+		Ok(())
+	}).await.unwrap();
+	srv.watchmand().start().await.unwrap();
+	assert_ne!(srv.watchmand().native_child().await.unwrap(), old_child);
+	srv.watchmand().wait_for_sync_height(height).await;
+	let recovered = db.read(async |tx| Ok(tx.query_one("SELECT p.onchain_spent_txid,p.onchain_spent_height, \
+		c.frontier_at IS NOT NULL AS registered,c.confirmed_height FROM vtxo p,vtxo c \
+		WHERE p.vtxo_id=$1 AND c.vtxo_id=$2", &[&parent.to_string(),&id.to_string()]).await?)).await.unwrap();
+	assert_eq!(recovered.get::<_, Option<&str>>("onchain_spent_txid"), Some(txid.to_string().as_str()));
+	assert_eq!(recovered.get::<_, Option<i32>>("onchain_spent_height"), Some(height.to_u32() as i32));
+	assert!(recovered.get::<_, bool>("registered"));
+	assert_eq!(recovered.get::<_, Option<i32>>("confirmed_height"), Some(height.to_u32() as i32));
+	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(height.to_u32()));
+	assert_eq!(ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap(), hash);
+	height
 }
 
 /// A key with no fallback registration keeps its backing while a registered
