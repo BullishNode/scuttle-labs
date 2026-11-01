@@ -9,7 +9,7 @@ use bitcoin::secp256k1::PublicKey;
 use lightning_invoice::Bolt11Invoice;
 use server_rpc::protos::{self, VtxoSpendState};
 use crate::Wallet;
-use crate::vtxo::{FallbackStatus, WalletVtxo};
+use crate::vtxo::FallbackStatus;
 
 impl TryFrom<VtxoSpendState> for FallbackStatus {
 	type Error = anyhow::Error;
@@ -79,10 +79,6 @@ impl Wallet {
 				"missing fallback status cannot release a known commitment");
 		}
 		Ok(state)
-	}
-
-	pub(crate) async fn committed_fallback_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
-		Ok(self.inner.db.get_all_vtxos().await?.into_iter().filter(|coin| coin.fallback_status.is_some()).collect())
 	}
 
 	pub(crate) async fn has_fallback_commitment(&self, id: VtxoId) -> anyhow::Result<bool> {
