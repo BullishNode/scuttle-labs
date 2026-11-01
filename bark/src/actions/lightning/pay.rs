@@ -194,6 +194,11 @@ impl WalletAction for LightningSend {
 							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: Some(error) },
 					});
 				}
+				if let PaymentStatus::Success(preimage) =
+					check_lightning_send_payment_status(wallet, &self, htlcs).await.retry()? {
+					settle_lightning_send_payment(wallet, &self, htlcs, preimage).await?;
+					return Ok(Advance::Done);
+				}
 				revoke_lightning_send_htlcs(wallet, &self, htlcs, revocation).await?;
 				return Ok(Advance::Done);
 			},
