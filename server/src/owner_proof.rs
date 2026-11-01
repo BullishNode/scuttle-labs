@@ -93,15 +93,4 @@ impl OwnerLinks {
 		self.verify(tx, builder.build_unsigned_vtxos().map(|v| v.policy().user_pubkey()), server, network).await
 	}
 
-	/// A stored receive grant is returned unchanged; it creates no new rights.
-	pub(crate) async fn verify_existing_grant(
-		&self, tx: &Tx<'_>, user: PublicKey, grant: &[ark::Vtxo<ark::vtxo::Full>],
-		server: &Keypair, network: Network,
-	) -> anyhow::Result<()> {
-		if grant.is_empty() || grant.iter().any(|v| v.policy().user_pubkey() != user) {
-			return Err(OwnershipRefusal::Invalid(user).into());
-		}
-		self.verify(tx, [user], server, network).await
-	}
-
 }
