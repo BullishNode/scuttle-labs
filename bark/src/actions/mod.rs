@@ -542,6 +542,11 @@ where
 		// The driver consumes its in-memory action before advancing it. Read
 		// the original durable state under the action lock, not that empty slot.
 		let ids = match wallet.inner.db.get_wallet_action_checkpoint(&self.id).await? {
+			Some(WalletActionCheckpoint::LightningSend(send)) => match send.progress {
+				lightning::pay::Progress::RevocableHtlcs { htlcs, .. } |
+				lightning::pay::Progress::RevocationStuck { htlcs, .. } => Some(htlcs.vtxo_ids),
+				_ => None,
+			},
 			Some(WalletActionCheckpoint::ArkoorSend(send)) => match &send.progress {
 				arkoor_send::Progress::Registration { signed_change_vtxos, .. } => Some(
 					send.input_vtxo_ids.iter().copied().chain(signed_change_vtxos.iter().map(|coin| coin.id())).collect::<Vec<_>>()),

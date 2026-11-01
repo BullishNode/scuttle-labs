@@ -38,7 +38,7 @@ use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus, PaymentMethod};
 use crate::persist::models::PaidInvoice;
 use crate::subsystem::{LightningMovement, LightningSendMovement, Subsystem};
-use crate::vtxo::VtxoLockHolder;
+use crate::vtxo::{FallbackStatus, VtxoLockHolder};
 
 const LN_PAY_NAMESPACE: &str = "ln_pay";
 
@@ -181,6 +181,19 @@ impl WalletAction for LightningSend {
 			},
 			Progress::RevocableHtlcs { htlcs, revocation } |
 			Progress::RevocationStuck { htlcs, revocation } => {
+				let mut committed = false;
+				for id in &htlcs.vtxo_ids {
+					committed |= wallet.has_fallback_commitment(*id).await.retry()?;
+				}
+				if committed {
+					return Ok(match retire_fallback_lightning_send(wallet, htlcs).await {
+						Ok(true) => Advance::Done,
+						Ok(false) => Advance::Park { state: self,
+							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: None },
+						Err(error) => Advance::Park { state: self,
+							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: Some(error) },
+					});
+				}
 				revoke_lightning_send_htlcs(wallet, &self, htlcs, revocation).await?;
 				return Ok(Advance::Done);
 			},
@@ -700,6 +713,28 @@ pub(crate) async fn settle_lightning_send_payment(
 	).await.retry()?;
 
 	Ok(())
+}
+
+/// Retire this Ark send only after every original HTLC has a terminal
+/// authenticated customer fallback outcome. This does not classify CLN.
+async fn retire_fallback_lightning_send(wallet: &Wallet, htlcs: &Htlcs) -> anyhow::Result<bool> {
+	let mut terminal = wallet.fallback_inputs_terminal(&htlcs.vtxo_ids).await?;
+	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
+	for id in &htlcs.vtxo_ids {
+		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?
+			.context("fallback HTLC disappeared before action retirement")?;
+		terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited));
+	}
+	if !terminal { return Ok(false); }
+
+	let current = wallet.inner.db.get_movement_by_id(htlcs.movement_id).await?;
+	ensure!(current.status != MovementStatus::Successful, "successful Lightning send contradicts customer fallback retirement");
+	if current.status != MovementStatus::Failed || current.effective_balance != SignedAmount::ZERO
+		|| current.offchain_fee != Amount::ZERO {
+		wallet.inner.movements.finish_movement_with_update(htlcs.movement_id, MovementStatus::Failed,
+			MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO)).await?;
+	}
+	Ok(true)
 }
 
 /// Cosign the revocation with the server, mark the HTLC vtxos spent
