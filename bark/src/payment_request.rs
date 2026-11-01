@@ -1096,20 +1096,6 @@ mod test {
 }
 
 #[cfg(test)]
-mod source_review_currency_counterpart {
-	use super::*;
-	#[test]
-	fn currency_offer_is_rejected_without_panic() {
-		// Public currency fixture from pinned lightning 0.2.2 offer parsing tests.
-		let text = "lno1qcp4256ypqpzwyq2p32x2um5ypmx2cm5dae8x93pqthvwfzadd7jejes8q9lhc4rvjxd022zv5l44g6qah82ru5rdpnpj";
-		let offer = Offer::from_str(text).expect("valid pinned upstream offer fixture");
-		assert!(matches!(offer.amount(), Some(ark::lightning::OfferAmount::Currency { .. })));
-		let details = Wallet::details_for_offer(&offer, Network::Bitcoin, None);
-		assert!(!details.errors.is_empty(), "unsupported currency should be reported, never panic");
-	}
-}
-
-#[cfg(test)]
 mod offer_currency_tests {
 	use super::*;
 
