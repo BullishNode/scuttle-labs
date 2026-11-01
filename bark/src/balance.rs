@@ -211,9 +211,7 @@ impl Wallet {
 				continue;
 			}
 			match vtxos.get(&exit.vtxo_id) {
-				Some(v) if v.state == VtxoState::Exited => {
-					if counted.insert(v.id()) { balance.pending_exit += v.amount(); }
-				},
+				Some(v) if v.state == VtxoState::Exited => balance.pending_exit += v.amount(),
 				Some(v) => warn!("Exit of VTXO {} has committed but the VTXO is {:?}",
 					exit.vtxo_id, v.state,
 				),
