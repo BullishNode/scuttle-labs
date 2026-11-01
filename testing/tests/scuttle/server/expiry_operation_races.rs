@@ -621,17 +621,23 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	}).await.expect("A's actual ordinary fallback must publish");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await,parent);
 	let chain=ctx.bitcoind().sync_client();
-	assert_eq!(parent.input.len(),1);
-	assert_eq!(parent.input[0].previous_output,a.chain_anchor());
-	let backing=ctx.bitcoind().await_transaction(a.chain_anchor().txid).await;
-	let backing_amount=backing.output[a.chain_anchor().vout as usize].value;
-	let original_board_fee=backing_amount.checked_sub(a.amount()).unwrap();
+	// Both expired backing roots are batched: A pays its customer, while B's
+	// completed ordinary refresh lets the operator reclaim its old backing.
+	assert_eq!(parent.input.len(),2);
+	let points=parent.input.iter().map(|input|input.previous_output).collect::<std::collections::HashSet<_>>();
+	assert_eq!(points,[a.chain_anchor(),b.chain_anchor()].into_iter().collect());
+	let mut backing_amount=sat(0);
+	for coin in [&a,&b] {
+		let backing=ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
+		backing_amount+=backing.output[coin.chain_anchor().vout as usize].value;
+	}
+	let original_board_fee=backing_amount.checked_sub(a.amount()+b.amount()).unwrap();
 	assert_eq!(parent.output.iter().map(|o|o.value).sum::<bitcoin::Amount>(),backing_amount);
 	let (index,output)=parent.output.iter().enumerate().find(|(_,o)|o.script_pubkey==fallback).unwrap();
 	assert_eq!(output.value,sat(99_000));
 	let operator=srv.watchmand().config().sweep_address.clone().unwrap().require_network(bitcoin::Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator,fallback);
-	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>(),original_board_fee+sat(1_000));
+	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>(),b.amount()+original_board_fee+sat(1_000));
 	assert_eq!(parent.output.len(),3);
 	assert_eq!(parent.output.iter().filter(|o|**o==bitcoin_ext::fee::fee_anchor()).count(),1);
 	assert!(chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().is_some());
@@ -652,6 +658,12 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 		WHERE e.vtxo_id=$1 ORDER BY a.id",&[&a.id().to_string()]).await?.into_iter().map(|row|
 		(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,Vec<u8>>(4))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(allocations.len(),1); assert_eq!((allocations[0].1,allocations[0].2,allocations[0].3),(100_000,1_000,99_000));
+	let operator_rows=db.read(async |tx| Ok(tx.query("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid \
+		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='operator'",
+		&[&b.id().to_string()]).await?.into_iter().map(|row|(row.get::<_,i64>(0),row.get::<_,i64>(1),
+			row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,String>(4))).collect::<Vec<_>>())).await.unwrap();
+	assert_eq!(operator_rows,vec![(100_000,0,0,0,parent.compute_txid().to_string())]);
 	let confirmed=ctx.generate_blocks(6).await;
 	super::expiry_test::rebuilt(&ctx,&srv,&db).await;
 	let actual=chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().unwrap();
