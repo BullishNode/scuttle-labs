@@ -9,7 +9,7 @@ use bitcoin::secp256k1::PublicKey;
 use lightning_invoice::Bolt11Invoice;
 use server_rpc::protos::{self, VtxoSpendState};
 use crate::Wallet;
-use crate::vtxo::FallbackStatus;
+use crate::vtxo::{FallbackStatus, VtxoStateKind};
 
 impl TryFrom<VtxoSpendState> for FallbackStatus {
 	type Error = anyhow::Error;
@@ -133,17 +133,20 @@ impl Wallet {
 	pub(crate) async fn filter_expired_refresh_inputs<V: VtxoRef>(&self, inputs: Vec<V>) -> anyhow::Result<Vec<V>> {
 		let tip = self.inner.chain.tip().await?;
 		let mut keyed = Vec::new();
-		let mut committed = HashSet::new();
+		let mut excluded = HashSet::new();
 		for input in &inputs {
 			if let Some(stored) = self.inner.db.get_wallet_vtxo(input.vtxo_id()).await? {
-				if stored.fallback_status.is_some() { committed.insert(stored.id()); continue; }
+				if stored.state.kind() == VtxoStateKind::Spent || stored.fallback_status.is_some() {
+					excluded.insert(stored.id());
+					continue;
+				}
 				if stored.expiry_height() <= tip { keyed.push((stored.id(), self.get_vtxo_key(&stored.vtxo).await?)); }
 			}
 		}
 		let queries = keyed.iter().map(|(id,key)| (*id,key)).collect::<Vec<_>>();
 		let states = self.fetch_vtxo_spend_states(&queries).await?;
 		let queried = keyed.iter().map(|(id,_)| *id).collect::<HashSet<_>>();
-		Ok(inputs.into_iter().filter(|input| !committed.contains(&input.vtxo_id())
+		Ok(inputs.into_iter().filter(|input| !excluded.contains(&input.vtxo_id())
 			&& (!queried.contains(&input.vtxo_id()) || states.get(&input.vtxo_id()) == Some(&VtxoSpendState::Spendable))).collect())
 	}
 }
