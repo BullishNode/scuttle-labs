@@ -22,10 +22,10 @@ use log::{debug, error, info, trace, warn};
 
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
-use ark::lightning::{Invoice, PaymentHash, PaymentStatus, Preimage};
+use ark::lightning::{CheckAmountError, Invoice, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
-use bitcoin_ext::BlockHeight;
+use bitcoin_ext::{AmountExt, BlockHeight};
 use server_rpc::protos::{self, lightning_payment_status};
 
 use crate::Wallet;
@@ -362,6 +362,15 @@ pub(crate) async fn start_lightning_send(
 
 	let payment_amount = invoice.get_payment_amount(user_amount)
 		.context("invoice has bad payment amount")?;
+	// A fixed invoice cannot deliver a caller-specified larger amount.
+	if let Some(invoice_msat) = invoice.amount_msat() {
+		let invoice_amount = Amount::from_msat_ceil(invoice_msat);
+		if payment_amount != invoice_amount {
+			return Err(CheckAmountError::InvalidUserAmount {
+				invoice: invoice_amount, user: payment_amount,
+			}.into());
+		}
+	}
 	if payment_amount == Amount::ZERO {
 		bail!("Cannot pay invoice for 0 sats (0 sat invoices are not any-amount invoices)");
 	}

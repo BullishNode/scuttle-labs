@@ -367,13 +367,11 @@ impl Server {
 			htlc_vtxo_sum += htlc_vtxo.amount();
 		}
 
-		// Verify against the invoice amount if applicable, disallowing underpayments.
+		// New admissions must match the fixed invoice's rounded satoshi quote.
+		// Recorded retries above retain their original payment parameters.
 		if let Some(invoice_msat) = invoice.amount_msat() {
-			if invoice_msat > payment_amount.to_msat() {
-				return badarg!("requested payment amount too low for invoice");
-			}
-			if invoice_msat < payment_amount.to_msat() / 2 {
-				return badarg!("requested payment amount more than double invoice amount");
+			if payment_amount != Amount::from_msat_ceil(invoice_msat) {
+				return badarg!("requested payment amount must equal the fixed invoice amount");
 			}
 		}
 
