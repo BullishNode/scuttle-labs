@@ -1,4 +1,11 @@
 use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use axum::body::Bytes;
+use axum::http::{HeaderMap, header};
+use axum::routing::post;
+use axum::Router;
 
 use bitcoincore_rpc::RpcApi;
 
@@ -599,6 +606,126 @@ async fn finished_exit_does_not_change_on_sync() {
 			assert_ne!(movement.id, movement_id, "the exit movement must not be updated again");
 		}
 	}
+}
+
+/// Dropping one public progress future during a real historical-block read
+/// must not remove an initialized exit from this same open manager.
+#[tokio::test]
+async fn canceled_progress_future_keeps_initialized_exit_tracking() {
+	let ctx = TestContext::new("bark_sdk/canceled_progress_future_keeps_initialized_exit_tracking").await;
+	let srv = ctx.captaind("server").create().await;
+	let target = Arc::new(Mutex::new(None::<u64>));
+	let armed = Arc::new(AtomicBool::new(false));
+	let hits = Arc::new(AtomicUsize::new(0));
+	let entered = Arc::new(tokio::sync::Notify::new());
+	let release = Arc::new(tokio::sync::Notify::new());
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+	let upstream = ctx.bitcoind().rpc_url();
+	let client = reqwest::Client::builder().no_proxy().build().unwrap();
+	let app = Router::new().route("/", post({
+		let (target, armed, hits, entered, release) = (target.clone(), armed.clone(), hits.clone(), entered.clone(), release.clone());
+		move |headers: HeaderMap, body: Bytes| {
+			let (target, armed, hits, entered, release, upstream, client) =
+				(target.clone(), armed.clone(), hits.clone(), entered.clone(), release.clone(), upstream.clone(), client.clone());
+			async move {
+				let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+				if request["method"] == "getblockhash" && request["params"][0].as_u64() == *target.lock().unwrap()
+					&& armed.swap(false, Ordering::SeqCst) {
+					hits.fetch_add(1, Ordering::SeqCst);
+					log::info!("issue31: acknowledged historical claimable-height Core request");
+					entered.notify_one();
+					release.notified().await;
+				}
+				let response = client.post(upstream).header(header::AUTHORIZATION, headers[header::AUTHORIZATION].clone())
+					.header(header::CONTENT_TYPE, "application/json").body(body).send().await.unwrap();
+				(response.status(), response.bytes().await.unwrap())
+			}
+		}
+	})).layer(axum::extract::DefaultBodyLimit::disable());
+	let proxy = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+	let wallet = ctx.bark_sdk("bark", &srv).cfg(move |cfg| {
+		cfg.daemon_manual_sync = true;
+		cfg.bitcoind_address = Some(proxy_url);
+	}).boarded(sat(400_000)).create().await;
+	let [boarded] = wallet.vtxos().await.unwrap().try_into().expect("one genuine board");
+	let id = boarded.id();
+	let full = wallet.get_full_vtxo(id).await.unwrap();
+	wallet.exit_mgr().start_exit_for_entire_wallet().await.unwrap();
+	assert_eq!(wallet.exit_mgr().get_exit_vtxo_ids().await, vec![id]);
+
+	let mut awaiting = None;
+	for _ in 0..10 {
+		wallet.sync_onchain().await.unwrap();
+		wallet.progress_exits().await.unwrap();
+		let exit = wallet.exit_mgr().get_exit_vtxo(id).await.expect("the original exit stays tracked");
+		if let ExitState::AwaitingDelta(state) = exit.state() { awaiting = Some(*state); break; }
+		assert!(!matches!(exit.state(), ExitState::Claimable(_) | ExitState::Claimed(_)));
+		ctx.generate_blocks(1).await;
+		wallet.chain().invalidate_caches().await;
+	}
+	let awaiting = awaiting.expect("real exit broadcasts and confirms before the cancellation cut");
+	let tip = ctx.generate_blocks(blocks_until(&ctx, awaiting.claimable_height) + 1).await;
+	assert!(tip > awaiting.claimable_height);
+	assert!(tip.to_u32() - awaiting.confirmed_block.height.to_u32() > 6);
+	wallet.chain().invalidate_caches().await;
+	let before = wallet.exit_mgr().get_exit_vtxo(id).await.unwrap();
+	assert!(before.is_initialized());
+	assert_eq!(before.state(), &ExitState::AwaitingDelta(awaiting));
+	let durable = wallet.exit_mgr().get_exit_status(id, true, false).await.unwrap().unwrap();
+	let movement_id = before.movement_id().unwrap();
+	let movement = find_movement(&wallet, movement_id).await;
+	assert_eq!(movement.status, MovementStatus::Pending);
+	let mut notifications = wallet.subscribe_notifications();
+	let actual_hash = ctx.bitcoind().sync_client().get_block_hash(awaiting.claimable_height.into()).unwrap();
+	*target.lock().unwrap() = Some(awaiting.claimable_height.to_u32().into());
+	armed.store(true, Ordering::SeqCst);
+	{
+		// Both the future and its pinned reference are scoped here. On the
+		// acknowledged backend await, drop the actual public future, not
+		// just a Pin<&mut _> while retaining the underlying future elsewhere.
+		let progress = wallet.progress_exits();
+		tokio::pin!(progress);
+		tokio::select! {
+			_ = entered.notified().wait(Duration::from_secs(30)) => {},
+			result = &mut progress => panic!("MISSED_TARGET: progress finished before the historical-block gate: {result:?}"),
+		}
+	}
+	assert_eq!(hits.load(Ordering::SeqCst), 1);
+	assert!(!armed.load(Ordering::SeqCst));
+	assert_eq!(wallet.exit_mgr().get_exit_status(id, true, false).await.unwrap().unwrap(), durable);
+	assert_eq!(wallet.exit_mgr().get_exit_vtxo_ids().await, vec![id]);
+	let retained = wallet.exit_mgr().get_exit_vtxo(id).await.expect("same manager must retain the original exit after future cancellation");
+	assert_eq!(retained.state(), before.state());
+	assert_eq!(retained.history(), before.history());
+	assert_eq!(retained.txids(), before.txids());
+	assert_eq!(find_movement(&wallet, movement_id).await, movement);
+	while let Some(Some(notification)) = futures::FutureExt::now_or_never(notifications.next()) {
+		if let WalletNotification::MovementUpdated { movement } = notification {
+			assert_ne!(movement.id, movement_id, "canceling only the read future must not finish the exit");
+		}
+	}
+
+	release.notify_one();
+	wallet.progress_exits().await.unwrap();
+	let continued = wallet.exit_mgr().get_exit_vtxo(id).await.expect("continue the same tracked exit without reload or a new exit");
+	let ExitState::Claimable(claimable) = continued.state() else { panic!("ordinary retry must reach Claimable: {:?}", continued.state()) };
+	assert_eq!(claimable.claimable_since.height, awaiting.claimable_height);
+	assert_eq!(claimable.claimable_since.hash, actual_hash);
+	assert_eq!(continued.id(), id);
+	assert_eq!(continued.movement_id(), Some(movement_id));
+	assert_eq!(wallet.exit_mgr().get_exit_status(id, true, false).await.unwrap().unwrap().state, *continued.state());
+	let coin = ctx.bitcoind().sync_client().get_tx_out(&full.point().txid, full.point().vout, Some(true)).unwrap().unwrap();
+	assert!(coin.confirmations >= 6);
+	assert_eq!(coin.value, sat(400_000));
+	assert_eq!(coin.value, full.amount());
+	assert_eq!(coin.script_pub_key.script().unwrap(), full.txout().script_pubkey);
+	let history = wallet.history().await.unwrap();
+	wallet.progress_exits().await.unwrap();
+	assert_eq!(wallet.exit_mgr().get_exit_vtxo(id).await.unwrap().state(), continued.state());
+	assert_eq!(wallet.history().await.unwrap(), history);
+	assert_eq!(hits.load(Ordering::SeqCst), 1);
+	proxy.abort();
 }
 
 include!("../scuttle/bark_sdk/exit_fallback.rs");
