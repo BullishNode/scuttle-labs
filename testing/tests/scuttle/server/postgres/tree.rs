@@ -1,7 +1,7 @@
 use ark_testing::util::ToAltString;
 use std::collections::BTreeSet;
 
-use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
+use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin::secp256k1::{rand, Keypair};
 use chrono::{DateTime, Local};
 use bitcoin::hashes::Hash;
