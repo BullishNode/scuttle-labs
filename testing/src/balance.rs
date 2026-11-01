@@ -9,17 +9,14 @@ use bark::actions::WalletAction;
 use bark::vtxo::VtxoState;
 use bark_json::primitives::{VtxoStateInfo, WalletVtxoInfo};
 
-/// Generic consistency checks use retained local ownership, never server
-/// payout history. Ambiguous historical imports need fixture-specific proof.
+/// Generic consistency checks cover Ark balances only. Known fallback
+/// commitments are status-only; their principal/output proof remains fixture-specific.
 pub(crate) fn retained_principal(
-	vtxos: &[WalletVtxoInfo], awaiting: &HashSet<VtxoId>, paths: &[(VtxoId, Vec<VtxoId>)],
+	vtxos: &[WalletVtxoInfo], commitments: &HashSet<VtxoId>, paths: &[(VtxoId, Vec<VtxoId>)],
 ) -> HashMap<VtxoId, Amount> {
 	let mut principal = HashMap::new();
 	for coin in vtxos {
-		if coin.state == VtxoStateInfo::Spent { continue; }
-		assert!(!(awaiting.contains(&coin.id) && matches!(coin.state,
-			VtxoStateInfo::Locked { movement_id: None, action_id: None })),
-			"holderless pending import needs a fixture-specific ownership assertion");
+		if coin.state == VtxoStateInfo::Spent || coin.fallback_status.is_some() { continue; }
 		assert!(principal.insert(coin.id, coin.amount).is_none(), "duplicate retained VTXO ID");
 	}
 	let mut seen = HashSet::new();
@@ -28,7 +25,7 @@ pub(crate) fn retained_principal(
 		assert!(!path.iter().any(|ancestor| *ancestor != *child && principal.contains_key(ancestor)),
 			"overlapping retained ownership needs a fixture-specific conservation assertion");
 	}
-	if principal.keys().any(|id| awaiting.contains(id)) && principal.len() > 1 {
+	if !commitments.is_empty() && principal.len() > 1 {
 		assert_eq!(seen.len(), principal.len(), "missing signed bodies for pending ownership check");
 	}
 	principal
@@ -45,19 +42,19 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 		wallet.sync().await;
 	}
 	let balance = wallet.balance().await.expect("balance");
-	let awaiting = wallet.awaiting_settlement_vtxos().await.expect("awaiting settlement")
-		.into_iter().collect::<HashSet<_>>();
 	let retained = wallet.all_vtxos().await.expect("retained vtxos");
+	let commitments = retained.iter().filter(|coin| coin.fallback_status.is_some())
+		.map(|coin| coin.id()).collect::<HashSet<_>>();
 	let infos = retained.iter().map(WalletVtxoInfo::from).collect::<Vec<_>>();
 	let mut paths = Vec::new();
-	if !awaiting.is_empty() {
+	if !commitments.is_empty() {
 		for coin in &retained {
 			if coin.state != VtxoState::Spent {
 				paths.push((coin.id(), wallet.get_full_vtxo(coin.id()).await.expect("signed body").ancestor_ids()));
 			}
 		}
 	}
-	let principal = retained_principal(&infos, &awaiting, &paths);
+	let principal = retained_principal(&infos, &commitments, &paths);
 	let vtxos = retained.into_iter().filter(|coin| principal.contains_key(&coin.id())).collect::<Vec<_>>();
 
 	let locked_amount_of = |ids: &[VtxoId]| -> Amount {
@@ -71,13 +68,9 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 	let max_exit_depth = wallet.ark_info().await.expect("ark info").map(|i| i.max_vtxo_exit_depth);
 	let mut spendable = Amount::ZERO;
 	let mut needs_refresh = Amount::ZERO;
-	let mut awaiting_settlement = Amount::ZERO;
 	let mut locked = Amount::ZERO;
 	for vtxo in &vtxos {
 		match vtxo.state {
-			VtxoState::Spendable if awaiting.contains(&vtxo.id()) => {
-				awaiting_settlement += principal[&vtxo.id()]
-			},
 			VtxoState::Spendable if vtxo.needs_refresh(tip, max_exit_depth) => {
 				needs_refresh += vtxo.amount()
 			},
@@ -87,7 +80,6 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 			VtxoState::Spent => unreachable!("historic spent body cannot establish ownership"),
 		}
 	}
-	assert_eq!(balance.awaiting_settlement, awaiting_settlement, "awaiting value stays owned and unavailable");
 	assert_eq!(balance.spendable, spendable,
 		"spendable must equal the spendable VTXOs that need no refresh: {balance:?}",
 	);
@@ -144,8 +136,8 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 	assert!(pending_locked <= locked,
 		"pending fields count more than the locked VTXOs ({locked}): {balance:?}",
 	);
-	assert_eq!(balance.pending(), pending_locked + balance.pending_exit + awaiting_settlement, "{balance:?}");
-	assert_eq!(balance.total(), spendable + needs_refresh + pending_locked + balance.pending_exit + awaiting_settlement,
+	assert_eq!(balance.pending(), pending_locked + balance.pending_exit, "{balance:?}");
+	assert_eq!(balance.total(), spendable + needs_refresh + pending_locked + balance.pending_exit,
 		"total must be the sum of every field: {balance:?}",
 	);
 	assert_eq!(balance.has_pending(), balance.pending() > Amount::ZERO, "{balance:?}");

@@ -4,7 +4,7 @@ mod signing;
 mod state;
 
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
-pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+pub use self::state::{FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 use std::time::Duration;
 
@@ -60,8 +60,12 @@ pub enum ServerStatusAdoption {
 	Spendable,
 	/// The server considers the VTXO spent.
 	Spent,
+	/// Terminal fallback first discovered during recovery or import.
+	FallbackSpent,
 	/// Allocated customer principal awaiting independent payout verification.
 	FallbackPending,
+	/// Canonical terminal policy result with no Bitcoin payout output.
+	Forfeited,
 	/// Neither spendable nor spent: the server is still waiting on a preimage
 	/// or on the VTXO's transaction chain. No wallet state describes this, and
 	/// finishing that flow is what decides where the VTXO belongs.
@@ -69,6 +73,10 @@ pub enum ServerStatusAdoption {
 }
 
 impl ServerStatusAdoption {
+	pub(crate) fn from_status(state: VtxoSpendState, committed: bool) -> anyhow::Result<Self> {
+		if committed && state == VtxoSpendState::Spent { Ok(Self::FallbackSpent) }
+		else { Self::from_spend_state(state) }
+	}
 	/// Errors when the server gave no usable answer.
 	///
 	/// Matched exhaustively (no catch-all) so a new spend state forces an
@@ -78,6 +86,7 @@ impl ServerStatusAdoption {
 			VtxoSpendState::Spendable => ServerStatusAdoption::Spendable,
 			VtxoSpendState::Spent => ServerStatusAdoption::Spent,
 			VtxoSpendState::FallbackPending => ServerStatusAdoption::FallbackPending,
+			VtxoSpendState::FallbackForfeited => ServerStatusAdoption::Forfeited,
 			state @ (
 				VtxoSpendState::Unclaimed
 				| VtxoSpendState::Unregistered
@@ -121,8 +130,13 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = impl VtxoRef>,
 		holder: Option<VtxoLockHolder>,
 	) -> anyhow::Result<()> {
+		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
+		let ids = vtxos.into_iter().map(|v| v.vtxo_id()).collect::<Vec<_>>();
+		for id in &ids {
+			ensure!(!self.has_fallback_commitment(*id).await?, "a committed fallback source cannot be locked for another operation");
+		}
 		self.set_vtxo_states(
-			vtxos, &VtxoState::Locked { holder }, &[VtxoStateKind::Spendable],
+			ids, &VtxoState::Locked { holder }, &[VtxoStateKind::Spendable],
 		).await
 	}
 
@@ -140,6 +154,7 @@ impl Wallet {
 		vtxo: &Vtxo<Full>,
 		holder: &Option<VtxoLockHolder>,
 	) -> anyhow::Result<bool> {
+		if self.has_fallback_commitment(vtxo.id()).await? { return Ok(false); }
 		let stored = self.inner.db.get_wallet_vtxo(vtxo.id()).await
 			.with_context(|| format!("error querying vtxo {}", vtxo.id()))?;
 		Ok(match stored {
@@ -312,13 +327,40 @@ impl Wallet {
 		&self,
 		vtxos: impl IntoIterator<Item = &'a Vtxo<Full>> + Clone,
 	) -> anyhow::Result<()> {
-		self.store_vtxos(vtxos.clone(), &VtxoState::Spendable).await?;
+		self.store_vtxos_with_server_status(vtxos.clone()).await?;
 
 		// Post vtxo IDs to server for recovery (non-critical, just log errors)
 		if let Err(e) = self.post_recovery_vtxo_ids(vtxos.into_iter().map(|v| v.id())).await {
 			error!("Failed to post recovery vtxo IDs to server: {:#}", e);
 		}
 
+		Ok(())
+	}
+
+	/// Authenticated first storage without posting another recovery hint. Keep
+	/// request, adoption and body/marker write under the same wallet lock.
+	pub(crate) async fn store_vtxos_with_server_status<'a>(
+		&self, vtxos: impl IntoIterator<Item = &'a Vtxo<Full>> + Clone,
+	) -> anyhow::Result<()> {
+		// Validate every owner/status before any positive storage. A new
+		// fallback body and its recheck marker are persisted atomically.
+		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
+		let mut states = Vec::new();
+		for vtxo in vtxos.clone() {
+			let key = self.get_vtxo_key(vtxo).await?;
+			let (state, committed) = self.fetch_vtxo_status_locked(vtxo.id(), &key).await?;
+			if committed { self.validate_vtxo(vtxo).await?; }
+			ensure!(committed || matches!(state, VtxoSpendState::Spendable | VtxoSpendState::Unregistered | VtxoSpendState::Spent),
+				"new output is not yet released by its authenticated server");
+			states.push((vtxo, state, committed));
+		}
+		for (vtxo, state, committed) in states {
+			if committed {
+				self.inner.db.store_fallback_vtxo(vtxo, FallbackStatus::try_from(state)?).await?;
+			} else {
+				self.store_vtxos([vtxo], &if state == VtxoSpendState::Spent { VtxoState::Spent } else { VtxoState::Spendable }).await?;
+			}
+		}
 		Ok(())
 	}
 
@@ -365,8 +407,8 @@ impl Wallet {
 
 	/// Ask the server for the status of `vtxo_id` and move the wallet's vtxo along
 	/// with it. An ordinary spendable reply keeps a locally spent vtxo spent.
-	/// A fallback-pending reply may restore it as awaiting settlement only after
-	/// its complete signed body has been validated against the chain.
+	/// An explicit fallback claim fences its aliases independently of native
+	/// body validation; it never makes an unvalidated body spendable.
 	///
 	/// A locked vtxo is left alone and the server isn't asked at all: returns
 	/// `Ok(None)`. Unlock the vtxo first if you want its status adopted.
@@ -380,7 +422,9 @@ impl Wallet {
 			.with_context(|| format!("error querying vtxo {vtxo_id}"))?
 			.with_context(|| format!("vtxo {vtxo_id} is not in this wallet"))?;
 
-		if stored.state.kind() == VtxoStateKind::Locked {
+		let committed = stored.fallback_status.is_some();
+		if stored.state.kind() == VtxoStateKind::Locked
+			&& !(matches!(&stored.state, VtxoState::Locked { holder: None }) && committed) {
 			warn!("Cannot trust and adopt server state for {vtxo_id}. \
 				The vtxo must be unlocked first");
 			return Ok(None);
@@ -403,20 +447,7 @@ impl Wallet {
 			ServerStatusAdoption::Spent => {
 				self.trust_ordinary_spends(&[vtxo_id]).await?;
 			},
-			ServerStatusAdoption::FallbackPending => {
-				// An actual pending status fences previously validated principal even
-				// if the chain source is unavailable. Unvalidated spent history still
-				// requires full validation before it can acquire any positive value.
-				if stored.state == VtxoState::Spendable {
-					let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-					let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-					if !snapshot.adopted_payout_vtxos.contains(&vtxo_id)
-						&& self.inner.db.get_wallet_vtxo(vtxo_id).await?
-							.is_some_and(|current| current.state == VtxoState::Spendable) {
-						snapshot.awaiting_settlement.insert(vtxo_id);
-						self.inner.db.store_fallback_snapshot(&snapshot).await?;
-					}
-				}
+			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited => {
 				let coin = self.get_full_vtxo(vtxo_id).await?;
 				self.validate_vtxo(&coin).await?;
 				self.retain_fallback_pending(&[coin]).await?;
@@ -439,7 +470,9 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = impl VtxoRef>,
 		holder: Option<VtxoLockHolder>,
 	) -> anyhow::Result<()> {
+		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
 		for v in vtxos {
+			if self.has_fallback_commitment(v.vtxo_id()).await? { continue; }
 			self.inner.db.release_vtxo_lock(v.vtxo_id(), holder.as_ref()).await?;
 		}
 		Ok(())

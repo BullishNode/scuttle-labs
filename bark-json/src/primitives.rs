@@ -164,6 +164,21 @@ impl From<Vtxo<Full>> for VtxoInfo {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackStatusInfo { Pending, Spent, Forfeited }
+
+impl From<bark::vtxo::FallbackStatus> for FallbackStatusInfo {
+	fn from(status: bark::vtxo::FallbackStatus) -> Self {
+		match status {
+			bark::vtxo::FallbackStatus::Pending => Self::Pending,
+			bark::vtxo::FallbackStatus::Spent => Self::Spent,
+			bark::vtxo::FallbackStatus::Forfeited => Self::Forfeited,
+		}
+	}
+}
+
 /// A VTXO together with its current wallet state.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
@@ -173,10 +188,9 @@ pub struct WalletVtxoInfo {
 	pub vtxo: VtxoInfo,
 	/// The current state of this VTXO in the wallet.
 	pub state: VtxoStateInfo,
-	/// The expired coin is excluded from new operations pending an
-	/// authoritative server decision or in-flight operation settlement.
-	#[serde(default)]
-	pub awaiting_settlement: bool,
+	/// Last authenticated fallback outcome; this is not another balance.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fallback_status: Option<FallbackStatusInfo>,
 }
 
 impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
@@ -194,7 +208,7 @@ impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
 				exit_depth: Some(v.exit_depth),
 			},
 			state: VtxoStateInfo::from(&v.state),
-			awaiting_settlement: false,
+			fallback_status: v.fallback_status.map(Into::into),
 		}
 	}
 }

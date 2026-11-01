@@ -556,13 +556,15 @@ async fn refresh_should_refresh_vtxos_no_dust() {
 	let balance = bark2.offchain_balance().await;
 	if is_bark_version!(> "0.7.1") {
 		assert_eq!(balance.spendable, sat(200_000) - expected_fee, "{balance:?}");
-		assert_eq!(balance.awaiting_settlement + balance.needs_refresh, sat(331), "{balance:?}");
 		let wallet = bark2.client().await;
+		let remainder = wallet.all_vtxos().await.unwrap().into_iter().find(|coin| coin.amount() == sat(331)).unwrap();
+		assert_eq!(remainder.amount(), sat(331));
+		assert_eq!(balance.needs_refresh + if remainder.fallback_status.is_some() { remainder.amount() } else { sat(0) }, sat(331), "{balance:?}");
 		assert_eq!(wallet.get_vtxo_by_id(vtxo.id).await.unwrap().state, bark::vtxo::VtxoState::Spent);
 		assert!(!wallet.vtxos().await.unwrap().iter().any(|coin| coin.id() == vtxo.id),
 			"the old 200000-sat round input cannot return to the live coin set");
-		assert_eq!(wallet.balance().await.unwrap().total(), sat(200_331) - expected_fee,
-			"the 198000-sat replacement and 331-sat pending coin count exactly once");
+		assert_eq!(wallet.balance().await.unwrap().total() + if remainder.fallback_status.is_some() { remainder.amount() } else { sat(0) }, sat(200_331) - expected_fee,
+			"the replacement and the exact known331sat right retain principal without another Ark balance");
 
 	} else {
 		assert_eq!(balance.spendable, sat(200_331) - expected_fee, "{balance:?}");

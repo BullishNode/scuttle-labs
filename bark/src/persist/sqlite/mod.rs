@@ -11,6 +11,7 @@
 mod convert;
 mod migrations;
 mod query;
+mod scuttle;
 
 
 use std::path::{Path, PathBuf};
@@ -21,7 +22,7 @@ use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
 use log::debug;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use ark::{Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
@@ -295,37 +296,27 @@ impl BarkPersister for SqliteClient {
 		tx.commit().context("Failed to commit transaction")
 	}
 
-	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot> {
-		use rusqlite::OptionalExtension;
-		let bytes: Option<Vec<u8>> = self.connect()?.query_row(
-			"SELECT snapshot FROM bark_fallback_snapshot WHERE id = 1", [], |row| row.get(0),
-		).optional()?;
-		Ok(bytes.map(|bytes| serde_json::from_slice(&bytes)).transpose()?.unwrap_or_default())
+
+
+	async fn set_vtxo_fallback_status(&self, id: VtxoId, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let coin = query::set_vtxo_fallback_status(&tx, id, status)?;
+		tx.commit()?;
+		Ok(coin)
 	}
 
-	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()> {
-		let bytes = serde_json::to_vec(snapshot)?;
-		self.connect()?.execute(
-			"INSERT INTO bark_fallback_snapshot (id, snapshot) VALUES (1, ?1)
-			ON CONFLICT (id) DO UPDATE SET snapshot = excluded.snapshot", [&bytes],
-		)?;
-		Ok(())
-	}
-
-	async fn get_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
-		query::get_fallback_record(&self.connect()?)
-	}
-
-	async fn store_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
-		query::store_fallback_record(&self.connect()?, record)
-	}
-
-	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
-		query::get_pending_fallback_record(&self.connect()?)
-	}
-
-	async fn store_pending_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
-		query::store_pending_fallback_record(&self.connect()?, record)
+	async fn store_fallback_vtxo(&self, vtxo: &Vtxo<Full>, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		query::store_vtxo_with_initial_state(&tx, vtxo, &VtxoState::Locked { holder: None })?;
+		let coin = query::set_vtxo_fallback_status(&tx, vtxo.id(), status)?;
+		tx.commit()?;
+		Ok(coin)
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {
@@ -404,9 +395,10 @@ impl BarkPersister for SqliteClient {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
+		association: Option<&crate::persist::models::ReceiveAssociation>,
 	) -> anyhow::Result<()> {
 		let conn = self.connect()?;
-		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount)
+		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount, association)
 	}
 
 	async fn get_settled_lightning_receive(
@@ -415,6 +407,14 @@ impl BarkPersister for SqliteClient {
 	) -> anyhow::Result<Option<SettledLightningReceive>> {
 		let conn = self.connect()?;
 		query::get_settled_lightning_receive(&conn, payment_hash)
+	}
+
+	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
+		query::fallback_lightning_receives(&self.connect()?)
+	}
+
+	async fn set_receive_fallback_status(&self, hash: PaymentHash, status: crate::vtxo::FallbackStatus) -> anyhow::Result<()> {
+		query::set_receive_fallback_status(&mut self.connect()?, hash, status)
 	}
 
 	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
@@ -568,31 +568,55 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_tables_reopen_without_changing_wallet_records() {
-		let (path, conn) = in_memory_db();
+	fn fallback_outcomes_reopen_without_rewriting_upstream_history() {
+		let (path, mut conn) = in_memory_db();
 		let db = SqliteClient::open(&path).unwrap();
 		let history = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
 			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
 			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		assert!(!history.is_empty());
-		// These are persistence sentinels, not authenticated financial proofs.
-		conn.execute_batch("INSERT INTO bark_fallback_record (id,record,spk) VALUES (1,X'01',X'02');
-			INSERT INTO bark_fallback_snapshot (id,snapshot) VALUES (1,X'04');
-			INSERT INTO bark_properties (id,network,fingerprint) VALUES ('control','regtest','deadbeef');").unwrap();
-		assert_eq!(conn.query_row("SELECT registered FROM bark_fallback_record", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-		conn.execute("UPDATE bark_fallback_record SET registered=0 WHERE id=1", []).unwrap();
+		let coin = &VTXO_VECTORS.board_vtxo;
+		let tx = conn.transaction().unwrap();
+		query::store_vtxo_with_initial_state(&tx, coin, &VtxoState::Spendable).unwrap();
+		query::set_vtxo_fallback_status(&tx, coin.id(), crate::vtxo::FallbackStatus::Pending).unwrap();
+		tx.commit().unwrap();
 		drop(db);
 		let _reopened = SqliteClient::open(&path).unwrap();
+		let stored = query::get_wallet_vtxo_by_id(&conn, coin.id()).unwrap().unwrap();
+		assert_eq!(stored.fallback_status, Some(crate::vtxo::FallbackStatus::Pending));
+		assert_eq!(stored.state, VtxoState::Locked { holder: None });
+		assert_eq!(query::get_full_vtxo_by_id(&conn, coin.id()).unwrap().unwrap().serialize(), coin.serialize());
 		let after = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
 			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
 			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		assert_eq!(after, history);
-		assert_eq!(conn.query_row("SELECT record,spk,registered FROM bark_fallback_record", [],
-			|row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, i64>(2)?)))
-			.unwrap(), (vec![1], vec![2], 0));
-		assert_eq!(conn.query_row("SELECT snapshot FROM bark_fallback_snapshot", [], |row| row.get::<_, Vec<u8>>(0)).unwrap(), vec![4]);
-		assert_eq!(conn.query_row("SELECT network,fingerprint FROM bark_properties WHERE id='control'", [],
-			|row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).unwrap(), ("regtest".to_owned(), "deadbeef".to_owned()));
+		assert_eq!(history, after);
+	}
+
+	#[test]
+	fn receipt_bearing_wallet_is_refused_without_writes() {
+		let (path, conn) = in_memory_db();
+		let current = SqliteClient::open(&path).unwrap();
+		conn.execute("CREATE TABLE bark_fallback_receipt(vtxo_id TEXT PRIMARY KEY,receipt BLOB)", []).unwrap();
+		drop(current);
+		let before: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+		assert!(SqliteClient::open(&path).unwrap_err().to_string().contains("not a fresh Scuttle store"));
+		let after: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+		assert_eq!(before, after);
+		assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bark_fallback_receipt')", [],
+			|row| row.get::<_, bool>(0)).unwrap());
+	}
+
+
+	#[test]
+	fn registration_shaped_wallet_is_refused_even_with_mailbox_identity() {
+		let (path,conn) = in_memory_db();
+		let db = SqliteClient::open(&path).unwrap();
+		drop(db);
+		conn.execute_batch("CREATE TABLE bark_fallback_record(id INTEGER PRIMARY KEY,record BLOB);
+			INSERT INTO bark_fallback_record VALUES(1,X'010203');").unwrap();
+		let changes: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+		assert!(SqliteClient::open(&path).is_err());
+		assert_eq!(conn.query_row("SELECT total_changes()", [], |row| row.get::<_,i64>(0)).unwrap(), changes);
+		assert_eq!(conn.query_row("SELECT record FROM bark_fallback_record", [], |row| row.get::<_,Vec<u8>>(0)).unwrap(), vec![1,2,3]);
 	}
 
 	#[tokio::test]
@@ -669,6 +693,7 @@ mod test {
 			.unwrap();
 		db.store_bdk_wallet_changeset(&created.take_staged().unwrap()).await.unwrap();
 
+		#[allow(deprecated)]
 		let loaded = {
 			let changeset = db.initialize_bdk_wallet().await.unwrap();
 			bdk_wallet::Wallet::load()

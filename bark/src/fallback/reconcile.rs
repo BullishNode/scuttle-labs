@@ -1,224 +1,151 @@
-//! Expired inputs are checked against server decisions before a new refresh.
+//! Adopt authenticated outcomes on known coins, without a payout or ancestry ledger.
 
 use std::collections::{BTreeSet, HashSet};
-use std::time::Duration;
-
 use anyhow::Context;
-use log::warn;
-
-use ark::{ProtocolEncoding, Vtxo, VtxoId};
-use ark::vtxo::Full;
-use ark::vtxo::VtxoRef;
-use server_rpc::protos::VtxoSpendState;
-
+use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy};
+use ark::lightning::PaymentHash;
+use ark::vtxo::{Full, VtxoRef};
+use bitcoin::secp256k1::PublicKey;
+use lightning_invoice::Bolt11Invoice;
+use server_rpc::protos::{self, VtxoSpendState};
 use crate::Wallet;
-use crate::actions::{WalletAction, WalletActionCheckpoint};
-use crate::vtxo::{VtxoState, VtxoStateKind};
+use crate::vtxo::{FallbackStatus, WalletVtxo};
+
+impl TryFrom<VtxoSpendState> for FallbackStatus {
+	type Error = anyhow::Error;
+	fn try_from(state: VtxoSpendState) -> anyhow::Result<Self> {
+		Ok(match state {
+			VtxoSpendState::FallbackPending => Self::Pending,
+			VtxoSpendState::Spent => Self::Spent,
+			VtxoSpendState::FallbackForfeited => Self::Forfeited,
+			_ => bail!("fallback commitment has a contradictory spend state"),
+		})
+	}
+}
 
 impl Wallet {
-	/// Ordinary spend reports use upstream trust. Clear pending projections
-	/// before retiring the source so reconciliation cannot resurrect it.
-	pub(crate) async fn trust_ordinary_spends(&self, ids: &[VtxoId]) -> anyhow::Result<()> {
-		if ids.is_empty() { return Ok(()); }
-		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-		let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-		for id in ids {
-			snapshot.awaiting_settlement.remove(id);
-			snapshot.adopted_payout_vtxos.remove(id);
+	pub(crate) async fn receive_fallback_status(&self, hash: PaymentHash, invoice: &Bolt11Invoice, grants: &[VtxoId])
+		-> anyhow::Result<Option<FallbackStatus>>
+	{
+		ensure!(!grants.is_empty() && PaymentHash::from(invoice) == hash, "receive association is incomplete");
+		let (mut srv, _) = self.require_server().await?;
+		let response = srv.client.check_lightning_receive(protos::CheckLightningReceiveRequest {
+			hash: hash.to_vec(), wait: false,
+		}).await?.into_inner();
+		ensure!(response.invoice == invoice.to_string()
+			&& Some(response.amount_sat) == invoice.amount_milli_satoshis().map(|msat| msat / 1000),
+			"receive status differs from the original signed invoice");
+		let actual = response.htlc_vtxos.iter().map(|raw| VtxoId::from_slice(raw)).collect::<Result<BTreeSet<_>, _>>()?;
+		ensure!(actual.len() == response.htlc_vtxos.len() && actual.len() == grants.len()
+			&& actual == grants.iter().copied().collect(), "receive status differs from the original grants");
+		response.fallback_spend_state.map(|raw| {
+			let state = VtxoSpendState::try_from(raw).context("unknown receive fallback status")?;
+			FallbackStatus::try_from(state)
+		}).transpose()
+	}
+
+	pub(crate) async fn apply_receive_fallback(&self, hash: PaymentHash, grants: &[VtxoId], status: FallbackStatus)
+		-> anyhow::Result<()>
+	{
+		// Caller holds FallbackHistory across the status request and adoption.
+		for id in grants {
+			let coin = self.inner.db.get_wallet_vtxo(*id).await?.context("receive grant is not retained")?;
+			let payment_hash = match coin.policy() {
+				VtxoPolicy::ServerHtlcRecv(policy) => policy.payment_hash,
+				VtxoPolicy::ServerHtlcRecv_v0(policy) => policy.payment_hash,
+				_ => bail!("receive grant has another policy"),
+			};
+			ensure!(payment_hash == hash, "receive grant belongs to another invoice");
 		}
-		self.inner.db.store_fallback_snapshot(&snapshot).await?;
+		for id in grants { self.inner.db.set_vtxo_fallback_status(*id, status).await?; }
+		Ok(())
+	}
+
+	pub(crate) async fn observe_server_vtxo_status(&self, id: VtxoId, owner: &[u8],
+		state: VtxoSpendState, committed: bool) -> anyhow::Result<VtxoSpendState>
+	{
+		ensure!(PublicKey::from_slice(owner)? == self.mailbox_keypair().public_key(),
+			"server coin ownership does not match this mailbox");
+		// Every status-bearing RPC caller holds FallbackHistory before sending
+		// its request, so an older reply cannot overwrite a newer reorg outcome.
+		let stored = self.inner.db.get_wallet_vtxo(id).await?;
+		if committed {
+			let status = FallbackStatus::try_from(state)?;
+			if stored.is_some() { self.inner.db.set_vtxo_fallback_status(id, status).await?; }
+		} else {
+			ensure!(!matches!(state, VtxoSpendState::FallbackPending | VtxoSpendState::FallbackForfeited),
+				"fallback status is missing its commitment marker");
+			ensure!(stored.is_none_or(|coin| coin.fallback_status.is_none()),
+				"missing fallback status cannot release a known commitment");
+		}
+		Ok(state)
+	}
+
+	pub(crate) async fn committed_fallback_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
+		Ok(self.inner.db.get_all_vtxos().await?.into_iter().filter(|coin| coin.fallback_status.is_some()).collect())
+	}
+
+	pub(crate) async fn has_fallback_commitment(&self, id: VtxoId) -> anyhow::Result<bool> {
+		Ok(self.inner.db.get_wallet_vtxo(id).await?.is_some_and(|coin| coin.fallback_status.is_some()))
+	}
+
+	pub(crate) async fn fallback_inputs_terminal(&self, ids: &[VtxoId]) -> anyhow::Result<bool> {
+		ensure!(!ids.is_empty(), "fallback operation has no known inputs");
+		let mut keyed = Vec::new();
+		for id in ids {
+			let coin = self.inner.db.get_wallet_vtxo(*id).await?
+				.ok_or_else(|| anyhow::anyhow!("retained fallback input is missing"))?;
+			keyed.push((*id, self.get_vtxo_key(&coin.vtxo).await?));
+		}
+		let queries = keyed.iter().map(|(id,key)| (*id,key)).collect::<Vec<_>>();
+		let states = self.fetch_vtxo_spend_states(&queries).await?;
+		let mut terminal = true;
+		for id in ids {
+			ensure!(states.contains_key(id), "fallback operation is missing an authenticated input status");
+			let coin = self.inner.db.get_wallet_vtxo(*id).await?
+				.ok_or_else(|| anyhow::anyhow!("retained fallback input disappeared"))?;
+			let status = coin.fallback_status.ok_or_else(|| anyhow::anyhow!("operation input has no committed fallback status"))?;
+			terminal &= status != FallbackStatus::Pending;
+		}
+		Ok(terminal)
+	}
+
+	pub(crate) async fn trust_ordinary_spends(&self, ids: &[VtxoId]) -> anyhow::Result<()> {
+		for id in ids {
+			ensure!(self.inner.db.get_wallet_vtxo(*id).await?.is_none_or(|coin|
+				coin.fallback_status != Some(FallbackStatus::Pending)),
+				"ordinary spend cannot erase a pending fallback commitment");
+		}
 		self.mark_vtxos_as_spent(ids).await
 	}
 
-	/// Callers validate these signed bodies before admitting a recovered claim.
-	/// Persist complete new bodies as unheld history before the pending marker,
-	/// then restore only these validated sources under that marker.
 	pub(crate) async fn retain_fallback_pending(&self, coins: &[Vtxo<Full>]) -> anyhow::Result<()> {
-		if coins.is_empty() { return Ok(()); }
-		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-		let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-		let mut restore = BTreeSet::new();
 		for coin in coins {
-			if snapshot.adopted_payout_vtxos.contains(&coin.id()) { continue; }
-			let stored = self.inner.db.get_wallet_vtxo(coin.id()).await?;
-			// Inserting an existing body does not replace its witness material.
-			// A marker must not credit an unsigned unanswered recovery row.
-			if stored.is_some() {
-				ensure!(self.get_full_vtxo(coin.id()).await?.serialize() == coin.serialize(),
-					"retained fallback body differs from the validated body");
-			}
-			snapshot.awaiting_settlement.insert(coin.id());
-			if stored.is_none_or(|stored| matches!(stored.state,
-				VtxoState::Spent | VtxoState::Locked { holder: None })) { restore.insert(coin.id()); }
+			self.validate_vtxo(coin).await?;
+			let key = self.get_vtxo_key(coin).await?;
+			let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
+			let (state, committed) = self.fetch_vtxo_status_locked(coin.id(), &key).await?;
+			ensure!(committed, "retained source has no authenticated commitment");
+			self.inner.db.store_fallback_vtxo(coin, FallbackStatus::try_from(state)?).await?;
+			ensure!(self.get_full_vtxo(coin.id()).await?.serialize() == coin.serialize(), "retained fallback body changed");
 		}
-		// A crash before the marker now retains the actual signed body without
-		// advertising it as available or establishing unvalidated principal.
-		self.store_vtxos(coins, &VtxoState::Locked { holder: None }).await?;
-		for coin in coins {
-			ensure!(self.get_full_vtxo(coin.id()).await?.serialize() == coin.serialize(),
-				"retained fallback body changed before the pending marker");
-		}
-		self.inner.db.store_fallback_snapshot(&snapshot).await?;
-		self.restore_fallback_vtxos(&restore).await?;
-		self.apply_fallback_chain_states(&mut snapshot).await
+		Ok(())
 	}
 
-	pub(crate) async fn operation_input_ids(&self) -> anyhow::Result<HashSet<VtxoId>> {
-		let mut ids = HashSet::new();
-		for round in self.pending_round_states().await? {
-			ids.extend(round.state().participation().inputs.iter().map(|coin| coin.id()));
-		}
-		for action in self.inner.db.get_all_wallet_action_checkpoints().await? {
-			ids.extend(match action {
-				WalletActionCheckpoint::LightningSend(action) => action.pending_balance_vtxo_ids(),
-				WalletActionCheckpoint::LightningReceive(action) => action.pending_balance_vtxo_ids(),
-				WalletActionCheckpoint::ArkoorSend(action) => action.pending_balance_vtxo_ids(),
-				WalletActionCheckpoint::Board(action) => action.pending_balance_vtxo_ids(),
-				WalletActionCheckpoint::Offboard(action) => action.pending_balance_vtxo_ids(),
-			});
-		}
-		Ok(ids)
-	}
-
-	/// Wallet/UI projection of expired coins whose owner or in-flight operation
-	/// is still being settled. No absent or failed status response is treated
-	/// as either spendable or already paid.
-	pub async fn awaiting_settlement_vtxos(&self) -> anyhow::Result<HashSet<VtxoId>> {
-		let snapshot = self.inner.db.get_fallback_snapshot().await?;
-		let pending = self.fallback_pending_principal(&snapshot).await?;
-		Ok(snapshot.awaiting_settlement.into_iter().chain(pending.into_keys()).collect())
-	}
-
-
-	pub(crate) async fn reconcile_expired_inputs(&self, ids: &[VtxoId]) -> anyhow::Result<HashSet<VtxoId>> {
-		if ids.is_empty() { return Ok(HashSet::new()); }
-		let snapshot = self.inner.db.get_fallback_snapshot().await?;
-		let principal = self.fallback_pending_principal(&snapshot).await?;
-		let mut signed_parents = HashSet::new();
-		let mut retry = HashSet::new();
-		let mut keyed = Vec::new();
-		for id in ids {
-			let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
-			if stored.state != VtxoState::Spendable {
-				if snapshot.adopted_payout_vtxos.contains(id) { continue; }
-				if stored.state == (VtxoState::Locked { holder: None })
-					|| stored.state == VtxoState::Spent && snapshot.awaiting_settlement.contains(id) {
-					retry.insert(*id);
-				} else { continue; }
-			}
-			if principal.get(id).is_some_and(|amount| *amount < stored.amount()) { signed_parents.insert(*id); }
-			let key = self.get_vtxo_key(&stored.vtxo).await?;
-			keyed.push((*id, key));
-		}
-		let queries = keyed.iter().map(|(id, key)| (*id, key)).collect::<Vec<_>>();
-		let statuses = self.fetch_vtxo_spend_states(&queries).await;
-		let mut pending = Vec::new();
-		let mut validation_error = None;
-		for id in &retry {
-			if statuses.as_ref().ok().and_then(|states| states.get(id)) != Some(&VtxoSpendState::FallbackPending) { continue; }
-			let validated = async {
-				let coin = self.get_full_vtxo(*id).await?;
-				self.validate_vtxo(&coin).await?;
-				Ok::<_, anyhow::Error>(coin)
-			}.await;
-			match validated {
-				Ok(coin) => pending.push(coin),
-				Err(error) => {
-					warn!("Could not validate pending recovery source {id}: {error:#}");
-					validation_error = Some(error);
-				},
-			}
-		}
-		// A marker is only a hint. Fresh authenticated Pending and complete
-		// validated material provide the same authority as an explicit import.
-		self.retain_fallback_pending(&pending).await?;
-		// Remote status must not monopolize the local history lock. Only
-		// inputs we queried and still own as Spendable can gain a pending
-		// marker or be offered to the caller after the request completes.
-		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-		let mut snapshot = self.inner.db.get_fallback_snapshot().await?;
-		let mut eligible = HashSet::new();
-		let mut spent = Vec::new();
-		for (id, _) in &keyed {
-			let Some(current) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
-			let status = statuses.as_ref().ok().and_then(|states| states.get(id));
-			if current.state != VtxoState::Spendable {
-				if retry.contains(id) && matches!(current.state,
-					VtxoState::Spent | VtxoState::Locked { holder: None }) {
-					if status == Some(&VtxoSpendState::Spent) {
-						if current.state != VtxoState::Spent {
-							self.inner.db.retire_vtxo_lock(*id, None).await?;
-						}
-						snapshot.awaiting_settlement.remove(id);
-					} else if current.state == VtxoState::Spent && status == Some(&VtxoSpendState::Spendable) {
-						// Upstream ordinary status never reverses local Spent history.
-						snapshot.awaiting_settlement.remove(id);
-					}
-				}
-				continue;
-			}
-			match status {
-				Some(VtxoSpendState::Spent) => {
-					snapshot.awaiting_settlement.remove(id);
-					snapshot.adopted_payout_vtxos.remove(id);
-					spent.push(*id);
-				},
-				Some(VtxoSpendState::Spendable) if !snapshot.adopted_payout_vtxos.contains(id)
-					&& !signed_parents.contains(id) => {
-					snapshot.awaiting_settlement.remove(id);
-					eligible.insert(*id);
-				},
-				// An allocation, missing reply or transport failure is not payment.
-				_ => { snapshot.awaiting_settlement.insert(*id); },
-			}
-		}
-		// Persist marker removal before ordinary retirement, as in
-		// trust_ordinary_spends. A newly acquired foreign holder must not be
-		// overwritten by the batch's older observation.
-		self.inner.db.store_fallback_snapshot(&snapshot).await?;
-		if !spent.is_empty() {
-			self.set_vtxo_states(&spent, &VtxoState::Spent,
-				&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
-		}
-		statuses.context("expired coins await an authoritative server status")?;
-		if let Some(error) = validation_error { return Err(error.context("pending recovery body awaits validation")); }
-		Ok(eligible)
-	}
-
-	pub(crate) async fn filter_expired_refresh_inputs<V: VtxoRef>(
-		&self, inputs: Vec<V>,
-	) -> anyhow::Result<Vec<V>> {
+	pub(crate) async fn filter_expired_refresh_inputs<V: VtxoRef>(&self, inputs: Vec<V>) -> anyhow::Result<Vec<V>> {
 		let tip = self.inner.chain.tip().await?;
-		let pending = self.awaiting_settlement_vtxos().await?;
-		let mut expired = HashSet::new();
+		let mut keyed = Vec::new();
+		let mut committed = HashSet::new();
 		for input in &inputs {
 			if let Some(stored) = self.inner.db.get_wallet_vtxo(input.vtxo_id()).await? {
-				if stored.expiry_height() <= tip || pending.contains(&input.vtxo_id()) { expired.insert(input.vtxo_id()); }
+				if stored.fallback_status.is_some() { committed.insert(stored.id()); continue; }
+				if stored.expiry_height() <= tip { keyed.push((stored.id(), self.get_vtxo_key(&stored.vtxo).await?)); }
 			}
 		}
-		if expired.is_empty() { return Ok(inputs); }
-		if let Err(error) = self.sync_fallback_payouts().await {
-			warn!("Could not verify fallback outputs before refresh: {:#}", error);
-		}
-		let ids = expired.iter().copied().collect::<Vec<_>>();
-		let eligible = self.reconcile_expired_inputs(&ids).await?;
-		let snapshot = self.inner.db.get_fallback_snapshot().await?;
-		let pending = self.fallback_pending_principal(&snapshot).await?;
-		Ok(inputs.into_iter().filter(|input| !pending.contains_key(&input.vtxo_id())
-			&& (!expired.contains(&input.vtxo_id()) || eligible.contains(&input.vtxo_id()))).collect())
-	}
-
-	pub(crate) async fn reconcile_all_expired_vtxos(&self) -> anyhow::Result<()> {
-		let tip = self.inner.chain.tip().await?;
-		let pending = self.awaiting_settlement_vtxos().await?;
-		let mut ids = pending;
-		ids.extend(self.inner.db.get_vtxos_by_state(&[
-			VtxoStateKind::Spendable, VtxoStateKind::Locked,
-		]).await?.into_iter().filter(|vtxo|
-			vtxo.state == (VtxoState::Locked { holder: None })
-				|| vtxo.state == VtxoState::Spendable && vtxo.expiry_height() <= tip)
-			.map(|vtxo| vtxo.id()));
-		self.reconcile_expired_inputs(&ids.into_iter().collect::<Vec<_>>()).await?;
-		Ok(())
+		let queries = keyed.iter().map(|(id,key)| (*id,key)).collect::<Vec<_>>();
+		let states = self.fetch_vtxo_spend_states(&queries).await?;
+		let queried = keyed.iter().map(|(id,_)| *id).collect::<HashSet<_>>();
+		Ok(inputs.into_iter().filter(|input| !committed.contains(&input.vtxo_id())
+			&& (!queried.contains(&input.vtxo_id()) || states.get(&input.vtxo_id()) == Some(&VtxoSpendState::Spendable))).collect())
 	}
 }

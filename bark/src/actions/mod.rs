@@ -15,6 +15,7 @@ pub mod offboard;
 use std::fmt;
 use std::time::Duration;
 
+use anyhow::Context;
 use log::{debug, trace, warn};
 use server_rpc::StatusExt;
 
@@ -28,7 +29,7 @@ use crate::actions::lightning::pay::LightningSend;
 use crate::actions::lightning::receive::LightningReceive;
 use crate::actions::offboard::Offboard;
 use crate::lock_manager::LockGuard;
-use crate::vtxo::{VtxoState, VtxoStateKind, VtxoValidationError};
+use crate::vtxo::{FallbackStatus, VtxoState, VtxoStateKind, VtxoValidationError};
 
 pub(crate) const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -441,6 +442,10 @@ pub trait WalletAction: Sized + Send + Sync {
 	/// action (different states of the same action share an id).
 	fn id(&self) -> WalletActionId;
 
+	/// Get the action back from its stored checkpoint, `None` if the
+	/// checkpoint holds another kind of action.
+	fn from_checkpoint(checkpoint: WalletActionCheckpoint) -> Option<Self>;
+
 	/// The IDs of VTXOs which are currently in-use, either being spent or being
 	/// created, by the action and should be included in the wallet's balance.
 	/// The VTXOs should not be stored as spendable in the wallet, but they should
@@ -478,6 +483,114 @@ pub trait WalletAction: Sized + Send + Sync {
 	async fn on_abort(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self>;
 }
 
+/// The lock of a wallet action, with the checkpoint of the action as read
+/// while holding the lock.
+///
+/// Checkpoints are only written through this type. A write therefore always
+/// starts from the state stored under the lock, never from a copy that was
+/// read before another driver advanced or finished the action. Get one with
+/// [Wallet::try_lock_action] or [Wallet::lock_action].
+pub(crate) struct GuardedCheckpoint<A> {
+	id: WalletActionId,
+	/// `None` when the action has no checkpoint: it is not created yet, or
+	/// it has finished.
+	action: Option<A>,
+	_guard: Box<dyn LockGuard>,
+}
+
+impl<A> GuardedCheckpoint<A>
+where
+	A: WalletAction + Into<WalletActionCheckpoint> + Clone,
+{
+	pub fn get(&self) -> Option<&A> {
+		self.action.as_ref()
+	}
+
+	/// Store the first checkpoint of the action.
+	pub async fn create(&mut self, wallet: &Wallet, action: A) -> anyhow::Result<()> {
+		if self.action.is_some() {
+			bail!("action {} already has a checkpoint", self.id);
+		}
+		self.save(wallet, action).await
+	}
+
+	/// Change the checkpoint of the action outside of a step, like a setting
+	/// the user changes.
+	pub async fn update(&mut self, wallet: &Wallet, change: impl FnOnce(&mut A)) -> anyhow::Result<()> {
+		let mut action = self.action.take()
+			.with_context(|| format!("action {} has no checkpoint", self.id))?;
+		change(&mut action);
+		self.save(wallet, action).await
+	}
+
+	/// Finish the action: release its vtxo locks and remove its checkpoint.
+	///
+	/// The normal terminal path is [Advance::Done] or [Advance::Failed] from
+	/// a step. Calling this directly is for actions that end outside of a
+	/// step, like a cancel.
+	pub async fn finish(self, wallet: &Wallet) -> anyhow::Result<()> {
+		self.finish_or_remove(wallet, true).await
+	}
+
+	/// Remove the checkpoint of the action, and keep the vtxos it locked
+	/// locked.
+	pub async fn remove(self, wallet: &Wallet) -> anyhow::Result<()> {
+		self.finish_or_remove(wallet, false).await
+	}
+
+	async fn finish_or_remove(self, wallet: &Wallet, release_locks: bool) -> anyhow::Result<()> {
+		// The driver consumes its in-memory action before advancing it. Read
+		// the original durable state under the action lock, not that empty slot.
+		let ids = match wallet.inner.db.get_wallet_action_checkpoint(&self.id).await? {
+			Some(WalletActionCheckpoint::ArkoorSend(send)) => match &send.progress {
+				arkoor_send::Progress::Registration { signed_change_vtxos, .. } => Some(
+					send.input_vtxo_ids.iter().copied().chain(signed_change_vtxos.iter().map(|coin| coin.id())).collect::<Vec<_>>()),
+				_ => None,
+			},
+			Some(WalletActionCheckpoint::Offboard(offboard)) => match offboard.progress {
+				offboard::Progress::OffboardTxPrepared { offboard_vtxo_ids, .. } |
+				offboard::Progress::ReadyForOffboard { offboard_vtxo_ids, prior_txid: Some(_), .. } => Some(offboard_vtxo_ids),
+				_ => None,
+			},
+			_ => None,
+		};
+		let history_guard = if let Some(ids) = ids {
+			let guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
+			ensure!(!ids.is_empty(), "protected action has no retained inputs");
+			let mut committed = false;
+			let mut terminal = true;
+			for id in ids {
+				let coin = wallet.inner.db.get_wallet_vtxo(id).await?
+					.context("protected action input or signed change is missing")?;
+				committed |= coin.fallback_status.is_some();
+				terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited));
+			}
+			ensure!(!committed || terminal, "fallback input or signed change is unresolved; retaining its checkpoint");
+			Some(guard)
+		} else { None };
+		if release_locks {
+			if history_guard.is_some() {
+				wallet.release_action_locks_locked(&self.id).await?;
+			} else {
+				wallet.release_action_locks(&self.id).await?;
+			}
+		}
+		// Keep History through removal: a later status adoption must not race
+		// the assessment above or forget the signed Registration checkpoint.
+		wallet.inner.db.remove_wallet_action_checkpoint(&self.id).await?;
+		Ok(())
+	}
+
+	/// Private to this module: only the executor stores the state a step
+	/// returns, see [Wallet::drive_checkpoint].
+	async fn save(&mut self, wallet: &Wallet, action: A) -> anyhow::Result<()> {
+		debug_assert_eq!(action.id(), self.id, "checkpoint saved under another action id");
+		wallet.inner.db.upsert_wallet_action_checkpoint(&self.id, &action.clone().into()).await?;
+		self.action = Some(action);
+		Ok(())
+	}
+}
+
 /// How aggressively the executor should drive an action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriveMode {
@@ -511,64 +624,97 @@ impl Wallet {
 	/// returning each one to [`crate::vtxo::VtxoState::Spendable`].
 	///
 	/// Cheap when nothing is held (no-op). Used as the cleanup hook by
-	/// the executor on `Advance::Done` and by manual cancellation via
-	/// [`Self::stop_wallet_action`].
+	/// [`GuardedCheckpoint::finish`].
 	pub async fn release_action_locks(&self, action_id: &WalletActionId) -> anyhow::Result<()> {
+		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
+		self.release_action_locks_locked(action_id).await
+	}
+
+	/// Caller holds History through holder release and checkpoint removal.
+	async fn release_action_locks_locked(&self, action_id: &WalletActionId) -> anyhow::Result<()> {
 		let vtxos = self.get_vtxos_locked_by_action(action_id).await?;
 		if vtxos.is_empty() {
 			return Ok(());
 		}
 		debug!("releasing {} vtxo lock(s) held by action {}", vtxos.len(), action_id);
-		self.unlock_vtxos(
-			vtxos, Some(crate::vtxo::VtxoLockHolder::Action { id: action_id.clone() }),
-		).await
+		let holder = crate::vtxo::VtxoLockHolder::Action { id: action_id.clone() };
+		for coin in vtxos {
+			if self.has_fallback_commitment(coin.id()).await? { continue; }
+			self.inner.db.release_vtxo_lock(coin.id(), Some(&holder)).await?;
+		}
+		Ok(())
 	}
 
-	/// Finish a wallet action: release its vtxo locks and remove the
-	/// checkpoint row. Intended for manual cleanup of stuck actions;
-	/// the normal terminal path is `Advance::Done` from `advance`.
-	pub async fn stop_wallet_action(&self, action_id: &WalletActionId) -> anyhow::Result<()> {
-		self.release_action_locks(action_id).await?;
-		self.inner.db.remove_wallet_action_checkpoint(action_id).await?;
-		Ok(())
+	/// Take the lock of a wallet action without waiting, and read its
+	/// checkpoint under it. `None` if another driver holds the lock.
+	pub(crate) async fn try_lock_action<A>(&self, id: &WalletActionId)
+		-> anyhow::Result<Option<GuardedCheckpoint<A>>>
+	where
+		A: WalletAction,
+	{
+		match self.inner.lock_manager.try_lock(id).await {
+			Some(guard) => Ok(Some(self.read_checkpoint(id, guard).await?)),
+			None => Ok(None),
+		}
+	}
+
+	/// Take the lock of a wallet action, waiting up to `timeout` for it, and
+	/// read its checkpoint under it.
+	pub(crate) async fn lock_action<A>(&self, id: &WalletActionId, timeout: Duration)
+		-> anyhow::Result<GuardedCheckpoint<A>>
+	where
+		A: WalletAction,
+	{
+		let guard = self.inner.lock_manager.lock(id, timeout).await?;
+		self.read_checkpoint(id, guard).await
+	}
+
+	async fn read_checkpoint<A>(&self, id: &WalletActionId, guard: Box<dyn LockGuard>)
+		-> anyhow::Result<GuardedCheckpoint<A>>
+	where
+		A: WalletAction,
+	{
+		let action = match self.inner.db.get_wallet_action_checkpoint(id).await? {
+			Some(checkpoint) => Some(A::from_checkpoint(checkpoint)
+				.with_context(|| format!("checkpoint {} holds another kind of action", id))?),
+			None => None,
+		};
+		Ok(GuardedCheckpoint { id: id.clone(), action, _guard: guard })
 	}
 
 	/// Drive a wallet action to its next park or terminal state.
 	///
 	/// Holds a per-action-id in-flight guard so concurrent drives of
 	/// the same action (e.g. the periodic sync racing a user call)
-	/// don't step on each other.
-	pub async fn drive_action<A>(&self, action: A, mode: DriveMode) -> anyhow::Result<()>
+	/// don't step on each other. If another driver holds it, or the action
+	/// has finished, nothing is driven.
+	pub(crate) async fn drive_action<A>(&self, id: &WalletActionId, mode: DriveMode) -> anyhow::Result<()>
 	where
 		A: WalletAction + Into<WalletActionCheckpoint> + Clone,
 	{
-		let guard = match self.inner.lock_manager.try_lock(&action.id()).await {
-			Some(g) => g,
+		match self.try_lock_action::<A>(id).await? {
+			Some(checkpoint) => self.drive_checkpoint(checkpoint, mode).await,
 			None => {
-				trace!("action {} is already being driven, skipping", action.id());
-				return Ok(());
+				trace!("action {} is already being driven, skipping", id);
+				Ok(())
 			},
-		};
-
-		self.drive_action_with_guard(action, mode, guard).await
+		}
 	}
 
-	/// Drive an action assuming the caller already holds its per-id
-	/// lock. `lock_guard` MUST be the guard returned by
-	/// `lock_manager.try_lock(&lock_key::<A>(&action.id()))`; it is
-	/// held for RAII and dropped when this function returns.
-	pub(crate) async fn drive_action_with_guard<A>(
+	/// Drive a wallet action whose lock the caller already holds. The lock
+	/// is released when this function returns. If the action has no
+	/// checkpoint, it has finished: nothing is driven.
+	pub(crate) async fn drive_checkpoint<A>(
 		&self,
-		action: A,
+		checkpoint: GuardedCheckpoint<A>,
 		mode: DriveMode,
-		_lock_guard: Box<dyn LockGuard>,
 	) -> anyhow::Result<()>
 	where
 		A: WalletAction + Into<WalletActionCheckpoint> + Clone,
 	{
 		// Box the driver so its state machine lives on the heap rather
 		// than inline in the caller's future.
-		Box::pin(self.run_action_loop(action, mode)).await
+		Box::pin(self.run_action_loop(checkpoint, mode)).await
 	}
 
 	/// Run one `advance` step and hand a failure to the action's handler.
@@ -626,29 +772,34 @@ impl Wallet {
 		self.run_step(action).await
 	}
 
-	async fn run_action_loop<A>(&self, mut action: A, mode: DriveMode) -> anyhow::Result<()>
+	async fn run_action_loop<A>(&self, mut checkpoint: GuardedCheckpoint<A>, mode: DriveMode)
+		-> anyhow::Result<()>
 	where
 		A: WalletAction + Into<WalletActionCheckpoint> + Clone,
 	{
+		let id = checkpoint.id.clone();
 		// In-memory counter of consecutive retries, for the backoff curve.
 		// Lives only for this drive_action call so the curve resets between
 		// drives.
 		let mut retries: u32 = 0;
 
 		loop {
-			let id = action.id();
+			let action = match checkpoint.action.take() {
+				Some(action) => action,
+				None => {
+					trace!("action {} has already finished, skipping", id);
+					return Ok(());
+				},
+			};
 
 			match self.advance_step(action).await {
 				Advance::Next(next) => {
 					retries = 0;
-					let checkpoint: WalletActionCheckpoint = next.clone().into();
-					self.inner.db.upsert_wallet_action_checkpoint(&id, &checkpoint).await?;
-					action = next;
+					checkpoint.save(self, next).await?;
 				},
 				Advance::Retry { state, error } => {
 					retries = retries.saturating_add(1);
-					let checkpoint: WalletActionCheckpoint = state.clone().into();
-					self.inner.db.upsert_wallet_action_checkpoint(&id, &checkpoint).await?;
+					checkpoint.save(self, state).await?;
 					match mode {
 						DriveMode::UntilParkOrDone => {
 							warn!("action {} failed, leaving checkpoint for retry: {:#}", id, error);
@@ -658,13 +809,11 @@ impl Wallet {
 							let delay = retries.pow(2) * BASE_RETRY_BACKOFF;
 							warn!("action {} failed, retrying in {:?}: {:#}", id, delay, error);
 							bark_runtime::sleep(delay).await;
-							action = state;
 						},
 					}
 				},
 				Advance::Park { state, wake_after, error } => {
-					let checkpoint: WalletActionCheckpoint = state.clone().into();
-					self.inner.db.upsert_wallet_action_checkpoint(&id, &checkpoint).await?;
+					checkpoint.save(self, state).await?;
 					match mode {
 						DriveMode::UntilParkOrDone => {
 							return match error {
@@ -676,7 +825,6 @@ impl Wallet {
 							if let Some(delay) = wake_after {
 								debug!("action {} parked; sleeping {:?} before re-drive", id, delay);
 								bark_runtime::sleep(delay).await;
-								action = state;
 							} else {
 								return match error {
 									Some(error) => Err(error),
@@ -687,13 +835,13 @@ impl Wallet {
 					}
 				},
 				Advance::Done => {
-					if let Err(e) = self.stop_wallet_action(&id).await {
+					if let Err(e) = checkpoint.finish(self).await {
 						warn!("action {} done but couldn't cancel: {:#}", id, e);
 					}
 					return Ok(());
 				},
 				Advance::Failed(e) => {
-					if let Err(e) = self.stop_wallet_action(&id).await {
+					if let Err(e) = checkpoint.finish(self).await {
 						warn!("action {} failed but couldn't cancel: {:#}", id, e);
 					}
 					return Err(e);

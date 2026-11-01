@@ -8,7 +8,6 @@
 //! - Provide stable, serde-friendly representations for database backends.
 //! - Enable forward/backward compatibility when schema migrations occur.
 
-pub use ark::fallback::FallbackRegistration;
 use ark::fallback::OwnerLink;
 
 use std::borrow::Cow;
@@ -54,6 +53,8 @@ pub struct SerdeVtxo {
 	/// records stored before this field existed, so they get caught up.
 	#[serde(default)]
 	pub registered: bool,
+	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
+	pub fallback_status: Option<crate::vtxo::FallbackStatus>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -67,7 +68,7 @@ impl SerdeVtxo {
 
 	pub fn to_wallet_vtxo(&self) -> Result<WalletVtxo, MissingStateError> {
 		let state = self.current_state().cloned().ok_or(MissingStateError)?;
-		Ok(wallet_vtxo_from_full(&self.vtxo, state, self.registered))
+		Ok(wallet_vtxo_from_full(&self.vtxo, state, self.registered, self.fallback_status))
 	}
 }
 
@@ -84,6 +85,7 @@ pub(crate) fn wallet_vtxo_from_full(
 	vtxo: &Vtxo<Full>,
 	state: VtxoState,
 	registered: bool,
+	fallback_status: Option<crate::vtxo::FallbackStatus>,
 ) -> WalletVtxo {
 	WalletVtxo {
 		vtxo: vtxo.to_bare(),
@@ -91,6 +93,7 @@ pub(crate) fn wallet_vtxo_from_full(
 		exit_depth: vtxo.exit_depth(),
 		exit_tx_weight: vtxo.transactions().map(|t| t.tx.weight()).sum(),
 		registered,
+		fallback_status,
 	}
 }
 
@@ -227,6 +230,19 @@ pub struct SettledLightningReceive {
 	pub invoice: Bolt11Invoice,
 	pub amount: Amount,
 	pub settled_at: chrono::DateTime<chrono::Local>,
+	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
+	pub association: Option<ReceiveAssociation>,
+}
+
+/// Original claim identity retained when the live checkpoint is retired.
+/// No allocation, payout output or client ancestry is stored here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiveAssociation {
+	pub key_index: u32,
+	pub claim_destination: Option<ark::Address>,
+	pub grant_ids: Vec<VtxoId>,
+	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
+	pub fallback_status: Option<crate::vtxo::FallbackStatus>,
 }
 
 /// Persistable view of an [ExitVtxo].

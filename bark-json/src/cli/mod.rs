@@ -21,6 +21,7 @@ use bark::actions::lightning::receive::{
 };
 
 use crate::cli::fees::FeeSchedule;
+use crate::primitives::FallbackStatusInfo;
 use crate::exit::error::ExitError;
 use crate::exit::package::ExitTransactionPackage;
 use crate::exit::ExitState;
@@ -250,10 +251,6 @@ pub struct DebugInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct Balance {
-	/// Owned value awaiting settlement; included in pending, never spendable.
-	#[serde(default, rename = "awaiting_settlement_sat", with = "bitcoin::amount::serde::as_sat")]
-	#[cfg_attr(feature = "utoipa", schema(value_type = u64, required))]
-	pub awaiting_settlement: Amount,
 	/// Sats that are immediately spendable, either in-round or
 	/// out-of-round.
 	#[serde(rename = "spendable_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -323,7 +320,6 @@ impl From<bark::Balance> for Balance {
 		Balance {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,
-			awaiting_settlement: v.awaiting_settlement,
 			pending_in_round: v.pending_in_round,
 			pending_lightning_send: v.pending_lightning_send,
 			claimable_lightning_receive: v.claimable_lightning_receive,
@@ -343,10 +339,6 @@ impl From<bark::Balance> for Balance {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct BalanceSummary {
-	/// Owned value awaiting settlement; included in pending, never spendable.
-	#[serde(default, rename = "awaiting_settlement_sat", with = "bitcoin::amount::serde::as_sat")]
-	#[cfg_attr(feature = "utoipa", schema(value_type = u64, required))]
-	pub awaiting_settlement: Amount,
 	/// Sats that can be spent right now. See `spendable_sat` of [Balance].
 	#[serde(rename = "spendable_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
@@ -356,8 +348,7 @@ pub struct BalanceSummary {
 	#[serde(rename = "needs_refresh_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub needs_refresh: Amount,
-	/// Sats awaiting settlement or held by operations: `awaiting_settlement_sat`
-	/// plus the sum of the `pending_*_sat`
+	/// Sats held by operations: the sum of the `pending_*_sat`
 	/// fields of [Balance]. They either come back as spendable or leave the
 	/// wallet, for example to the on-chain wallet.
 	#[serde(rename = "pending_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -371,8 +362,7 @@ pub struct BalanceSummary {
 
 impl From<&Balance> for BalanceSummary {
 	fn from(v: &Balance) -> Self {
-		let pending = v.awaiting_settlement
-			+ v.pending_in_round
+		let pending = v.pending_in_round
 			+ v.pending_board
 			+ v.pending_arkoor_send
 			+ v.pending_lightning_send
@@ -382,7 +372,6 @@ impl From<&Balance> for BalanceSummary {
 		BalanceSummary {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,
-			awaiting_settlement: v.awaiting_settlement,
 			pending,
 			total: v.spendable + v.needs_refresh + pending,
 		}
@@ -400,7 +389,6 @@ impl From<bark::BalanceSummary> for BalanceSummary {
 		BalanceSummary {
 			spendable: v.spendable,
 			needs_refresh: v.needs_refresh,
-			awaiting_settlement: v.awaiting_settlement,
 			pending: v.pending,
 			total: v.total,
 		}
@@ -601,15 +589,36 @@ pub struct OffboardResult {
 	pub movement_id: MovementId,
 }
 
+/// Lifecycle phase of a lightning receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum LightningReceiveStateKind {
+	/// The invoice waits to be paid
+	AwaitingPayment,
+	/// The server holds the incoming HTLCs for the wallet to claim
+	HtlcsReady,
+	/// The preimage was revealed to claim the HTLCs
+	PreimageRevealed,
+	/// The claimed VTXOs are being delivered
+	Delivering,
+	/// The receive settled
+	Settled,
+	/// A state added after this client was built
+	#[serde(other)]
+	Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct LightningReceiveInfo {
 	/// The payment hash linked to the lightning receive
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the receive: `awaiting-payment`, `htlcs-ready`,
-	/// `preimage-revealed`, `delivering`, or `settled`.
-	pub state: String,
+	/// Lifecycle phase of the invoice; payout progress is `fallback_status`.
+	pub state: LightningReceiveStateKind,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fallback_status: Option<FallbackStatusInfo>,
 	/// The invoice string, if known.
 	pub invoice: String,
 	/// The payment preimage, if known.
@@ -651,11 +660,12 @@ impl LightningReceiveInfo {
 			LightningReceiveState::InProgress(recv) => LightningReceiveInfo::from(recv),
 			LightningReceiveState::Settled(s) => LightningReceiveInfo {
 				payment_hash: s.payment_hash,
-				state: "settled".to_string(),
+				state: LightningReceiveStateKind::Settled,
+				fallback_status: s.association.as_ref().and_then(|claim| claim.fallback_status).map(Into::into),
 				invoice: s.invoice.to_string(),
 				payment_preimage: Some(s.preimage),
 				amount: s.amount,
-				htlc_vtxo_ids: vec![],
+				htlc_vtxo_ids: s.association.as_ref().map(|claim| claim.grant_ids.clone()).unwrap_or_default(),
 				settled_at: Some(s.settled_at),
 				preimage_revealed_at: None,
 				finished_at: Some(s.settled_at),
@@ -665,15 +675,42 @@ impl LightningReceiveInfo {
 	}
 }
 
+/// Lifecycle phase of a lightning send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum LightningSendStateKind {
+	/// The wallet has no record of the payment: it was never made, or it
+	/// failed and its HTLCs were revoked
+	Unknown,
+	/// The inputs are selected
+	Start,
+	/// The inputs are locked
+	InputsLocked,
+	/// The server cosigned the HTLCs
+	HtlcReceived,
+	/// The server was asked to pay
+	PaymentInitiated,
+	/// The payment failed and the HTLCs are being revoked
+	RevocableHtlcs,
+	/// The payment failed and revoking the HTLCs failed; consider an
+	/// emergency exit
+	RevocationStuck,
+	/// The payment succeeded
+	Paid,
+	/// A state added after this client was built
+	#[serde(other)]
+	Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
 pub struct LightningSendInfo {
 	/// The payment hash of the outgoing lightning payment
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the send: `unknown`, `start`, `inputs-locked`, `htlc-received`,
-	/// `payment-initiated`, `revocable-htlcs`, `revocation-stuck`, or `paid`.
-	pub state: String,
+	/// Lifecycle phase of the send
+	pub state: LightningSendStateKind,
 	/// The invoice string, if known.
 	pub invoice: Option<String>,
 	/// The payment preimage, revealed once the payment succeeded.
@@ -687,28 +724,28 @@ impl LightningSendInfo {
 		match state {
 			LightningSendState::Unknown => LightningSendInfo {
 				payment_hash: hash,
-				state: "unknown".to_string(),
+				state: LightningSendStateKind::Unknown,
 				invoice: None,
 				preimage: None,
 			},
 			LightningSendState::Paid(paid) => LightningSendInfo {
 				payment_hash: paid.payment_hash,
-				state: "paid".to_string(),
+				state: LightningSendStateKind::Paid,
 				invoice: None,
 				preimage: Some(paid.preimage),
 			},
 			LightningSendState::InProgress(send) => {
-				let phase = match send.progress {
-					SendProgress::Start => "start",
-					SendProgress::InputsLocked { .. } => "inputs-locked",
-					SendProgress::HtlcReceived(_) => "htlc-received",
-					SendProgress::PaymentInitiated(_) => "payment-initiated",
-					SendProgress::RevocableHtlcs { .. } => "revocable-htlcs",
-					SendProgress::RevocationStuck { .. } => "revocation-stuck",
+				let state = match send.progress {
+					SendProgress::Start => LightningSendStateKind::Start,
+					SendProgress::InputsLocked { .. } => LightningSendStateKind::InputsLocked,
+					SendProgress::HtlcReceived(_) => LightningSendStateKind::HtlcReceived,
+					SendProgress::PaymentInitiated(_) => LightningSendStateKind::PaymentInitiated,
+					SendProgress::RevocableHtlcs { .. } => LightningSendStateKind::RevocableHtlcs,
+					SendProgress::RevocationStuck { .. } => LightningSendStateKind::RevocationStuck,
 				};
 				LightningSendInfo {
 					payment_hash: send.invoice.payment_hash(),
-					state: phase.to_string(),
+					state,
 					invoice: Some(send.invoice.to_string()),
 					preimage: None,
 				}
@@ -721,15 +758,22 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 	#[allow(deprecated)] // populates deprecated compat fields kept for old clients
 	fn from(recv: &LightningReceive) -> Self {
 		let (state, htlc_vtxo_ids) = match &recv.progress {
-			ReceiveProgress::AwaitingPayment => ("awaiting-payment", vec![]),
-			ReceiveProgress::HtlcsReady(htlcs) => ("htlcs-ready", htlcs.vtxo_ids.clone()),
-			ReceiveProgress::PreimageRevealed(htlcs) => ("preimage-revealed", htlcs.vtxo_ids.clone()),
+			ReceiveProgress::AwaitingPayment => {
+				(LightningReceiveStateKind::AwaitingPayment, vec![])
+			},
+			ReceiveProgress::HtlcsReady(htlcs) => {
+				(LightningReceiveStateKind::HtlcsReady, htlcs.vtxo_ids.clone())
+			},
+			ReceiveProgress::PreimageRevealed(htlcs) => {
+				(LightningReceiveStateKind::PreimageRevealed, htlcs.vtxo_ids.clone())
+			},
 			// The HTLCs are spent once the claim outputs await delivery.
-			ReceiveProgress::Delivering(_) => ("delivering", vec![]),
+			ReceiveProgress::Delivering(_) => (LightningReceiveStateKind::Delivering, vec![]),
 		};
 		LightningReceiveInfo {
 			payment_hash: recv.payment_hash,
-			state: state.to_string(),
+			state,
+			fallback_status: recv.fallback_status.map(Into::into),
 			invoice: recv.invoice.to_string(),
 			payment_preimage: Some(recv.payment_preimage),
 			amount: recv.invoice.amount_milli_satoshis()
@@ -750,9 +794,8 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_awaiting_balance_counts_owned_value_once() {
+	fn ordinary_pending_balance_counts_each_bucket_once() {
 		let balance = Balance {
-			awaiting_settlement: Amount::from_sat(5_000),
 			spendable: Amount::from_sat(2_000),
 			needs_refresh: Amount::ZERO,
 			pending_lightning_send: Amount::ZERO,
@@ -760,16 +803,15 @@ mod test {
 			pending_in_round: Amount::ZERO,
 			pending_board: Amount::ZERO,
 			pending_arkoor_send: Amount::ZERO,
-			pending_offboard: Amount::ZERO,
+			pending_offboard: Amount::from_sat(5_000),
 			pending_exit: Amount::ZERO,
 		};
 		let summary = BalanceSummary::from(&balance);
 		assert_eq!(summary.spendable, Amount::from_sat(2_000));
-		assert_eq!(summary.awaiting_settlement, Amount::from_sat(5_000));
 		assert_eq!(summary.pending, Amount::from_sat(5_000));
 		assert_eq!(summary.total, Amount::from_sat(7_000));
 		let encoded = serde_json::to_value(&summary).unwrap();
-		assert_eq!(encoded["awaiting_settlement_sat"], 5_000);
+		assert!(encoded.get("awaiting_settlement_sat").is_none());
 	}
 
 	fn lightning_receive_base_json() -> serde_json::Value {
@@ -801,6 +843,56 @@ mod test {
 		let mut json = lightning_receive_base_json();
 		json["htlc_vtxo_ids"] = serde_json::json!([]);
 		serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
+	}
+
+	/// The names are the strings `state` carried before it was typed.
+	#[test]
+	fn lightning_receive_states_keep_their_wire_names() {
+		let states = [
+			("awaiting-payment", LightningReceiveStateKind::AwaitingPayment),
+			("htlcs-ready", LightningReceiveStateKind::HtlcsReady),
+			("preimage-revealed", LightningReceiveStateKind::PreimageRevealed),
+			("delivering", LightningReceiveStateKind::Delivering),
+			("settled", LightningReceiveStateKind::Settled),
+		];
+		for (name, state) in states {
+			assert_eq!(serde_json::to_value(state).unwrap(), serde_json::json!(name));
+			let parsed = serde_json::from_value::<LightningReceiveStateKind>(serde_json::json!(name))
+				.unwrap();
+			assert_eq!(parsed, state, "{} parsed as {:?}", name, parsed);
+		}
+	}
+
+	/// The names are the strings `state` carried before it was typed.
+	#[test]
+	fn lightning_send_states_keep_their_wire_names() {
+		let states = [
+			("unknown", LightningSendStateKind::Unknown),
+			("start", LightningSendStateKind::Start),
+			("inputs-locked", LightningSendStateKind::InputsLocked),
+			("htlc-received", LightningSendStateKind::HtlcReceived),
+			("payment-initiated", LightningSendStateKind::PaymentInitiated),
+			("revocable-htlcs", LightningSendStateKind::RevocableHtlcs),
+			("revocation-stuck", LightningSendStateKind::RevocationStuck),
+			("paid", LightningSendStateKind::Paid),
+		];
+		for (name, state) in states {
+			assert_eq!(serde_json::to_value(state).unwrap(), serde_json::json!(name));
+			let parsed = serde_json::from_value::<LightningSendStateKind>(serde_json::json!(name))
+				.unwrap();
+			assert_eq!(parsed, state, "{} parsed as {:?}", name, parsed);
+		}
+	}
+
+	#[test]
+	fn unknown_lightning_states_parse_as_other() {
+		let mut json = lightning_receive_base_json();
+		json["state"] = serde_json::json!("some-future-state");
+		let info = serde_json::from_value::<LightningReceiveInfo>(json).unwrap();
+		assert_eq!(info.state, LightningReceiveStateKind::Other);
+
+		let send = serde_json::from_value::<LightningSendStateKind>(serde_json::json!("x")).unwrap();
+		assert_eq!(send, LightningSendStateKind::Other);
 	}
 
 	#[allow(deprecated)]

@@ -463,29 +463,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		Ok(())
 	}
 
-	/// Local ownership retained while a reported spend is verified.
-	async fn get_fallback_snapshot(&self) -> anyhow::Result<crate::FallbackSnapshot>;
-
-	/// Atomically replace local recovery ownership.
-	async fn store_fallback_snapshot(&self, snapshot: &crate::FallbackSnapshot) -> anyhow::Result<()>;
-
-	/// Read the immutable signed fallback destination.
-	async fn get_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>>;
-
-	/// Adopt canonical signatures only when the immutable binding is unchanged.
-	async fn store_fallback_record(&self, record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()>;
-
-	/// An authenticated local destination which has not received a server acknowledgement.
-	/// It must not authorize coin issuance or be reported as registered.
-	async fn get_pending_fallback_record(&self) -> anyhow::Result<Option<ark::fallback::FallbackRegistration>> {
-		Ok(None)
-	}
-
-	/// Keep the exact local binding immutable while registration is unavailable.
-	async fn store_pending_fallback_record(&self, _record: &ark::fallback::FallbackRegistration) -> anyhow::Result<()> {
-		bail!("persister does not support pending fallback registration")
-	}
-
 	/// Get the last revealed/used [Vtxo] key index.
 	///
 	/// Returns:
@@ -588,6 +565,7 @@ pub trait BarkPersister: Send + Sync + 'static {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
+		association: Option<&models::ReceiveAssociation>,
 	) -> anyhow::Result<()>;
 
 	/// Look up a settled lightning receive record by payment hash.
@@ -595,6 +573,16 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		payment_hash: PaymentHash,
 	) -> anyhow::Result<Option<SettledLightningReceive>>;
+
+	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
+		bail!("this persister does not support receive outcome rechecks")
+	}
+
+	async fn set_receive_fallback_status(&self, _hash: PaymentHash, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<()>
+	{
+		bail!("this persister does not support durable receive outcomes")
+	}
 
 	/// Store an entry indicating a [Vtxo] is being exited.
 	///
@@ -704,6 +692,23 @@ pub trait BarkPersister: Send + Sync + 'static {
 		new_state: VtxoState,
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<WalletVtxo>;
+
+	/// Persist authenticated fallback status before changing spendability.
+	/// Keep the marker on the existing coin through terminal/reorg checks;
+	/// no ordinary cleanup may clear it or release its commitment.
+	async fn set_vtxo_fallback_status(&self, _id: VtxoId, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		bail!("this persister does not support durable fallback outcomes")
+	}
+
+	/// Atomically retain a validated newly discovered body and its commitment.
+	/// A crash must not leave a terminal body without its recheck marker.
+	async fn store_fallback_vtxo(&self, _vtxo: &Vtxo<Full>, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		bail!("this persister does not support atomic fallback adoption")
+	}
 
 	/// Release `holder`'s lock on the given vtxo, transitioning it to
 	/// [VtxoState::Spendable]. `holder` must match the value passed at

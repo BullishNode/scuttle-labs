@@ -30,10 +30,12 @@ use server_rpc::protos::mailbox_server::MailboxMessage;
 
 use crate::{Wallet, WalletInner, SUBSCRIBE_REQUEST_TIMEOUT};
 use crate::actions::DriveMode;
+use crate::actions::lightning::pay::{ln_pay_action_id, LightningSend};
 use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
+use crate::vtxo::VtxoState;
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -65,6 +67,12 @@ const MAILBOX_PROCESSING_LOCK_KEY: &str = "mailbox.processing";
 /// waiters acquire the lock and dedup as usual.
 const MAILBOX_PROCESSING_LOCK_TIMEOUT: std::time::Duration =
 	std::time::Duration::from_secs(30);
+
+/// How long the handler of a lightning send notification waits for a drive
+/// of the send to release the lock of the send. Other mailbox messages wait
+/// meanwhile, so keep it short.
+const LIGHTNING_SEND_LOCK_TIMEOUT: std::time::Duration =
+	std::time::Duration::from_secs(10);
 
 /// Whether a structurally-valid arkoor vtxo is safe to store as a spendable
 /// received payment.
@@ -416,7 +424,7 @@ impl Wallet {
 		// message is informational/ignored.
 		let advance = match mailbox_msg.message {
 			Some(Message::Arkoor(msg)) => {
-				match self.process_received_arkoor_package(msg.vtxos).await {
+				match self.process_received_arkoor_package(msg.vtxos, msg.owners).await {
 					Ok(()) => true,
 					Err(e) => {
 						error!("Error processing received arkoor package: {:#}", e);
@@ -474,8 +482,19 @@ impl Wallet {
 	async fn process_received_arkoor_package(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
+		owners: Vec<protos::core::VtxoOwner>,
 	) -> anyhow::Result<()> {
-		let vtxos = self.process_raw_vtxos(raw_vtxos).await?;
+		let mut owner_map = HashMap::new();
+		for owner in owners {
+			let id = VtxoId::from_slice(&owner.vtxo_id)?;
+			let mailbox = bitcoin::secp256k1::PublicKey::from_slice(&owner.owner_mailbox)?;
+			ensure!(owner_map.insert(id, mailbox).is_none(), "duplicate mailbox ownership metadata");
+		}
+		let vtxos = self.process_raw_vtxos(raw_vtxos).await?.into_iter().filter(|vtxo| {
+			let ours = owner_map.get(&vtxo.id()) == Some(&self.mailbox_keypair().public_key());
+			if !ours { warn!("Not counting mailbox coin {}: missing or foreign owner mailbox", vtxo.id()); }
+			ours
+		}).collect::<Vec<_>>();
 
 		// Serialize the receive dedup across all consumers of this wallet's
 		// mailbox so two of them can't both record a movement for the same
@@ -516,6 +535,20 @@ impl Wallet {
 		if let Err(e) = self.register_vtxo_transactions_with_server(&new_vtxos).await {
 			warn!("Failed to register received arkoor vtxo transactions with server: {:#}", e);
 		}
+
+		let mut current = Vec::new();
+		for coin in new_vtxos {
+			let key = self.get_vtxo_key(&coin).await?;
+			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
+			if state == protos::VtxoSpendState::Spent
+				&& !committed {
+				self.store_vtxos([&coin], &VtxoState::Spent).await?;
+				continue;
+			}
+			current.push(coin);
+		}
+		let new_vtxos = current;
+		if new_vtxos.is_empty() { return Ok(()); }
 
 		// TODO: Make sure we don't effectively skip the entire package if the movement fails to
 		//       be recorded due to bark getting killed after this point.
@@ -619,19 +652,16 @@ impl Wallet {
 		// Errors are logged but not propagated: we always advance the
 		// mailbox checkpoint to avoid re-processing the same
 		// notification on the next poll.
-		match self.lightning_send_checkpoint(payment_hash).await {
-			Ok(Some(send)) => {
-				match self.drive_action(send, DriveMode::UntilParkOrDone).await {
+		let action_id = ln_pay_action_id(payment_hash);
+		match self.lock_action::<LightningSend>(&action_id, LIGHTNING_SEND_LOCK_TIMEOUT).await {
+			Ok(checkpoint) if checkpoint.get().is_some() => {
+				match self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await {
 					Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
 					Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
 				}
 			},
-			Ok(None) => {
-				debug!("Lightning send finished notification has no pending action for {}", payment_hash);
-			},
-			Err(e) => {
-				error!("Failed to look up lightning send checkpoint for {}: {:#}", payment_hash, e);
-			},
+			Ok(_) => debug!("Lightning send finished notification has no pending action for {}", payment_hash),
+			Err(e) => error!("Failed to look up lightning send checkpoint for {}: {:#}", payment_hash, e),
 		}
 
 		Ok(())

@@ -28,14 +28,14 @@ async fn reject_arkoor_with_bad_signature() {
 
 			let response = upstream.read_mailbox(req).await?.into_inner();
 			let message = response.messages[0].message.as_ref().unwrap();
-			let mut vtxo = match message {
+			let (mut vtxo, owners) = match message {
 				Message::Arkoor(message) => {
-					Vtxo::deserialize(&message.vtxos[0]).unwrap()
+					(Vtxo::deserialize(&message.vtxos[0]).unwrap(), message.owners.clone())
 				},
 				_ => panic!("unexpected message type"),
 			};
 			vtxo.invalidate_final_sig();
-			let message = ArkoorMessage { vtxos: vec![vtxo.serialize()] };
+			let message = ArkoorMessage { vtxos: vec![vtxo.serialize()], owners };
 
 			Ok(protos::mailbox_server::MailboxMessages {
 				messages: vec![protos::mailbox_server::MailboxMessage {
@@ -216,7 +216,7 @@ async fn accept_mailbox() {
 
 /// Helper to read all vtxo_ids from a recovery mailbox
 async fn read_recovery_vtxo_ids(
-	mb_rpc: &mut server_rpc::protos::mailbox_server::mailbox_service_client::MailboxServiceClient<tonic::transport::Channel>,
+	mb_rpc: &mut MailboxClient,
 	wallet: &bark::Wallet,
 ) -> Vec<VtxoId> {
 	let recovery_mailbox_kp = wallet.recovery_mailbox_keypair();

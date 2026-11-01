@@ -16,13 +16,13 @@ use ark::{ProtocolEncoding, Vtxo};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 
-use crate::{VtxoId, WalletProperties};
+use crate::{MailboxIdentity, VtxoId, WalletProperties};
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
 use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
 use crate::persist::{RoundStateId, StoredRoundState};
 use crate::persist::models::{
-	FallbackRegistration,	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
+	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
 };
 use crate::persist::sqlite::convert::{row_to_movement, row_to_wallet_vtxo, rows_to_wallet_vtxos};
 use crate::round::RoundState;
@@ -46,6 +46,8 @@ pub (crate) fn set_properties(
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
 	})?;
+	conn.execute("INSERT INTO bark_mailbox_identity (id, public_key, network) VALUES (1, ?1, ?2)",
+		params![properties.mailbox_identity.public_key.to_string(), properties.mailbox_identity.network.to_string()])?;
 
 	Ok(())
 }
@@ -89,7 +91,8 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT * FROM bark_properties";
+	let query = "SELECT p.*, m.public_key AS mailbox_pubkey, m.network AS mailbox_network
+		FROM bark_properties p LEFT JOIN bark_mailbox_identity m ON m.id = p.id";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -98,6 +101,12 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
+		let mailbox_pubkey: String = row.get("mailbox_pubkey").context("missing mailbox identity")?;
+		let mailbox_network: String = row.get("mailbox_network").context("missing mailbox network")?;
+		let mailbox_identity = MailboxIdentity {
+			network: Network::from_str(&mailbox_network).context("invalid mailbox network")?,
+			public_key: PublicKey::from_str(&mailbox_pubkey).context("invalid mailbox public key")?,
+		};
 
 		let server_pubkey = server_pubkey
 			.map(|s| PublicKey::from_str(&s))
@@ -115,6 +124,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
+				mailbox_identity,
 			}
 		))
 	} else {
@@ -414,7 +424,8 @@ pub fn get_pending_round_state_ids(
 /// Columns the `vtxo_view`-based listings always select, in the order
 /// [`row_to_wallet_vtxo`] expects them.
 const VTXO_VIEW_COLUMNS: &str =
-	"raw_bare, exit_depth, exit_tx_weight, state, registered";
+	"raw_bare, exit_depth, exit_tx_weight, state, registered,
+	(SELECT fallback_status FROM bark_vtxo b WHERE b.id=vtxo_view.id) AS fallback_status";
 
 pub fn get_wallet_vtxo_by_id(
 	conn: &Connection,
@@ -571,6 +582,8 @@ pub fn delete_vtxo(
 	tx: &rusqlite::Transaction,
 	id: VtxoId
 ) -> anyhow::Result<Option<Vtxo<Full>>> {
+	ensure!(get_wallet_vtxo_by_id(tx, id)?.is_none_or(|coin| coin.fallback_status.is_none()),
+		"fallback identity must be retained for status rechecks");
 	// Delete all vtxo-states
 	let query = "DELETE FROM bark_vtxo_state WHERE vtxo_id = ?1";
 	tx.execute(query, [id.to_string()])?;
@@ -637,6 +650,9 @@ pub fn update_vtxo_state_checked(
 		WHERE
 			vtxo_id = :vtxo_id AND
 			state_kind IN (SELECT atom FROM json_each(:old_states)) AND
+			EXISTS(SELECT 1 FROM bark_vtxo b WHERE b.id=:vtxo_id AND
+				(b.fallback_status IS NULL OR :state_kind='Exited'
+				 OR (b.fallback_status!='pending' AND :state_kind='Spent'))) AND
 			state != :state";
 
 	let new_state_blob = serde_json::to_vec(&new_state)?;
@@ -682,6 +698,7 @@ pub fn release_vtxo_lock(
 		SELECT :vtxo_id, :spendable_kind, :spendable FROM most_recent_vtxo_state
 		WHERE
 			vtxo_id = :vtxo_id AND
+			EXISTS(SELECT 1 FROM bark_vtxo b WHERE b.id=:vtxo_id AND b.fallback_status IS NULL) AND
 			state = :expected_state";
 
 	let expected = VtxoState::Locked { holder: holder.cloned() };
@@ -700,13 +717,27 @@ pub fn release_vtxo_lock(
 	Ok(())
 }
 
+pub fn set_vtxo_fallback_status(
+	tx: &Transaction, id: VtxoId, status: crate::vtxo::FallbackStatus,
+) -> anyhow::Result<WalletVtxo> {
+	let coin = get_wallet_vtxo_by_id(tx, id)?.context("fallback source is not stored")?;
+	let state = status.state_for(&coin.state);
+	tx.execute("UPDATE bark_vtxo SET fallback_status=?2 WHERE id=?1 AND fallback_status IS NOT ?2",
+		params![id.to_string(), status.as_str()])?;
+	tx.execute("INSERT INTO bark_vtxo_state(vtxo_id,state_kind,state)
+		SELECT ?1,?2,?3 FROM most_recent_vtxo_state WHERE vtxo_id=?1 AND state!=?3",
+		params![id.to_string(), state.kind().as_str(), serde_json::to_vec(&state)?])?;
+	get_wallet_vtxo_by_id(tx, id)?.context("fallback source disappeared")
+}
+
 /// Holder-scoped retirement, with no intermediate Spendable state.
 pub fn retire_vtxo_lock(
 	conn: &Connection, vtxo_id: VtxoId, holder: Option<&VtxoLockHolder>,
 ) -> anyhow::Result<bool> {
 	let changed = conn.execute("INSERT INTO bark_vtxo_state (vtxo_id,state_kind,state) \
 		SELECT :id,:kind,:next FROM most_recent_vtxo_state \
-		WHERE vtxo_id=:id AND state=:expected", named_params! {
+		WHERE vtxo_id=:id AND state=:expected AND EXISTS(SELECT 1 FROM bark_vtxo b
+			WHERE b.id=:id AND (b.fallback_status IS NULL OR b.fallback_status!='pending'))", named_params! {
 		":id": vtxo_id.to_string(),
 		":kind": VtxoStateKind::Spent.as_str(),
 		":next": serde_json::to_vec(&VtxoState::Spent)?,
@@ -845,50 +876,6 @@ pub fn get_last_vtxo_key_index(conn: &Connection) -> anyhow::Result<Option<u32>>
 	} else {
 		Ok(None)
 	}
-}
-
-pub fn get_fallback_record(conn: &Connection) -> anyhow::Result<Option<FallbackRegistration>> {
-	let bytes: Option<Vec<u8>> = conn.query_row(
-		"SELECT record FROM bark_fallback_record WHERE id = 1 AND registered = 1",
-		[],
-		|row| row.get(0),
-	).optional()?;
-	bytes.map(|bytes| FallbackRegistration::deserialize(&bytes).map_err(Into::into)).transpose()
-}
-
-pub fn get_pending_fallback_record(conn: &Connection) -> anyhow::Result<Option<FallbackRegistration>> {
-	let bytes: Option<Vec<u8>> = conn.query_row(
-		"SELECT record FROM bark_fallback_record WHERE id = 1 AND registered = 0",
-		[],
-		|row| row.get(0),
-	).optional()?;
-	bytes.map(|bytes| FallbackRegistration::deserialize(&bytes).map_err(Into::into)).transpose()
-}
-
-pub fn store_pending_fallback_record(conn: &Connection, record: &FallbackRegistration) -> anyhow::Result<()> {
-	store_fallback_binding(conn, record, false)
-}
-
-pub fn store_fallback_record(conn: &Connection, record: &FallbackRegistration) -> anyhow::Result<()> {
-	store_fallback_binding(conn, record, true)
-}
-
-fn store_fallback_binding(conn: &Connection, record: &FallbackRegistration, registered: bool) -> anyhow::Result<()> {
-	let changed = conn.execute(
-		"INSERT INTO bark_fallback_record (id, record, spk, registered)
-		VALUES (1, ?1, ?2, ?3)
-		ON CONFLICT (id) DO UPDATE SET
-			record = excluded.record,
-			registered = MAX(bark_fallback_record.registered, excluded.registered)
-		WHERE bark_fallback_record.spk = excluded.spk",
-		params![
-			record.serialize(),
-			record.spk.as_bytes(),
-			registered,
-		],
-	)?;
-	ensure!(changed == 1, "immutable fallback record mismatch");
-	Ok(())
 }
 
 pub fn get_mailbox_checkpoint(conn: &Connection) -> anyhow::Result<u64> {
@@ -1173,10 +1160,11 @@ pub fn record_settled_lightning_receive(
 	preimage: Preimage,
 	invoice: &Bolt11Invoice,
 	amount: Amount,
+	association: Option<&crate::persist::models::ReceiveAssociation>,
 ) -> anyhow::Result<()> {
 	let query = "
-		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat)
-		VALUES (:payment_hash, :preimage, :invoice, :amount_sat)
+		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat, association)
+		VALUES (:payment_hash, :preimage, :invoice, :amount_sat, :association)
 		ON CONFLICT(payment_hash) DO NOTHING";
 	let mut statement = conn.prepare(query)?;
 	statement.execute(named_params! {
@@ -1184,7 +1172,15 @@ pub fn record_settled_lightning_receive(
 		":preimage": preimage.as_hex().to_string(),
 		":invoice": invoice.to_string(),
 		":amount_sat": amount.to_sat() as i64,
+		":association": association.map(serde_json::to_vec).transpose()?,
 	})?;
+	if let Some(expected) = association {
+		let stored = get_settled_lightning_receive(conn, payment_hash)?.context("settled receive disappeared")?
+			.association.context("settled receive has no original claim association")?;
+		ensure!((stored.key_index, &stored.claim_destination, &stored.grant_ids)
+			== (expected.key_index, &expected.claim_destination, &expected.grant_ids),
+			"settled receive claim association differs");
+	}
 	Ok(())
 }
 
@@ -1192,7 +1188,7 @@ pub fn get_settled_lightning_receive(
 	conn: &Connection,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<Option<SettledLightningReceive>> {
-	let query = "SELECT preimage, invoice, amount_sat, settled_at
+	let query = "SELECT preimage, invoice, amount_sat, settled_at, association
 		FROM bark_settled_lightning_receive WHERE payment_hash = :payment_hash";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
@@ -1209,7 +1205,33 @@ pub fn get_settled_lightning_receive(
 		.context("invalid invoice in bark_settled_lightning_receive")?;
 	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat")? as u64);
 	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
-	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
+	let association = row.get::<_, Option<Vec<u8>>>("association")?
+		.map(|raw| serde_json::from_slice(&raw)).transpose()?;
+	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at, association }))
+}
+
+pub fn fallback_lightning_receives(conn: &Connection) -> anyhow::Result<Vec<SettledLightningReceive>> {
+	let mut statement = conn.prepare("SELECT payment_hash FROM bark_settled_lightning_receive WHERE association IS NOT NULL ORDER BY payment_hash")?;
+	let hashes = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+	let mut ret = Vec::new();
+	for hash in hashes {
+		let recv = get_settled_lightning_receive(conn, hash.parse()?)?.context("known receive disappeared")?;
+		if recv.association.as_ref().is_some_and(|claim| claim.fallback_status.is_some()) { ret.push(recv); }
+	}
+	Ok(ret)
+}
+
+pub fn set_receive_fallback_status(conn: &mut Connection, hash: PaymentHash, status: crate::vtxo::FallbackStatus)
+	-> anyhow::Result<()>
+{
+	let tx = conn.transaction()?;
+	let mut association = get_settled_lightning_receive(&tx, hash)?.context("receive is not stored")?
+		.association.context("receive has no original claim association")?;
+	association.fallback_status = Some(status);
+	tx.execute("UPDATE bark_settled_lightning_receive SET association=?2 WHERE payment_hash=?1",
+		params![hash.to_string(), serde_json::to_vec(&association)?])?;
+	tx.commit()?;
+	Ok(())
 }
 
 
