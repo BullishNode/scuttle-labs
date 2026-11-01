@@ -18,7 +18,7 @@ use bark::onchain::OnchainWallet;
 use bark::persist::BarkPersister;
 use bark::persist::adaptor::{partition, Query, QueryRange, Record, StorageAdaptor, StorageAdaptorWrapper};
 use bark::persist::adaptor::filestore::FileStorageAdaptor;
-use bark::persist::models::RoundStateId;
+use bark::persist::models::{RoundStateId, SerdeRoundState};
 use bark::round::{RoundFlowKind, RoundStatus};
 use bark::subsystem::RoundMovement;
 use bark::vtxo::{VtxoLockHolder, VtxoState};
@@ -60,6 +60,9 @@ struct RefreshTransport {
 	nonce_requests: Arc<AtomicUsize>,
 	lose_forfeit_reply: Arc<AtomicBool>,
 	accepted_forfeits: Arc<AtomicUsize>,
+	forfeit_requests: Arc<AtomicUsize>,
+	wrong_issued_outputs: Arc<Mutex<Option<(UnlockHash, Vec<Vec<u8>>)>>>,
+	wrong_issued_replies: Arc<AtomicUsize>,
 	registrations: Arc<AtomicUsize>,
 	leaf_cosigns: Arc<AtomicUsize>,
 	invalid_released_preimage: Arc<AtomicBool>,
@@ -109,6 +112,7 @@ impl captaind::proxy::ArkRpcProxy for RefreshTransport {
 	async fn forfeit_vtxos(&self, upstream: &mut ArkClient, request: protos::ForfeitVtxosRequest)
 		-> Result<protos::ForfeitVtxosResponse, tonic::Status>
 	{
+		self.forfeit_requests.fetch_add(1, Ordering::SeqCst);
 		let response = upstream.forfeit_vtxos(request).await?.into_inner();
 		self.accepted_forfeits.fetch_add(1, Ordering::SeqCst);
 		if self.lose_forfeit_reply.swap(false, Ordering::SeqCst) {
@@ -125,6 +129,12 @@ impl captaind::proxy::ArkRpcProxy for RefreshTransport {
 		let fault = *self.status_fault.lock().unwrap();
 		if matches!(fault, CancellationStatusFault::Pass) {
 			let mut response = result?.into_inner();
+			let replacement = self.wrong_issued_outputs.lock().unwrap().clone();
+			if let Some((target, outputs)) = replacement
+				&& target == hash && response.status == protos::RoundParticipationStatus::RoundPartIssued as i32 {
+				response.output_vtxos = outputs;
+				self.wrong_issued_replies.fetch_add(1, Ordering::SeqCst);
+			}
 			if response.status == protos::RoundParticipationStatus::RoundPartReleased as i32
 				&& self.invalid_released_preimage.load(Ordering::SeqCst) {
 				response.unlock_preimage.as_mut().unwrap()[0] ^= 1;
