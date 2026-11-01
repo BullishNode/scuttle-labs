@@ -377,6 +377,11 @@ pub(crate) async fn start_lightning_send(
 	}
 
 	invoice.check_signature().context("invoice has bad signature")?;
+	if let Invoice::Bolt11(invoice) = &invoice {
+		if invoice.would_expire(bark_runtime::now().duration_since(bark_runtime::UNIX_EPOCH)?) {
+			bail!("invoice has expired");
+		}
+	}
 
 	let payment_amount = invoice.get_payment_amount(user_amount)
 		.context("invoice has bad payment amount")?;

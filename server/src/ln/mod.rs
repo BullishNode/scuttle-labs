@@ -354,6 +354,11 @@ impl Server {
 		// An exact retry acknowledges existing work even if its node or a new
 		// admission view is now unavailable. The monitor owns any re-drive.
 		if recorded { return Ok(()); }
+		if let Invoice::Bolt11(invoice) = &invoice {
+			if invoice.is_expired() {
+				return badarg!("invoice has expired");
+			}
+		}
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
