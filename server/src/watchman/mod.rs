@@ -52,7 +52,7 @@ use tracing::{info, trace, warn};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use ark::vtxo::policy::signing::VtxoSigner;
-use bitcoin_ext::{fee, BlockHeight, BlockRef, TxStatus, P2TR_DUST};
+use bitcoin_ext::{fee, BlockHeight, BlockRef, TransactionExt, TxStatus, P2TR_DUST};
 use bitcoin_ext::bdk::{WalletExt, KEYCHAIN};
 use bitcoin_ext::cpfp::MakeCpfpFees;
 use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
@@ -864,13 +864,21 @@ impl Watchman {
 
 		// Create a CPFP transaction to pay fees for the progress tx
 		//TODO(stevenroose) adapt feerate to how close the deadline is
-		let fees = MakeCpfpFees::Effective(fee_rate);
+		let (anchor, _) = progress_tx.fee_anchor().context("progress tx has no fee anchor")?;
+		let fees = if let Some(child) = bcd::get_mempool_spending_tx(&self.bitcoind, anchor).await? {
+			let (current_package_fee, _) = payout::mempool_child_fee(&self.bitcoind, child).await?
+				.context("progress fee child left the mempool")?;
+			MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
+		} else {
+			MakeCpfpFees::Effective(fee_rate)
+		};
 		let cpfp_tx = wallet.make_signed_p2a_cpfp(&progress_tx, fees)
 			.with_context(|| format!("failed to create CPFP for vtx {}", txid))?;
 
 		// Broadcast the progress tx and CPFP as a package
 		let cpfp_txid = cpfp_tx.compute_txid();
-		bcd::submit_package(&self.bitcoind, &[progress_tx, cpfp_tx]).await?;
+		let result = bcd::submit_package(&self.bitcoind, &[&progress_tx, &cpfp_tx]).await?;
+		bcd::require_package_acceptance(&result, &[&progress_tx, &cpfp_tx])?;
 
 		slog!(ProgressBroadcast, vtxo_id: vtxo.id(), txid, cpfp_txid);
 
