@@ -66,7 +66,8 @@ pub(super) async fn signed_leaf(
 	assert_eq!(leaf.policy(), &policy);
 	assert_eq!(leaf.amount(), input.amount());
 	assert_eq!(leaf.chain_anchor(), input.chain_anchor());
-	assert_eq!(leaf.exit_delta(), BlockDelta::new(144));
+	assert_eq!(leaf.exit_delta(), input.exit_delta());
+	assert_eq!(leaf.exit_delta(), srv.config().vtxo_exit_delta);
 	let funding = ctx.bitcoind().await_transaction(leaf.chain_anchor().txid).await;
 	leaf.validate(&funding).unwrap();
 	wallet.register_vtxo_transactions_with_server(&[leaf.clone()]).await.unwrap();
