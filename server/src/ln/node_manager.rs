@@ -95,6 +95,13 @@ fn payment_error_reaches_caller(error: &anyhow::Error) -> bool {
 	error.is::<crate::error::FallbackRefusal>() || error.is::<PaymentPreflightRefusal>()
 }
 
+/// A proven refusal before any attempt exists is a rejection, so the client
+/// can use the existing signed revocation path rather than await an outcome.
+fn intra_ark_preflight_refusal(error: anyhow::Error) -> anyhow::Error {
+	anyhow::Error::new(PaymentPreflightRefusal(error))
+		.context(crate::error::BadArgument::new("intra-Ark payment refused before recording an attempt"))
+}
+
 /// Handle for the cln manager process.
 pub struct LightningManager {
 	db: database::Db,
@@ -398,16 +405,34 @@ impl LightningManager {
 			})))
 		}.await.map_err(PaymentPreflightRefusal)?;
 
-		let (attempt_id, promoted) = self.db.write(async |t| {
+		let attempt_id = self.db.write(async |t| {
 			// Lock the funding sources before promoting the receive. The attempt
 			// and its actual funding link then become visible together.
 			database::expiry_guard::guard_new_lightning_inputs(t, htlc_vtxo_ids).await?;
+			if let Some(validation) = validation {
+				validation.map_err(intra_ark_preflight_refusal)?;
+			}
 			let mut promoted = false;
-			if let Some(sub) = sub.as_ref().filter(|_| validation.as_ref().is_some_and(|v| v.is_ok())) {
+			if let Some(sub) = sub.as_ref() {
 				promoted = sub.status == LightningHtlcSubscriptionStatus::Created
 					&& t.store_lightning_htlc_subscription_status(sub.id,
 						LightningHtlcSubscriptionStatus::Accepted, Some(htlc_send_expiry_height),
 						Some(LightningHtlcSubscriptionStatus::Created)).await?;
+				if !promoted {
+					let current = t.query_one("SELECT status FROM lightning_htlc_subscription WHERE id=$1 FOR UPDATE",
+						&[&sub.id]).await?.get::<_, LightningHtlcSubscriptionStatus>(0);
+					let error = match current {
+						LightningHtlcSubscriptionStatus::Accepted
+							| LightningHtlcSubscriptionStatus::HtlcsReady
+							| LightningHtlcSubscriptionStatus::Settled
+							=> PayInvoiceRace::AlreadyBeingPaid(current).into(),
+						LightningHtlcSubscriptionStatus::Canceled => PayInvoiceRace::Canceled.into(),
+						LightningHtlcSubscriptionStatus::Created => bail!(
+							"htlc subscription {} is Created but was not promoted", sub.id,
+						),
+					};
+					return Err(intra_ark_preflight_refusal(error));
+				}
 			}
 			let attempt_id = t.store_lightning_payment_start(
 				node.id, &invoice, amount, sender_mailbox_id, htlc_vtxo_ids,
@@ -421,7 +446,7 @@ impl LightningManager {
 				new.label = Some(attempt_id.to_string());
 				xpay::create_xpay(&**t, new).await.context("failed to store the xpay call")?;
 			}
-			Ok((attempt_id, promoted))
+			Ok(attempt_id)
 		}).await?;
 
 		// If there is an existing subscription, it's an intra-Ark lightning
@@ -429,26 +454,16 @@ impl LightningManager {
 		if let Some(sub) = sub {
 			trace!("Updating subscription status for intra-Ark lightning payment with payment hash {payment_hash}");
 
-			// This subscription read is what routes us down the intra-Ark path,
-			// so it is also where the sender's side has to be validated against
-			// it: `initiate_lightning_payment` checks the same thing, but a
-			// receive registered after that check would otherwise land here
-			// unvalidated and be paid out of our vtxopool.
-			let res = match validation.expect("existing subscription was validated") {
-				Ok(()) => self.finish_intra_ark_payment(sub, promoted).await,
-				Err(e) => Err(e),
-			};
+			// Only a validated sender and an actual subscription promotion can
+			// reach these post-commit notifications and backend cancellation.
+			let res = self.finish_intra_ark_payment(sub).await;
 			if let Err(e) = res {
 				trace!("Failed to update subscription status: {e:#}");
 				let attempt = self.db.read(async |t|
 					t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await
 				).await?.filter(|attempt| attempt.id == attempt_id)
 					.context("internal payment attempt disappeared")?;
-				if promoted {
-					self.payment_handler().fail_payment_attempt(&attempt, Some(&e.to_string())).await?;
-				} else {
-					self.payment_handler().fail_refused_payment_attempt(&attempt, Some(&e.to_string())).await?;
-				}
+				self.payment_handler().fail_payment_attempt(&attempt, Some(&e.to_string())).await?;
 				return Err(e);
 			}
 
@@ -486,30 +501,7 @@ impl LightningManager {
 	async fn finish_intra_ark_payment(
 		&self,
 		subscription: LightningHtlcSubscription,
-		promoted: bool,
 	) -> anyhow::Result<()> {
-		if !promoted {
-			let current = self.db
-				.read(async |t| t.get_htlc_subscription_by_id(subscription.id).await).await?
-				.context("htlc subscription disappeared")?
-				.status;
-			return Err(match current {
-				// Someone already paid the invoice (external LN acceptance or a
-				// prior initiate). Not an internal fault; the attempt is failed
-				// so the client can revoke its HTLC VTXOs.
-				LightningHtlcSubscriptionStatus::Accepted
-					| LightningHtlcSubscriptionStatus::HtlcsReady
-					| LightningHtlcSubscriptionStatus::Settled
-				=> PayInvoiceRace::AlreadyBeingPaid(current).into(),
-				LightningHtlcSubscriptionStatus::Canceled => PayInvoiceRace::Canceled.into(),
-				// The guarded update applies to every Created row, so this is
-				// unreachable unless the guard itself is wrong.
-				LightningHtlcSubscriptionStatus::Created => anyhow!(
-					"htlc subscription {} is Created but was not promoted", subscription.id,
-				),
-			});
-		}
-
 		let payment_hash = PaymentHash::from(&subscription.invoice);
 		// Wake check_lightning_receive so the client sees Accepted.
 		let _ = self.payment_update_tx.send(payment_hash);
@@ -1351,6 +1343,24 @@ impl LightningManagerProcess {
 #[cfg(test)]
 mod preflight_test {
 	use super::*;
+	use server_rpc::error::StatusExt;
+	use crate::rpcserver::ToStatus;
+
+	#[test]
+	fn proven_intra_ark_refusal_reaches_client_as_rejection() {
+		for error in [PayInvoiceRace::Canceled.into(),
+			PayInvoiceRace::AlreadyBeingPaid(LightningHtlcSubscriptionStatus::HtlcsReady).into(),
+			anyhow::Error::new(crate::error::BadArgument::new("invoice does not match the receive"))] {
+			let refusal = intra_ark_preflight_refusal(error);
+			assert!(payment_error_reaches_caller(&refusal));
+			let status = refusal.to_status();
+			assert_eq!(status.code(), tonic::Code::InvalidArgument);
+			assert!(status.is_rejection(), "the SDK must abort initiation and enter signed revocation");
+		}
+		let backend = anyhow!("database connection failed");
+		assert!(!payment_error_reaches_caller(&backend));
+		assert_eq!(backend.to_status().code(), tonic::Code::Internal);
+	}
 
 	#[test]
 	fn pre_attempt_refusals_reach_the_client_without_reclassifying_recorded_outcomes() {
