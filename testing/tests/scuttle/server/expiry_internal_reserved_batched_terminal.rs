@@ -198,7 +198,7 @@ async fn reserved_batched_terminal(reorg:bool) {
 	for _ in 0..5 { ctx.bitcoind().fund_addr(fee_address.clone(), sat(150_000)).await; }
 	ctx.generate_blocks(2).await;
 	srv.watchmand().start().await.unwrap();
-	tokio::time::timeout(Duration::from_secs(120), async {
+	let reservation_tip = tokio::time::timeout(Duration::from_secs(120), async {
 		loop {
 			let height = ctx.generate_blocks(1).await;
 			srv.wait_for_sync_height(height).await;
@@ -207,7 +207,11 @@ async fn reserved_batched_terminal(reorg:bool) {
 			if let Some(closures) = super::expiry_lightning_terminal::confirmed_grant_closures(
 				&ctx, &db, &grants, &receive_destination,
 			).await {
-				if closures.values().all(|(_, closed)| closed.checked_add(6).is_some_and(|required| required <= height.to_u32())) { break; }
+				if closures.values().all(|(_, closed)| closed.checked_add(5).is_some_and(|required| required <= height.to_u32())) {
+					assert_eq!(Some(height.to_u32()), closures.values().map(|(_, closed)| closed.checked_add(5).unwrap()).max(),
+						"capture the first six-confirmation tip before another block can consume the pending refund");
+					break height;
+				}
 			}
 		}
 	}).await.expect("receive grants must close in funded operator payouts six confirmations deep");
@@ -229,6 +233,8 @@ async fn reserved_batched_terminal(reorg:bool) {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("a real refund reservation of all three originals must precede either user timeout claim");
+	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(reservation_tip.to_u32()),
+		"capture the original pending reservations before any further mining");
 	let reserved_ids=reservations.values().map(|(id,_)|*id).collect::<BTreeSet<_>>();
 	let mut reserved=(BTreeSet::new(),BTreeMap::new());
 	for id in &reserved_ids {

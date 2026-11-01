@@ -124,7 +124,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	srv.watchmand().start().await.unwrap();
 	// Funded operator closures must reach six confirmations before any sender
 	// reservation can be committed. Hold the resulting tip for capture.
-	tokio::time::timeout(Duration::from_secs(150),async {
+	let reservation_tip=tokio::time::timeout(Duration::from_secs(150),async {
 		loop {
 			let height=ctx.generate_blocks(1).await;
 			srv.wait_for_sync_height(height).await;
@@ -133,7 +133,11 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 			if let Some(closures) = super::expiry_lightning_terminal::confirmed_grant_closures(
 				&ctx, &db, &grants, &receive_spk,
 			).await {
-				if closures.values().all(|(_, closed)| closed.checked_add(6).is_some_and(|required| required <= height.to_u32())) { break; }
+				if closures.values().all(|(_, closed)| closed.checked_add(5).is_some_and(|required| required <= height.to_u32())) {
+					assert_eq!(Some(height.to_u32()), closures.values().map(|(_, closed)| closed.checked_add(5).unwrap()).max(),
+						"capture the first six-confirmation tip before another block can consume the pending refund");
+					break height;
+				}
 			}
 		}
 	}).await.expect("receive grants must close in funded operator payouts six confirmations deep");
@@ -166,6 +170,8 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("normal refund reservations were not committed");
+	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(reservation_tip.to_u32()),
+		"capture the original pending reservations before any further mining");
 	srv.watchmand().stop().await.unwrap();
 	// All physical conflicts and fee UTXOs precede the user-claim fork. Thus
 	// old reservations remain conflicted even when those claims are
