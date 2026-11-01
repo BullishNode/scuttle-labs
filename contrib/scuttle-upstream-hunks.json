@@ -1,5 +1,5 @@
 {
-  "upstream": "51781ef693f5da15c9a5aa5720af8c5387652f23",
+  "upstream": "bd10c514c9718b480558961568fee2b70eac8cf5",
   "scope": "Reviewed upstream-file hunks at the Series0 baseline; intentional future topic changes require review.",
   "per_file_hunks": {
     ".config/nextest.toml": 2,
