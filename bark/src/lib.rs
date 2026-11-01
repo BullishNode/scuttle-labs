@@ -1547,7 +1547,7 @@ impl Wallet {
 	}
 
 	async fn require_server(&self) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		self.require_server_with_deadline(None).await
+		Box::pin(self.require_server_with_deadline(None)).await
 	}
 
 	async fn require_server_with_deadline(&self, deadline: Option<Instant>) -> anyhow::Result<(ServerConnection, ArkInfo)> {
