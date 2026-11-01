@@ -115,8 +115,7 @@ impl ClnXpayClient {
 	/// recheck is still required if this endpoint changes after the commit.
 	pub(crate) async fn qualify_before_attempt(&self) -> anyhow::Result<cln_rpc::GetinfoResponse> {
 		let mut rpc = self.rpc.clone();
-		let (info, _) = self.qualify_node(&mut rpc).await?;
-		Ok(info)
+		self.qualify_node(&mut rpc).await
 	}
 
 	async fn hold_dispatch_integrity(&self, attempt: &LightningPaymentAttempt, reason: &str) -> anyhow::Result<()> {
@@ -332,7 +331,7 @@ impl ClnXpayClient {
 	/// The persistent acknowledgement survives supported same-node restarts;
 	/// an unacknowledged/changed endpoint cannot certify an old call.
 	async fn qualify_node(&self, rpc: &mut ClnGrpcClient)
-		-> anyhow::Result<(cln_rpc::GetinfoResponse, cln_rpc::SetconfigResponse)>
+		-> anyhow::Result<cln_rpc::GetinfoResponse>
 	{
 		let info = super::unary_rpc(rpc.getinfo(cln_rpc::GetinfoRequest {})).await?.into_inner();
 		ensure!(qualified_node(&info, self.node_pubkey, self.network), "unqualified xpay node/version/network");
@@ -340,14 +339,14 @@ impl ClnXpayClient {
 			config: "xpay-slow-mode".into(), val: Some("true".into()), transient: Some(false),
 		})).await?.into_inner();
 		ensure!(slow_mode_ack(&ack), "native xpay-slow-mode acknowledgement is missing or inconsistent");
-		Ok((info, ack))
+		Ok(info)
 	}
 
 	async fn prepare_call(
 		&self, rpc: &mut ClnGrpcClient, attempt: &LightningPaymentAttempt,
 		request: &cln_rpc::XpayRequest, amount: Amount, retry_for: Duration,
 	) -> anyhow::Result<QualifiedCall> {
-		let (info, ack) = self.qualify_node(rpc).await?;
+		let info = self.qualify_node(rpc).await?;
 		let (records, server_tip) = self.db.read(async |t| Ok((
 			xpay::get_xpays_by_payment_hash(&**t, attempt.payment_hash).await?,
 			t.get_highest_block(database::BlockTable::Captaind).await?.map(|block| block.height),
@@ -361,7 +360,7 @@ impl ClnXpayClient {
 		if !request_matches(&record, attempt, &request, amount, retry_for) {
 			return Err(RequestBindingRefusal(anyhow!("xpay request differs from its original attempt/label/invoice")).into());
 		}
-		Ok(QualifiedCall { record, request, info, ack })
+		Ok(QualifiedCall { record, request, info })
 	}
 
 	/// Stores the xpay error on `attempt` and returns it as stored, so later
@@ -810,7 +809,6 @@ struct QualifiedCall {
 	record: ClnXpayRecord,
 	request: cln_rpc::XpayRequest,
 	info: cln_rpc::GetinfoResponse,
-	ack: cln_rpc::SetconfigResponse,
 }
 
 impl QualifiedCall {
@@ -819,35 +817,7 @@ impl QualifiedCall {
 	}
 
 	fn finish(self, error: &anyhow::Error) -> NativeNoRoute {
-		let config = self.ack.config.as_ref().expect("qualified acknowledgement");
-		// Kept in the existing error column with the terminal transaction. This
-		// is provenance for this fresh receipt, not a string the monitor trusts.
-		let error = serde_json::json!({
-			"native_completion": "cln-26.06.6-slow-xpay-noroute-v1",
-			"code": 205,
-			"attempt_id": self.record.label,
-			"lightning_node_id": self.record.lightning_node_id,
-			"node_pubkey": self.info.id.as_hex().to_string(),
-			"network": self.info.network,
-			"version": self.info.version,
-			"slow_mode": { "config": config.config, "value_bool": config.value_bool,
-				"dynamic": config.dynamic, "plugin": config.plugin, "transient": false },
-			"request": { "invstring": self.request.invstring, "label": self.request.label,
-				"amount_msat": self.request.amount_msat.as_ref().map(|v| v.msat),
-				"maxfee_msat": self.request.maxfee.as_ref().map(|v| v.msat),
-				"retry_for": self.request.retry_for, "maxdelay": self.request.maxdelay,
-				"partial_msat": self.request.partial_msat.as_ref().map(|v| v.msat),
-				"layers": self.request.layers, "payer_note": self.request.payer_note,
-				"localinvreqid": self.request.localinvreqid, "dev_use_shadow": self.request.dev_use_shadow },
-			"payment_hash": self.record.payment_hash.to_string(),
-			"payment_amount_msat": self.record.payment_amount_msat,
-			"rpc_deadline_secs": self.request.retry_for.map(|retry| u64::from(retry) + XPAY_TIMEOUT_BUFFER.as_secs()),
-			"original_attempt_expiry": self.record.attempt_expiry.to_rfc3339(),
-			"dispatch_count": self.record.dispatch_count,
-			"original_htlc_expiry": self.record.htlc_expiry.map(|h| h.to_u32()),
-			"native_reply": error.downcast_ref::<tonic::Status>().expect("native reply").message(),
-		}).to_string();
-		NativeNoRoute { record: self.record, error }
+		NativeNoRoute { record: self.record, error: error.to_string() }
 	}
 }
 

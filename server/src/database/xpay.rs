@@ -114,8 +114,8 @@ pub struct ClnXpayRecord {
 	/// the intended amount.
 	pub routing_fee_msat: Option<i64>,
 	/// On fresh Scuttle calls, Some(205) is written only with a qualified live
-	/// 26.06.6 slow-mode NoRoute receipt for dispatch_count=1 in the attempt's error column, in the
-	/// same source-serialized terminal transaction. Other outcome writers and
+	/// 26.06.6 slow-mode NoRoute reply for dispatch_count=1, in the same
+	/// source-serialized terminal transaction. Other outcome writers and
 	/// upstream backfill leave it NULL. Neither this column nor status=fail
 	/// alone authorizes a transition or certifies any old/restored row.
 	pub error_code: Option<i32>,
