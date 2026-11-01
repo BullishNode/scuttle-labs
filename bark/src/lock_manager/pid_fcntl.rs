@@ -101,11 +101,15 @@ impl FcntlPidLockManager {
 		fs::create_dir_all(&datadir)
 			.with_context(|| format!("failed to create datadir {}", datadir.display()))
 			.map_err(&setup)?;
+		let datadir = fs::canonicalize(&datadir)
+			.with_context(|| format!("failed to resolve datadir {}", datadir.display()))
+			.map_err(&setup)?;
 
 		// POSIX fcntl locks are scoped to (process, inode), so a second
 		// `fcntl(F_SETLK)` from the same process on the same file would
 		// silently succeed. Track which datadirs this process already
-		// holds the lock for so a second `new()` fails cleanly.
+		// holds the lock for so a second `new()` fails cleanly, including
+		// through a relative path or a directory symlink.
 		let registration = Registration::try_register(&datadir)?;
 
 		let path = datadir.join(LOCK_FILE);
