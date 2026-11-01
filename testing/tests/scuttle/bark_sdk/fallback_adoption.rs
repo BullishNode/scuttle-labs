@@ -910,6 +910,8 @@ struct MissingExpiredStatus {
 	target: Arc<Mutex<Option<VtxoId>>>,
 	paused: Arc<AtomicBool>,
 	stall_handshake: Arc<AtomicBool>,
+	slow_unary: Arc<AtomicBool>,
+	unary_durations: Arc<Mutex<Vec<Duration>>>,
 	calls: Arc<AtomicUsize>,
 	arrived: Arc<Notify>,
 	release: Arc<Notify>,
@@ -917,6 +919,18 @@ struct MissingExpiredStatus {
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for MissingExpiredStatus {
+	async fn get_vtxo_status(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxoStatusRequest)
+		-> Result<protos::GetVtxoStatusResponse, tonic::Status>
+	{
+		let started = tokio::time::Instant::now();
+		let response = upstream.get_vtxo_status(request).await?.into_inner();
+		if self.slow_unary.load(Ordering::SeqCst) {
+			tokio::time::sleep(Duration::from_secs(6)).await;
+			self.unary_durations.lock().unwrap().push(started.elapsed());
+		}
+		Ok(response)
+	}
+
 	async fn handshake(&self, upstream: &mut captaind::ArkClient, request: protos::HandshakeRequest)
 		-> Result<protos::HandshakeResponse, tonic::Status>
 	{
@@ -945,26 +959,32 @@ impl captaind::proxy::ArkRpcProxy for MissingExpiredStatus {
 
 #[tokio::test]
 async fn skipped_spent_refresh_does_not_invent_pending_principal() {
-	Box::pin(expired_status_retirement(false, false, false)).await;
+	Box::pin(expired_status_retirement(false, false, false, false)).await;
 }
 
 #[tokio::test]
 async fn paused_expired_status_cannot_reverse_concurrent_ordinary_retirement() {
-	Box::pin(expired_status_retirement(true, false, false)).await;
+	Box::pin(expired_status_retirement(true, false, false, false)).await;
 }
 
 #[tokio::test]
 async fn stalled_status_read_releases_history_for_unrelated_exit() {
-	Box::pin(expired_status_retirement(true, true, false)).await;
+	Box::pin(expired_status_retirement(true, true, false, false)).await;
 }
 
 #[tokio::test]
 async fn stalled_refresh_releases_status_waiter_and_local_exit() {
-	Box::pin(expired_status_retirement(true, true, true)).await;
+	Box::pin(expired_status_retirement(true, true, true, false)).await;
 }
 
-async fn expired_status_retirement(paused: bool, time_out: bool, refresh_lock: bool) {
-	let name = if refresh_lock { "bark_sdk/stalled_refresh_history_waiter" }
+#[tokio::test]
+async fn slow_status_imports_have_independent_read_budgets() {
+	Box::pin(expired_status_retirement(false, false, false, true)).await;
+}
+
+async fn expired_status_retirement(paused: bool, time_out: bool, refresh_lock: bool, slow_import: bool) {
+	let name = if slow_import { "bark_sdk/slow_status_import_budgets" }
+		else if refresh_lock { "bark_sdk/stalled_refresh_history_waiter" }
 		else if time_out { "bark_sdk/stalled_status_unrelated_exit" }
 		else if paused { "bark_sdk/paused_expired_status_retirement" }
 		else { "bark_sdk/skipped_spent_expired_refresh" };
@@ -990,6 +1010,42 @@ async fn expired_status_retirement(paused: bool, time_out: bool, refresh_lock: b
 	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
 	let change_ids = changes.iter().map(|coin| coin.id()).collect::<Vec<_>>();
 	assert!(stale.recover_vtxos(change_ids.clone(), None).await.unwrap().is_complete());
+	if slow_import {
+		Box::pin(async {
+			// Import the existing real spent source and unspent change into a new
+			// store with the SAME seed. No new funding or payment is introduced.
+			let mut bodies = vec![signed.clone()];
+			for id in &change_ids { bodies.push(current.get_full_vtxo(*id).await.unwrap()); }
+			assert!(bodies.len() >= 2);
+			let seed = mnemonic(&ctx, "current").await;
+			let database = Arc::new(SqliteClient::open(ctx.datadir.join("slow-import.sqlite")).unwrap());
+			let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database.clone()).await.unwrap();
+			let mut cfg = ctx.bark_default_cfg(&proxy, Some(ctx.bitcoind()));
+			config(&mut cfg);
+			let imported = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
+				OpenWalletArgs { persister: Some(database.clone()),
+					onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
+					run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
+			assert!(database.get_all_vtxos().await.unwrap().is_empty());
+			gate.slow_unary.store(true, Ordering::SeqCst);
+			let started = tokio::time::Instant::now();
+			let ids = imported.import_vtxos(&bodies, bark::ImportVtxoArgs::default()).await
+				.expect("healthy status reads each have their own budget");
+			gate.slow_unary.store(false, Ordering::SeqCst);
+			assert!(started.elapsed() > Duration::from_secs(10), "MISSED_TARGET: aggregate did not exceed one read budget");
+			let durations = gate.unary_durations.lock().unwrap().clone();
+			assert_eq!(durations.len(), bodies.len());
+			assert!(durations.iter().all(|duration| *duration >= Duration::from_secs(6) && *duration < Duration::from_secs(10)),
+				"MISSED_TARGET: every genuine status response must fit one existing read budget");
+			assert_eq!(ids.into_iter().collect::<BTreeSet<_>>(), bodies.iter().map(|coin| coin.id()).collect());
+			assert_eq!(imported.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spent);
+			for id in &change_ids { assert_eq!(imported.get_vtxo_by_id(*id).await.unwrap().state, VtxoState::Spendable); }
+			for coin in &bodies { assert!(imported.get_full_vtxo(coin.id()).await.unwrap().serialize() == coin.serialize()); }
+			assert_eq!(imported.balance().await.unwrap().total(), sat(40_000));
+			assert!(imported.history().await.unwrap().is_empty());
+			assert!(database.get_all_wallet_action_checkpoints().await.unwrap().is_empty());
+		}).await;
+	}
 	if !paused {
 		assert_eq!(stale.trust_and_adopt_server_vtxo_status(source.id()).await.unwrap(),
 			Some(bark::vtxo::ServerStatusAdoption::Spent));

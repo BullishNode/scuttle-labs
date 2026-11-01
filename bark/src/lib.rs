@@ -1688,17 +1688,17 @@ impl Wallet {
 		-> anyhow::Result<(VtxoSpendState, bool)>
 	{
 		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		self.fetch_vtxo_status_locked(vtxo_id, keypair, Instant::now() + SERVER_READ_TIMEOUT).await
+		self.fetch_vtxo_status_locked(vtxo_id, keypair).await
 	}
 
 	/// Caller retains FallbackHistory from before the request through adoption
 	/// and any first-seen body/marker write using the returned status.
-	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair, deadline: Instant)
+	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair)
 		-> anyhow::Result<(VtxoSpendState, bool)>
 	{
-		let (mut srv, _) = self.require_server_with_deadline(Some(deadline)).await?;
+		let (mut srv, _) = self.require_server_with_deadline(Some(Instant::now() + SERVER_READ_TIMEOUT)).await?;
 		let attestation = VtxoStatusAttestation::new(vtxo_id, keypair);
-		let resp = Self::server_read(Some(deadline), srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+		let resp = Self::server_read(Some(Instant::now() + SERVER_READ_TIMEOUT), srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
 			vtxo_id: vtxo_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
 		})).await?.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
@@ -1715,9 +1715,11 @@ impl Wallet {
 	///
 	/// Each keypair must be its VTXO's private key so we can prove ownership.
 	///
-	/// A VTXO the server does not know, whose batch request failed, or whose
-	/// answer is unusable, is absent from the result. Only a server that cannot
-	/// be reached is an error.
+	/// Unknown IDs, failed RPC batches, undecodable IDs and unknown spend states
+	/// are absent from the result. A read timeout stops later chunks and returns
+	/// answers already processed; `Ok` does not imply complete coverage.
+	/// History acquisition, server admission, integrity checks and local adoption
+	/// or storage can return errors. Earlier adopted updates remain durable.
 	pub(crate) async fn fetch_vtxo_spend_states(
 		&self,
 		queries: &[(VtxoId, &Keypair)],
@@ -1729,13 +1731,12 @@ impl Wallet {
 		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
 	{
 		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		let deadline = Instant::now() + SERVER_READ_TIMEOUT;
 		let mut ret = HashMap::with_capacity(queries.len());
 		if queries.is_empty() {
 			return Ok(ret);
 		}
 
-		let (mut srv, _) = self.require_server_with_deadline(Some(deadline)).await?;
+		let (mut srv, _) = self.require_server_with_deadline(Some(Instant::now() + SERVER_READ_TIMEOUT)).await?;
 		for chunk in queries.chunks(MAX_NB_VTXO_IDS) {
 			let req = protos::GetVtxosStatusByIdsRequest {
 				vtxos: chunk.iter().map(|(id, keypair)| protos::VtxoStatusQuery {
@@ -1743,7 +1744,7 @@ impl Wallet {
 					attestation: VtxoStatusAttestation::new(*id, keypair).serialize(),
 				}).collect(),
 			};
-			let resp = match Self::server_read(Some(deadline), srv.client.get_vtxos_status_by_ids(req)).await {
+			let resp = match Self::server_read(Some(Instant::now() + SERVER_READ_TIMEOUT), srv.client.get_vtxos_status_by_ids(req)).await {
 				Err(error) => {
 					warn!("Stopping status reads with {} answers retained: {:#}", ret.len(), error);
 					break;

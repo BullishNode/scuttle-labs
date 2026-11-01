@@ -773,9 +773,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let error = tokio::time::timeout(Duration::from_secs(15), provider.try_claim_lightning_receive(hash, false))
 		.await.unwrap().unwrap_err();
 	assert!(format!("{error:#}").contains("Ark server read deadline elapsed"));
-	let mut retried_checkpoint = checkpoint.clone();
-	retried_checkpoint.claim_attempts = retried_checkpoint.claim_attempts.saturating_add(1);
-	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap() == Some(retried_checkpoint));
+	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap() == Some(checkpoint.clone()));
 	let grant_after = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
 	assert_eq!(grant_after.state, grant_before.state);
 	assert_eq!(grant_after.fallback_status, grant_before.fallback_status);

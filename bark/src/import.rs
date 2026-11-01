@@ -111,14 +111,13 @@ impl Wallet {
 			.context("error scanning the vtxo key space")?;
 
 		let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		let deadline = bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT;
 		let mut fallback_pending = Vec::new();
 		let mut to_store = Vec::with_capacity(pending.len());
 		for vtxo in &pending {
 			let id = vtxo.id();
 			let state = match keypairs.get(&vtxo.user_pubkey()) {
 				None => Err(ImportVtxoError::KeyNotFound { id, gap_limit }),
-				Some(keypair) => self.import_vtxo_state(vtxo, keypair, &args, deadline).await,
+				Some(keypair) => self.import_vtxo_state(vtxo, keypair, &args).await,
 			};
 			match state {
 				Ok((state, pending)) => {
@@ -166,14 +165,13 @@ impl Wallet {
 		vtxo: &Vtxo<Full>,
 		keypair: &Keypair,
 		args: &ImportVtxoArgs,
-		deadline: bark_runtime::Instant,
 	) -> Result<(VtxoState, bool), ImportVtxoError> {
 		if args.skip_status_check {
 			return Err(anyhow!("Scuttle imports require authenticated mailbox ownership and status").into());
 		}
 
 		let id = vtxo.id();
-		let (spend_state, committed) = self.fetch_vtxo_status_locked(id, keypair, deadline).await?;
+		let (spend_state, committed) = self.fetch_vtxo_status_locked(id, keypair).await?;
 		let adoption = ServerStatusAdoption::from_status(spend_state, committed)
 			.with_context(|| format!("cannot decide the state of vtxo {id}"))?;
 		Ok(match adoption {

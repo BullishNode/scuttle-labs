@@ -28,9 +28,10 @@ impl Wallet {
 		-> anyhow::Result<Option<FallbackStatus>>
 	{
 		ensure!(!grants.is_empty() && PaymentHash::from(invoice) == hash, "receive association is incomplete");
-		let deadline = Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT);
-		let (mut srv, _) = self.require_server_with_deadline(deadline).await?;
-		let response = Self::server_read(deadline, srv.client.check_lightning_receive(protos::CheckLightningReceiveRequest {
+		let (mut srv, _) = self.require_server_with_deadline(
+			Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT)).await?;
+		let response = Self::server_read(Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT),
+			srv.client.check_lightning_receive(protos::CheckLightningReceiveRequest {
 			hash: hash.to_vec(), wait: false,
 		})).await??.into_inner();
 		ensure!(response.invoice == invoice.to_string()
@@ -121,7 +122,7 @@ impl Wallet {
 			self.validate_vtxo(coin).await?;
 			let key = self.get_vtxo_key(coin).await?;
 			let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-			let (state, committed) = self.fetch_vtxo_status_locked(coin.id(), &key, bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT).await?;
+			let (state, committed) = self.fetch_vtxo_status_locked(coin.id(), &key).await?;
 			ensure!(committed, "retained source has no authenticated commitment");
 			self.inner.db.store_fallback_vtxo(coin, FallbackStatus::try_from(state)?).await?;
 			ensure!(self.get_full_vtxo(coin.id()).await?.serialize() == coin.serialize(), "retained fallback body changed");

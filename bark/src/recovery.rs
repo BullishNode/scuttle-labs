@@ -771,7 +771,8 @@ impl Wallet {
 	/// discovery at creation or a later interrupted scan. It starts from the
 	/// beginning using the same store and seed; no known VTXO IDs are needed.
 	/// Previously stored results are handled idempotently. Normal open and
-	/// sync do not automatically repeat this scan.
+	/// sync do not automatically repeat this scan. This is an explicit Rust SDK
+	/// operation; no CLI, REST or NWC entry point is supplied.
 	///
 	/// Returns the existing [`RecoveryReport`]; inspect [`RecoveryReport::is_complete`]
 	/// and its categories rather than assuming every discovered coin is spendable.

@@ -481,13 +481,12 @@ impl WalletAction for Offboard {
 async fn offboard_inputs_terminal(wallet: &Wallet, ids: &[VtxoId]) -> anyhow::Result<Option<bool>> {
 	ensure!(!ids.is_empty(), "offboard has no retained inputs");
 	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
-	let deadline = bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT;
 	let mut terminal = true;
 	let mut fallback = false;
 	for id in ids {
 		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input is missing")?;
 		let key = wallet.get_vtxo_key(&coin.vtxo).await?;
-		let (state, committed) = wallet.fetch_vtxo_status_locked(*id, &key, deadline).await?;
+		let (state, committed) = wallet.fetch_vtxo_status_locked(*id, &key).await?;
 		fallback |= committed;
 		if !committed {
 			match state {

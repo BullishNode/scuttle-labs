@@ -345,11 +345,10 @@ impl Wallet {
 		// Validate every owner/status before any positive storage. A new
 		// fallback body and its recheck marker are persisted atomically.
 		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-		let deadline = bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT;
 		let mut states = Vec::new();
 		for vtxo in vtxos.clone() {
 			let key = self.get_vtxo_key(vtxo).await?;
-			let (state, committed) = self.fetch_vtxo_status_locked(vtxo.id(), &key, deadline).await?;
+			let (state, committed) = self.fetch_vtxo_status_locked(vtxo.id(), &key).await?;
 			if committed { self.validate_vtxo(vtxo).await?; }
 			ensure!(committed || matches!(state, VtxoSpendState::Spendable | VtxoSpendState::Unregistered | VtxoSpendState::Spent),
 				"new output is not yet released by its authenticated server");
