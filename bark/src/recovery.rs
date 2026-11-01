@@ -650,7 +650,8 @@ impl Wallet {
 	///
 	/// Returns `Ok(false)` when the server doesn't offer the rpc.
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
-		let (mut srv, ark_info) = self.require_server().await?;
+		let (mut srv, ark_info) = self.require_server_with_deadline(
+			Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT)).await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
 
 		let mut start_index = 0u32;
@@ -669,7 +670,8 @@ impl Wallet {
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
 			let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
+			let deadline = Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT);
+			let resp = match Self::server_read(deadline, srv.client.recover_vtxos_by_xpub(req)).await? {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {
 					info!("Server doesn't support VTXO recovery by xpub: {}", status.message());
@@ -765,9 +767,18 @@ impl Wallet {
 	/// mailboxes are then read from checkpoint 0, and every VTXO they reference
 	/// that the lookup didn't settle is resolved against the server, and against the chain when the server
 	/// reports it spendable, one mailbox page at a time and stored accordingly.
-	/// Returns a [`RecoveryReport`] (see it for why recovered/skipped/failed
-	/// matters).
-	pub(crate) async fn recover_from_seed(&self) -> anyhow::Result<RecoveryReport> {
+	/// This can be called explicitly on an existing wallet after a failed
+	/// discovery at creation or a later interrupted scan. It starts from the
+	/// beginning using the same store and seed; no known VTXO IDs are needed.
+	/// Previously stored results are handled idempotently. Normal open and
+	/// sync do not automatically repeat this scan. This is an explicit Rust SDK
+	/// operation; no CLI, REST or NWC entry point is supplied.
+	///
+	/// Returns the existing [`RecoveryReport`]; inspect [`RecoveryReport::is_complete`]
+	/// and its categories rather than assuming every discovered coin is spendable.
+	/// An error can follow partial durable recovery. Retry after the underlying
+	/// service recovers; existing held coins and uncertain outcomes remain fenced.
+	pub async fn recover_from_seed(&self) -> anyhow::Result<RecoveryReport> {
 		let mut report = RecoveryReport::default();
 		let gap_limit = self.inner.config.vtxo_key_gap_limit;
 

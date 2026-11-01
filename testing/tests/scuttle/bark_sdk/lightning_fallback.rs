@@ -259,20 +259,26 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 
 #[tokio::test]
 async fn receive_claim_reply_loss_is_durable_before_wire_and_recovers_after_reopen() {
-	receive_claim_reply_loss_reopen(false).await;
+	receive_claim_reply_loss_reopen(false, false).await;
 }
 
 /// The same actually settled, reply-lost claim must also retain its rightful
 /// fallback after reopening, registering the signed leaf, and going absent.
 #[tokio::test]
 async fn receive_claim_reply_loss_reopen_abandon_fallback_and_seed_recovery() {
-	receive_claim_reply_loss_reopen(true).await;
+	receive_claim_reply_loss_reopen(true, false).await;
 }
 
 /// Observe sponsorship directly in Core, including a child already mined.
 
-async fn receive_claim_reply_loss_reopen(fallback: bool) {
-	let ctx = TestContext::new(if fallback {
+#[tokio::test]
+async fn seed_recovery_preserves_active_receive_grants_and_then_claims() {
+	receive_claim_reply_loss_reopen(false, true).await;
+}
+
+async fn receive_claim_reply_loss_reopen(fallback: bool, scan_held: bool) {
+	let ctx = TestContext::new(if scan_held { "bark_sdk/seed_recovery_active_receive" }
+	else if fallback {
 		"bark_sdk/receive_claim_reply_loss_fallback_seed_recovery"
 	} else {
 		"bark_sdk/receive_claim_reply_loss_reopen"
@@ -287,7 +293,8 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	}
 	srv.wait_for_vtxopool(&ctx).await;
 	let gate = HoldSuccessfulReceiveClaim { hold: Arc::new(AtomicBool::new(true)),
-		arrived: Arc::new(tokio::sync::Notify::new()), requests: Arc::new(AtomicUsize::new(0)) };
+		arrived: Arc::new(tokio::sync::Notify::new()), requests: Arc::new(AtomicUsize::new(0)),
+		hold_before: scan_held, release_before: Arc::new(tokio::sync::Notify::new()) };
 	let proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
 	let mut wallet_builder = ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true);
 	if fallback { wallet_builder = wallet_builder.app_bip86(); }
@@ -313,6 +320,46 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 			_ = async { tokio::time::timeout(Duration::from_secs(30), gate.arrived.notified()).await.unwrap(); } => {},
 		}
 		let checkpoint = wallet.lightning_receive_checkpoint(hash).await.unwrap().unwrap();
+		if scan_held {
+			assert!(!checkpoint.grant_ids.is_empty());
+			let key = wallet.peek_keypair(checkpoint.key_index).await.unwrap();
+			let mut rpc = srv.get_public_rpc().await;
+			let mut original = Vec::new();
+			for id in &checkpoint.grant_ids {
+				let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+					vtxo_id: id.to_bytes().to_vec(),
+					attestation: VtxoStatusAttestation::new(*id, &key).serialize(),
+				}).await.unwrap().into_inner();
+				assert_eq!(status.spend_state, protos::VtxoSpendState::HtlcRecvUnclaimed as i32);
+				assert!(!status.fallback_committed);
+				let coin = wallet.get_vtxo_by_id(*id).await.unwrap();
+				assert_eq!(coin.state, bark::vtxo::VtxoState::Locked {
+					holder: Some(bark::vtxo::VtxoLockHolder::Action { id: checkpoint.id() }),
+				});
+				original.push((*id, coin.state, wallet.get_full_vtxo(*id).await.unwrap().serialize()));
+			}
+			let history = wallet.history().await.unwrap();
+			for _ in 0..2 {
+				let report = wallet.recover_from_seed().await.unwrap();
+				assert!(report.is_complete());
+				let skipped = report.skipped().ids().collect::<Vec<_>>();
+				assert!(checkpoint.grant_ids.iter().all(|id| skipped.contains(id)));
+				assert_eq!(report.recovered().total_amount(), bitcoin::Amount::ZERO);
+				assert!(wallet.lightning_receive_checkpoint(hash).await.unwrap() == Some(checkpoint.clone()));
+				assert!(wallet.history().await.unwrap() == history);
+				assert_eq!(gate.requests.load(Ordering::SeqCst), 1, "seed discovery must not re-drive the held claim");
+				for (id, state, body) in &original {
+					assert_eq!(wallet.get_vtxo_by_id(*id).await.unwrap().state, *state);
+					assert_eq!(wallet.get_full_vtxo(*id).await.unwrap().serialize(), *body);
+				}
+			}
+			let mut hold = lightning.internal.hold_client().await;
+			wait_for_hold_invoice_accepted(&mut hold, hash).await;
+			gate.release_before.notify_one();
+			// The same request now reaches the real server; pause its successful
+			// reply at the original lost-reply cut before continuing the old tail.
+			tokio::time::timeout(Duration::from_secs(30), gate.arrived.notified()).await.unwrap();
+		}
 		assert!(futures::poll!(&mut claim).is_pending(),
 			"the captured checkpoint must precede any client reply or timeout-error handling");
 		assert_eq!(gate.requests.load(Ordering::SeqCst), 1);

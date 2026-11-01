@@ -6,6 +6,9 @@ use crate::actions::WalletActionCheckpoint;
 use crate::vtxo::VtxoStateKind;
 
 impl Wallet {
+	/// Reconcile known commitments with best-effort authenticated status reads.
+	/// Unanswered IDs retain their current state; success does not certify that
+	/// every known commitment was refreshed.
 	pub async fn sync_fallback_payouts(&self) -> anyhow::Result<()> {
 		let mut operation_sources = HashSet::new();
 		for checkpoint in self.inner.db.get_all_wallet_action_checkpoints().await? {

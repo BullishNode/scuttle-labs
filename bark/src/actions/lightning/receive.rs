@@ -121,7 +121,14 @@ impl WalletAction for LightningReceive {
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
 		if matches!(&self.progress, Progress::PreimageRevealed(_) | Progress::Delivering(_)) {
 			let _history_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await.retry()?;
-			let outcome = wallet.receive_fallback_status(self.payment_hash, &self.invoice, &self.grant_ids).await.retry()?;
+			// Observing status has not retried a claim. Keep the exact checkpoint
+			// and use the existing timed park without consuming the claim budget.
+			let outcome = match wallet.receive_fallback_status(self.payment_hash, &self.invoice, &self.grant_ids).await {
+				Ok(outcome) => outcome,
+				Err(error) => return Ok(Advance::Park {
+					state: self, wake_after: Some(BASE_RETRY_BACKOFF), error: Some(error),
+				}),
+			};
 			if let Some(status) = outcome {
 				wallet.apply_receive_fallback(self.payment_hash, &self.grant_ids, status).await.retry()?;
 				if self.fallback_status != Some(status) {
