@@ -28,6 +28,11 @@
   `captaind rpc expiry-holds`. Holds remain alarmed and counted until an actual
   decision clears them; listing cannot change a payment or release held funds.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Reconcile an existing Lightning attempt through the private operator listener
+  and `captaind rpc reconcile-lightning-attempt`. Only its recorded online node
+  can resolve it; missing, Pending and unknown outcomes stay protected, and the
+  command never starts another payment or overrides a paid source's settlement.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
 - Confine invalid expiry ownership to its own terminal and preserve unrelated
   ready outputs when signed split preparation is unavailable. Database and
   allocation failures still propagate. Operator-only sweeps continue without a

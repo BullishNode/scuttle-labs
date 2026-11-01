@@ -197,6 +197,25 @@ impl Tx<'_> {
 		if expected != recorded { return Ok(SourceSettlement::Unknown); }
 		Ok(if funded { SourceSettlement::Funded } else { SourceSettlement::Disjoint })
 	}
+
+	/// Call under the source and settlement locks in the failure transaction.
+	/// A native failure cannot release a source paid by another observation,
+	/// or one whose recorded settlement provenance is incomplete.
+	pub async fn ensure_attempt_sources_allow_failure(&self, attempt: &super::LightningPaymentAttempt)
+		-> anyhow::Result<()>
+	{
+		let sources = self.settlement_attempt_sources(attempt.payment_hash, attempt.id).await?
+			.context("payment attempt source provenance is unavailable")?;
+		for source in sources {
+			match self.source_settlement(attempt.payment_hash, source).await? {
+				SourceSettlement::NotSettled | SourceSettlement::Disjoint => {},
+				SourceSettlement::Funded | SourceSettlement::Unknown => {
+					return badarg!("source settlement does not permit failure of payment attempt {}", attempt.id);
+				},
+			}
+		}
+		Ok(())
+	}
 }
 
 impl Tx<'_> {

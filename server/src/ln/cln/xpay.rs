@@ -429,6 +429,18 @@ impl ClnXpayClient {
 		Ok(())
 	}
 
+	/// Observe existing work only. An operator cannot dispatch a new call or
+	/// turn an empty lookup into failure, nor select a different backend.
+	pub async fn reconcile_existing_payment_attempt(&self, attempt: LightningPaymentAttempt)
+		-> anyhow::Result<()>
+	{
+		ensure!(!attempt.is_self_payment(), "intra-Ark attempts resolve through their receive");
+		let info = super::unary_rpc(self.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await?.into_inner();
+		ensure!(qualified_node(&info, self.node_pubkey, self.network), "recorded native node/version/network changed");
+		self.reconcile_payment_attempt(attempt, None, None, false).await?;
+		Ok(())
+	}
+
 	async fn reconcile_payment_attempt(
 		&self, attempt: LightningPaymentAttempt, pay_error: Option<&str>,
 		no_route: Option<&NativeNoRoute>, allow_redrive: bool,

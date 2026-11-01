@@ -162,8 +162,11 @@ impl<'a> PaymentAttemptHandler<'a> {
 				t.lock_settlement_sources(attempt.payment_hash).await?;
 				None
 			};
-			if native_no_route.is_some() {
+			if status == LightningPaymentStatus::Failed {
 				t.lock_htlc_settlements().await?;
+				t.ensure_attempt_sources_allow_failure(attempt).await?;
+			}
+			if native_no_route.is_some() {
 				t.ensure_not_settled(attempt.payment_hash).await?;
 			}
 			let updated = t.verify_and_update_payment_attempt(

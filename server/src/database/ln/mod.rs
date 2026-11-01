@@ -155,6 +155,16 @@ impl<'t> Tx<'t> {
 		rows.into_iter().map(|row| row.try_into()).collect()
 	}
 
+	pub async fn get_lightning_payment_attempt_by_id(
+		&self, attempt_id: i64,
+	) -> anyhow::Result<Option<LightningPaymentAttempt>> {
+		let row = self.query_opt(&format!("
+			SELECT {LIGHTNING_PAYMENT_ATTEMPT_COLUMNS}
+			FROM lightning_payment_attempt lpa WHERE lpa.id=$1
+		"), &[&attempt_id]).await?;
+		row.map(TryInto::try_into).transpose()
+	}
+
 	pub async fn get_open_lightning_payment_attempt_by_payment_hash(
 		&self,
 		payment_hash: PaymentHash,

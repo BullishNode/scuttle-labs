@@ -389,7 +389,15 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		&[&hash.to_string()]).await?.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(attempts.len(), 2);
 	let predicate = async |source| db.read(async |t| t.source_settlement(hash, source).await).await.unwrap();
+	let failure_allowed = async |id| db.write(async |t| {
+		t.lock_settlement_sources(hash).await?;
+		t.lock_htlc_settlements().await?;
+		let attempt = t.get_lightning_payment_attempt_by_id(id).await?.unwrap();
+		t.ensure_attempt_sources_allow_failure(&attempt).await
+	}).await;
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
+	failure_allowed(attempts[0]).await.unwrap();
+	failure_allowed(attempts[1]).await.unwrap();
 	// Supported retry shape: failed A={S,T}, later B={S}. An incoming S
 	// witness proves only S, not A's unspent co-input T. Roll this controlled
 	// metadata shape and its WAL back before the remaining receive controls.
@@ -432,15 +440,22 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap().is_some());
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::Disjoint);
 	assert_eq!(predicate(ids[1]).await, SourceSettlement::Disjoint);
+	failure_allowed(attempts[0]).await.unwrap();
+	failure_allowed(attempts[1]).await.unwrap();
 	// Add an actual subscription funding association in this controlled fixture.
 	// Until its complete origin is recorded, the old observation fails closed.
 	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET lightning_htlc_subscription_id=$2,updated_at=NOW() WHERE id=$1",
 		&[&attempts[0], &subscription]).await?)).await.unwrap();
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::Unknown);
+	assert!(format!("{:#}", failure_allowed(attempts[0]).await.unwrap_err())
+		.contains("source settlement does not permit failure"));
 	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
 		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap(), None);
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
 	assert_eq!(predicate(ids[1]).await, SourceSettlement::Disjoint);
+	assert!(format!("{:#}", failure_allowed(attempts[0]).await.unwrap_err())
+		.contains("source settlement does not permit failure"));
+	failure_allowed(attempts[1]).await.unwrap();
 	// A truncated receive observation is not evidence of disjointness.
 	db.write(async |t| Ok(t.execute("DELETE FROM htlc_settlement_source WHERE kind='receive' AND attempt_id=$1",
 		&[&attempts[0]]).await?)).await.unwrap();
@@ -501,6 +516,14 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		assert_eq!(predicate(*source).await, SourceSettlement::Unknown);
 		assert_eq!(db.read(async |t| Ok(t.query_one("SELECT reason FROM expiry_hold WHERE vtxo_id=$1",
 			&[&source.to_string()]).await?.get::<_, String>(0))).await.unwrap(), "settlement_provenance_unknown");
+	}
+	for id in &attempts {
+		let before = db.read(async |t| t.get_lightning_payment_attempt_by_id(*id).await).await.unwrap().unwrap();
+		assert!(format!("{:#}", failure_allowed(*id).await.unwrap_err())
+			.contains("source settlement does not permit failure"));
+		let after = db.read(async |t| t.get_lightning_payment_attempt_by_id(*id).await).await.unwrap().unwrap();
+		assert_eq!(after.status, before.status);
+		assert_eq!(after.updated_at, before.updated_at, "a refused failure guard does not rewrite the attempt");
 	}
 }
 

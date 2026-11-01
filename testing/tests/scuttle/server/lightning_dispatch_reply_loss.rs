@@ -34,7 +34,7 @@ use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use cln_rpc::plugins::hold;
 use server::database::Db;
 use server_log::{ArkFeeRecorded, ExpiryHoldObserved, XpayRpcReturned};
-use server_rpc::protos;
+use server_rpc::{protos, RequestExt};
 
 async fn remote_pays(node: &Lightningd, hash: PaymentHash) -> Vec<cln_rpc::ListpaysPays> {
 	node.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
@@ -75,6 +75,15 @@ async fn recovery_binds_restarted_payment_success_to_source() {
 async fn recovery_records_its_native_routing_fee() {
 	tokio::time::timeout(Duration::from_secs(180), external_success_during_restart(true)).await
 		.expect("routing fee reconciliation must finish within 180 seconds");
+}
+
+/// The operator observes genuine Pending, refuses an unconfigured original
+/// node, then reconciles after that SAME node is re-added. The normal monitor
+/// may win final success; neither path may dispatch or charge another payment.
+#[tokio::test]
+async fn admin_reconciliation_keeps_orphans_held_until_the_same_node_returns() {
+	tokio::time::timeout(Duration::from_secs(180), external_success_with_fault(false, false, false, RestartCut::OrphanAdmin)).await
+		.expect("the same-node orphan recovery and original money tail must finish");
 }
 
 #[cfg(target_os = "linux")]
@@ -135,19 +144,21 @@ async fn initial_zero_delay_refusal_leaves_original_htlc_revocable() {
 }
 
 #[derive(Clone, Copy)]
-enum RestartCut { None, QueuedNative, BeforeFirstRpc, PreflightRefusal, NoDelayRoom, InitialZeroDelay }
+enum RestartCut { None, QueuedNative, BeforeFirstRpc, PreflightRefusal, NoDelayRoom, InitialZeroDelay, OrphanAdmin }
 
 async fn external_success_during_restart(routed: bool) {
 	external_success_with_fault(routed, false, false, RestartCut::None).await;
 }
 
 async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadline: bool, restart: RestartCut) {
+	let orphan_admin = matches!(restart, RestartCut::OrphanAdmin);
 	let zero_part_restart = matches!(restart, RestartCut::QueuedNative);
 	let no_delay_room = matches!(restart, RestartCut::NoDelayRoom);
 	let initial_zero_delay = matches!(restart, RestartCut::InitialZeroDelay);
 	let preflight_refusal = matches!(restart, RestartCut::PreflightRefusal | RestartCut::InitialZeroDelay);
 	let count_zero_restart = matches!(restart, RestartCut::BeforeFirstRpc | RestartCut::NoDelayRoom);
 	let ctx = TestContext::new(if no_delay_room { "scuttle/count_zero_no_delay_room" }
+		else if orphan_admin { "scuttle/admin_same_node_orphan_reconciliation" }
 		else if initial_zero_delay { "scuttle/native_initial_zero_delay_refusal_revocation" }
 		else if preflight_refusal { "scuttle/native_preflight_refusal_revocation" }
 		else if count_zero_restart { "scuttle/count_zero_native_bark_crash_recovery" }
@@ -503,6 +514,23 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 	assert_eq!(pending[0].label.as_deref(), Some(label.as_str()));
 	assert_eq!(pending[0].status(), ListpaysPaysStatus::Pending);
 	assert!(pending[0].preimage.is_none());
+	let admin_request = || {
+		let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: attempt });
+		request.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+		request
+	};
+	if orphan_admin {
+		let before = super::owner_helpers::source_rows(&db, &sources).await;
+		let mut admin = server_rpc::admin::ScuttleServiceClient::connect(
+			format!("http://{}", srv.config().rpc.admin_address.unwrap())).await.unwrap();
+		let response = admin.reconcile_lightning_attempt(admin_request()).await.unwrap().into_inner();
+		assert_eq!(response.attempt_id, attempt);
+		assert_eq!(response.payment_hash, hash.to_vec());
+		assert!(matches!(response.status.as_str(), "requested" | "submitted"));
+		assert_eq!(super::owner_helpers::source_rows(&db, &sources).await, before);
+		assert_eq!(remote_pays(&lightning.internal, hash).await, pending);
+		assert_one_source_dispatch(&db, hash, &sources, attempt, &label, false, user_fee).await;
+	}
 	let pending_part = if routed {
 		let parts = lightning.internal.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
@@ -689,6 +717,22 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		assert_eq!(plugin.client_key_path, hold.client_key_path);
 		plugin.uri = hold.uri.parse().unwrap();
 	}
+	if orphan_admin {
+		let nodes = srv.config().cln_array.clone();
+		srv.config_mut().cln_array.clear();
+		srv.start().await.unwrap();
+		let before = super::owner_helpers::source_rows(&db, &sources).await;
+		let mut admin = server_rpc::admin::ScuttleServiceClient::connect(
+			format!("http://{}", srv.config().rpc.admin_address.unwrap())).await.unwrap();
+		let error = admin.reconcile_lightning_attempt(admin_request()).await.unwrap_err();
+		assert!(error.message().contains("recorded Lightning node is not online"), "{error}");
+		assert_eq!(super::owner_helpers::source_rows(&db, &sources).await, before);
+		assert_one_source_dispatch(&db, hash, &sources, attempt, &label, false, user_fee).await;
+		assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+		assert_eq!(remote_pays(&lightning.internal, hash).await, vec![remote.clone()]);
+		srv.stop().await.unwrap();
+		srv.config_mut().cln_array = nodes;
+	}
 	let mut fee_logs = if routed {
 		Some(db.write(async |tx| {
 			let locked = tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 FOR UPDATE",
@@ -701,8 +745,25 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 		}).await.unwrap())
 	} else { srv.start().await.unwrap(); None };
 	srv.watchmand().start().await.unwrap();
+	let mut admin = if orphan_admin {
+		Some(server_rpc::admin::ScuttleServiceClient::connect(
+			format!("http://{}", srv.config().rpc.admin_address.unwrap())).await.unwrap())
+	} else { None };
+	let mut reconciled = false;
 	tokio::time::timeout(Duration::from_secs(45), async {
 		loop {
+			if let Some(admin) = &mut admin {
+				match admin.reconcile_lightning_attempt(admin_request()).await {
+					Ok(response) => {
+						let response = response.into_inner();
+						assert_eq!(response.attempt_id, attempt);
+						assert_eq!(response.payment_hash, hash.to_vec());
+						assert_ne!(response.status, "failed", "a real paid source is never an admin refund");
+						reconciled = true;
+					},
+					Err(error) => assert!(error.message().contains("recorded Lightning node is not online"), "{error}"),
+				}
+			}
 			let status = db.read(async |tx| Ok(tx.query_one("SELECT status::TEXT,final_amount_msat FROM lightning_payment_attempt WHERE id=$1",
 				&[&attempt]).await?)).await.unwrap();
 			if status.get::<_, &str>(0) == "succeeded" {
@@ -713,6 +774,22 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("restart must reconcile the previous source-bound CLN payment and preimage");
+	if orphan_admin {
+		assert!(reconciled, "the actual private reconciliation RPC must succeed after same-node restoration");
+		let address = srv.config().rpc.admin_address.unwrap().to_string();
+		let attempt_id = attempt.to_string();
+		let output = Captaind::base_cmd().env("RUST_LOG", "off").args([
+			"rpc", "--addr", &address, "reconcile-lightning-attempt", &attempt_id,
+		]).output().await.unwrap();
+		assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+		let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+		assert_eq!(result["attempt_id"], attempt);
+		assert_eq!(result["status"], "succeeded");
+		assert_eq!(result["payment_hash"], hash.to_string());
+		let records = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await.unwrap();
+		assert_eq!(records.len(), 1);
+		assert_eq!(records[0].dispatch_count, Some(1));
+	}
 	assert_one_source_dispatch(&db, hash, &sources, attempt, &label, true, user_fee).await;
 	let terminal_snapshot = if routed {
 		let event = tokio::time::timeout(Duration::from_secs(10), async {

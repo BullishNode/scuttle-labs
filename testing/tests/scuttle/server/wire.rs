@@ -3,6 +3,33 @@ use server_rpc::{protos, RequestExt};
 use ark_testing::{sat, Captaind, TestContext};
 use server::database::Db;
 
+/// The inherited admin-fail gate is observation-only: the operator supplies
+/// an ID, never a requested outcome. Authority is the same private listener.
+#[tokio::test]
+async fn fail_attempt_requires_admin_auth() {
+	let ctx = TestContext::new("server/fail_attempt_requires_admin_auth").await;
+	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
+	let request = || {
+		let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: i64::MAX });
+		request.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+		request
+	};
+	let mut public = server_rpc::admin::ScuttleServiceClient::connect(srv.ark_url()).await.unwrap();
+	assert_eq!(public.reconcile_lightning_attempt(request()).await.unwrap_err().code(), tonic::Code::Unimplemented);
+	let address = srv.config().rpc.admin_address.unwrap().to_string();
+	let mut admin = server_rpc::admin::ScuttleServiceClient::connect(format!("http://{address}")).await.unwrap();
+	let missing = protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: i64::MAX };
+	assert_eq!(admin.reconcile_lightning_attempt(missing).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+	let mut old = request();
+	old.set_pver(server_rpc::pver::PROTOCOL_VERSION_SCUTTLE - 1);
+	assert_eq!(admin.reconcile_lightning_attempt(old).await.unwrap_err().code(), tonic::Code::InvalidArgument);
+	assert_eq!(admin.reconcile_lightning_attempt(request()).await.unwrap_err().code(), tonic::Code::NotFound);
+	let output = Captaind::base_cmd().env("RUST_LOG", "off")
+		.args(["rpc", "--addr", &address, "reconcile-lightning-attempt", &i64::MAX.to_string()]).output().await.unwrap();
+	assert!(!output.status.success());
+	assert!(String::from_utf8_lossy(&output.stderr).contains("unknown Lightning payment attempt"));
+}
+
 /// The fork epoch is required before operations, and operator methods are not public.
 #[tokio::test]
 async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {

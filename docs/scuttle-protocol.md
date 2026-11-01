@@ -19,6 +19,13 @@ the negotiated version. This includes recovery, status, streams and retry paths.
 The operator service uses the configured private administrative listener, never
 the public Ark or Mailbox routes. Its network trust boundary is unchanged.
 
+`captaind rpc --addr <private-admin-address> reconcile-lightning-attempt <attempt-id>`
+observes an existing external payment on its recorded online node. It returns
+the current attempt state; it cannot choose an outcome, switch nodes or dispatch
+another payment. Pending, missing and unknown outcomes remain protected. Restore
+the same original node and store before reconciling an orphaned attempt. A manual
+check, an elapsed deadline or an empty node response never authorizes a refund.
+
 New functional fork fields use tags `1000` and above. Upstream invoice
 `expiry_secs` retains tag `6`. The four retired owner-proof slots (board `7`,
 VTXO request `3`, arkoor destination `3`, receive-claim preparation `6`) are

@@ -115,6 +115,9 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum RpcCommand {
+	/// Observe an existing Lightning attempt on its recorded online node.
+	#[command()]
+	ReconcileLightningAttempt { attempt_id: i64 },
 	/// List unresolved expiry holds on the private operator listener.
 	#[command()]
 	ExpiryHolds,
@@ -686,6 +689,19 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 	debug!("Query admin rpc-endpoint at {}", endpoint);
 
 	match cmd {
+		RpcCommand::ReconcileLightningAttempt { attempt_id } => {
+			let mut rpc = rpc::admin::ScuttleServiceClient::connect(endpoint)
+				.await.context("failed to connect to operator rpc")?;
+			let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id });
+			request.set_pver(rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+			let response = rpc.reconcile_lightning_attempt(request).await?.into_inner();
+			serde_json::to_writer_pretty(std::io::stdout(), &serde_json::json!({
+				"attempt_id": response.attempt_id,
+				"payment_hash": ark::lightning::PaymentHash::from_slice(&response.payment_hash)?.to_string(),
+				"status": response.status,
+			}))?;
+			println!();
+		},
 		RpcCommand::ExpiryHolds => {
 			let mut rpc = rpc::admin::ScuttleServiceClient::connect(endpoint)
 				.await.context("failed to connect to operator rpc")?;

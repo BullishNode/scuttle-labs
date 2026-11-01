@@ -237,6 +237,19 @@ impl rpc::server::BanAdminService for Server {
 
 #[async_trait]
 impl rpc::server::ScuttleService for Server {
+	async fn reconcile_lightning_attempt(
+		&self, req: tonic::Request<protos::scuttle::ReconcileLightningAttemptRequest>,
+	) -> Result<tonic::Response<protos::scuttle::ReconcileLightningAttemptResponse>, tonic::Status> {
+		super::validate_scuttle_pver(&req)?;
+		let id = req.into_inner().attempt_id;
+		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }
+		let attempt = self.lightning_manager.reconcile_lightning_attempt(id).await.to_status()?
+			.ok_or_else(|| tonic::Status::not_found("unknown Lightning payment attempt"))?;
+		Ok(tonic::Response::new(protos::scuttle::ReconcileLightningAttemptResponse {
+			attempt_id: attempt.id, payment_hash: attempt.payment_hash.to_vec(), status: attempt.status.to_string(),
+		}))
+	}
+
 	async fn list_expiry_holds(
 		&self, req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::scuttle::ListExpiryHoldsResponse>, tonic::Status> {
