@@ -46,7 +46,7 @@ use crate::database;
 use crate::database::block::BlockTable;
 use crate::database::htlc_vtxo;
 use crate::database::hold::{self as hold_db, HoldTransition};
-use crate::database::ln::{LightningNodeId, LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
+use crate::database::ln::{LightningNodeId, LightningHtlcSubscription, LightningHtlcSubscriptionStatus, LightningPaymentStatus};
 use crate::ln::guard::{PaymentGuard, PaymentGuards};
 use crate::ln::htlc_recvs_expired;
 use crate::ln::node_manager::post_lightning_receive_notification;
@@ -626,11 +626,16 @@ impl ClnHoldProcess {
 			t.lock_htlc_settlements().await?;
 			// Select only this receive's actual intra-Ark funding attempt;
 			// an unrelated same-hash external attempt is never canceled here.
-			let attempt = t.get_open_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await?;
+			let attempt = t.get_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await?;
 			if let Some(attempt) = &attempt {
 				ensure!(attempt.payment_hash == hash, "linked payment attempt has a different receive hash");
 				t.ensure_attempt_sources_allow_failure(attempt).await?;
+				ensure!(attempt.status != LightningPaymentStatus::Succeeded,
+					"succeeded funding attempt cannot cancel its receive");
 			}
+			// Terminal funding still protects the receive; only open attempts
+			// can be failed and notified below.
+			let attempt = attempt.filter(|attempt| !attempt.status.is_final());
 			let canceled = t.store_lightning_htlc_subscription_status(
 				htlc_subscription.id,
 				LightningHtlcSubscriptionStatus::Canceled,
