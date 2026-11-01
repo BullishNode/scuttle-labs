@@ -57,7 +57,7 @@ impl VtxoExitFrontier {
 
 	/// Register a vtxo in the frontier only if it is not already present in memory.
 	///
-	/// The DB insert in register() is idempotent (ON CONFLICT DO NOTHING), so this
+	/// The DB update in register() is idempotent, so this
 	/// is safe to call even if the vtxo was pre-inserted by finish_round.
 	pub async fn register(
 		&mut self,
@@ -66,7 +66,6 @@ impl VtxoExitFrontier {
 	) -> anyhow::Result<()> {
 		let vtxo_id = vtxo.id();
 		if !self.frontier.contains_key(&vtxo_id) {
-			self.frontier.insert(vtxo_id, (confirmed_height, vtxo));
 			self.db.write(async |t| {
 				t.add_vtxo_to_frontier(vtxo_id).await?;
 				if let Some(height) = confirmed_height {
@@ -74,6 +73,7 @@ impl VtxoExitFrontier {
 				}
 				Ok(())
 			}).await?;
+			self.frontier.insert(vtxo_id, (confirmed_height, vtxo));
 
 			slog!(WatchmanAddedVtxo, id: vtxo_id);
 		}
@@ -81,6 +81,8 @@ impl VtxoExitFrontier {
 		Ok(())
 	}
 
+	/// Persist a tracked spend without removing its retry evidence. The block
+	/// listener removes it after this transaction's successors are registered.
 	pub async fn spend(
 		&mut self,
 		vtxo_id: VtxoId,
@@ -88,16 +90,15 @@ impl VtxoExitFrontier {
 		spent_txid: Txid,
 		witness: &Witness,
 	) -> anyhow::Result<bool> {
-		if let Some((_height, vtxo)) = self.frontier.remove(&vtxo_id) {
+		if let Some((_height, vtxo)) = self.frontier.get(&vtxo_id) {
 			// Try to extract a preimage from the spending witness if this is an HTLC vtxo.
-			// This must succeed before we proceed — if persisting the preimage fails,
-			// block processing will error and the sync manager will retry. On retry the
-			// in-memory frontier is rebuilt from the DB, restoring this VTXO entry.
+			// Keep the cached input on any failure so the same-block retry reads
+			// this witness again, even for an old entry outside the DB sync window.
 			// If the HTLC tx gets unconfirmed and re-confirmed in a reorg, settle()
 			// is called again but the DB insert is idempotent (ON CONFLICT DO NOTHING).
-			let preimage = try_extract_preimage(&vtxo, witness);
+			let preimage = try_extract_preimage(vtxo, witness);
 
-			let chain_resolution = classify_htlc_spend(&vtxo, witness);
+			let chain_resolution = classify_htlc_spend(vtxo, witness);
 			let checkpoint = self.db.write(async |t| {
 				let checkpoint = if let Some(preimage) = preimage {
 					t.store_htlc_settlement_from(preimage,
@@ -302,23 +303,28 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 			frontier.confirm_txid(txid, height).await?;
 
 			// Find vtxos in the frontier that are spent by this tx
-			let mut removed_any = false;
+			let mut spent = Vec::new();
 			for input in &tx.input {
 				if frontier.spend(
 					input.previous_output.into(), height, txid, &input.witness,
 				).await? {
-					removed_any = true;
+					spent.push(VtxoId::from(input.previous_output));
 				}
 			}
 
 			// Find new vtxos originating from this tx and add to frontier
-			if removed_any {
+			if !spent.is_empty() {
 				let new_vtxos = frontier.db.read(async |t| t.get_vtxos_by_txid(txid).await).await?;
 				for vtxo in new_vtxos {
 					// Only add if not already in frontier
 					if !frontier.frontier.contains_key(&vtxo.id()) {
 						frontier.register(vtxo, Some(height)).await?;
 					}
+				}
+				// A later lookup or registration failure must leave a matched
+				// input to drive successor discovery on the same-block retry.
+				for id in spent {
+					frontier.frontier.remove(&id);
 				}
 			}
 		}
