@@ -1325,18 +1325,12 @@ async fn persist_round(
 			let Some(unlock_hash) = vtxo.unlock_hash() else {
 				continue; // Skip VTXOs without unlock hash
 			};
-			match t.store_round_participation_in_mailbox(*mailbox_id, unlock_hash).await {
-				Ok(checkpoint) => {
-					if let Some(cp) = checkpoint {
-						notifications.push((*mailbox_id, cp));
-					}
-					trace!("Posted round VTXO {} to mailbox", vtxo.id());
-				}
-				Err(e) => {
-					// Log but don't fail the round - mailbox delivery is best-effort
-					warn!("Failed to post round VTXO {} to mailbox: {:#}", vtxo.id(), e);
-				}
+			let checkpoint = t.store_round_participation_in_mailbox(*mailbox_id, unlock_hash)
+				.await.with_context(|| format!("error posting round VTXO {} to mailbox", vtxo.id()))?;
+			if let Some(cp) = checkpoint {
+				notifications.push((*mailbox_id, cp));
 			}
+			trace!("Posted round VTXO {} to mailbox", vtxo.id());
 		}
 
 		Ok(notifications)
