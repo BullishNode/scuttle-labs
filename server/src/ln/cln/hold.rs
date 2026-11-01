@@ -50,6 +50,7 @@ use crate::database::ln::{LightningNodeId, LightningHtlcSubscription, LightningH
 use crate::ln::guard::{PaymentGuard, PaymentGuards};
 use crate::ln::htlc_recvs_expired;
 use crate::ln::node_manager::post_lightning_receive_notification;
+use crate::ln::payment_handler::PaymentAttemptHandler;
 use crate::sync::SyncManager;
 use crate::system::RuntimeManager;
 use crate::telemetry;
@@ -621,13 +622,23 @@ impl ClnHoldProcess {
 		// settlement, and its payment attempt is left alone.
 		let node_id = self.node_id;
 		let hash = PaymentHash::from(*payment_hash);
-		let canceled = self.db.write(async |t| {
+		let (canceled, payment_attempt) = self.db.write(async |t| {
+			t.lock_settlement_sources(hash).await?;
+			t.lock_htlc_settlements().await?;
+			// Select only this receive's actual intra-Ark funding attempt;
+			// an unrelated same-hash external attempt is never canceled here.
+			let attempt = t.get_open_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await?;
+			if let Some(attempt) = &attempt {
+				ensure!(attempt.payment_hash == hash, "linked payment attempt has a different receive hash");
+				t.ensure_attempt_sources_allow_failure(attempt).await?;
+			}
 			let canceled = t.store_lightning_htlc_subscription_status(
 				htlc_subscription.id,
 				LightningHtlcSubscriptionStatus::Canceled,
 				None,
 				Some(htlc_subscription.status),
 			).await?;
+			if !canceled { return Ok((false, None)); }
 			// The plugin no longer serves the invoice; its row says so too.
 			if canceled {
 				let mirrored = hold_db::transition_open_hold(
@@ -639,7 +650,11 @@ impl ClnHoldProcess {
 					);
 				}
 			}
-			Ok(canceled)
+			if let Some(attempt) = &attempt {
+				let updated = PaymentAttemptHandler::fail_attempt_in_tx(t, attempt, Some(reason), false).await?;
+				ensure!(updated.is_some(), "linked payment attempt changed during subscription cancellation");
+			}
+			Ok((true, attempt))
 		}).await?;
 		if !canceled {
 			debug!("Lightning htlc subscription ({}) left {} before it could be \
@@ -649,18 +664,13 @@ impl ClnHoldProcess {
 			return Ok(());
 		}
 
-		// Fail the intra-Ark self-payment initiated against this
-		// subscription, if any. An unrelated outgoing payment that merely
-		// shares the payment hash is not a self-payment and must be left
-		// alone.
-		let payment_attempt = self.db.read(async |t|
-			t.get_open_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await
-		).await?;
+		// Notify the committed failure of this receive's intra-Ark payment.
+		// An unrelated outgoing payment sharing the hash is left alone.
 		if let Some(payment_attempt) = payment_attempt {
 			debug!("HTLC subscription canceled with ongoing payment attempt, \
-				marking as failed: {}", payment_attempt.id,
+				marked as failed: {}", payment_attempt.id,
 			);
-			self.payment_handler().fail_payment_attempt(&payment_attempt, Some(reason)).await?;
+			self.payment_handler().notify_payment_failed(&payment_attempt, Some(reason)).await?;
 		} else {
 			telemetry::add_lightning_payment(
 				htlc_subscription.lightning_node_id,

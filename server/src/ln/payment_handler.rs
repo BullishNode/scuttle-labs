@@ -56,52 +56,73 @@ impl<'a> PaymentAttemptHandler<'a> {
 	async fn fail_attempt(
 		&self, attempt: &LightningPaymentAttempt, error: Option<&str>, unlink_subscription: bool,
 	) -> anyhow::Result<Option<DateTime<Local>>> {
-		let new_status = LightningPaymentStatus::Failed;
-		let updated_at = self.db.write(async |t| if unlink_subscription {
+		let updated_at = self.db.write(async |t| {
+			t.lock_settlement_sources(attempt.payment_hash).await?;
+			t.lock_htlc_settlements().await?;
+			t.ensure_attempt_sources_allow_failure(attempt).await?;
+			Self::fail_attempt_in_tx(t, attempt, error, unlink_subscription).await
+		}).await?;
+
+		if updated_at.is_some() {
+			self.notify_payment_failed(attempt, error).await?;
+		}
+		Ok(updated_at)
+	}
+
+	/// Apply the existing failure write in a caller-owned transaction after
+	/// its validity/source/settlement locks and source failure predicate.
+	pub(crate) async fn fail_attempt_in_tx(
+		t: &database::Tx<'_>, attempt: &LightningPaymentAttempt,
+		error: Option<&str>, unlink_subscription: bool,
+	) -> anyhow::Result<Option<DateTime<Local>>> {
+		if unlink_subscription {
 			t.fail_refused_lightning_payment_attempt(attempt, error).await
 		} else {
 			let updated_at = t.update_lightning_payment_attempt_status(
-				attempt, new_status, error,
+				attempt, LightningPaymentStatus::Failed, error,
 			).await?;
 			if updated_at.is_some() {
 				end_xpay(t, attempt, ClnXpayOutcome::Fail { error_code: None }).await?;
 			}
 			Ok(updated_at)
-		}).await?;
+		}
+	}
 
-		if updated_at.is_some() {
-			trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",
-				attempt.id, new_status, attempt.payment_hash,
-			);
+	/// Notify only after the caller's failure transaction committed.
+	pub(crate) async fn notify_payment_failed(
+		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
+	) -> anyhow::Result<()> {
+		let new_status = LightningPaymentStatus::Failed;
+		trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",
+			attempt.id, new_status, attempt.payment_hash,
+		);
 
-			self.payment_update_tx.send(attempt.payment_hash)
-				.context("payment update channel broken")?;
+		self.payment_update_tx.send(attempt.payment_hash)
+			.context("payment update channel broken")?;
 
+		// Falls back to the stored error: `update_..._status` keeps it
+		// when handed `None`.
+		let failure = LightningFailureKind::classify(error.or(attempt.error.as_deref()));
+
+		self.post_lightning_send_finished(
+			attempt, None, Some(failure),
+		).await;
+
+		// Attempted amount (not final_amount_msat) so failed/succeeded
+		// volumes stay comparable.
+		telemetry::add_lightning_payment(
+			attempt.lightning_node_id,
+			attempt.amount_msat,
+			telemetry::LightningPaymentMetricStatus::Failed,
+			telemetry::LightningDirection::Send,
+			attempt.is_self_payment(),
+			attempt.user_agent.as_deref(),
 			// Falls back to the stored error: `update_..._status` keeps it
 			// when handed `None`.
-			let failure = LightningFailureKind::classify(error.or(attempt.error.as_deref()));
-
-			self.post_lightning_send_finished(
-				attempt, None, Some(failure),
-			).await;
-
-			// Attempted amount (not final_amount_msat) so failed/succeeded
-			// volumes stay comparable.
-			telemetry::add_lightning_payment(
-				attempt.lightning_node_id,
-				attempt.amount_msat,
-				telemetry::LightningPaymentMetricStatus::Failed,
-				telemetry::LightningDirection::Send,
-				attempt.is_self_payment(),
-				attempt.user_agent.as_deref(),
-				// Falls back to the stored error: `update_..._status` keeps it
-				// when handed `None`.
-				Some(LightningFailureKind::classify(error.or(attempt.error.as_deref()))),
-				None,
-			);
-		}
-
-		Ok(updated_at)
+			Some(LightningFailureKind::classify(error.or(attempt.error.as_deref()))),
+			None,
+		);
+		Ok(())
 	}
 
 	/// Verify and update a lightning payment attempt, broadcast the update, and
