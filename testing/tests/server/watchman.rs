@@ -187,6 +187,7 @@ async fn watchman_sweeps_exit_after_forfeit() {
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
+		cfg.postgres.max_connections = 1;
 		cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
 		cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
 	}).create().await;
