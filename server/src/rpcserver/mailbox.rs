@@ -109,7 +109,7 @@ mod tests {
 		let id = VtxoId::from_slice(&[1; 36]).unwrap();
 		let owner = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
 		let message = new_mailbox_msg(MailboxEntry {
-			checkpoint: Checkpoint::from(1),
+			checkpoint: Checkpoint::from(1_u64),
 			payload: MailboxPayload::RecoveryVtxoIds { vtxo_ids: vec![id] },
 			owner_mailboxes: BTreeMap::from([(id, owner)]),
 		});

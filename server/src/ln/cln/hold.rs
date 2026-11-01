@@ -50,7 +50,6 @@ use crate::database::ln::{LightningNodeId, LightningHtlcSubscription, LightningH
 use crate::ln::guard::{PaymentGuard, PaymentGuards};
 use crate::ln::htlc_recvs_expired;
 use crate::ln::node_manager::post_lightning_receive_notification;
-use crate::ln::payment_handler::PaymentAttemptHandler;
 use crate::sync::SyncManager;
 use crate::system::RuntimeManager;
 use crate::telemetry;
