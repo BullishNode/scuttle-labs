@@ -102,7 +102,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 		}).await.expect("the native receiver rejection must close its own attempt");
 		assert_eq!(rejected.lightning_node_id, node_id);
 		assert_eq!(rejected.amount_msat, principal.to_sat() * 1_000);
-		assert_eq!(rejected.final_amount_msat, None);
+		assert_eq!(rejected.final_amount_msat, Some(0));
 		let links = db.read(async |t| Ok(t.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
 			WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&rejected.id]).await?
 			.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await.unwrap();
