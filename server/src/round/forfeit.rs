@@ -114,8 +114,16 @@ impl Server {
 			// nb this call is quite expensive computationally, so we don't want to
 			// keep the lock while doing it
 			let nonces = HarkForfeitNonces::generate(self.server_key.leak_ref(), unlock_hash);
-			ret.push(nonces.public_nonce());
-			self.forfeit_nonces.lock().insert_some(*vtxo, nonces);
+			// A concurrent retry may have populated the cache while we generated.
+			let mut cache = self.forfeit_nonces.lock();
+			if let Some(existing) = cache.get(vtxo).and_then(|opt| opt.as_ref())
+				.filter(|n| n.unlock_hash == unlock_hash)
+			{
+				ret.push(existing.public_nonce());
+			} else {
+				ret.push(nonces.public_nonce());
+				cache.insert_some(*vtxo, nonces);
+			}
 		}
 		Ok(ret)
 	}
