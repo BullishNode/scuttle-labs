@@ -113,7 +113,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 		.find(|offboard| matches!(&offboard.progress,
 			Progress::OffboardTxPrepared { offboard_tx, .. } if offboard_tx.compute_txid() == offboard_txid))
 		.expect("the genuine prepared offboard must be durable before its RPC");
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	// The old watchman view prevents a decision while Core and captaind
 	// reach expiry. No chain acknowledgement or financial row is fabricated.
 	srv.watchmand().stop().await.unwrap();
@@ -395,7 +395,7 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
 	assert!(expired < deadline);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("
 		SELECT COUNT(*)
 		FROM lightning_payment_attempt_htlc_vtxo
@@ -497,7 +497,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	let sponsor=ctx.bitcoind().fund_addr(funding.clone(),sat(100_000)).await;
 	ctx.generate_blocks(2).await;
 	let postgres=srv.config().postgres.clone();
-	let db=Db::connect(&postgres,bitcoin::Network::Regtest).await.unwrap();
+	let db=Db::connect(&postgres).await.unwrap();
 	let wallet_db=SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
 	let mut expired=srv.subscribe_log::<server_log::OffboardSessionTimeout>();
 	let error=Box::pin(owner.offboard_vtxos(ids.clone(),offboard_address.clone())).await.unwrap_err();

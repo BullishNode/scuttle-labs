@@ -112,7 +112,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 
 	// Capture the registered owners before the absent-client interval.
 	let first_height = ctx.bitcoind().get_block_count().await;
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let operator_script = {
 		let config = wm.config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -345,7 +345,7 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 
 	// Capture the registered owners before the absent-client interval.
 	let first_height = ctx.bitcoind().get_block_count().await;
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let operator_script = {
 		let config = wm.config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()

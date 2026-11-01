@@ -260,7 +260,7 @@ async fn exited_unattempted_send_does_not_block_unrelated_expiry_payout() {
 		assert!(source.has_all_witnesses());
 		let mut seen = BTreeSet::new();
 		confirm_actual_path(&ctx, &source, &mut seen).await;
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 		srv.wait_for_sync_height(height).await;
 		srv.watchmand().wait_for_sync_height(height).await;
@@ -389,7 +389,7 @@ async fn unattempted_shared_preimage(legacy: bool) {
 	} else { VtxoPolicy::new_server_htlc_send(key.public_key(), hash, expiry) };
 	let source = signed_leaf(&ctx, &srv, &wallet, send_input, policy).await;
 	assert_eq!(matches!(source.policy(), VtxoPolicy::ServerHtlcSend_v0(_)), legacy);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	if legacy {
 		let invoice = lightning.external.hold_client().await.invoice(hold::InvoiceRequest {
 			payment_hash: hash.to_vec(), amount_msat: 90_000_000,
@@ -471,7 +471,7 @@ async fn send_claim_does_not_block_ordinary_progression() {
 		wallet.register_vtxo_transactions_with_server(&[refund.clone()]).await.unwrap();
 		let funding = ctx.bitcoind().await_transaction(refund.chain_anchor().txid).await;
 		refund.validate(&funding).unwrap();
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 		let resolved = db.read(async |t| htlc_vtxo::get_htlc_vtxo(t, source.id()).await).await.unwrap().unwrap();
 		assert_eq!(resolved.htlc.offchain_resolution, Some(HtlcResolution::Revoked));
@@ -873,7 +873,7 @@ async fn linked_send_with_shared_preimage(failed: bool, with_internal_receive: b
 	let fee = srv.config().fees.lightning_send.calculate(sat(100_000),
 		[ark::fees::VtxoFeeInfo::from_vtxo_and_tip(&source, tip)]).unwrap();
 	assert_eq!(fee, sat(0), "the entire declared principal funds the native payment");
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 	let invoice = lightning.external.hold_client().await.invoice(hold::InvoiceRequest {
 		payment_hash: hash.to_vec(), amount_msat: 100_000_000,

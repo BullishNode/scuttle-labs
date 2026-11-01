@@ -35,7 +35,7 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 		let board_amount = btc(2);
 		let wallet = Box::pin(ctx.bark_sdk("bark", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 			.boarded(board_amount).create()).await;
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		let original = wallet.vtxos().await.unwrap();
 		assert_eq!(original.len(), 1);
 		let source = wallet.get_full_vtxo(original[0].id()).await.unwrap();
@@ -458,7 +458,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool, scan_held: bool) {
 
 	// Read the real background journal; the test never inserts a decision,
 	// ownership result, registration, or payout transaction into Postgres.
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (parent, child) = tokio::time::timeout(Duration::from_secs(60), async {
 		// Confirm only real signed prefixes when the ordinary watchman publishes them,
 		// then honor its configured grace before expecting the next signed step.

@@ -139,7 +139,7 @@ fn accepted_reply_loss() -> Pin<Box<dyn Future<Output = ()>>> {
 		assert_eq!(delivery.vtxos.iter().map(|coin| coin.amount()).sum::<Amount>(), net);
 		let ids = delivery.vtxos.iter().map(|coin| coin.id()).collect::<BTreeSet<_>>();
 		assert_eq!(ids.len(), delivery.vtxos.len());
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		for coin in &delivery.vtxos {
 			assert_eq!(coin.policy(), address.policy());
 			recipient.validate_vtxo(coin).await.unwrap();

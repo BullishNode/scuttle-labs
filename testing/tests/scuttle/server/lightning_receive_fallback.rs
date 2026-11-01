@@ -80,7 +80,7 @@ async fn registered_receive_fallback() {
 			config.ln_receive_anti_dos_required = false;
 		}).watchmand().create().await;
 	srv.wait_for_vtxopool(&ctx).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_eq!(srv.config().vtxopool.vtxo_target_issue_threshold, 50);
 	assert_eq!(srv.config().vtxopool.vtxo_pre_expiry, BlockDelta::new(12));
 	assert_eq!(srv.config().vtxopool.max_vtxo_exit_depth, 6);

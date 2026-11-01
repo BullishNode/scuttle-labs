@@ -93,7 +93,7 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	let fee_funding = ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
 	ctx.generate_blocks(2).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	assert!(height < source.expiry_height().to_u32());
 	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;

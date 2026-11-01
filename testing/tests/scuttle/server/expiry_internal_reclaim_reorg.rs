@@ -230,7 +230,7 @@ async fn reclaim_reorg(when: When) {
 	}).await.unwrap().into_inner();
 	let grants = granted.htlc_vtxos.iter().map(|b| Vtxo::<Full>::deserialize(b).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(|g| g.amount()).sum::<bitcoin::Amount>(), sat(90_000));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	drop(client); drop(rpc);
 	// Expose the grant leaves so the receiver could claim them on chain.
 	let mut seen = BTreeSet::new();

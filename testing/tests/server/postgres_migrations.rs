@@ -17,8 +17,8 @@ async fn get_bare_vtxo_by_id() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -56,8 +56,8 @@ async fn fix_offboard_vtxos() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	// the user vtxo that gets offboarded

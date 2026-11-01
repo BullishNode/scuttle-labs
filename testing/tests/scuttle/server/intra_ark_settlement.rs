@@ -73,7 +73,7 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	srv.wait_for_lightning_receive_accepted(hash).await;
 	assert!(matches!(Box::pin(receiver.try_claim_lightning_receive(hash, true)).await.unwrap(), LightningReceiveState::Settled(_)));
 	Box::pin(payer.check_lightning_payment(hash, true)).await.unwrap();
-	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (subscription, attempt, preimage) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
@@ -211,7 +211,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	assert!(grants.iter().all(|grant| grant.expiry_height() > expiry_tip),
 		"this cut needs the real HTLC expiry before the original coin expiry");
 	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres, Network::Regtest).await.unwrap();
+	let db = Db::connect(&postgres).await.unwrap();
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
 	let attempt = db.read(async |tx| tx.get_lightning_payment_attempt_by_subscription_id(sub.id).await).await.unwrap().unwrap();
 	assert_eq!(sub.status, LightningHtlcSubscriptionStatus::HtlcsReady);

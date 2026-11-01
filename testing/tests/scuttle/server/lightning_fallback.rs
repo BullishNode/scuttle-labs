@@ -13,7 +13,7 @@ async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	let checked = Arc::new(AtomicBool::new(false));
 	let prepare_checked = Arc::new(AtomicBool::new(false));
 	let prepare_wallet = Arc::new(std::sync::OnceLock::new());
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let proxy = srv.start_proxy_no_mailbox(CheckClaim { wallet: recipient.clone(), db,
 		server: srv.mailbox_keypair(), other_mailbox: other,
 		hold: lightning.internal.hold_client().await, native_payment: true, checked: checked.clone(),
@@ -67,7 +67,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let payment = tokio::spawn(async move { payer.xpay(cln_rpc::XpayRequest {
 		invstring: external_invoice, ..Default::default()
 	}).await });
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	wait_for_subscription_status(&db, hash, "accepted").await;
 	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let tip = ctx.bitcoind().get_block_count().await as u32;
@@ -134,7 +134,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		let cfg = srv.watchmand().config();
 		cfg.sweep_address.clone().unwrap().require_network(cfg.network).unwrap().script_pubkey()
 	};
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let preimage = ark::lightning::Preimage::random();
 	let hash = preimage.compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;

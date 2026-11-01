@@ -456,7 +456,7 @@ async fn recipient_round_links_and_owned_change_survive_restart() {
 	let external_link = external_address.owner_link(bitcoin::Network::Regtest, srv.ark_info().await.mailbox_pubkey).unwrap().unwrap();
 	external.owner_proofs.insert(external_key, external_link);
 	let history = wallet.history().await.unwrap();
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let submitted = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM round_participation", &[]).await?.get::<_, i64>(0))).await.unwrap();
 	for delegated in [false, true] {
 		let error = if delegated {

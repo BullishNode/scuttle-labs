@@ -408,7 +408,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	assert_eq!(srv.ark_info().await.fees.lightning_receive.calculate(gross).unwrap(), sat(0));
 	let invoice = provider.bolt11_invoice_for_address(gross, address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_eq!(destination, bitcoin::ScriptBuf::new_p2tr(&ark::SECP,
 		recipient_mailbox.parse::<bitcoin::secp256k1::PublicKey>().unwrap().x_only_public_key().0, None));
 	let operation_provider = provider.clone();

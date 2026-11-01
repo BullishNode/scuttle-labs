@@ -101,7 +101,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	}).await.unwrap().into_inner();
 	let grants=reply.htlc_vtxos.iter().map(|raw|Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(Vtxo::amount).sum::<bitcoin::Amount>(),sat(180_000));
-	let db=Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db=Db::connect(&srv.config().postgres).await.unwrap();
 	let original_ids=sources.iter().map(|source|source.id().to_string()).collect::<Vec<_>>();
 	let grant_ids=grants.iter().map(|grant|grant.id().to_string()).collect::<BTreeSet<_>>();
 	let scope=db.read(async |t| {

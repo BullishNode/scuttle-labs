@@ -131,7 +131,7 @@ async fn oversized_fee_child() {
 	let address = srv.watchmand().wait_wallet_address().await;
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation, entitlement, facts, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,e.id AS entitlement, \
@@ -354,7 +354,7 @@ async fn payout_reorg(depth: u32) {
 	let before = ctx.bitcoind().get_block_count().await as u32;
 	assert!(before < coin.expiry_height().to_u32());
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - before).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation, parent) = wait_for_payout(&db, ids[0]).await;
 	let txid = parent.compute_txid();
 	*observed.lock().unwrap() = Some(txid.to_string());
@@ -497,7 +497,7 @@ async fn expiry_payout_fee_replacement_keeps_parent_and_counts_only_confirmed_ch
 	ctx.generate_blocks(2).await;
 	let before = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - before).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation, parent) = wait_for_payout(&db, ids[0]).await;
 	let (first_child, first_fee) = super::watchman::observed_payout_fee_child(&ctx, &parent).unwrap();
 	let first_fee = u64::try_from(first_fee).unwrap();
@@ -574,7 +574,7 @@ async fn expiry_payout_replaces_orphan_funding_child_without_changing_parent() {
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	let before = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - before).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation a \
@@ -680,7 +680,7 @@ async fn independently_sponsored_payout(confirm_before_restart: bool) {
 	drop(client);
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32()+1-height).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation,parent) = tokio::time::timeout(Duration::from_secs(30),async {
 		loop {
 			let row = db.read(async |t|Ok(t.query_opt("SELECT a.id,a.sweep_tx,a.broadcast_at IS NULL AS unpublished \
@@ -769,7 +769,7 @@ async fn expiry_payout_replaces_unrecognized_foreign_fee_child() {
 	drop(client);
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,a.sweep_tx \
@@ -900,7 +900,7 @@ async fn positive_untrusted_parent_recovery(crash: bool) {
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	assert!(height < coin.expiry_height().to_u32());
 	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (allocation, entitlement, facts, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,e.id AS entitlement,e.irreversible_facts::TEXT AS facts,a.sweep_tx, \

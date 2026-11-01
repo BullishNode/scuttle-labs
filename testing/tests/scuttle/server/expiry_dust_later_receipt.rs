@@ -12,7 +12,7 @@ use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
 use bark::{Wallet};
 use bark::movement::Movement;
 use bark::vtxo::VtxoState;
-use bitcoin::{Amount, Network, OutPoint, ScriptBuf, TxOut};
+use bitcoin::{Amount, OutPoint, ScriptBuf, TxOut};
 use bitcoin::hex::DisplayHex;
 use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::RpcApi;
@@ -280,7 +280,7 @@ async fn two_receipts() {
 	drop(donor_cli);
 	drop(recipient);
 
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	for (mailbox, record) in [(old.mailbox, &binding), (change.mailbox, &donor_binding)] {
 		assert_eq!(*record, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 	}

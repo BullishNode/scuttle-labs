@@ -74,7 +74,7 @@ impl Daemon {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres, cfg.network).await?;
+		let db = database::Db::create(&cfg.postgres).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -121,7 +121,7 @@ impl Daemon {
 		info!("Starting server at {}", cfg.data_dir.display());
 
 		info!("Connecting to db at {}:{}", cfg.postgres.host, cfg.postgres.port);
-		let db = database::Db::connect(&cfg.postgres, cfg.network)
+		let db = database::Db::connect(&cfg.postgres)
 			.await
 			.context("failed to connect to db")?;
 

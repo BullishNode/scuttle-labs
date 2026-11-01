@@ -80,7 +80,7 @@ async fn expiry_native_rpc_refusals_have_stable_reasons() {
 	let mut rpc = srv.get_public_rpc().await;
 	let error = rpc.request_lightning_pay_htlc_cosign(request().await).await.expect_err("new obligation on expired backing");
 	assert_eq!(error.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "expired_new_lightning");
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	db.write(async |t| {
 		t.query_one("INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,$2) RETURNING id",
 			&[&source.id().to_string(),&100_000_i64]).await?;
@@ -150,7 +150,7 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 			vtxo_requests: vec![output], ..Default::default()
 		}).await.unwrap_err());
 	}
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let counts = db.read(async |tx| Ok(tx.query_one("SELECT
 		(SELECT count(*) FROM owner_key),
 		(SELECT count(*) FROM lightning_payment_attempt),
@@ -173,7 +173,7 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 async fn ownership_board_requires_coin_and_mailbox_authorization() {
 	let ctx = TestContext::new("server/ownership_board_joint_authorization").await;
 	let srv = ctx.captaind("server").create().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let bob = ctx.bark_sdk("bob", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let bob_mailbox = bob.mailbox_identifier();
 
@@ -313,7 +313,7 @@ async fn ownership_board_refusals_preserve_funding_and_exact_replay() {
 		user_pubkey: coin.public_key().serialize().to_vec(), pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
 		funding_tx: bitcoin::consensus::serialize(&funding), owner_proof: Some(link.into()),
 	};
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let mut rpc = srv.get_public_rpc().await;
 	let txids = [funding_id.to_string(), exit_txid.to_string()];
 	let board_rows = async || db.read(async |tx| {
@@ -495,7 +495,7 @@ async fn ownership_package_refusals_preserve_sources_and_isolated_prefixes() {
 	let mut ids = builder.build_unsigned_vtxos().map(|v| v.id()).collect::<Vec<_>>(); ids.push(input.id());
 	ids.extend(builder.build_unsigned_internal_vtxos().into_iter().map(|(v, _)| v.id()));
 	let txids = builder.virtual_transactions().map(|txid| txid.to_string()).collect::<Vec<_>>();
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let hash = Preimage::random().compute_payment_hash();
 	let response = reject_package_proofs(&srv, &db, PackageAdmission::Arkoor, request.clone(), &isolated,
 		isolated_link, conflict, &ids, &txids, hash).await;
@@ -682,7 +682,7 @@ impl captaind::proxy::ArkRpcProxy for CheckRoundLinks {
 async fn ownership_round_refusals_release_flux_and_preserve_durable_participations() {
 	let ctx = TestContext::new("server/ownership_round_refusals").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().funded(btc(1)).create().await;
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let other = Keypair::new(&ark::SECP, &mut bip39::rand::thread_rng());
 	unmapped_owner_link(&srv, &other, &other).await;
 	let state = CheckRoundLinks { wallet: Arc::new(Mutex::new(None)), db: db.clone(), server: srv.mailbox_keypair(),

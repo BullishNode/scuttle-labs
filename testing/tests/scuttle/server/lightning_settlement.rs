@@ -20,7 +20,7 @@ async fn settled_spendable_htlcs_cannot_be_revoked() {
 	let sources = htlc_send_vtxo_ids(&wallet, hash).await;
 	assert!(!sources.is_empty());
 	let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	for source in &sources {
 		assert_eq!(db.read(async |tx| tx.source_settlement(hash, *source).await).await.unwrap(),
 			server::database::ln::SourceSettlement::Funded);

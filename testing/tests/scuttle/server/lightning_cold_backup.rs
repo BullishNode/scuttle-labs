@@ -294,7 +294,7 @@ async fn lightning_backup(unclean: bool) {
 	// Capture the trusted issuance BEFORE any grant consumes its Pool coins.
 	// A later operator allocation may also sweep their untouched siblings.
 	let original_postgres = original.config().postgres.clone();
-	let initial_db = Db::connect(&original_postgres, bitcoin::Network::Regtest).await.unwrap();
+	let initial_db = Db::connect(&original_postgres).await.unwrap();
 	let initial_pool = initial_db.read(async |tx| Ok(tx.query("SELECT p.vtxo,v.spend_state::TEXT AS state \
 		FROM vtxo_pool p JOIN vtxo v USING(vtxo_id) WHERE p.spent_at IS NULL ORDER BY p.vtxo_id", &[]).await?
 		.into_iter().map(|row| {
@@ -468,7 +468,7 @@ async fn lightning_backup(unclean: bool) {
 	original.watchmand().stop().await.unwrap();
 	original.stop().await.unwrap();
 	// The real operators have stopped before the final durable snapshot is read.
-	let db = Db::connect(&server_config.postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&server_config.postgres).await.unwrap();
 	let checkpoint = pending_checkpoint(&db, hash, source, &grants).await;
 	let ancestry = signed_grant_ancestry(&db, &grants).await;
 	let remaining_pool = db.read(async |tx| Ok(tx.query("SELECT p.vtxo,v.spend_state::TEXT AS state \
@@ -547,7 +547,7 @@ async fn lightning_backup(unclean: bool) {
 	let config = helper.into_config(&server_config.postgres.name);
 	assert_eq!(config.name, server_config.postgres.name);
 	assert_ne!(config.port, server_config.postgres.port);
-	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&config).await.unwrap();
 	assert_eq!(pending_checkpoint(&db, hash, source, &grants).await, checkpoint);
 	assert_eq!(signed_grant_ancestry(&db, &grants).await, ancestry);
 	let restored_changesets = db.read(async |tx| Ok(tx.query("SELECT kind::TEXT AS kind,id,content FROM wallet_changeset ORDER BY kind,id", &[]).await?

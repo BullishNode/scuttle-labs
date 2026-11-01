@@ -107,7 +107,7 @@ async fn forfeit_refuses_exited_input() {
 	assert!(err.contains("exited onchain"), "unexpected error: {err}");
 
 	// the participation was not forfeited, so the preimage was not released
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let forfeited = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT forfeited_at IS NOT NULL FROM round_participation \
@@ -138,7 +138,7 @@ async fn forfeit_calls_do_not_reveal_participation_membership() {
 	// both wallets join the round but only forfeit once it confirmed
 	ctx.refresh_all(&srv, &[&victim, &other]).await;
 
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let hashes = db.read(async |t| {
 		let rows = t.query(
 			"SELECT unlock_hash FROM round_participation WHERE round_id IS NOT NULL", &[],

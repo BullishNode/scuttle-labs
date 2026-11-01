@@ -119,7 +119,7 @@ async fn native_refund_status(two_sources: bool) {
 	}).await.unwrap().into_inner();
 	let grants = reply.htlc_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(Vtxo::amount).sum::<bitcoin::Amount>(), sat(invoice_amount));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	super::expiry_lightning_terminal::assert_stored_grant_ancestry(&db, &grants).await;
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	// Independent confirmed coins fund the real operator closure and each

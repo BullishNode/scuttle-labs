@@ -243,7 +243,7 @@ async fn bounded_round_inventory() {
 	assert_eq!(funding.output[anchor.vout as usize].value, sat(COUNT as u64 * LEAF_SAT));
 	let original_state = client.get_vtxo_by_id(original.id()).await.unwrap();
 	assert_eq!(original_state.state, bark::vtxo::VtxoState::Spent);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let native = db.read(async |tx| tx.get_user_vtxo_by_id(original.id()).await).await.unwrap();
 	assert_eq!(native.spend_state, server::database::SpendState::Spent);
 	let forfeits = db.read(async |tx| Ok(tx.query(
@@ -259,7 +259,7 @@ async fn bounded_round_inventory() {
 	let owners = (0..COUNT).map(|_| owner()).collect::<Vec<_>>();
 	assert_eq!(owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>().len(), COUNT);
 	let mut rpc = srv.get_public_rpc().await;
-	let proof_db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let proof_db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mailbox_key = srv.mailbox_keypair();
 	let mut first_link_elapsed = Duration::ZERO;
 	for owner in &owners {
@@ -473,7 +473,7 @@ async fn automatic_multilevel_split() {
 	assert_eq!(minimum_outputs, 324 * 43);
 	assert!(minimum_outputs > 10_000);
 	let mut rpc = srv.get_public_rpc().await;
-	let proof_db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let proof_db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mailbox_key = srv.mailbox_keypair();
 	for owner in &owners {
 		let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &owner.mailbox_key, &owner.key).unwrap();
@@ -485,7 +485,7 @@ async fn automatic_multilevel_split() {
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(PAYEES as u64 * LEAF_SAT)).await;
 	assert_eq!(ids.len(), 1);
 	let client = wallet.client().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let keys = owners.iter().map(|owner| owner.key.public_key().to_string()).collect::<Vec<_>>();
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()])
 		.await?.get::<_, i64>(0))).await.unwrap(), PAYEES as i64);

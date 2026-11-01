@@ -28,7 +28,7 @@ async fn expiry_view_services_watchmand_without_captaind_or_financial_sweep() {
 			cfg.watchman.reaction_interval = Duration::from_secs(600);
 			cfg.watchman.sweep_interval = Duration::from_secs(7200);
 		}).create()).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let before = wait_completed(&ctx, &db, height).await;
 	srv.watchmand().stop().await.unwrap();
@@ -78,7 +78,7 @@ async fn watchmand_lag_twenty_blocks_takes_no_decision_on_unprocessed_block() {
 	let current = ctx.bitcoind().get_block_count().await as u32;
 	assert!(before >= current);
 	ctx.generate_blocks(before - current).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let completed = wait_completed(&ctx, &db, BlockHeight::new(before)).await;
 	let paused = srv.watchmand().pause_native().await.unwrap();
 	let next = ctx.generate_blocks(20).await;
@@ -113,7 +113,7 @@ async fn watchmand_lag_twenty_blocks_takes_no_decision_on_unprocessed_block() {
 async fn crash_during_partial_listener_cycle_rederives() {
 	let ctx = TestContext::new("scuttle/expiry_partial_listener_cycle_crash").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().watchmand().create().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let initial = wait_completed(&ctx, &db, height).await;
 	let target = height.to_u32() + 1;

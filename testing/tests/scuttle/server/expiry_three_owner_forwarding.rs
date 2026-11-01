@@ -12,7 +12,7 @@ use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
 use bark::{Wallet};
 use bark::movement::{Movement, MovementStatus, PaymentMethod};
 use bark::vtxo::VtxoState;
-use bitcoin::{Amount, Network, OutPoint, Transaction};
+use bitcoin::{Amount, OutPoint, Transaction};
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
@@ -183,7 +183,7 @@ async fn three_owners() {
 	let bindings = [&a_binding, &b_binding, &c_binding];
 	assert_eq!(mailboxes.iter().map(|mailbox| mailbox.as_pubkey().to_string()).collect::<BTreeSet<_>>().len(), 3);
 	assert_eq!(bindings.iter().map(|script| (*script).clone()).collect::<BTreeSet<_>>().len(), 3);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	for (mailbox, binding) in mailboxes.iter().zip(&bindings) {
 		assert_eq!(**binding, bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 		for input in &board.input {

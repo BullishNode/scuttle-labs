@@ -302,7 +302,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 	};
 	#[cfg(target_os = "linux")]
 	if preflight_refusal {
-		let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		let before = super::owner_helpers::source_rows(&db, &sources).await;
 		let refused = Arc::new(Mutex::new(false));
 		let observed = refused.clone();
@@ -465,7 +465,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 					"allowed":accepted[0].allowed,"source_sat":source.amount().to_sat(),"claim_fee_sat":2_000,
 					"output_sat":claim.output[0].value.to_sat(),"scope":"Core acceptance only; no broadcast, terminal native outcome or N6 withdrawal"})
 			).unwrap()).await.unwrap();
-			let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+			let db = Db::connect(&srv.config().postgres).await.unwrap();
 			let held = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 			assert!(!held.status.is_final());
 			assert!(held.final_amount_msat.is_none());
@@ -503,7 +503,7 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 	drop(wallet);
 	// The accepted sender is now fenced: no later client open/sync,
 	// revocation or resubmission recovers this payment or the unused sibling.
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let attempt = db.read(async |tx| Ok(tx.query_one("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1",
 		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
 	let label = attempt.to_string();
@@ -1104,7 +1104,7 @@ async fn observe_queued_redrive(
 	let original_logs = queue.logs.lock().unwrap().clone();
 	let original_id = *original_logs.payments.first().context("native A ID missing")?;
 	ensure!(original_logs.continuing.is_empty(), "MISSED_TARGET: A already left the native queue");
-	let db = Db::connect(&srv.config().postgres, Network::Regtest).await?;
+	let db = Db::connect(&srv.config().postgres).await?;
 	let original = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?
 		.context("original economic attempt missing")?;
 	ensure!(!original.status.is_final() && original.error.is_none() && original.final_amount_msat.is_none(),
@@ -1209,7 +1209,7 @@ async fn crash_before_first_native_rpc(
 ) -> anyhow::Result<serde_json::Value> {
 	const LATCH_CLASS: i32 = 0x5343544c;
 	const LATCH_OBJECT: i32 = 1;
-	let db = Db::connect(&srv.config().postgres, Network::Regtest).await?;
+	let db = Db::connect(&srv.config().postgres).await?;
 	let source_rows = super::owner_helpers::source_rows(&db, sources).await;
 	let native = node.native_child().await?;
 	let channels = normal_channels(node).await?;
@@ -1668,7 +1668,7 @@ async fn queued_send_does_not_inherit_completed_payment() {
 		assert_eq!(sat(100_000) + fee, sources[0].amount());
 		let mailbox = ark::mailbox::MailboxAuthorization::new(&wallet.mailbox_keypair(),
 			chrono::Local::now() + Duration::from_secs(300));
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 		assert!(db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().is_none());
 		assert!(db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().is_none());
@@ -1833,7 +1833,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		assert_eq!(old.get_vtxo_key(&old_source).await.unwrap().public_key(), old_source.policy().user_pubkey());
 		assert_eq!(old_source.amount(), sat(100_000));
 		drop(old);
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		let old_attempt = db.read(async |tx| Ok(tx.query_one("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1",
 			&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
 		let old_label = old_attempt.to_string();

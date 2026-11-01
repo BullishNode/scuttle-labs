@@ -133,7 +133,7 @@ async fn list_expiry_holds_requires_admin_auth() {
 	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
 	let wallet = ctx.bark_sdk("owner", &srv).funded(sat(200_000)).boarded(sat(100_000)).create().await;
 	let coin = wallet.spendable_vtxos().await.unwrap().remove(0);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	// Explicit visibility/upsert metadata on a real owned board. The separate
 	// held_coin_is_listed_and_cleared_on_decision case drives a natural hold.
 	db.write(async |tx| tx.record_expiry_hold(coin.id(), "operator_visibility_control").await).await.unwrap();

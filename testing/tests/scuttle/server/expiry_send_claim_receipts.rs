@@ -211,7 +211,7 @@ async fn external_payment(ctx: &TestContext, count: usize, selected: usize) -> E
 		mailbox_id: None, retry_for_secs: Some(1),
 	}).await.unwrap();
 	lightning.external.wait_for_hold_invoice_accepted(hash).await;
-	let db = Db::connect(&server.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&server.config().postgres).await.unwrap();
 	let dispatch = external_dispatch(&db, hash, &sources[..selected]).await;
 	let native_expiry = assert_native_pending(&lightning.internal, hash, &dispatch,
 		ctx.bitcoind().get_block_count().await as u32).await;
@@ -497,7 +497,7 @@ async fn send_claim_follows_internal_attempt_settlement() {
 			.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
 		assert!(!grants.is_empty());
 		assert_eq!(grants.iter().map(Vtxo::amount).sum::<Amount>(), sat(90_000));
-		let db = Db::connect(&server.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&server.config().postgres).await.unwrap();
 		assert_internal_grants(&db, hash, source, &grants, false).await;
 		let mut seen = BTreeSet::new();
 		confirm_actual_path(&ctx, source, &mut seen).await;
@@ -635,7 +635,7 @@ async fn internal_send_records_fee_without_native_payment() {
 		assert!(!grants.is_empty());
 		assert_eq!(grants.iter().map(Vtxo::amount).sum::<Amount>(), sat(90_000));
 		assert!(grants.iter().all(|grant| sources.iter().all(|source| grant.chain_anchor() != source.chain_anchor())));
-		let db = Db::connect(&server.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&server.config().postgres).await.unwrap();
 		assert_internal_grants(&db, hash, source, &grants, false).await;
 		let pending = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert!(pending.is_self_payment() && !pending.status.is_final());

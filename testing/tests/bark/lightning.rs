@@ -125,7 +125,7 @@ async fn bark_pay_ln_succeeds() {
 		let checked = Arc::new(AtomicUsize::new(0));
 		let postgres = srv.config().postgres.clone();
 		let proxy = srv.start_proxy_no_mailbox(CheckFixedAmount { invoice: invoice.clone(),
-			db: Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap(),
+			db: Db::connect(&postgres).await.unwrap(),
 			node: lightning.internal.grpc_client().await, checked: checked.clone() }).await;
 		bark_1.set_ark_url(&proxy.address).await;
 		bark_1.pay_lightning_wait(invoice, None).await;
@@ -1213,7 +1213,7 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 	assert!(grants.iter().all(|h| h.htlc.offchain_resolution.is_none() && h.htlc.chain_resolution.is_none()));
 	let grant_ids = grants.iter().map(|h| h.vtxo.vtxo.id().to_string()).collect::<std::collections::BTreeSet<_>>();
 	assert_eq!(grant_ids.len(), grants.len());
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let subscription = db.read(async |t| Ok(t.query_one(
 		"SELECT id,status::TEXT FROM lightning_htlc_subscription WHERE payment_hash=$1",
 		&[&payment_hash.to_string()]).await?)).await.unwrap();

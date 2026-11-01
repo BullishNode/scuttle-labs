@@ -59,7 +59,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 		invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![grants[0].to_bytes().to_vec()],
 		mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let paid_source = db.read(async |t| Ok(t.query_one("

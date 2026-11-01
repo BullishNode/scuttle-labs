@@ -104,7 +104,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 	let syncing_wallet = wallet.clone();
 	let syncing = tokio::spawn(async move { syncing_wallet.sync_pending_rounds().await });
 	let _request = tokio::time::timeout(Duration::from_secs(15), arrived).await.unwrap().unwrap();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (participation, hash) = db.read(async |tx| {
 		let row = tx.query_one("
 			SELECT p.id, p.unlock_hash
@@ -352,7 +352,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		let sponsor = srv.watchmand().wait_wallet_address().await;
 		ctx.bitcoind().fund_addr(sponsor, sat(100_000)).await;
 		ctx.generate_blocks(2).await;
-		let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		// Leave only one block to maturity after trigger_round mines its normal block.
 		// The real signature window remains the original five seconds.
 		let before = source.expiry_height().to_u32() - 2;

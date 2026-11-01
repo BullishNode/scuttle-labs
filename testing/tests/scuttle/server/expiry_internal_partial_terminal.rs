@@ -140,7 +140,7 @@ async fn partial_terminal(case: TerminalCase) {
 	let grants = reply.htlc_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(Vtxo::amount).sum::<bitcoin::Amount>(), sat(180_000));
 	assert!(grants.len() >= 2);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let scope = db.read(async |t| {
 		let rows = t.query("SELECT a.id,a.lightning_htlc_subscription_id AS subscription_id FROM lightning_payment_attempt a \
 			WHERE a.payment_hash=$1 AND a.lightning_htlc_subscription_id IS NOT NULL", &[&hash.to_string()]).await?;

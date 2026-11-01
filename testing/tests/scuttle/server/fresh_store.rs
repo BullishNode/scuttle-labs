@@ -7,7 +7,7 @@ async fn fresh_scuttle_schema_reopens_without_history_changes() {
 	let mut ctx = TestContext::new_minimal("postgresd/fresh_scuttle_schema_reopen").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&cfg).await.unwrap();
 	let client = ctx.postgres_manager().database_client(Some(&cfg.name)).await;
 	let version: i32 = client.query_one("SELECT MAX(version) FROM public.refinery_schema_history", &[])
 		.await.unwrap().get(0);
@@ -28,7 +28,7 @@ async fn fresh_scuttle_schema_reopens_without_history_changes() {
 		FROM public.refinery_schema_history ORDER BY version";
 	let before = client.query(history, &[]).await.unwrap().into_iter()
 		.map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
-	Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	Db::connect(&cfg).await.unwrap();
 	let after = client.query(history, &[]).await.unwrap().into_iter()
 		.map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
 	assert_eq!(before, after);
@@ -49,7 +49,7 @@ async fn old_fork_database_is_refused_before_initialization_writes() {
 	let tables = client.query("SELECT schemaname || '.' || tablename FROM pg_catalog.pg_tables \
 		WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY 1", &[]).await.unwrap()
 		.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
-	let error = match Db::connect(&cfg, bitcoin::Network::Regtest).await {
+	let error = match Db::connect(&cfg).await {
 		Ok(_) => panic!("old fork store must be refused"),
 		Err(error) => error,
 	};
@@ -76,7 +76,7 @@ async fn registration_shaped_shadow_store_is_refused_without_writes() {
 	let mut ctx = TestContext::new_minimal("postgresd/registration_shadow_store_refused").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::create(&cfg).await.unwrap();
 	drop(db);
 	let client = ctx.postgres_manager().database_client(Some(&cfg.name)).await;
 	client.batch_execute("CREATE TABLE scuttle.fallback_record(mailbox_pk TEXT PRIMARY KEY, record BYTEA NOT NULL);
@@ -84,7 +84,7 @@ async fn registration_shaped_shadow_store_is_refused_without_writes() {
 	let before = client.query("SELECT version,name,checksum FROM public.refinery_schema_history ORDER BY version", &[]).await.unwrap()
 		.into_iter().map(|row| (row.get::<_,i32>(0),row.get::<_,String>(1),row.get::<_,String>(2))).collect::<Vec<_>>();
 	assert!(client.query_one("SELECT to_regclass('scuttle.owner_key') IS NOT NULL", &[]).await.unwrap().get::<_,bool>(0));
-	let error = match Db::connect(&cfg, bitcoin::Network::Regtest).await { Ok(_) => panic!("shadow store must refuse"), Err(error) => error };
+	let error = match Db::connect(&cfg).await { Ok(_) => panic!("shadow store must refuse"), Err(error) => error };
 	assert!(format!("{error:#}").contains("not a fresh Scuttle store"));
 	let after = client.query("SELECT version,name,checksum FROM public.refinery_schema_history ORDER BY version", &[]).await.unwrap()
 		.into_iter().map(|row| (row.get::<_,i32>(0),row.get::<_,String>(1),row.get::<_,String>(2))).collect::<Vec<_>>();
@@ -100,14 +100,14 @@ async fn requestless_scuttle_store_is_refused_without_history_changes() {
 	let mut ctx = TestContext::new_minimal("postgresd/requestless_scuttle_store_refused").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::create(&config).await.unwrap();
 	drop(db);
 	let client = ctx.postgres_manager().database_client(Some(&config.name)).await;
 	client.batch_execute("ALTER TABLE public.cln_xpay DROP COLUMN signed_invoice").await.unwrap();
 	let history = "SELECT version,name,checksum FROM public.refinery_schema_history ORDER BY version";
 	let before = client.query(history, &[]).await.unwrap().into_iter()
 		.map(|row| (row.get::<_, i32>(0), row.get::<_, String>(1), row.get::<_, String>(2))).collect::<Vec<_>>();
-	let error = match Db::connect(&config, bitcoin::Network::Regtest).await {
+	let error = match Db::connect(&config).await {
 		Ok(_) => panic!("old requestless Scuttle shape must be refused"),
 		Err(error) => error,
 	};

@@ -2,7 +2,7 @@
 async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	let ctx = TestContext::new("scuttle/recovery_posts_do_not_create_ownership").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let server_key = srv.mailbox_keypair();
 	let coin_key = Keypair::new(&SECP, &mut thread_rng());
 	let owner = Keypair::new(&SECP, &mut thread_rng());
@@ -78,7 +78,7 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 	let mut ctx = TestContext::new_minimal("postgresd/delivery_owner_batch").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::create(&config).await.unwrap();
 	let server = super::test_server_mailbox_key();
 	let first = Keypair::new(&SECP, &mut thread_rng());
 	let second = Keypair::new(&SECP, &mut thread_rng());
@@ -116,7 +116,7 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 async fn mailbox_authorization_delivery_and_commit_notifications() {
 	let ctx = TestContext::new("server/mailbox_authorization_delivery_and_commit_notifications").await;
 	let srv = ctx.captaind("server").create().await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let server_key = srv.mailbox_keypair();
 	let coin_key = Keypair::new(&SECP, &mut thread_rng());
 	let registered_key = Keypair::new(&SECP, &mut thread_rng());

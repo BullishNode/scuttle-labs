@@ -40,7 +40,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 		cfg.postgres.max_connections = 100;
 	}).create().await;
 
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to captaind's postgres");
+	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
 
 	let mailbox_kp = Keypair::new(&SECP, &mut thread_rng());
 	let mailbox_id = MailboxIdentifier::from_pubkey(mailbox_kp.public_key());
@@ -157,7 +157,7 @@ async fn mailbox_post_arkoor_requires_known_vtxos() {
 	let ctx = TestContext::new("server/mailbox_post_arkoor_requires_known_vtxos").await;
 	let srv = ctx.captaind("server").create().await;
 
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.expect("connect to captaind's postgres");
+	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
 	let mut rpc = srv.get_mailbox_public_rpc().await;
 
 	let mailbox_kp = Keypair::new(&SECP, &mut thread_rng());

@@ -471,7 +471,7 @@ impl Captaind {
 	/// database.
 	pub async fn htlc_vtxos(&self, payment_hash: PaymentHash) -> Vec<HtlcVtxo> {
 		let postgres = self.config().postgres.clone();
-		let db = Db::connect(&postgres, bitcoin::Network::Regtest).await.expect("connect to captaind's postgres");
+		let db = Db::connect(&postgres).await.expect("connect to captaind's postgres");
 		db.read(async |t| htlc_vtxo::get_htlc_vtxo_states_by_payment_hash(&t, payment_hash).await)
 			.await.expect("read htlc vtxos")
 	}

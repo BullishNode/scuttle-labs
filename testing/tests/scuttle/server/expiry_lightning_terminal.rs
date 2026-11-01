@@ -177,7 +177,7 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		lightning.external.wait_for_hold_invoice_accepted(hash).await;
 		receiver.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
 	}
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let attempt = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id FROM lightning_payment_attempt a \
@@ -352,7 +352,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
 	drop(rpc); // No second prepare, cooperative revoke, claim or wallet return.
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (attempt, subscription) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,a.lightning_htlc_subscription_id AS subscription_id FROM lightning_payment_attempt a \
@@ -531,7 +531,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 	assert_eq!(grants.len(), if expose_small_grant { 3 } else if large_cover { 1 } else { 2 },
 		"admission must retain the standard existing cover, including the normal two-grant control");
 	assert_eq!(grants.iter().map(|g| g.amount()).sum::<bitcoin::Amount>(), sat(invoice_amount));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_stored_grant_ancestry(&db, &grants).await;
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	if expose_small_grant {
@@ -870,7 +870,7 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 	}
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().is_some(),
 		"both native attempts must still share one actual physical incoming root");
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert_stored_grant_ancestry(&db, &grants).await;
 	drop(sender);
 	drop(recipient);
@@ -1072,7 +1072,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			assert!(admission_tip < earlier.expiry_height());
 			assert!(earlier.expiry_height() < source.expiry_height());
 			assert!(deadline < source.expiry_height());
-			let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+			let db = Db::connect(&srv.config().postgres).await.unwrap();
 			for (wallet, coin, owner) in [(&sender, &source, mailbox), (&customer, &earlier, earlier_mailbox)] {
 				let funding = ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
 				coin.validate(&funding).unwrap();

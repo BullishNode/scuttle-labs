@@ -26,7 +26,7 @@ async fn fallback_balance_completed_refresh_and_operator_backing_conserve_one_pr
 	let mature = ctx.generate_blocks(original[0].expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(mature).await;
 	srv.watchmand().wait_for_sync_height(mature).await;
-	let database = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let database = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let operator = database.read(async |tx| Ok(tx.query_opt("SELECT e.id FROM expiry_entitlement e \

@@ -65,7 +65,7 @@ async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
 	let response = ark::arkoor::package::ArkoorPackageCosignResponse::try_from(response).unwrap();
 	let htlcs = builder.user_cosign(&[key], response).unwrap().build_signed_vtxos();
 	wallet.register_vtxo_transactions_with_server(&htlcs).await.unwrap();
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let htlc = &htlcs[0];
 	assert!(input.expiry_height() < deadline);
 	let cut = async || {
@@ -236,7 +236,7 @@ async fn expiry_cancelled_unclaimed_output_keeps_owner_after_participation_remov
 	let wallet = ctx.bark("wallet", &srv).funded(sat(500_000)).create().await;
 	let originals = wallet.board_and_confirm_and_register(&ctx, sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	let (participation, hash, leaf) = db.read(async |t| {
 		let row = t.query_one("
 			SELECT id, unlock_hash, forfeited_at IS NOT NULL AS forfeited

@@ -56,7 +56,7 @@ async fn offline_signed_addresses_receive_split_and_isolated_outputs() {
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	reopened.sync_mailbox().await.unwrap();
 	assert_eq!(assert_balance_consistent(&reopened, false).await.spendable, sat(199_999));
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	for address in [first, second] {
 		let owner = db.read(async |tx| tx.expiry_owner(address.policy().user_pubkey()).await).await.unwrap();
 		assert!(matches!(owner, server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
@@ -111,7 +111,7 @@ async fn rejected_change_link_unlocks_inputs_without_recycling_the_key() {
 	assert_eq!(sender.spendable_vtxos().await.unwrap().into_iter().map(|coin| coin.id()).collect::<Vec<_>>(), before);
 	assert!(sender.pending_arkoor_sends().await.unwrap().is_empty());
 	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(400_000));
-	let db = server::database::Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let keys = [key.to_string(), address.policy().user_pubkey().to_string()];
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	armed.store(false, Ordering::SeqCst);
@@ -174,7 +174,7 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 	assert_eq!(sender.balance().await.unwrap().total(), sat(400_000));
 	let next_key = sender.peek_next_keypair().await.unwrap().1;
 	let postgres = srv.config().postgres.clone();
-	let db = server::database::Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = server::database::Db::connect(&postgres).await.unwrap();
 	let economic_rows = async || db.read(async |tx| Ok(tx.query("SELECT vtxo_id,amount,policy,oor_spent_txid \
 		FROM vtxo WHERE anchor_point=$1 ORDER BY vtxo_id", &[&source.chain_anchor().to_string()]).await?
 		.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1), row.get::<_, Vec<u8>>(2), row.get::<_, Option<String>>(3))).collect::<Vec<_>>())).await.unwrap();

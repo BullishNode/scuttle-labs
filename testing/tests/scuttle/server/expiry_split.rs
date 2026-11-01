@@ -104,7 +104,7 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 	let expired = ctx.generate_blocks(input.expiry_height().to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
 	if !pin { srv.watchmand().wait_for_sync_height(expired).await; }
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let root = db.read(async |t| {
 		let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()],
 			server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 }).await?;
@@ -480,7 +480,7 @@ async fn held_sibling(invalid_terminal: bool) {
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	// Deliberately corrupt attribution evidence after genuine signed admission.
 	assert!(matches!(db.read(async |tx| tx.expiry_owner(unknown).await).await.unwrap(), server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == unknown));
 	db.write(async |tx| {

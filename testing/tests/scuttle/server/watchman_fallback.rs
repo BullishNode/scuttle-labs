@@ -41,7 +41,7 @@ pub(super) async fn watchman_sweeps_boards() {
 	ctx.generate_blocks(2).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&sponsor.txid, sponsor.vout, Some(true))
 		.unwrap().unwrap().confirmations >= 2);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let operator_script = wm.config().sweep_address.clone().unwrap()
 		.require_network(Network::Regtest).unwrap().script_pubkey();
 
@@ -280,7 +280,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 	let round_funding = ctx.bitcoind().await_transaction(round_anchor.txid).await;
 	assert_eq!(round_funding.output[round_anchor.vout as usize].value, sat(400_000));
 	for replacement in &replacements { replacement.validate(&round_funding).unwrap(); }
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let limits = server::database::expiry_inventory::BackingSnapshotLimits {
 		max_rows: 10_000, max_serialized_bytes: 10_000_000,
 	};
@@ -645,7 +645,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		.require_network(Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator_script, destination);
 	assert_ne!(claimant_destination, destination);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 
 	bark1.start_exit_all().await;
 	complete_exit(&ctx, &bark1).await;
@@ -1078,7 +1078,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		.require_network(Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator_script, destination);
 	assert_ne!(receiver_destination, destination);
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 
 	bark2.start_exit_all().await;
 	complete_exit(&ctx, &bark2).await;
@@ -1442,7 +1442,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 	let parsed: bark::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
 	let hash = PaymentHash::from(&parsed);
 	srv.wait_for_vtxopool(&ctx).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let initial_pool = futures::TryStreamExt::try_collect::<Vec<_>>(db.load_vtxopool().await.unwrap()).await.unwrap();
 	assert_eq!(initial_pool.len(), 10);
 	assert!(initial_pool.iter().all(|coin| coin.amount() == sat(10_000)));
@@ -1952,7 +1952,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 		barks.push(bark);
 	}
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mut originals = Vec::new();
 	let mut destinations = Vec::new();
 	let mut mailboxes = Vec::new();
@@ -2352,7 +2352,7 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	let wm = srv.watchmand();
 	wm.add_slog_handler(failures.clone());
 	let core = ctx.bitcoind().sync_client();
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
 
 	// Fee children use separate, declared watchman capital. Never reduce customer principal.
@@ -2804,7 +2804,7 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	let connector_point = OutPoint::new(offboard_txid, 1);
 	let connector_id = ark::VtxoId::from(connector_point);
 	assert_eq!(offboard.output[1].value, sat(1_320));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator_script, destination);
 	let connector_expiry = max_expiry.to_u32() + 144;
@@ -3092,7 +3092,7 @@ async fn sweep_offboard_forfeit(captaind_down: bool) {
 	let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
 	source.validate(&funding).unwrap();
 	assert_eq!(source.amount(), sat(400_000));
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let scan_from = ctx.bitcoind().get_block_count().await + 1;
 
 	// snapshot the wallet before offboarding; the attacker keeps the stale vtxo
@@ -3344,7 +3344,7 @@ pub(super) async fn watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table
 
 	// Plant the cross-domain state: record the same preimage as a settled
 	// Lightning payment hash.
-	let db = Db::connect(&srv.config().postgres.clone(), bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let unlock_preimage = db
 		.read(async |t| {
 			let row = t
@@ -3433,7 +3433,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	let bark2 = ctx.bark("bark2", &srv).funded(sat(500_000)).create().await;
 	bark1.board_and_confirm_and_register(&ctx, sat(200_000)).await;
 	bark2.board_and_confirm_and_register(&ctx, sat(200_000)).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mut originals = Vec::new();
 	let mut destinations = Vec::new();
 	let mut mailboxes = Vec::new();
@@ -3971,7 +3971,7 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 	let wallet = ctx.bark_sdk("bark", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(1_000_000)).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let initial = futures::TryStreamExt::try_collect::<Vec<_>>(db.load_vtxopool().await.unwrap()).await.unwrap();
 	assert_eq!(initial.len(), 2);
 	assert!(initial.iter().all(|coin| coin.amount() == sat(100_000)));
@@ -4374,7 +4374,7 @@ pub(super) async fn watchman_claims_expired_receive_grant_before_receiver() {
 	let wm = srv.watchmand();
 	let mut claims = wm.subscribe_log::<ClaimBroadcast>();
 	srv.wait_for_vtxopool(&ctx).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 
 	// Request a grant without ever sending the preimage to the server.
 	let preimage = ark::lightning::Preimage::random();
@@ -4660,7 +4660,7 @@ pub(super) async fn expiry_same_owner_fragments(name: &str, small_first: bool) {
 	let wallet = ctx.bark_sdk("bark", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(1_000_000)).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
-	let db = Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let initial = futures::TryStreamExt::try_collect::<Vec<_>>(db.load_vtxopool().await.unwrap()).await.unwrap();
 	assert_eq!(initial.len(), 2);
 	assert!(initial.iter().all(|coin| coin.amount() == sat(100_000)));

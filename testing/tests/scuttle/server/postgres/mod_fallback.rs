@@ -5,8 +5,8 @@ async fn legacy_lightning_payment_attempt_lifecycle() {
 	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&config).await.unwrap();
+	let db = Db::connect(&config).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -39,8 +39,8 @@ async fn legacy_lightning_payment_attempt_result_update() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -77,8 +77,8 @@ async fn legacy_lightning_payment_attempt_error_cleared_on_success() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -123,8 +123,8 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg, bitcoin::Network::Regtest).await.expect("Connected to database");
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
@@ -188,8 +188,8 @@ async fn watchman_receive_claim_uses_upstream_facts_for_both_encodings() {
 	let mut ctx = TestContext::new_minimal("postgresd/watchman_receive_claim_upstream_facts").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&cfg).await.unwrap();
+	let db = Db::connect(&cfg).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let key = VTXO_VECTORS.board_vtxo.user_pubkey();
 	let (node, _) = db.write(async |t| t.register_lightning_node(&key).await).await.unwrap();
@@ -268,7 +268,7 @@ async fn mailbox_writers_need_no_registration_and_delivery_matches_the_birth_own
 	let mut ctx = TestContext::new_minimal("postgresd/mailbox_without_registration").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create(&cfg, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::create(&cfg).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let foreign = Keypair::from_seckey_slice(&ark::SECP, &[249; 32]).unwrap();
 	let mailbox = MailboxIdentifier::from_pubkey(foreign.public_key());
@@ -324,8 +324,8 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 	let mut ctx = TestContext::new_minimal("postgresd/settlement_provenance_origins").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&config).await.unwrap();
+	let db = Db::connect(&config).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let base = &VTXO_VECTORS.board_vtxo;
 	let key = base.user_pubkey();
@@ -533,8 +533,8 @@ async fn original_signed_xpay_invoice_survives_reopen_and_outcome_writes() {
 	let mut ctx = TestContext::new_minimal("postgresd/original_signed_xpay_invoice").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config, bitcoin::Network::Regtest).await.unwrap();
-	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	Db::create(&config).await.unwrap();
+	let db = Db::connect(&config).await.unwrap();
 	let key = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node, _) = db.write(async |tx| tx.register_lightning_node(&key).await).await.unwrap();
 	let invoice = Invoice::from_str(BOLT11_INVOICE).unwrap();
@@ -564,7 +564,7 @@ async fn original_signed_xpay_invoice_survives_reopen_and_outcome_writes() {
 		xpay::create_xpay(&**tx, &original).await
 	}).await.unwrap();
 	drop(db);
-	let db = Db::connect(&config, bitcoin::Network::Regtest).await.unwrap();
+	let db = Db::connect(&config).await.unwrap();
 	let restored = db.read(async |tx| xpay::get_xpay_by_id(&**tx, row.id).await).await.unwrap().unwrap();
 	assert_eq!(restored, row);
 	assert_eq!(restored.signed_invoice.as_deref(), Some(BOLT11_INVOICE));
