@@ -81,53 +81,6 @@ impl VtxoExitFrontier {
 		Ok(())
 	}
 
-	/// Persist a tracked spend without removing its retry evidence. The block
-	/// listener removes it after this transaction's successors are registered.
-	pub async fn spend(
-		&mut self,
-		vtxo_id: VtxoId,
-		spent_height: BlockHeight,
-		spent_txid: Txid,
-		witness: &Witness,
-	) -> anyhow::Result<bool> {
-		if let Some((_height, vtxo)) = self.frontier.get(&vtxo_id) {
-			// Try to extract a preimage from the spending witness if this is an HTLC vtxo.
-			// Keep the cached input on any failure so the same-block retry reads
-			// this witness again, even for an old entry outside the DB sync window.
-			// If the HTLC tx gets unconfirmed and re-confirmed in a reorg, settle()
-			// is called again but the DB insert is idempotent (ON CONFLICT DO NOTHING).
-			let preimage = try_extract_preimage(vtxo, witness);
-
-			let chain_resolution = classify_htlc_spend(vtxo, witness);
-			let checkpoint = self.db.write(async |t| {
-				let checkpoint = if let Some(preimage) = preimage {
-					t.store_htlc_settlement_from(preimage,
-						crate::database::ln::HtlcSettlementOrigin::Onchain(vtxo_id)).await?
-				} else { None };
-				t.register_vtxo_spend(vtxo_id, spent_height, spent_txid).await?;
-				t.clear_completed_split_hold(vtxo_id, spent_txid).await?;
-				if let Some(resolution) = chain_resolution {
-					htlc_vtxo::set_htlc_vtxo_chain_resolution(
-						&t, vtxo_id, resolution, spent_height,
-					).await?;
-				}
-				Ok(checkpoint)
-			}).await?;
-			if let Some(preimage) = preimage {
-				self.htlc_settler.notify_stored(checkpoint, preimage.compute_payment_hash());
-			}
-
-			if let Some(resolution) = chain_resolution {
-				slog!(HtlcVtxoResolvedOnChain, vtxo_id, height: spent_height,
-					resolution: resolution.as_str().to_owned(),
-				);
-			}
-			Ok(true)
-		} else {
-			Ok(false)
-		}
-	}
-
 	/// Mark all VTXOs with the given txid in their point as confirmed on this height
 	pub async fn confirm_txid(&mut self, txid: Txid, height: BlockHeight) -> anyhow::Result<()> {
 		// Since we use a BTreeMap, entries are ordered by VtxoId.
@@ -302,30 +255,66 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 			// Check if any unconfirmed VTXOs in frontier have this txid as their funding tx
 			frontier.confirm_txid(txid, height).await?;
 
-			// Find vtxos in the frontier that are spent by this tx
-			let mut spent = Vec::new();
-			for input in &tx.input {
-				if frontier.spend(
-					input.previous_output.into(), height, txid, &input.witness,
-				).await? {
-					spent.push(VtxoId::from(input.previous_output));
-				}
-			}
+			let spent = tx.input.iter().filter_map(|input| {
+				let id = VtxoId::from(input.previous_output);
+				let (_, vtxo) = frontier.frontier.get(&id)?;
+				Some((id, try_extract_preimage(vtxo, &input.witness),
+					classify_htlc_spend(vtxo, &input.witness)))
+			}).collect::<Vec<_>>();
+			if spent.is_empty() { continue; }
 
-			// Find new vtxos originating from this tx and add to frontier
-			if !spent.is_empty() {
-				let new_vtxos = frontier.db.read(async |t| t.get_vtxos_by_txid(txid).await).await?;
-				for vtxo in new_vtxos {
-					// Only add if not already in frontier
-					if !frontier.frontier.contains_key(&vtxo.id()) {
-						frontier.register(vtxo, Some(height)).await?;
+			// Commit each source-to-successor transition together. A restart
+			// before commit reloads the inputs; after commit it reloads successors.
+			let (new_vtxos, notifications) = frontier.db.write(async |t| {
+				let new_vtxos = t.get_vtxos_by_txid(txid).await?;
+				let ids = spent.iter().map(|(id, _, _)| id.to_string())
+					.chain(new_vtxos.iter().map(|vtxo| vtxo.id().to_string())).collect::<Vec<_>>();
+				let hashes = spent.iter().filter_map(|(_, preimage, _)|
+					preimage.map(|preimage| preimage.compute_payment_hash().to_string())).collect::<Vec<_>>();
+				// Lock every touched source before the first settlement WAL write,
+				// including other sources of any hash revealed by this transaction.
+				t.query_one("SELECT generation FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+				t.query("SELECT v.vtxo_id FROM vtxo v LEFT JOIN htlc_vtxo h ON h.id=v.id \
+					WHERE v.vtxo_id=ANY($1) OR h.payment_hash=ANY($2) \
+					ORDER BY v.vtxo_id FOR UPDATE OF v", &[&ids, &hashes]).await?;
+				let mut notifications = Vec::new();
+				for &(id, preimage, resolution) in &spent {
+					if let Some(preimage) = preimage {
+						let checkpoint = t.store_htlc_settlement_from(preimage,
+							crate::database::ln::HtlcSettlementOrigin::Onchain(id)).await?;
+						notifications.push((checkpoint, preimage.compute_payment_hash()));
+					}
+					t.register_vtxo_spend(id, height, txid).await?;
+					t.clear_completed_split_hold(id, txid).await?;
+					if let Some(resolution) = resolution {
+						htlc_vtxo::set_htlc_vtxo_chain_resolution(t, id, resolution, height).await?;
 					}
 				}
-				// A later lookup or registration failure must leave a matched
-				// input to drive successor discovery on the same-block retry.
-				for id in spent {
-					frontier.frontier.remove(&id);
+				for vtxo in &new_vtxos {
+					if !frontier.frontier.contains_key(&vtxo.id()) {
+						t.add_vtxo_to_frontier(vtxo.id()).await?;
+						t.register_vtxo_confirmation(vtxo.id(), height).await?;
+					}
 				}
+				Ok((new_vtxos, notifications))
+			}).await?;
+			for (id, _, resolution) in spent {
+				frontier.frontier.remove(&id);
+				if let Some(resolution) = resolution {
+					slog!(HtlcVtxoResolvedOnChain, vtxo_id: id, height,
+						resolution: resolution.as_str().to_owned(),
+					);
+				}
+			}
+			for vtxo in new_vtxos {
+				let id = vtxo.id();
+				if !frontier.frontier.contains_key(&id) {
+					frontier.frontier.insert(id, (Some(height), vtxo));
+					slog!(WatchmanAddedVtxo, id);
+				}
+			}
+			for (checkpoint, hash) in notifications {
+				frontier.htlc_settler.notify_stored(checkpoint, hash);
 			}
 		}
 
