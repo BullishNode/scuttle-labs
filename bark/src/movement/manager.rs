@@ -362,11 +362,13 @@ impl MovementManager {
 			);
 		}
 
-		// Update the status and persist it.
-		guard.status = new_status;
-		guard.time.completed_at = Some(chrono::Local::now());
-		self.db.update_movement(&*guard).await
+		// Persist the new status before publishing it in the cache.
+		let mut movement = guard.clone();
+		movement.status = new_status;
+		movement.time.completed_at = Some(chrono::Local::now());
+		self.db.update_movement(&movement).await
 			.map_err(|e| MovementError::PersisterError { id, e })?;
+		*guard = movement;
 
 		self.notifications.dispatch_movement_updated(guard.clone());
 
@@ -410,19 +412,6 @@ impl MovementManager {
 
 		drop(guard);
 		self.unload_movement_from_cache(id).await
-	}
-
-	/// Reverse a canonical receipt's terminal history after a reorg. The
-	/// caller must retain its original identity and independently prove that
-	/// the former receipt no longer has the required canonical depth.
-	pub(crate) async fn reopen_movement(&self, id: MovementId, update: MovementUpdate) -> Result<(), MovementError> {
-		let mut guard = self.get_cached_movement(id).await?;
-		update.apply_to(&mut *guard, chrono::Local::now());
-		guard.status = MovementStatus::Pending;
-		guard.time.completed_at = None;
-		self.db.update_movement(&guard).await.map_err(|e| MovementError::PersisterError { id, e })?;
-		self.notifications.dispatch_movement_updated(guard.clone());
-		Ok(())
 	}
 
 	async fn get_cached_movement(
@@ -591,6 +580,8 @@ mod test {
 
 	use crate::notification::WalletNotification;
 	use crate::persist::adaptor::StorageAdaptorWrapper;
+	#[cfg(feature = "sqlite")]
+	use crate::persist::sqlite::{helpers::in_memory_db, SqliteClient};
 
 	use super::*;
 
@@ -624,5 +615,64 @@ mod test {
 			},
 			other => panic!("expected a MovementUpdated notification, got {:?}", other),
 		}
+	}
+
+	#[cfg(feature = "sqlite")]
+	#[tokio::test]
+	async fn finish_movement_retries_sqlite_failure_before_cache_publication() {
+		// Keep the original connection alive: every SqliteClient operation
+		// opens another connection to this same actual shared-memory database.
+		let (path, conn) = in_memory_db();
+		let db = Arc::new(SqliteClient::open(&path).unwrap());
+		let notifications = NotificationDispatch::new();
+		let manager = MovementManager::new(db.clone(), notifications.clone());
+		manager.register_subsystem(Subsystem::EXIT).await.unwrap();
+		let id = manager.new_movement(Subsystem::EXIT, "start").await.unwrap();
+		let pending = db.get_movement_by_id(id).await.unwrap();
+		assert_eq!(pending.status, MovementStatus::Pending);
+		assert!(pending.time.completed_at.is_none());
+		let mut stream = notifications.subscribe();
+
+		conn.execute_batch(&format!("CREATE TRIGGER issue32_reject_terminal_update \
+			BEFORE UPDATE ON bark_movements \
+			WHEN NEW.id = {id} AND OLD.status = 'pending' AND NEW.status != 'pending' \
+			BEGIN SELECT RAISE(ABORT, 'issue32 terminal movement write rejected'); END;"))
+			.unwrap();
+		for _ in 0..2 {
+			// The SAME manager must retry the failed persistence, not return
+			// success from a terminal value left only in its active cache.
+			let error = manager.finish_movement(id, MovementStatus::Canceled).await
+				.expect_err("a still-failing SQLite write cannot finish a movement");
+			match error {
+				MovementError::PersisterError { id: failed, e } => {
+					assert_eq!(failed, id);
+					assert!(matches!(e.downcast_ref::<rusqlite::Error>(),
+						Some(rusqlite::Error::SqliteFailure(_, Some(message)))
+							if message == "issue32 terminal movement write rejected"), "{e:#}");
+				},
+				other => panic!("expected the actual SQLite persistence failure, got {other}"),
+			}
+			assert_eq!(db.get_movement_by_id(id).await.unwrap(), pending);
+			assert!(stream.next().now_or_never().is_none(), "failed persistence must not notify completion");
+		}
+
+		conn.execute_batch("DROP TRIGGER issue32_reject_terminal_update;").unwrap();
+		manager.finish_movement(id, MovementStatus::Canceled).await.unwrap();
+		let finished = db.get_movement_by_id(id).await.unwrap();
+		assert_eq!(finished.status, MovementStatus::Canceled);
+		assert!(finished.time.completed_at.is_some());
+		let reopened = SqliteClient::open(&path).unwrap();
+		assert_eq!(reopened.get_movement_by_id(id).await.unwrap(), finished);
+		match stream.next().now_or_never() {
+			Some(Some(WalletNotification::MovementUpdated { movement })) => assert_eq!(movement, finished),
+			other => panic!("expected one persisted MovementUpdated notification, got {other:?}"),
+		}
+		assert!(stream.next().now_or_never().is_none(), "only one completion notification expected");
+
+		manager.finish_movement(id, MovementStatus::Canceled).await.unwrap();
+		let again = db.get_movement_by_id(id).await.unwrap();
+		assert_eq!(again, finished);
+		assert_eq!(again.time.completed_at, finished.time.completed_at);
+		assert!(stream.next().now_or_never().is_none(), "same terminal retry must not notify twice");
 	}
 }

@@ -14,7 +14,7 @@ use server_rpc::protos;
 
 
 /// Two grants share a hash, but only one funds a paid attempt.
-/// Its preimage must neither collect the unused grant nor block its refund.
+/// Its preimage must neither collect the unused grant nor block its automatic expiry refund.
 async fn same_hash_sources(cooperative_refund: bool) {
 	let name = if cooperative_refund { "server/expiry_unused_same_hash_cooperative_refund" }
 		else { "server/expiry_unused_same_hash_source" };
@@ -129,26 +129,45 @@ async fn same_hash_sources(cooperative_refund: bool) {
 		}
 	}
 	if cooperative_refund {
+		assert_eq!(signed_grants[1].amount(), sat(100_000));
+		let unused = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, grants[1]).await).await.unwrap().unwrap();
+		assert_eq!(unused.htlc.offchain_resolution, None);
+		assert_eq!(unused.vtxo.oor_spent_txid, None);
+		let keys = sources.iter().map(|(_, key)| key.public_key()).collect::<Vec<_>>();
 		for index in [0, 1] {
 			let key = sources[index].1;
 			let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints([signed_grants[index].clone()],
 				VtxoPolicy::new_pubkey(key.public_key())).unwrap().generate_user_nonces(&[key]).unwrap();
+			let mut ids = grants.clone();
+			ids.extend(sources.iter().map(|(input, _)| input.id()));
+			ids.extend(builder.build_unsigned_vtxos().map(|v| v.id()));
+			ids.extend(builder.build_unsigned_internal_vtxos().into_iter().map(|(v, _)| v.id()));
+			let txids = builder.virtual_transactions().map(|id| id.to_string()).collect::<Vec<_>>();
+			let source_before = super::expiry_admission::source_rows(&db, &ids).await;
+			let owners_before = super::expiry_admission::owner_rows(&db, &keys).await;
+			let ids_text = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
+			let committed = async || db.read(async |t| Ok(t.query_one("SELECT jsonb_build_object(
+				'htlcs',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM htlc_vtxo h WHERE h.payment_hash=$2),
+				'attempts',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM lightning_payment_attempt a WHERE a.payment_hash=$2),
+				'links',(SELECT jsonb_agg(to_jsonb(l) ORDER BY l.vtxo_id) FROM lightning_payment_attempt_htlc_vtxo l JOIN lightning_payment_attempt a ON a.id=l.lightning_payment_attempt_id WHERE a.payment_hash=$2),
+				'wal',(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM htlc_settlement s WHERE s.payment_hash=$2),
+				'origins',(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.kind,o.attempt_id,o.subscription_id,o.vtxo_id) FROM htlc_settlement_source o JOIN htlc_settlement s ON s.id=o.settlement_id WHERE s.payment_hash=$2),
+				'owners',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.vtxo_id) FROM coin_owner c WHERE c.vtxo_id=ANY($1)),
+				'virtual',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.txid) FROM virtual_transaction v WHERE v.txid=ANY($3)),
+				'entitlements',(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)),
+				'allocations',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.allocation_id,c.entitlement_id) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1)))::TEXT",
+				&[&ids_text, &hash.to_string(), &txids]).await?.get::<_, String>(0))).await.unwrap();
+			let before = committed().await;
 			let response = rpc.request_lightning_pay_htlc_revocation(
 				super::signed_package(&srv, &[&client], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await,
 			).await;
-			if index == 0 {
-				assert_eq!(response.unwrap_err().code(), tonic::Code::InvalidArgument,
-					"the actually paid source cannot also receive a refund");
-			} else {
-				let response = ArkoorPackageCosignResponse::try_from(response.unwrap().into_inner()).unwrap();
-				let refund = builder.user_cosign(&[key], response).unwrap().build_signed_vtxos();
-				assert_eq!(refund.iter().map(|v| v.amount()).sum::<bitcoin::Amount>(), sat(100_000));
-				client.register_vtxo_transactions_with_server(&refund).await.unwrap();
-				let original = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, grants[1]).await).await.unwrap().unwrap();
-				assert_eq!(original.htlc.offchain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Revoked));
-			}
+			let error = response.expect_err("a settled hash must not be cooperatively refunded through either source");
+			assert_eq!(error.code(), tonic::Code::InvalidArgument);
+			assert!(error.message().ends_with("invoice has already been paid"), "{error}");
+			assert_eq!(committed().await, before);
+			assert_eq!(super::expiry_admission::source_rows(&db, &ids).await, source_before);
+			assert_eq!(super::expiry_admission::owner_rows(&db, &keys).await, owners_before);
 		}
-		return;
 	}
 
 	let destination = client.fallback_script();
@@ -186,6 +205,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, sat(99_000));
+	if cooperative_refund { assert_eq!(output.value + sat(1_000), signed_grants[1].amount()); }
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	assert_eq!(db.read(async |t| Ok(t.query_one("

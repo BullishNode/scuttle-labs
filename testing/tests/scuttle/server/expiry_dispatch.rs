@@ -1,151 +1,15 @@
 use std::time::Duration;
 
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
-use ark::lightning::{Bolt12InvoiceExt, Invoice, PaymentHash, Preimage};
+use ark::lightning::{Invoice, Preimage};
 use ark::VtxoPolicy;
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use server::database::ln::LightningPaymentStatus;
 use server_rpc::protos;
 use cln_rpc::plugins::hold;
-use bitcoin::constants::ChainHash;
-use bitcoin::secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey};
-use bitcoin::{Amount, Network};
-use lightning::blinded_path::{BlindedHop, Direction, IntroductionNode};
-use lightning::blinded_path::payment::{BlindedPayInfo, BlindedPaymentPath};
-use lightning::io::Cursor;
-use lightning::ln::channelmanager::PaymentId;
-use lightning::ln::inbound_payment::ExpandedKey;
-use lightning::offers::invoice::{Bolt12Invoice, UnsignedBolt12Invoice};
-use lightning::offers::nonce::Nonce;
-use lightning::offers::offer::OfferBuilder;
-use lightning::sign::EntropySource;
-use lightning::types::features::BlindedHopFeatures;
-use lightning::util::ser::{BigSize, Readable, Writeable};
 
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::util::poll_interval;
-
-struct InvoiceEntropy;
-
-impl EntropySource for InvoiceEntropy {
-	fn get_secure_random_bytes(&self) -> [u8; 32] { rand::random() }
-}
-
-fn unresolved_introduction_invoice(
-	payment_hash: PaymentHash, amount_msat: u64, unknown_scid: u64,
-) -> Invoice {
-	assert!(amount_msat > 0);
-	assert_eq!(amount_msat % 1_000, 0, "registered HTLC principal must be whole sats");
-	let principal = Amount::from_sat(amount_msat / 1_000);
-	let secp = Secp256k1::new();
-	let pubkey = |byte| PublicKey::from_secret_key(
-		&secp, &SecretKey::from_slice(&[byte; 32]).unwrap(),
-	);
-	let issuer = Keypair::from_secret_key(
-		&secp, &SecretKey::from_slice(&[43; 32]).unwrap(),
-	);
-	let introduction = pubkey(40);
-	let path = BlindedPaymentPath::from_blinded_path_and_payinfo(
-		introduction,
-		pubkey(41),
-		vec![
-			BlindedHop { blinded_node_id: pubkey(43), encrypted_payload: vec![0; 43] },
-			BlindedHop { blinded_node_id: pubkey(44), encrypted_payload: vec![0; 44] },
-		],
-		BlindedPayInfo {
-			fee_base_msat: 1,
-			fee_proportional_millionths: 1_000,
-			cltv_expiry_delta: 42,
-			htlc_minimum_msat: 100,
-			htlc_maximum_msat: 1_000_000_000_000,
-			features: BlindedHopFeatures::empty(),
-		},
-	);
-	let offer = OfferBuilder::new(issuer.public_key())
-		.chain(Network::Regtest)
-		.amount_msats(amount_msat)
-		.build().unwrap();
-	let expanded_key = ExpandedKey::new(rand::random());
-	let nonce = Nonce::from_entropy_source(&InvoiceEntropy);
-	let request = offer.request_invoice(
-		&expanded_key, nonce, &secp, PaymentId(rand::random()),
-	).unwrap().chain(Network::Regtest).unwrap().build_and_sign().unwrap();
-	assert_eq!(request.chain(), ChainHash::using_genesis_block(Network::Regtest));
-	let ldk_hash = lightning::types::payment::PaymentHash(payment_hash.to_byte_array());
-	let unsigned = request.respond_with(vec![path], ldk_hash).unwrap().build().unwrap();
-	assert_eq!(unsigned.payment_paths().len(), 1);
-	assert_eq!(unsigned.payment_paths()[0].introduction_node(), &IntroductionNode::NodeId(introduction));
-
-	// Change the introduction in the unsigned stream, then sign the new invoice.
-	let mut bytes = Vec::new();
-	unsigned.write(&mut bytes).unwrap();
-	let stream_len = u64::try_from(bytes.len()).unwrap();
-	let mut cursor = Cursor::new(bytes.as_slice());
-	let mut modified = Vec::new();
-	let mut replaced = false;
-	while cursor.position() < stream_len {
-		let record_start = usize::try_from(cursor.position()).unwrap();
-		let typ = BigSize::read(&mut cursor).unwrap().0;
-		let len = usize::try_from(BigSize::read(&mut cursor).unwrap().0).unwrap();
-		let value_start = usize::try_from(cursor.position()).unwrap();
-		let value_end = value_start.checked_add(len).unwrap();
-		let value = bytes.get(value_start..value_end).expect("complete local TLV value");
-		if typ == 160 {
-			assert!(!replaced, "one payment-path TLV");
-			let prefix = value.get(..33).expect("compressed introduction key");
-			assert!(matches!(prefix[0], 2 | 3));
-			assert_eq!(prefix, introduction.serialize().as_slice());
-			let replacement_len = len.checked_sub(33).unwrap().checked_add(9).unwrap();
-			BigSize(typ).write(&mut modified).unwrap();
-			BigSize(u64::try_from(replacement_len).unwrap()).write(&mut modified).unwrap();
-			modified.push(0); // DirectedShortChannelId, NodeOne.
-			modified.extend_from_slice(&unknown_scid.to_be_bytes());
-			modified.extend_from_slice(value.get(33..).unwrap());
-			replaced = true;
-		} else {
-			modified.extend_from_slice(bytes.get(record_start..value_end).unwrap());
-		}
-		cursor.set_position(u64::try_from(value_end).unwrap());
-	}
-	assert_eq!(cursor.position(), stream_len);
-	assert!(replaced);
-	let unsigned = UnsignedBolt12Invoice::try_from(modified).unwrap();
-	let directed = IntroductionNode::DirectedShortChannelId(Direction::NodeOne, unknown_scid);
-	assert_eq!(unsigned.payment_paths().len(), 1);
-	assert_eq!(unsigned.payment_paths()[0].introduction_node(), &directed);
-	assert_eq!(unsigned.chain(), ChainHash::using_genesis_block(Network::Regtest));
-	assert_eq!(unsigned.payment_hash(), ldk_hash);
-	assert_eq!(unsigned.amount_msats(), amount_msat);
-	let invoice = unsigned.sign(|message: &UnsignedBolt12Invoice| {
-		Ok(secp.sign_schnorr_no_aux_rand(message.as_ref().as_digest(), &issuer))
-	}).unwrap();
-
-	let mut signed_bytes = Vec::new();
-	invoice.write(&mut signed_bytes).unwrap();
-	let signed = Bolt12Invoice::try_from(signed_bytes).unwrap();
-	assert_eq!(signed.payment_paths().len(), 1);
-	assert_eq!(signed.payment_paths()[0].introduction_node(), &directed);
-	assert_eq!(signed.chain(), ChainHash::using_genesis_block(Network::Regtest));
-	assert_eq!(signed.payment_hash(), ldk_hash);
-	assert_eq!(signed.amount_msats(), amount_msat);
-	assert_eq!(signed.issuer_signing_pubkey(), Some(issuer.public_key()));
-	signed.check_signature().unwrap();
-	signed.validate_signing_key(&offer).unwrap();
-	signed.validate_issuance(&offer, principal).unwrap();
-
-	let invoice = Invoice::Bolt12(signed).to_string().parse::<Invoice>().unwrap();
-	let Invoice::Bolt12(signed) = &invoice else { panic!("BOLT12 round trip") };
-	assert_eq!(signed.payment_paths().len(), 1);
-	assert_eq!(signed.payment_paths()[0].introduction_node(), &directed);
-	assert_eq!(signed.chain(), ChainHash::using_genesis_block(Network::Regtest));
-	assert_eq!(signed.payment_hash(), ldk_hash);
-	assert_eq!(signed.amount_msats(), amount_msat);
-	assert_eq!(signed.issuer_signing_pubkey(), Some(issuer.public_key()));
-	signed.check_signature().unwrap();
-	signed.validate_signing_key(&offer).unwrap();
-	signed.validate_issuance(&offer, principal).unwrap();
-	invoice
-}
 
 #[tokio::test]
 async fn lightning_rejection_refunds_only_its_source() {
@@ -160,9 +24,25 @@ async fn lightning_rejection_refunds_only_its_source() {
 		let wallet = sender.client().await;
 		let hash = Preimage::from_slice(&[73;32]).unwrap().compute_payment_hash();
 		let principal = sat(90_000);
-		let unknown_scid = 0x00ff_ffffu64 << 40;
-		assert!(ctx.bitcoind().get_block_count().await < unknown_scid >> 40);
-		let invoice = unresolved_introduction_invoice(hash, principal.to_sat() * 1_000, unknown_scid);
+		// Delete a genuine, still-unpaid receiver invoice before any send. A
+		// normally routed HTLC must then fail at the receiver, producing actual
+		// failed native parts rather than treating an arbitrary RPC error as cash authority.
+		let invoice = lightning.external.invoice_with_preimage(Some(principal),
+			"deleted-before-dispatch", "native receiver rejection", [73; 32]).await;
+		let mut receiver = lightning.external.grpc_client().await;
+		let deleted = receiver.del_invoice(cln_rpc::DelinvoiceRequest {
+			label: "deleted-before-dispatch".into(),
+			status: cln_rpc::delinvoice_request::DelinvoiceStatus::Unpaid as i32, desconly: None,
+		}).await.unwrap().into_inner();
+		assert_eq!(deleted.status(), cln_rpc::delinvoice_response::DelinvoiceStatus::Unpaid);
+		assert_eq!(deleted.payment_hash, hash.to_vec());
+		assert_eq!(deleted.bolt11.as_deref(), Some(invoice.as_str()));
+		assert!(deleted.payment_preimage.is_none());
+		assert!(receiver.list_invoices(cln_rpc::ListinvoicesRequest {
+			payment_hash: Some(hash.to_vec()), ..Default::default()
+		}).await.unwrap().into_inner().invoices.is_empty());
+		let invoice = invoice.parse::<Invoice>().unwrap();
+		assert_eq!(invoice.payment_hash(), hash);
 		let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 		let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 		let mut rpc = srv.get_public_rpc().await;
@@ -192,27 +72,13 @@ async fn lightning_rejection_refunds_only_its_source() {
 			&[&info.id]).await?)).await.unwrap();
 		assert_eq!(node.get::<_, Vec<u8>>("pubkey"), info.id);
 		let node_id = node.get::<_, i64>("id");
-		assert!(payer.list_channels(cln_rpc::ListchannelsRequest {
-			short_channel_id: Some("16777215x0x0".into()), ..Default::default()
-		}).await.unwrap().into_inner().channels.is_empty());
-		let probe = payer.xpay(cln_rpc::XpayRequest {
-			invstring: invoice.to_string(), label: Some("unresolved-introduction-probe".into()),
-			amount_msat: None, maxfee: None, layers: vec![], retry_for: Some(1),
-			partial_msat: None, maxdelay: None, payer_note: None, localinvreqid: None, dev_use_shadow: None,
-		}).await.unwrap_err();
-		assert_eq!(probe.code(), tonic::Code::Unknown);
-		assert!(probe.message().contains("Could not resolve any paths: unknown short_channel_id"));
 		assert!(payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().payments.is_empty());
 		assert!(payer.list_pays(cln_rpc::ListpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().pays.is_empty());
-
 		let mut returned = srv.subscribe_log::<server_log::XpayRpcReturned>();
-		assert!(payer.list_channels(cln_rpc::ListchannelsRequest {
-			short_channel_id: Some("16777215x0x0".into()), ..Default::default()
-		}).await.unwrap().into_inner().channels.is_empty());
 		rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 			invoice: invoice.to_string(), payment_amount_sat: principal.to_sat(),
 			htlc_vtxo_ids: vec![sources[0].0.id().to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(1),
@@ -221,11 +87,11 @@ async fn lightning_rejection_refunds_only_its_source() {
 			loop {
 				let result = returned.recv().await.unwrap();
 				if result.payment_hash == hash {
-					assert!(result.error.unwrap().contains("Could not resolve any paths: unknown short_channel_id"));
+					assert!(result.error.is_some());
 					break;
 				}
 			}
-		}).await.expect("the product dispatch must reach the native unresolved-introduction branch");
+		}).await.expect("the product dispatch must reach the native receiver rejection");
 		let rejected = tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
 				if let Some(attempt) = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap() {
@@ -233,21 +99,35 @@ async fn lightning_rejection_refunds_only_its_source() {
 				}
 				tokio::time::sleep(poll_interval()).await;
 			}
-		}).await.expect("the upstream rejection must close its own attempt");
+		}).await.expect("the native receiver rejection must close its own attempt");
 		assert_eq!(rejected.lightning_node_id, node_id);
 		assert_eq!(rejected.amount_msat, principal.to_sat() * 1_000);
-		assert_eq!(rejected.final_amount_msat, None);
+		assert_eq!(rejected.final_amount_msat, Some(0));
 		let links = db.read(async |t| Ok(t.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
 			WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&rejected.id]).await?
 			.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await.unwrap();
 		assert_eq!(links, vec![sources[0].0.id().to_string()]);
 		assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
-		assert!(payer.list_send_pays(cln_rpc::ListsendpaysRequest {
+		let rejected_label = rejected.id.to_string();
+		let rejected_parts = payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
-		}).await.unwrap().into_inner().payments.is_empty());
-		assert!(payer.list_pays(cln_rpc::ListpaysRequest {
+		}).await.unwrap().into_inner().payments;
+		assert!(!rejected_parts.is_empty());
+		assert!(rejected_parts.iter().all(|part| part.payment_hash == hash.to_vec()
+			&& part.label.as_deref() == Some(rejected_label.as_str())
+			&& part.groupid == rejected_parts[0].groupid && part.created_index > 0
+			&& part.status() == cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Failed
+			&& part.payment_preimage.is_none()));
+		assert_eq!(rejected_parts.iter().map(|part| part.amount_msat.as_ref().unwrap().msat).sum::<u64>(), principal.to_sat() * 1_000);
+		let rejected_pays = payer.list_pays(cln_rpc::ListpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
-		}).await.unwrap().into_inner().pays.is_empty());
+		}).await.unwrap().into_inner().pays;
+		assert_eq!(rejected_pays.len(), 1);
+		assert_eq!(rejected_pays[0].label.as_deref(), Some(rejected_label.as_str()));
+		assert_eq!(rejected_pays[0].payment_hash, hash.to_vec());
+		assert_eq!(rejected_pays[0].status(), cln_rpc::listpays_pays::ListpaysPaysStatus::Failed);
+		assert!(rejected_pays[0].created_index.unwrap() > 0);
+		assert!(rejected_pays[0].preimage.is_none());
 
 		// Only after the definite rejection, create the same-hash held sibling.
 		let invoice = lightning.external.hold_client().await.invoice(hold::InvoiceRequest {
@@ -265,16 +145,28 @@ async fn lightning_rejection_refunds_only_its_source() {
 		assert!(matches!(pending.status, LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted));
 		assert!(pending.final_amount_msat.is_none());
 		let label = pending.id.to_string();
-		let parts = payer.list_send_pays(cln_rpc::ListsendpaysRequest {
+		let native_parts = payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().payments;
+		assert_eq!(native_parts.iter().filter(|part| part.label.as_deref() == Some(rejected_label.as_str()))
+			.cloned().collect::<Vec<_>>(), rejected_parts);
+		let parts = native_parts.iter().filter(|part| part.label.as_deref() == Some(label.as_str()))
+			.cloned().collect::<Vec<_>>();
+		assert_eq!(native_parts.len(), rejected_parts.len() + parts.len());
 		assert!(!parts.is_empty());
 		assert!(parts.iter().all(|part| part.label.as_deref() == Some(label.as_str()) && part.payment_hash == hash.to_vec()
 			&& part.status() == cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Pending && part.payment_preimage.is_none()));
 		assert_eq!(parts.iter().map(|part| part.amount_msat.as_ref().unwrap().msat).sum::<u64>(), principal.to_sat() * 1_000);
-		let aggregate = payer.list_pays(cln_rpc::ListpaysRequest {
+		let native_pays = payer.list_pays(cln_rpc::ListpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().pays;
+		// Native xpay overlays Pending on old failed groups while this same hash is active.
+		let mut expected_rejected_pays = rejected_pays.clone();
+		expected_rejected_pays[0].status = cln_rpc::listpays_pays::ListpaysPaysStatus::Pending as i32;
+		assert_eq!(native_pays.iter().filter(|pay| pay.label.as_deref() == Some(rejected_label.as_str()))
+			.cloned().collect::<Vec<_>>(), expected_rejected_pays);
+		let aggregate = native_pays.iter().filter(|pay| pay.label.as_deref() == Some(label.as_str())).collect::<Vec<_>>();
+		assert_eq!(native_pays.len(), rejected_pays.len() + aggregate.len());
 		assert_eq!(aggregate.len(), 1);
 		assert_eq!(aggregate[0].label.as_deref(), Some(label.as_str()));
 		assert_eq!(aggregate[0].status(), cln_rpc::listpays_pays::ListpaysPaysStatus::Pending);
@@ -360,7 +252,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 		assert!(!state.get::<_, bool>("entitled"));
 		assert_eq!(payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
-		}).await.unwrap().into_inner().payments, parts);
+		}).await.unwrap().into_inner().payments, native_parts);
 		assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 	}).await.expect("typed rejection/source isolation exceeded the unchanged 180-second limit");
 }

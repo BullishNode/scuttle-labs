@@ -220,7 +220,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 	drop(rpc);
 	// No returning-wallet revoke/claim or preimage disclosure after this point.
 	let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
-	tokio::time::timeout(Duration::from_secs(150), async {
+	let reservation_tip = tokio::time::timeout(Duration::from_secs(150), async {
 		for _ in 0..100 {
 			let tip = ctx.generate_blocks(1).await;
 			srv.wait_for_sync_height(tip).await;
@@ -229,7 +229,9 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 			if let Some(closures) = super::expiry_lightning_terminal::confirmed_grant_closures(
 				&ctx, &db, &grants, &recipient_destination,
 			).await {
-				if closures.values().all(|(_, closed)| closed.checked_add(6).is_some_and(|required| required <= tip.to_u32())) {
+				if closures.values().all(|(_, closed)| closed.checked_add(5).is_some_and(|required| required <= tip.to_u32())) {
+					assert_eq!(Some(tip.to_u32()), closures.values().map(|(_, closed)| closed.checked_add(5).unwrap()).max(),
+						"capture the first six-confirmation tip before another block can consume the pending refund");
 					let hash = ctx.bitcoind().sync_client().get_block_hash(u64::from(tip.to_u32())).unwrap();
 					loop {
 						let rebuilt = db.read(async |t| {
@@ -251,7 +253,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 								GROUP BY a.id HAVING COUNT(DISTINCT e.vtxo_id)=2",
 								&[&ids,&anchor.to_string()]).await?.is_some())
 						}).await.unwrap();
-						if rebuilt { return; }
+						if rebuilt { return tip; }
 						tokio::time::sleep(Duration::from_millis(50)).await;
 					}
 				}
@@ -260,7 +262,7 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 		panic!("the actual operator grant closures did not reach six confirmations");
 	}).await.expect("both attempts need funded canonical grant closure before refund");
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&anchor.txid, anchor.vout, Some(true)).unwrap().is_some(),
-		"the original shared root must remain unspent through actual H+6 grant closure");
+		"the original shared root must remain unspent through six-confirmation grant closure at C+5");
 	srv.watchmand().trigger_sweep().await;
 	// Hold this tip while capturing the real decision: a funded refund may
 	// enter the mempool, but must not become a canonical customer receipt.
@@ -278,6 +280,8 @@ async fn expiry_internal_shared_root_frontier_replan_survives_restart_and_reorg(
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("initial shared-root refund required an absent actor");
+	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(reservation_tip.to_u32()),
+		"capture the original pending reservation before any further mining");
 	assert!(old_parent.input.iter().any(|input| input.previous_output==anchor));
 	// The refund spends only the shared customer root. Each receive grant
 	// already has a separate funded operator closure six confirmations deep.

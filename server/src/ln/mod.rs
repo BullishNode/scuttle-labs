@@ -18,6 +18,7 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use tokio::sync::broadcast;
 use bitcoin::Amount;
+use bitcoin::amount::CheckedSum;
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 use tracing::{error, info, trace, warn};
@@ -229,7 +230,8 @@ impl Server {
 
 		let payment_hash = requested_policy.payment_hash;
 
-		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount).sum::<Amount>();
+		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount)
+			.checked_sum().badarg("HTLC amount overflow")?;
 		check_max_amount("lightning send", htlc_amount, self.config.max_ln_send_amount)?;
 
 		// Held for the whole call, so no other call decides on this payment
@@ -318,14 +320,18 @@ impl Server {
 		// while the payment is validated and handed to the lightning node.
 		let _guard = self.payment_guards.lock(payment_hash).await;
 
+		invoice.check_signature().context("invalid invoice signature")?;
 		let htlc_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&htlc_vtxo_ids).await).await?;
+		let recorded = self.db.read(async |t|
+			t.is_recorded_lightning_payment(&invoice, payment_amount, &htlc_vtxo_ids).await
+		).await?;
 
 		slog!(LightningPaymentInitRequested, payment_hash, htlc_vtxo_ids: htlc_vtxo_ids.clone());
 
 		let chain_tip = self.sync_manager.chain_tip().height;
 		let mut vtxos = vec![];
 		for htlc_vtxo in htlc_vtxos {
-			htlc_vtxo.check_htlc_send_spendable(chain_tip)?;
+			if !recorded { htlc_vtxo.check_htlc_send_spendable(chain_tip)?; }
 
 			let vtxo = htlc_vtxo.vtxo.clone();
 
@@ -345,6 +351,14 @@ impl Server {
 
 			vtxos.push(vtxo);
 		}
+		// An exact retry acknowledges existing work even if its node or a new
+		// admission view is now unavailable. The monitor owns any re-drive.
+		if recorded { return Ok(()); }
+		if let Invoice::Bolt11(invoice) = &invoice {
+			if invoice.is_expired() {
+				return badarg!("invoice has expired");
+			}
+		}
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
@@ -358,13 +372,11 @@ impl Server {
 			htlc_vtxo_sum += htlc_vtxo.amount();
 		}
 
-		// Verify against the invoice amount if applicable, disallowing underpayments.
+		// New admissions must match the fixed invoice's rounded satoshi quote.
+		// Recorded retries above retain their original payment parameters.
 		if let Some(invoice_msat) = invoice.amount_msat() {
-			if invoice_msat > payment_amount.to_msat() {
-				return badarg!("requested payment amount too low for invoice");
-			}
-			if invoice_msat < payment_amount.to_msat() / 2 {
-				return badarg!("requested payment amount more than double invoice amount");
+			if payment_amount != Amount::from_msat_ceil(invoice_msat) {
+				return badarg!("requested payment amount must equal the fixed invoice amount");
 			}
 		}
 
@@ -851,13 +863,9 @@ impl Server {
 			LightningHtlcSubscriptionStatus::Accepted => {}, // we continue
 			LightningHtlcSubscriptionStatus::HtlcsReady => {
 				// we already did this, let's fetch the vtxos and return them
-				let vtxos = self.db.write(async |t| {
-					let vtxos = t.get_user_vtxos_by_id(&sub.htlc_vtxos).await?.into_iter()
-						.map(|v| v.vtxo).collect::<Vec<_>>();
-					owner_links.verify_existing_grant(t, user_pubkey, &vtxos,
-						self.mailbox_key.leak_ref(), self.config.network).await?;
-					Ok(vtxos)
-				}).await?;
+				let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&sub.htlc_vtxos).await).await?.into_iter()
+					.map(|v| v.vtxo)
+					.collect();
 				return Ok((sub, vtxos));
 			},
 			LightningHtlcSubscriptionStatus::Canceled => {

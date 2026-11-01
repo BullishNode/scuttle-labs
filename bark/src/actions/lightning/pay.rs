@@ -22,10 +22,10 @@ use log::{debug, error, info, trace, warn};
 
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
-use ark::lightning::{Invoice, PaymentHash, PaymentStatus, Preimage};
+use ark::lightning::{CheckAmountError, Invoice, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
-use bitcoin_ext::BlockHeight;
+use bitcoin_ext::{AmountExt, BlockHeight};
 use server_rpc::protos::{self, lightning_payment_status};
 
 use crate::Wallet;
@@ -38,7 +38,7 @@ use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus, PaymentMethod};
 use crate::persist::models::PaidInvoice;
 use crate::subsystem::{LightningMovement, LightningSendMovement, Subsystem};
-use crate::vtxo::VtxoLockHolder;
+use crate::vtxo::{FallbackStatus, VtxoLockHolder};
 
 const LN_PAY_NAMESPACE: &str = "ln_pay";
 
@@ -181,6 +181,24 @@ impl WalletAction for LightningSend {
 			},
 			Progress::RevocableHtlcs { htlcs, revocation } |
 			Progress::RevocationStuck { htlcs, revocation } => {
+				let mut committed = false;
+				for id in &htlcs.vtxo_ids {
+					committed |= wallet.has_fallback_commitment(*id).await.retry()?;
+				}
+				if committed {
+					return Ok(match retire_fallback_lightning_send(wallet, htlcs).await {
+						Ok(true) => Advance::Done,
+						Ok(false) => Advance::Park { state: self,
+							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: None },
+						Err(error) => Advance::Park { state: self,
+							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: Some(error) },
+					});
+				}
+				if let PaymentStatus::Success(preimage) =
+					check_lightning_send_payment_status(wallet, &self, htlcs).await.retry()? {
+					settle_lightning_send_payment(wallet, &self, htlcs, preimage).await?;
+					return Ok(Advance::Done);
+				}
 				revoke_lightning_send_htlcs(wallet, &self, htlcs, revocation).await?;
 				return Ok(Advance::Done);
 			},
@@ -359,9 +377,23 @@ pub(crate) async fn start_lightning_send(
 	}
 
 	invoice.check_signature().context("invoice has bad signature")?;
+	if let Invoice::Bolt11(invoice) = &invoice {
+		if invoice.would_expire(bark_runtime::now().duration_since(bark_runtime::UNIX_EPOCH)?) {
+			bail!("invoice has expired");
+		}
+	}
 
 	let payment_amount = invoice.get_payment_amount(user_amount)
 		.context("invoice has bad payment amount")?;
+	// A fixed invoice cannot deliver a caller-specified larger amount.
+	if let Some(invoice_msat) = invoice.amount_msat() {
+		let invoice_amount = Amount::from_msat_ceil(invoice_msat);
+		if payment_amount != invoice_amount {
+			return Err(CheckAmountError::InvalidUserAmount {
+				invoice: invoice_amount, user: payment_amount,
+			}.into());
+		}
+	}
 	if payment_amount == Amount::ZERO {
 		bail!("Cannot pay invoice for 0 sats (0 sat invoices are not any-amount invoices)");
 	}
@@ -691,6 +723,28 @@ pub(crate) async fn settle_lightning_send_payment(
 	).await.retry()?;
 
 	Ok(())
+}
+
+/// Retire this Ark send only after every original HTLC has a terminal
+/// authenticated customer fallback outcome. This does not classify CLN.
+async fn retire_fallback_lightning_send(wallet: &Wallet, htlcs: &Htlcs) -> anyhow::Result<bool> {
+	let mut terminal = wallet.fallback_inputs_terminal(&htlcs.vtxo_ids).await?;
+	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
+	for id in &htlcs.vtxo_ids {
+		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?
+			.context("fallback HTLC disappeared before action retirement")?;
+		terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited));
+	}
+	if !terminal { return Ok(false); }
+
+	let current = wallet.inner.db.get_movement_by_id(htlcs.movement_id).await?;
+	ensure!(current.status != MovementStatus::Successful, "successful Lightning send contradicts customer fallback retirement");
+	if current.status != MovementStatus::Failed || current.effective_balance != SignedAmount::ZERO
+		|| current.offchain_fee != Amount::ZERO {
+		wallet.inner.movements.finish_movement_with_update(htlcs.movement_id, MovementStatus::Failed,
+			MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO)).await?;
+	}
+	Ok(true)
 }
 
 /// Cosign the revocation with the server, mark the HTLC vtxos spent

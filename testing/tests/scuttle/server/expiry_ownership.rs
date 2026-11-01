@@ -1,7 +1,8 @@
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::lightning::PaymentHash;
-use ark::VtxoPolicy;
+use ark::{ProtocolEncoding, VtxoPolicy};
 use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::rpc::RpcApi;
 use server_rpc::protos;
 
 use ark_testing::{btc, sat, TestContext};
@@ -12,23 +13,37 @@ use std::time::Duration;
 /// external payment. The preimage settler has no timeout event for this case.
 #[tokio::test]
 async fn expiry_abandoned_registered_send_needs_no_client_refund() {
-	abandoned_registered_send(false).await;
+	abandoned_registered_send(false, false).await;
 }
 
 #[tokio::test]
 async fn held_coin_is_listed_and_cleared_on_decision() {
-	abandoned_registered_send(true).await;
+	abandoned_registered_send(true, false).await;
 }
 
-async fn abandoned_registered_send(check_holds: bool) {
-	let name = if check_holds { "server/held_coin_is_listed_and_cleared_on_decision" }
+#[tokio::test]
+async fn expiry_completed_watchman_rejects_new_send_while_captain_lags() {
+	abandoned_registered_send(false, true).await;
+}
+
+async fn abandoned_registered_send(check_holds: bool, lagged_captain: bool) {
+	let name = if lagged_captain { "server/expiry_completed_watchman_lagged_captain" }
+		else if check_holds { "server/held_coin_is_listed_and_cleared_on_decision" }
 		else { "server/expiry_abandoned_registered_send" };
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal)
-		.funded(btc(10)).cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
-		.watchmand_cfg(|cfg| cfg.watchman.sweep_interval = std::time::Duration::from_secs(3600))
-		.create().await;
+	let builder = ctx.captaind("server").lightningd(&lightning.internal)
+		.funded(btc(10)).cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24));
+	let srv = if lagged_captain {
+		let srv = builder.create().await;
+		srv.attach_watchmand(ctx.watchmand("server-watchmand").bitcoind(ctx.bitcoind_arc())
+			.cfg(|cfg| cfg.watchman.sweep_interval = std::time::Duration::from_secs(3600))
+			.create(&srv).await);
+		srv
+	} else {
+		builder.watchmand_cfg(|cfg| cfg.watchman.sweep_interval = std::time::Duration::from_secs(3600))
+			.create().await
+	};
 	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let wallet = sender.client().await;
@@ -53,13 +68,101 @@ async fn abandoned_registered_send(check_holds: bool) {
 	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let htlc = &htlcs[0];
 	assert!(input.expiry_height() < deadline);
-	let expired = ctx.generate_blocks(input.expiry_height().to_u32() + 1 - tip.to_u32()).await;
+	let cut = async || {
+		db.read(async |tx| {
+			let id = htlc.id().to_string();
+			let row = tx.query_one("SELECT \
+				(SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1) AS entitlements, \
+				(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=$1) AS reservations, \
+				(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$2) AS attempts, \
+				(SELECT COUNT(*) FROM cln_xpay WHERE payment_hash=$2) AS requests, \
+				(SELECT COUNT(*) FROM lightning_payment_attempt_htlc_vtxo WHERE vtxo_id=$1) AS links, \
+				(SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$2) AS wal, \
+				(SELECT COUNT(*) FROM vtxo WHERE vtxo_id=$1 AND (confirmed_height IS NOT NULL OR onchain_spent_txid IS NOT NULL)) AS exits",
+				&[&id,&hash.to_string()]).await?;
+			Ok(["entitlements","reservations","attempts","requests","links","wal","exits"].into_iter()
+				.map(|key| (key.to_owned(),row.get::<_, i64>(key))).collect::<std::collections::BTreeMap<_,_>>())
+		}).await.unwrap()
+	};
+	let expired = if lagged_captain {
+		let c = BlockHeight::new(srv.bitcoind().get_block_count().await as u32);
+		srv.wait_for_sync_height(c).await;
+		assert!(c < input.expiry_height());
+		assert!(!srv.bitcoind().sync_client().call::<bool>("setnetworkactive", &[serde_json::json!(false)]).unwrap());
+		let before = ctx.bitcoind().get_block_count().await as u32;
+		assert!(before < input.expiry_height().to_u32());
+		ctx.bitcoind().generate(input.expiry_height().to_u32() + 1 - before).await;
+		BlockHeight::new(ctx.bitcoind().get_block_count().await as u32)
+	} else {
+		ctx.generate_blocks(input.expiry_height().to_u32() + 1 - tip.to_u32()).await
+	};
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let error = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	let completed = if lagged_captain {
+		let canonical = ctx.bitcoind().sync_client().get_block_hash(u64::from(expired.to_u32())).unwrap();
+		let view = tokio::time::timeout(Duration::from_secs(15), async {
+			loop {
+				if let Some(view) = db.read(async |tx| {
+					let Some(view) = tx.expiry_view().await? else { return Ok(None); };
+					Ok(if tx.expiry_view_is_current(view).await? { Some(view) } else { None })
+				}).await.unwrap() {
+					if view.processed.height==expired && view.processed.hash==canonical { break view; }
+				}
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the advancing watchmand must publish its real valid completed primary view");
+		let c = db.read(async |tx| tx.get_highest_block(server::database::BlockTable::Captaind).await)
+			.await.unwrap().unwrap();
+		assert!(c.height < input.expiry_height() && input.expiry_height() <= view.processed.height && view.processed.height < deadline);
+		assert_eq!(srv.bitcoind().get_block_count().await, u64::from(c.height.to_u32()), "captain Core RPC must remain genuinely lagged/alive");
+		lightning.internal.wait_for_block(expired).await;
+		assert!(cut().await.values().all(|count| *count==0));
+		let stored = db.read(async |tx| tx.get_user_vtxo_by_id(htlc.id()).await).await.unwrap();
+		assert_eq!(stored.vtxo.serialize(), htlc.serialize());
+		assert_eq!(stored.spend_state, server::database::SpendState::Spendable);
+		assert!(stored.confirmed_height.is_none());
+		assert!(!stored.decided_for_fallback);
+		Some((c.height,view.processed,view.generation))
+	} else { None };
+	let response = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000,
 		htlc_vtxo_ids: htlcs.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: None,
-	}).await.expect_err("offline sender cannot start an external payment after backing expiry");
+	}).await;
+	if let Some((captain,watchman,generation)) = completed {
+		let counts = cut().await;
+		let pays = lightning.internal.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
+			bolt11:None,payment_hash:Some(hash.to_vec()),status:None,index:None,limit:None,start:None,
+		}).await.unwrap().into_inner().pays;
+		let parts = lightning.internal.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
+			payment_hash:Some(hash.to_vec()),..Default::default()
+		}).await.unwrap().into_inner().payments;
+		// Preserve an authentic old-source admission/counters before the expected
+		// refusal assertion; never continue its unattempted-refund tail if admitted.
+		tokio::fs::write(ctx.datadir.join("lagged-admission-observation.json"), serde_json::to_vec_pretty(&serde_json::json!({
+			"captain_height":captain.to_u32(),"watchman_height":watchman.height.to_u32(),
+			"watchman_hash":watchman.hash.to_string(),"generation":generation,
+			"source_expiry":input.expiry_height().to_u32(),"htlc_expiry":deadline.to_u32(),
+			"source":htlc.id().to_string(),"rpc_ok":response.is_ok(),
+			"rpc_error":response.as_ref().err().map(|error| serde_json::json!({"code":error.code() as i32,
+				"message":error.message(),"reason":error.metadata().get("abandon-reason").and_then(|x|x.to_str().ok()),
+				"identifiers":error.metadata().get("identifiers").and_then(|x|x.to_str().ok())})),
+			"counts":counts,"native_pay_groups":pays.len(),"native_parts":parts.len(),
+		})).unwrap()).await.unwrap();
+		let error = response.as_ref().expect_err("completed watchmand maturity must refuse new work despite lagged captain");
+		assert_eq!(error.code(),tonic::Code::InvalidArgument);
+		assert_eq!(error.metadata().get("abandon-reason").unwrap().to_str().unwrap(),"expired_new_lightning");
+		assert_eq!(error.metadata().get("identifiers").unwrap().to_str().unwrap(),htlc.id().to_string());
+		assert!(counts.values().all(|count| *count==0));
+		assert!(pays.is_empty() && parts.is_empty());
+		let stored = db.read(async |tx| tx.get_user_vtxo_by_id(htlc.id()).await).await.unwrap();
+		assert_eq!(stored.vtxo.serialize(),htlc.serialize());
+		assert_eq!(stored.spend_state,server::database::SpendState::Spendable);
+		assert!(stored.confirmed_height.is_none());
+		assert!(srv.bitcoind().sync_client().call::<bool>("setnetworkactive", &[serde_json::json!(true)]).unwrap());
+		ctx.await_block_count_sync().await;
+		srv.wait_for_sync_height(expired).await;
+	}
+	let error = response.expect_err("offline sender cannot start an external payment after backing expiry");
 	assert!(error.message().contains("expired"), "{error}");
 	let attempts = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap();
 	assert!(attempts.is_none());

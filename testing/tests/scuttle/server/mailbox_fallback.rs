@@ -57,14 +57,20 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	}).await.unwrap().into_inner().messages;
 	assert_eq!(messages.len(), 1);
 	let Some(Message::RecoveryVtxoIds(message)) = &messages[0].message else { panic!("expected recovery hints"); };
-	assert_eq!(message.owners.len(), 1, "a foreign hint reports its actual owner");
-	assert_eq!(message.owners[0].vtxo_id, coin.id().to_bytes().to_vec());
-	assert_eq!(message.owners[0].owner_mailbox, owner.public_key().serialize().to_vec());
+	assert!(message.owners.is_empty(), "recovery locator must not disclose foreign ownership: {:?}", message.owners);
 	let mut actual = message.vtxo_ids.clone();
 	let mut expected = request().vtxo_ids;
 	actual.sort_unstable();
 	expected.sort_unstable();
 	assert_eq!(actual, expected);
+	let mut stream = rpc.subscribe_mailbox(protos::mailbox_server::MailboxRequest {
+		mailbox_id: mailbox.serialize(), authorization: Some(authorization), checkpoint: 0,
+	}).await.unwrap().into_inner();
+	let streamed = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap();
+	assert_eq!(streamed.checkpoint, messages[0].checkpoint);
+	let Some(Message::RecoveryVtxoIds(streamed)) = &streamed.message else { panic!("expected streamed recovery hints"); };
+	assert!(streamed.owners.is_empty(), "streamed locator must not disclose foreign ownership: {:?}", streamed.owners);
+	assert_eq!(streamed.vtxo_ids, message.vtxo_ids);
 }
 
 #[tokio::test]
@@ -162,12 +168,19 @@ async fn mailbox_authorization_delivery_and_commit_notifications() {
 	// Positive control: this same live subscription receives the committed post.
 	rpc.post_arkoor_message(post()).await.unwrap();
 	let message = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap();
-	assert!(matches!(message.message, Some(Message::Arkoor(_))));
+	let Some(Message::Arkoor(delivery)) = &message.message else { panic!("expected committed delivery"); };
+	assert_eq!(delivery.vtxos, vec![coin.serialize()]);
+	assert_eq!(delivery.owners, vec![protos::core::VtxoOwner {
+		vtxo_id: coin.id().to_bytes().to_vec(), owner_mailbox: target_key.public_key().serialize().to_vec(),
+	}]);
 	let stored = rpc.read_mailbox(request()).await.unwrap().into_inner();
 	assert_eq!(stored.messages.len(), 1);
+	assert_eq!(stored.messages[0], message, "authorized read and stream retain the same genuine delivery ownership");
 	rpc.post_recovery_vtxo_ids(protos::mailbox_server::PostRecoveryVtxoIdsRequest {
 		mailbox_id: target.serialize(), vtxo_ids: vec![coin.id().to_bytes().to_vec()], authorization: Some(authorization),
 	}).await.unwrap();
 	let message = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap();
-	assert!(matches!(message.message, Some(Message::RecoveryVtxoIds(_))));
+	let Some(Message::RecoveryVtxoIds(hint)) = message.message else { panic!("expected recovery locator"); };
+	assert_eq!(hint.vtxo_ids, vec![coin.id().to_bytes().to_vec()]);
+	assert!(hint.owners.is_empty());
 }

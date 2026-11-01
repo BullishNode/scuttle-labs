@@ -122,7 +122,7 @@ async fn rejected_change_link_unlocks_inputs_without_recycling_the_key() {
 }
 
 /// An accepted cosign can outlive its reply and the client process. The SDK
-/// resumes its persisted action with new proof signatures, keeping the same
+/// resumes its persisted action with a reconstructed joint proof, keeping the same
 /// economic transaction and the original input locked until finalization.
 #[tokio::test]
 async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
@@ -198,7 +198,8 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 	assert!(requests.len() >= 2, "the reopened client must send the accepted transaction again");
 	let first = requests.first().unwrap(); let replay = requests.last().unwrap();
 	assert_eq!(first.parts.len(), replay.parts.len());
-	let mut fresh_own_signature = false;
+	let own_mailbox = reopened.properties().await.unwrap().mailbox_identity.public_key;
+	let mut reconstructed_own_proof = false;
 	for (a, b) in first.parts.iter().zip(&replay.parts) {
 		assert_eq!(a.input_vtxo_id, b.input_vtxo_id); assert_eq!(a.use_checkpoint, b.use_checkpoint);
 		for (old, new) in [(&a.outputs, &b.outputs), (&a.isolated_outputs, &b.isolated_outputs)] {
@@ -211,12 +212,15 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 				if key == address.policy().user_pubkey() {
 					assert_eq!(old_proof, new_proof, "copied recipient evidence remains authoritative");
 				} else {
-					fresh_own_signature |= old_proof.signature != new_proof.signature;
+					assert_eq!(old_proof, new_proof, "the same joint intent must reconstruct its deterministic proof");
+					let link = ark::fallback::OwnerLink::try_from(new_proof.clone()).unwrap();
+					assert_eq!(link.verify_joint(bitcoin::Network::Regtest, &srv.mailbox_keypair(), key).unwrap().as_pubkey(), own_mailbox);
+					reconstructed_own_proof = true;
 				}
 			}
 		}
 	}
-	assert!(fresh_own_signature, "the resumed SDK must reconstruct and re-sign its own link");
+	assert!(reconstructed_own_proof, "the resumed SDK must reconstruct its own valid joint link");
 	recipient.sync_mailbox().await.unwrap();
 	assert_eq!(assert_balance_consistent(&reopened, false).await.spendable, sat(300_000));
 	assert_eq!(assert_balance_consistent(&recipient, false).await.spendable, sat(100_000));

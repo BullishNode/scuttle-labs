@@ -2768,6 +2768,57 @@ async fn undo_round() {
 	let funding_txid = finished.txid;
 	info!("Round finished with funding txid: {}", funding_txid);
 
+	let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+	let round_id = ark::rounds::RoundId::new(funding_txid);
+	let tree = db.read(async |tx| tx.get_round(round_id).await).await.unwrap().unwrap().into_cached_tree().unwrap();
+	let outputs = tree.output_vtxos().collect::<Vec<_>>();
+	let output_ids = tree.internal_vtxos().map(|(v,_)| v.id().to_string())
+		.chain(outputs.iter().map(|v| v.id().to_string())).collect::<Vec<_>>();
+	let keys = db.read(async |tx| Ok(tx.query("SELECT user_pubkey FROM owner_key ORDER BY user_pubkey", &[])
+		.await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
+	let input_ids = db.read(async |tx| Ok(tx.query("SELECT i.vtxo_id FROM round_part_input i \
+		JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$1 ORDER BY i.vtxo_id",
+		&[&funding_txid.to_string()]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
+	assert!(!input_ids.is_empty());
+	let all_ids = output_ids.iter().chain(&input_ids).cloned().collect::<Vec<_>>();
+	let global_owners = async || db.read(async |tx| Ok(tx.query_one("SELECT COALESCE(jsonb_agg(to_jsonb(k) \
+		ORDER BY user_pubkey),'[]')::TEXT FROM owner_key k WHERE user_pubkey=ANY($1)", &[&keys]).await?.get::<_,String>(0))).await.unwrap();
+	let owner_keys_before = global_owners().await;
+	assert_ne!(owner_keys_before,"[]");
+	let input_owners = async || db.read(async |tx| Ok(tx.query_one("SELECT COALESCE(jsonb_agg(to_jsonb(c) \
+		ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c WHERE vtxo_id=ANY($1)", &[&input_ids]).await?.get::<_,String>(0))).await.unwrap();
+	let input_owners_before = input_owners().await;
+	assert_ne!(input_owners_before,"[]");
+	let owned_outputs = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM coin_owner WHERE vtxo_id=ANY($1)",
+		&[&output_ids]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
+	assert!(!owned_outputs.is_empty(), "the actual completed round must have customer ownership projections");
+	let fenced = outputs.iter().find(|v|owned_outputs.contains(&v.id().to_string())).unwrap();
+	let snapshot = async || db.read(async |tx| Ok(tx.query_one("SELECT jsonb_build_object(
+		'vtxos',(SELECT COALESCE(jsonb_agg(to_jsonb(v) ORDER BY vtxo_id),'[]') FROM vtxo v WHERE vtxo_id=ANY($1)),
+		'owners',(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]') FROM coin_owner c WHERE vtxo_id=ANY($1)),
+		'keys',(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]') FROM owner_key k WHERE user_pubkey=ANY($2)),
+		'round',(SELECT to_jsonb(r) FROM round r WHERE funding_txid=$3),
+		'parts',(SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY id),'[]') FROM round_participation p WHERE round_id=$3),
+		'inputs',(SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY participation_id,vtxo_id),'[]') FROM round_part_input i
+			JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$3),
+		'outputs',(SELECT COALESCE(jsonb_agg(to_jsonb(o) ORDER BY participation_id,amount),'[]') FROM round_part_output o
+			JOIN round_participation p ON p.id=o.participation_id WHERE p.round_id=$3),
+		'entitlements',(SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY vtxo_id),'[]') FROM expiry_entitlement e WHERE vtxo_id=ANY($1)),
+		'history_count',(SELECT COUNT(*) FROM vtxo_history WHERE vtxo_id=ANY($1)))::TEXT",
+		&[&all_ids,&keys,&funding_txid.to_string()]).await?.get::<_,String>(0))).await.unwrap();
+	let before_refusal = snapshot().await;
+	// A constructed PG fence on the actual round output exercises only the
+	// transactional refusal. It rolls back together with the attempted undo.
+	let refused = db.write(async |tx| {
+		tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,$2)",
+			&[&fenced.id().to_string(), &(fenced.amount().to_sat() as i64)]).await?;
+		tx.undo_round(round_id).await
+	}).await.expect_err("economic references must still refuse the entire undo");
+	let error = refused.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();
+	assert_eq!(error.code(),&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION);
+	assert_eq!(error.constraint(),Some("expiry_entitlement_vtxo_id_fkey"));
+	assert_eq!(snapshot().await,before_refusal, "refused undo must roll back projection removal, input restoration and participation/history writes");
+
 	let output = srv.get_custom_command(&[
 		"undo-round", "--dangerous", "--force",
 		&funding_txid.to_string(),
@@ -2778,6 +2829,16 @@ async fn undo_round() {
 	info!("undo-round stdout: {}", stdout);
 	info!("undo-round stderr: {}", stderr);
 	assert!(output.status.success(), "undo-round exited with status {}", output.status);
+
+	let removed = db.read(async |tx| Ok(tx.query_one("SELECT
+		(SELECT COUNT(*) FROM vtxo WHERE vtxo_id=ANY($1)),
+		(SELECT COUNT(*) FROM coin_owner WHERE vtxo_id=ANY($1)),
+		(SELECT COUNT(*) FROM round WHERE funding_txid=$2)", &[&output_ids,&funding_txid.to_string()]).await?)).await.unwrap();
+	assert_eq!(removed.get::<_,i64>(0),0);
+	assert_eq!(removed.get::<_,i64>(1),0);
+	assert_eq!(removed.get::<_,i64>(2),0);
+	assert_eq!(global_owners().await,owner_keys_before, "undo removes only per-coin projections, never global signed owner bindings");
+	assert_eq!(input_owners().await,input_owners_before, "original round inputs retain their admitted ownership");
 }
 
 /// Verify that broadcasting the board vtxo's exit tx (outside of bark) causes

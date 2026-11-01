@@ -29,7 +29,7 @@ async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	}).await.unwrap();
 	paid.unwrap(); claimed.unwrap();
 	assert!(checked.load(Ordering::SeqCst));
-	assert!(prepare_checked.load(Ordering::SeqCst), "the actual cached HtlcsReady grant must reject all prepare probes before collection");
+	assert!(prepare_checked.load(Ordering::SeqCst), "cached grants must reject invalid proofs and preserve exact bodies and owners on a valid read before collection");
 	recipient.sync_mailbox().await.unwrap();
 	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
 	assert_eq!(provider.balance().await.unwrap().spendable, Amount::ZERO);
@@ -81,16 +81,20 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let owner = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(), hash, super::test_owner_link(&srv, &owner).await).await;
 	wallet.register_vtxo_transactions_with_server(&sources).await.unwrap();
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	let refusal = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000,
 		htlc_vtxo_ids: sources.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(5),
+	}).await.unwrap_err();
+	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+	assert!(refusal.message().contains("already being paid"));
+	let records = db.read(async |t| {
+		let row = t.query_one("SELECT \
+			(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1), \
+			(SELECT COUNT(*) FROM cln_xpay WHERE payment_hash=$1)", &[&hash.to_string()]).await?;
+		Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
 	}).await.unwrap();
-	wait_for_attempt_status(&db, hash, "failed").await;
-	let attempt = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
-	assert_eq!(attempt.status, server::database::ln::LightningPaymentStatus::Failed);
-	assert!(attempt.error.as_deref().unwrap().contains("already being paid"));
-	assert_eq!(attempt.lightning_htlc_subscription_id, None, "a failed promotion funded no grants");
+	assert_eq!(records, (0, 0), "a refused promotion records neither an attempt nor an external request");
 	let keys = vec![owner; sources.len()];
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		sources, ark::VtxoPolicy::new_pubkey(owner.public_key()),

@@ -1,8 +1,10 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::Preimage;
+use ark::fees::VtxoFeeInfo;
 use ark::{ProtocolEncoding, VtxoPolicy};
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::context::ToArkUrl;
@@ -437,4 +439,298 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 #[tokio::test]
 async fn expiry_prepared_offboard_retains_principal_when_payout_reorgs() {
 	offboard_race(false, true).await;
+}
+
+
+/// One expired, never-finished two-input intent is superseded by a real
+/// ordinary spend of lower-ID B and canonical customer fallback of A.
+#[tokio::test]
+async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallback() {
+	const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
+	let ctx=TestContext::new("server/mixed_terminal_offboard_lower_id_ordinary_spend").await;
+	let srv=ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
+		.cfg(|cfg| { cfg.vtxo_lifetime=BlockDelta::new(24); cfg.offboard_session_timeout=SESSION_TIMEOUT; })
+		.watchmand().create().await;
+	srv.watchmand().stop().await.unwrap();
+	#[derive(Clone)]
+	struct DropFirstFinish {
+		calls:Arc<AtomicUsize>,
+		finish_result:Arc<Mutex<Option<Result<protos::FinishOffboardResponse,tonic::Status>>>>,
+		prepare_result:Arc<Mutex<Option<Result<protos::PrepareOffboardResponse,tonic::Status>>>>,
+		prepare_ids:Arc<Mutex<Vec<Vec<u8>>>>,
+	}
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for DropFirstFinish {
+		async fn prepare_offboard(&self,upstream:&mut ArkClient,request:protos::PrepareOffboardRequest)
+			->Result<protos::PrepareOffboardResponse,tonic::Status>
+		{
+			*self.prepare_ids.lock().unwrap()=request.input_vtxo_ids.clone();
+			let result=upstream.prepare_offboard(request).await.map(tonic::Response::into_inner);
+			*self.prepare_result.lock().unwrap()=Some(result.clone()); result
+		}
+		async fn finish_offboard(&self,upstream:&mut ArkClient,request:protos::FinishOffboardRequest)
+			->Result<protos::FinishOffboardResponse,tonic::Status>
+		{
+			if self.calls.fetch_add(1,Ordering::SeqCst)==0 {
+				return Err(tonic::Status::internal("proxy dropped the original finish_offboard request"));
+			}
+			let result=upstream.finish_offboard(request).await.map(tonic::Response::into_inner);
+			*self.finish_result.lock().unwrap()=Some(result.clone()); result
+		}
+	}
+	let gate=DropFirstFinish {calls:Arc::new(AtomicUsize::new(0)),finish_result:Arc::new(Mutex::new(None)),
+		prepare_result:Arc::new(Mutex::new(None)),prepare_ids:Arc::new(Mutex::new(Vec::new()))};
+	let proxy=srv.start_proxy_no_mailbox(gate.clone()).await;
+	let owner=ctx.bark_sdk("owner",&proxy).funded(sat(500_000)).boarded(sat(100_000)).boarded(sat(100_000))
+		.cfg(|cfg| { cfg.daemon_manual_sync=true; cfg.vtxo_refresh_expiry_threshold=BlockDelta::new(4);
+			cfg.vtxo_exit_margin=BlockDelta::new(2); }).create().await;
+	owner.stop_daemon_wait().await.unwrap();
+	let mut coins=owner.spendable_vtxos().await.unwrap(); coins.sort_by_key(|coin|coin.id());
+	assert_eq!(coins.len(),2); assert!(coins.iter().all(|coin|coin.amount()==sat(100_000)));
+	let b=owner.get_full_vtxo(coins[0].id()).await.unwrap();
+	let a=owner.get_full_vtxo(coins[1].id()).await.unwrap();
+	assert!(b.id()<a.id(),"ordinary-Spent B must be the FIRST server input check");
+	let ids=vec![b.id(),a.id()];
+	let fallback=owner.fallback_script();
+	let offboard_address=ctx.bitcoind().get_new_address();
+	let funding=srv.watchmand().wait_wallet_address().await;
+	let sponsor=ctx.bitcoind().fund_addr(funding.clone(),sat(100_000)).await;
+	ctx.generate_blocks(2).await;
+	let postgres=srv.config().postgres.clone();
+	let db=Db::connect(&postgres,bitcoin::Network::Regtest).await.unwrap();
+	let wallet_db=SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
+	let mut expired=srv.subscribe_log::<server_log::OffboardSessionTimeout>();
+	let error=Box::pin(owner.offboard_vtxos(ids.clone(),offboard_address.clone())).await.unwrap_err();
+	assert!(format!("{error:#}").contains("proxy dropped the original finish_offboard request"));
+	assert_eq!(gate.calls.load(Ordering::SeqCst),1);
+	let prepared=owner.pending_offboards().await.unwrap().pop().unwrap();
+	let (offboard_txid,movement)=match &prepared.progress {
+		Progress::OffboardTxPrepared {offboard_tx,movement_id,offboard_vtxo_ids,..}=>{
+			assert_eq!(*offboard_vtxo_ids,ids); (offboard_tx.compute_txid(),*movement_id)
+		}, _=>panic!("the original whole offboard must be signed/prepared before the dropped finish"),
+	};
+	assert!(matches!(&prepared.kind,bark::actions::offboard::OffboardKind::OffboardWhole {input_vtxo_ids} if *input_vtxo_ids==ids));
+	assert_eq!(prepared.onchain_output_amount+prepared.committed_fee,sat(200_000));
+	for id in &ids {
+		assert_eq!(wallet_db.get_wallet_vtxo(*id).await.unwrap().unwrap().state,
+			VtxoState::Locked {holder:Some(VtxoLockHolder::Action {id:prepared.id.clone()})});
+	}
+	// Observe the real server session expiration, not merely a slept interval.
+	let event=tokio::time::timeout(Duration::from_secs(20),async {
+		loop {let event=expired.recv().await.unwrap(); if event.offboard_txid==offboard_txid {break event;}}
+	}).await.expect("the genuine unfinished offboard session must expire and release its server guards");
+	let mut event_ids=event.vtxos; event_ids.sort_unstable(); assert_eq!(event_ids,ids);
+	assert!(ctx.bitcoind().sync_client().custom_get_raw_transaction_info(offboard_txid,None).unwrap().is_none());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM offboards WHERE txid=$1",
+		&[&offboard_txid.to_string()]).await?.get::<_,i64>(0))).await.unwrap(),0);
+	owner.sync_pending_offboards().await.unwrap();
+	let lost=gate.finish_result.lock().unwrap().clone().unwrap().unwrap_err();
+	assert_eq!(lost.code(),tonic::Code::InvalidArgument); assert!(lost.message().contains("unknown offboard txid"));
+	let retry=owner.offboard_checkpoint(&prepared.id).await.unwrap().unwrap();
+	assert!(matches!(&retry.progress,Progress::ReadyForOffboard {offboard_vtxo_ids,prior_txid:Some(txid)}
+		if *offboard_vtxo_ids==ids && *txid==offboard_txid));
+	let mut expected=prepared.clone(); expected.progress=retry.progress.clone();
+	assert!(retry==expected,"only the genuine lost-session progress may change");
+	let mnemonic=tokio::fs::read_to_string(ctx.datadir.join("owner/mnemonic")).await.unwrap()
+		.trim().parse::<bip39::Mnemonic>().unwrap();
+	let restored=ctx.bark_sdk("restored",&srv).mnemonic(mnemonic)
+		.cfg(|cfg| {cfg.daemon_manual_sync=true; cfg.vtxo_refresh_expiry_threshold=BlockDelta::new(4);
+			cfg.vtxo_exit_margin=BlockDelta::new(2);}).create().await;
+	restored.stop_daemon_wait().await.unwrap();
+	let recovered=restored.spendable_vtxos().await.unwrap();
+	assert_eq!(recovered.len(),2); assert!(ids.iter().all(|id|recovered.iter().any(|coin|coin.id()==*id)));
+	assert_eq!(restored.mailbox_keypair().public_key(),owner.mailbox_keypair().public_key());
+	for coin in [&a,&b] {
+		assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(),coin.serialize());
+		assert_eq!(restored.get_vtxo_key(coin).await.unwrap().public_key(),coin.user_pubkey());
+	}
+	// Ordinary SDK coin control on ONLY the restored device: leave A aside
+	// so its public send must consume lower-ID B, without changing original holders.
+	restored.lock_vtxos([a.id()],None).await.unwrap();
+	let recipient=ctx.bark_sdk("recipient",&srv).cfg(|cfg| {cfg.daemon_manual_sync=true;
+		cfg.vtxo_refresh_expiry_threshold=BlockDelta::new(4);cfg.vtxo_exit_margin=BlockDelta::new(2);}).create().await;
+	recipient.stop_daemon_wait().await.unwrap();
+	let address=recipient.new_address().await.unwrap();
+	let sent=Box::pin(restored.send_arkoor_payment(&address,sat(100_000))).await.unwrap();
+	Box::pin(recipient.sync()).await;
+	assert_eq!(restored.get_vtxo_by_id(b.id()).await.unwrap().state,VtxoState::Spent);
+	assert_eq!(restored.get_vtxo_by_id(a.id()).await.unwrap().state,VtxoState::Locked {holder:None});
+	let send=restored.history().await.unwrap().into_iter().find(|m|m.id==sent).unwrap();
+	assert_eq!(send.status,bark::movement::MovementStatus::Successful);
+	assert_eq!(send.effective_balance,bitcoin::SignedAmount::from_sat(-100_000)); assert_eq!(send.offchain_fee,sat(0));
+	assert_eq!(recipient.balance().await.unwrap().spendable,sat(100_000));
+	let received=recipient.spendable_vtxos().await.unwrap(); assert_eq!(received.len(),1);
+	let received=recipient.get_full_vtxo(received[0].id()).await.unwrap();
+	assert_eq!(received.chain_anchor(),b.chain_anchor());
+	assert_eq!(received.expiry_height(),b.expiry_height());
+	let received_history=recipient.history().await.unwrap();
+	assert_eq!(received_history.iter().filter(|m|m.subsystem.name=="bark.arkoor").count(),1);
+	for id in &ids {assert_eq!(wallet_db.get_wallet_vtxo(*id).await.unwrap().unwrap().state,
+		VtxoState::Locked {holder:Some(VtxoLockHolder::Action {id:prepared.id.clone()})});}
+	assert!(owner.offboard_checkpoint(&prepared.id).await.unwrap().is_some_and(|cp|cp==retry));
+
+	// B inherits its original expiry. Schedule the one ordinary refresh late
+	// enough that its real tip+lifetime expiry covers A's six-confirmation tail.
+	let refresh_tip=a.expiry_height().saturating_sub(srv.config().vtxo_lifetime)+BlockDelta::new(8);
+	let current=ctx.bitcoind().get_block_count().await as u32;
+	if current<refresh_tip.to_u32() {ctx.generate_blocks(refresh_tip.to_u32()-current).await;}
+	let tip=BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	assert!(tip<b.expiry_height());
+	assert!(tip+BlockDelta::new(ark_testing::constants::ROUND_CONFIRMATIONS.try_into().unwrap())<a.expiry_height());
+	recipient.chain().invalidate_caches().await;
+	let quote=recipient.ark_info().await.unwrap().unwrap().fees.refresh
+		.calculate([VtxoFeeInfo::from_vtxo_and_tip(&received,tip)]).unwrap();
+	let mut finished=srv.subscribe_log::<server_log::RoundFinished>();
+	Box::pin(recipient.refresh_vtxos_delegated([received.id()])).await.unwrap().unwrap();
+	srv.trigger_round().await;
+	let round=tokio::time::timeout(Duration::from_secs(30),finished.recv()).await.unwrap().unwrap();
+	let round_tx=ctx.bitcoind().await_transaction(round.txid).await;
+	ctx.generate_blocks(ark_testing::constants::ROUND_CONFIRMATIONS).await;
+	tokio::time::timeout(Duration::from_secs(30),async {
+		loop {
+			recipient.chain().invalidate_caches().await;
+			Box::pin(recipient.sync()).await;
+			if recipient.pending_round_states().await.unwrap().is_empty() {break;}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	}).await.expect("the one genuine recipient refresh must confirm under its existing bound");
+	let live=recipient.spendable_vtxos().await.unwrap(); assert_eq!(live.len(),1);
+	let live=recipient.get_full_vtxo(live[0].id()).await.unwrap();
+	assert_eq!(live.amount()+quote,sat(100_000));
+	assert!(live.expiry_height()>a.expiry_height()+BlockDelta::new(7),
+		"the real replacement expiry must cover A expiry+1 and its original six confirmations");
+	let refreshes=recipient.history().await.unwrap().into_iter().filter(|m|
+		m.subsystem.is_subsystem(bark::subsystem::Subsystem::ROUND)
+		&& m.status==bark::movement::MovementStatus::Successful && m.offchain_fee==quote
+		&& m.effective_balance == -quote.to_signed().unwrap()).collect::<Vec<_>>();
+	assert_eq!(refreshes.len(),1,"one actual quoted refresh fee");
+	let round_fee=super::expiry_test::actual_fee(&ctx,&round_tx).await;
+	let current=ctx.bitcoind().get_block_count().await as u32;
+	assert!(current<a.expiry_height().to_u32(),"the single legal refresh must finish before A matures");
+	let height=ctx.generate_blocks(a.expiry_height().to_u32()+1-current).await;
+	srv.watchmand().start().await.unwrap();
+	super::expiry_test::rebuilt(&ctx,&srv,&db).await;
+	let parent:Transaction=tokio::time::timeout(Duration::from_secs(20),async {
+		loop {
+			let row=db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+				WHERE e.vtxo_id=$1 AND c.active AND a.broadcast_at IS NOT NULL",&[&a.id().to_string()]).await?)).await.unwrap();
+			if let Some(row)=row {break deserialize(row.get("sweep_tx")).unwrap();}
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+	}).await.expect("A's actual ordinary fallback must publish");
+	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await,parent);
+	let chain=ctx.bitcoind().sync_client();
+	// Both expired backing roots are batched: A pays its customer, while B's
+	// completed ordinary refresh lets the operator reclaim its old backing.
+	assert_eq!(parent.input.len(),2);
+	let points=parent.input.iter().map(|input|input.previous_output).collect::<std::collections::HashSet<_>>();
+	assert_eq!(points,[a.chain_anchor(),b.chain_anchor()].into_iter().collect());
+	let mut backing_amount=sat(0);
+	for coin in [&a,&b] {
+		let backing=ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
+		backing_amount+=backing.output[coin.chain_anchor().vout as usize].value;
+	}
+	let original_board_fee=backing_amount.checked_sub(a.amount()+b.amount()).unwrap();
+	assert_eq!(parent.output.iter().map(|o|o.value).sum::<bitcoin::Amount>(),backing_amount);
+	let (index,output)=parent.output.iter().enumerate().find(|(_,o)|o.script_pubkey==fallback).unwrap();
+	assert_eq!(output.value,sat(99_000));
+	let operator=srv.watchmand().config().sweep_address.clone().unwrap().require_network(bitcoin::Network::Regtest).unwrap().script_pubkey();
+	assert_ne!(operator,fallback);
+	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>(),b.amount()+original_board_fee+sat(1_000));
+	assert_eq!(parent.output.len(),3);
+	assert_eq!(parent.output.iter().filter(|o|**o==bitcoin_ext::fee::fee_anchor()).count(),1);
+	assert!(chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().is_some());
+	// At the real unconfirmed cut, B is already ordinary-Spent. A's pending
+	// commitment must still retain the signed original and its unresolved holder.
+	owner.sync_fallback_payouts().await.unwrap();
+	owner.sync_pending_offboards().await.unwrap();
+	let rejection=gate.prepare_result.lock().unwrap().clone().unwrap().unwrap_err();
+	assert_eq!(*gate.prepare_ids.lock().unwrap(),ids.iter().map(|id|id.to_bytes().to_vec()).collect::<Vec<_>>());
+	assert_eq!(rejection.code(),tonic::Code::InvalidArgument);
+	assert!(rejection.message().contains(&b.id().to_string()) && rejection.message().contains("is not spendable"));
+	assert!(rejection.metadata().get("abandon-reason").is_none(),"B must mask the later typed A refusal");
+	assert!(owner.offboard_checkpoint(&prepared.id).await.unwrap().is_some_and(|cp|cp==retry));
+	assert_eq!(owner.get_vtxo_by_id(a.id()).await.unwrap().fallback_status,Some(bark::vtxo::FallbackStatus::Pending));
+	assert_eq!(owner.get_vtxo_by_id(a.id()).await.unwrap().state,VtxoState::Locked {holder:Some(VtxoLockHolder::Action {id:prepared.id.clone()})});
+	let allocations=db.read(async |tx| Ok(tx.query("SELECT e.id,c.gross_sat,c.fee_sat,c.payout_sat,a.sweep_tx \
+		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
+		WHERE e.vtxo_id=$1 ORDER BY a.id",&[&a.id().to_string()]).await?.into_iter().map(|row|
+		(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,Vec<u8>>(4))).collect::<Vec<_>>())).await.unwrap();
+	assert_eq!(allocations.len(),1); assert_eq!((allocations[0].1,allocations[0].2,allocations[0].3),(100_000,1_000,99_000));
+	let operator_rows=db.read(async |tx| Ok(tx.query("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid \
+		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='operator'",
+		&[&received.id().to_string()]).await?.into_iter().map(|row|(row.get::<_,i64>(0),row.get::<_,i64>(1),
+			row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,String>(4))).collect::<Vec<_>>())).await.unwrap();
+	assert_eq!(operator_rows,vec![(100_000,0,0,0,parent.compute_txid().to_string())]);
+	let confirmed=ctx.generate_blocks(6).await;
+	super::expiry_test::rebuilt(&ctx,&srv,&db).await;
+	let actual=chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().unwrap();
+	assert!(actual.confirmations>=6); assert_eq!(actual.value,sat(99_000));
+	assert_eq!(actual.script_pub_key.script().unwrap(),fallback);
+	owner.sync_fallback_payouts().await.unwrap();
+	owner.sync_pending_offboards().await.unwrap();
+	let remaining=owner.offboard_checkpoint(&prepared.id).await.unwrap();
+	tokio::fs::write(ctx.datadir.join("issue70-terminal-cut.json"),serde_json::to_vec_pretty(&serde_json::json!({
+		"a":a.id().to_string(),"b":b.id().to_string(),"b_sorts_first":b.id()<a.id(),
+		"offboard_txid":offboard_txid.to_string(),"checkpoint_present":remaining.is_some(),
+		"payout_txid":parent.compute_txid().to_string(),"payout_sat":actual.value.to_sat(),
+		"confirmations":actual.confirmations,"refresh_fee_sat":quote.to_sat(),"round_network_fee_sat":round_fee.to_sat(),
+	})).unwrap()).await.unwrap();
+	assert!(remaining.is_none(),"terminal fallback A plus durably ordinary-Spent B must retire the original whole intent");
+	let old=wallet_db.get_movement_by_id(movement).await.unwrap();
+	assert_eq!(old.status,bark::movement::MovementStatus::Canceled);
+	assert_eq!(old.effective_balance,bitcoin::SignedAmount::ZERO); assert_eq!(old.offchain_fee,sat(0));
+	for id in &ids {
+		let coin=owner.get_vtxo_by_id(*id).await.unwrap(); assert_eq!(coin.state,VtxoState::Spent);
+		assert!(owner.lock_vtxos([*id],None).await.is_err(),"neither original may be unlocked into Spendable");
+	}
+	assert!(owner.get_vtxo_by_id(b.id()).await.unwrap().fallback_status.is_none());
+	db.read(async |tx| {
+		let ordinary=tx.get_user_vtxos_by_id(&[b.id()]).await?.remove(0);
+		assert_eq!(ordinary.spend_state,server::database::SpendState::Spent);
+		assert!(ordinary.oor_spent_txid.is_some()); assert!(ordinary.offboarded_in.is_none());
+		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+			WHERE e.vtxo_id=$1 AND c.disposition='customer'",&[&b.id().to_string()]).await?.get::<_,i64>(0),0);
+		assert_eq!(tx.query_one("SELECT COUNT(*) FROM offboards WHERE txid=$1",&[&offboard_txid.to_string()]).await?.get::<_,i64>(0),0);
+		Ok(())
+	}).await.unwrap();
+	assert_eq!(owner.get_vtxo_by_id(a.id()).await.unwrap().fallback_status,Some(bark::vtxo::FallbackStatus::Spent));
+	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
+	assert_eq!(owner.get_full_vtxo(a.id()).await.unwrap().serialize(),a.serialize());
+	assert_eq!(owner.get_full_vtxo(b.id()).await.unwrap().serialize(),b.serialize());
+	assert_eq!(ctx.bitcoind().get_received_by_address(&offboard_address),sat(0));
+	assert!(chain.custom_get_raw_transaction_info(offboard_txid,None).unwrap().is_none());
+	assert_eq!(recipient.balance().await.unwrap().spendable,live.amount());
+	assert_eq!(live.amount()+quote+actual.value+sat(1_000),sat(200_000));
+	let (child,fee)=super::watchman::observed_payout_fee_child(&ctx,&parent).unwrap();
+	let sponsor_tx=ctx.bitcoind().await_transaction(sponsor).await;
+	let sponsor_points=sponsor_tx.output.iter().enumerate().filter(|(_,o)|o.script_pubkey==funding.script_pubkey())
+		.map(|(index,_)|bitcoin::OutPoint::new(sponsor,index as u32)).collect::<Vec<_>>();
+	assert!(child.input.iter().any(|input|sponsor_points.contains(&input.previous_output)));
+	let mut fee_inputs=sat(0);
+	for input in &child.input {
+		fee_inputs+=ctx.bitcoind().await_transaction(input.previous_output.txid).await.output[input.previous_output.vout as usize].value;
+	}
+	assert_eq!(fee_inputs,sat(100_000));
+	assert!(fee>0);
+	assert_eq!(child.output.iter().map(|o|o.value).sum::<bitcoin::Amount>()+sat(u64::try_from(fee).unwrap()),fee_inputs);
+	let recipient_history=recipient.history().await.unwrap();
+	let recipient_balance=recipient.balance().await.unwrap().summary();
+	let history=owner.history().await.unwrap();
+	let mempool=chain.get_raw_mempool().unwrap();
+	owner.sync_pending_offboards().await.unwrap(); owner.sync_fallback_payouts().await.unwrap();
+	assert!(owner.history().await.unwrap()==history,"terminal intent retirement is idempotent");
+	assert!(owner.offboard_checkpoint(&prepared.id).await.unwrap().is_none());
+	assert_eq!(chain.get_raw_mempool().unwrap(),mempool);
+	let after=db.read(async |tx| Ok(tx.query("SELECT e.id,c.gross_sat,c.fee_sat,c.payout_sat,a.sweep_tx \
+		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
+		WHERE e.vtxo_id=$1 ORDER BY a.id",&[&a.id().to_string()]).await?.into_iter().map(|row|
+		(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,Vec<u8>>(4))).collect::<Vec<_>>())).await.unwrap();
+	assert_eq!(after,allocations,"same original A entitlement, parent and fee once");
+	assert!(recipient.history().await.unwrap()==recipient_history);
+	assert_eq!(recipient.balance().await.unwrap().summary(),recipient_balance);
+	assert_eq!(gate.calls.load(Ordering::SeqCst),2,"no new finish or replay of the unfinished transaction");
+	assert_eq!(confirmed.to_u32(),height.to_u32()+6);
 }

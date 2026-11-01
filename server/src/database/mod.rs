@@ -813,7 +813,6 @@ impl<'t> Tx<'t> {
 		for entry in &res {
 			match &entry.payload {
 				MailboxPayload::Arkoor { vtxos } => ids.extend(vtxos.iter().map(|v| v.id())),
-				MailboxPayload::RecoveryVtxoIds { vtxo_ids } => ids.extend(vtxo_ids),
 				_ => {},
 			}
 		}
@@ -821,7 +820,6 @@ impl<'t> Tx<'t> {
 		for entry in &mut res {
 			let ids = match &entry.payload {
 				MailboxPayload::Arkoor { vtxos } => vtxos.iter().map(|v| v.id()).collect::<Vec<_>>(),
-				MailboxPayload::RecoveryVtxoIds { vtxo_ids } => vtxo_ids.clone(),
 				_ => continue,
 			};
 			entry.owner_mailboxes = ids.into_iter().filter_map(|id| owners.get(&id).map(|owner| (id, *owner))).collect();

@@ -865,8 +865,11 @@ impl rpc::server::ArkService for Server {
 			Ok(SelfSignedInput { vtxo_id, attestation })
 		}).collect::<Result<_, tonic::Status>>()?;
 
-		req.unblinded_mailbox_id.as_ref()
+		let unblinded_mailbox_id = req.unblinded_mailbox_id.as_ref()
 			.map(|b| MailboxIdentifier::deserialize(b)).transpose().badarg("invalid unblinded mailbox id")?;
+		if self.config.round_status_attestation_required && unblinded_mailbox_id.is_none() {
+			macros::badarg!("interactive round participations need an unblinded mailbox id");
+		}
 		let mut owner_links = OwnerLinks::default();
 		let mut vtxo_requests = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests.clone() {
@@ -890,6 +893,7 @@ impl rpc::server::ArkService for Server {
 		let inp = RoundInput::RegisterPayment {
 			inputs,
 			vtxo_requests,
+			unblinded_mailbox_id,
 			owner_links,
 			unlock_preimage: Secret::new(unlock_preimage),
 			user_agent_name: crate::telemetry::current_user_agent_name(),

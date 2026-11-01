@@ -32,6 +32,8 @@ pub(crate) struct FallbackClaim {
 	pub transaction_id: Option<Txid>,
 	pub output_index: Option<u32>,
 	pub confirmed_block: Option<BlockRef>,
+	/// Canonical N6 user discharge, independent of the superseded payout parent.
+	pub user_claimed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +55,8 @@ fn fallback_outcome<'a>(principal: Amount, claims: impl IntoIterator<Item = &'a 
 	for claim in claims {
 		any = true;
 		covered = covered.checked_add(claim.gross).context("fallback source coverage overflow")?;
-		pending |= claim.confirmed_block.is_none();
-		paid |= claim.payout > Amount::ZERO;
+		pending |= claim.confirmed_block.is_none() && !claim.user_claimed;
+		paid |= claim.payout > Amount::ZERO || claim.user_claimed;
 	}
 	ensure!(covered <= principal, "fallback decisions exceed their known source");
 	Ok(if !any { None }
@@ -250,8 +252,13 @@ impl Tx<'_> {
 			CASE WHEN a.status='confirmed' AND NOT cv.invalid
 				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
-				THEN a.confirmed_hash END AS confirmed_hash,p.output_index
-			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
+				THEN a.confirmed_hash END AS confirmed_hash,p.output_index,
+			EXISTS(SELECT 1 FROM expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id
+				AND NOT cv.invalid AND cv.processed_height >= t.height+5
+				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=t.height AND b.hash=t.hash)
+				AND cv.processed_height=(SELECT MAX(height) FROM watchmand_block)
+				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=cv.processed_height AND b.hash=cv.processed_hash)) AS user_claimed
+			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,e.id AS entitlement_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
 				c.payout_sat,c.forfeited_sat,c.spk,c.disposition FROM expiry_entitlement e
 				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
 				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
@@ -280,6 +287,7 @@ impl Tx<'_> {
 				transaction_id: row.get::<_, Option<&str>>("sweep_txid").map(str::parse).transpose()?,
 				output_index: row.get::<_, Option<i32>>("output_index").map(u32::try_from).transpose()?,
 				confirmed_block,
+				user_claimed: row.get("user_claimed"),
 			};
 			ensure!(claim.fee.checked_add(claim.payout).and_then(|sum| sum.checked_add(claim.forfeited)) == Some(claim.gross),
 				"fallback receipt does not conserve its source");
@@ -643,7 +651,7 @@ mod tests {
 			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
 			allocation_id: 1, owner_mailbox: key, gross: Amount::from_sat(40_000),
 			fee: Amount::from_sat(1_000), payout: Amount::from_sat(39_000), forfeited: Amount::ZERO,
-			transaction_id: None, output_index: Some(0), confirmed_block: None,
+			transaction_id: None, output_index: Some(0), confirmed_block: None, user_claimed: false,
 		};
 		let principal = Amount::from_sat(100_000);
 		assert_eq!(fallback_outcome(principal, []).unwrap(), None);
@@ -653,7 +661,7 @@ mod tests {
 		let mut second = FallbackClaim {
 			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), allocation_id: 2, owner_mailbox: key,
 			gross: Amount::from_sat(60_000), fee: Amount::from_sat(1_000), payout: Amount::ZERO,
-			forfeited: Amount::from_sat(59_000), transaction_id: None, output_index: None, confirmed_block: None,
+			forfeited: Amount::from_sat(59_000), transaction_id: None, output_index: None, confirmed_block: None, user_claimed: false,
 		};
 		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
 		second.confirmed_block = first.confirmed_block;
@@ -662,6 +670,15 @@ mod tests {
 		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Forfeited));
 		assert!(fallback_outcome(Amount::from_sat(99_999), [&first, &second]).is_err());
 		first.confirmed_block = None;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
+		first.user_claimed = true;
+		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
+		second.confirmed_block = None;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
+		second.user_claimed = true;
+		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
+		first.user_claimed = false;
 		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
 	}
 

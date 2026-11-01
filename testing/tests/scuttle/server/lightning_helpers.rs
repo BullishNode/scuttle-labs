@@ -138,16 +138,24 @@ impl captaind::proxy::ArkRpcProxy for CheckClaim {
 		let mut conflict = req.clone();
 		conflict.owner_proof = Some(OwnerLink::new_joint(Network::Regtest, self.server.public_key(), &self.other_mailbox, &pair).unwrap().into());
 		for (request, reason) in [(missing, bark::FallbackRefusal::OwnerProofRequired),
-			(invalid, bark::FallbackRefusal::InvalidOwnerProof), (conflict, bark::FallbackRefusal::ConflictingOwnerBinding)] {
+			(invalid, bark::FallbackRefusal::InvalidOwnerProof)] {
 			super::expiry_admission::assert_owner_refusal(upstream.prepare_lightning_receive_claim(request).await.unwrap_err(), key, reason);
 			assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
 			assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
 			assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before);
 		}
-		let replay = upstream.prepare_lightning_receive_claim(req).await.unwrap().into_inner();
 		let bodies = |raw: &[Vec<u8>]| raw.iter().map(|bytes|
 			(Vtxo::<Full>::deserialize(bytes).unwrap().id(), bytes.clone())).collect::<std::collections::BTreeMap<_, _>>();
 		assert_eq!(bodies(&response.htlc_vtxos).len(), grants.len());
+		// A valid alternative M can read the original public grants; it cannot
+		// reassign their immutable owner or collect the native payment.
+		let cached = upstream.prepare_lightning_receive_claim(conflict).await.unwrap().into_inner();
+		assert_eq!(bodies(&cached.htlc_vtxos), bodies(&response.htlc_vtxos));
+		assert_eq!(cached.htlc_vtxos.len(), grants.len());
+		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
+		assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
+		assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before);
+		let replay = upstream.prepare_lightning_receive_claim(req).await.unwrap().into_inner();
 		assert_eq!(bodies(&replay.htlc_vtxos), bodies(&response.htlc_vtxos));
 		assert_eq!(replay.htlc_vtxos.len(), grants.len());
 		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);

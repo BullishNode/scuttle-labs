@@ -361,6 +361,16 @@ async fn exit_vtxo() {
 	// We stop the server
 	srv.stop().await.unwrap();
 
+	// A mixed explicit request must not silently start only its known subset.
+	let known = vtxo.id.to_string();
+	let unknown = "0000000000000000000000000000000000000000000000000000000000000000:0";
+	let history = serde_json::to_value(bark.history().await).unwrap();
+	let error = bark.try_run(["exit", "start", "--vtxo", &known, "--vtxo", unknown]).await
+		.expect_err("a missing requested source must refuse the complete targeted exit");
+	assert!(error.to_string().contains("not eligible for a targeted exit"), "{error:#}");
+	assert!(bark.list_exits().await.is_empty(), "a refused mixed request must not start its known input");
+	assert_eq!(serde_json::to_value(bark.history().await).unwrap(), history);
+
 	// Make bark exit and check the balance
 	bark.start_exit_vtxos([vtxo.id]).await;
 	complete_exit(&ctx, &bark).await;
@@ -658,7 +668,20 @@ async fn exit_revoked_lightning_payment() {
 
 #[tokio::test]
 async fn bark_should_exit_a_pending_board() {
-	let ctx = TestContext::new("exit/bark_should_exit_a_pending_board").await;
+	pending_board_exit(false).await;
+}
+
+#[tokio::test]
+async fn bark_should_exit_a_pending_board_offline() {
+	pending_board_exit(true).await;
+}
+
+async fn pending_board_exit(offline: bool) {
+	let ctx = TestContext::new(if offline {
+		"exit/bark_should_exit_a_pending_board_offline"
+	} else {
+		"exit/bark_should_exit_a_pending_board"
+	}).await;
 
 	#[derive(Clone)]
 	struct InvalidSigProxy;
@@ -701,6 +724,13 @@ async fn bark_should_exit_a_pending_board() {
 	assert_eq!(board_mvt.output_vtxos.len(), 1);
 	assert_eq!(board_mvt.exited_vtxos.len(), 0);
 	assert_eq!(board_mvt.time.completed_at.is_some(), false);
+
+	if offline {
+		let mut rpc = srv.get_public_rpc().await;
+		srv.stop().await.unwrap();
+		assert!(rpc.get_ark_info(protos::Empty {}).await.is_err(),
+			"stopped server must no longer provide board registration metadata");
+	}
 
 	// Bring the board near to its expiry
 	let board_vtxo = bark.vtxos().await.first().cloned().unwrap();

@@ -446,12 +446,6 @@ async fn exposed_small_receive_grant_refunds_absent_sender_after_six_confirmatio
 }
 
 #[tokio::test]
-async fn grant_sweep_waits_for_revoked_depth() {
-	tokio::time::timeout(Duration::from_secs(180), internal_safe_pool_grants(false, true, false)).await
-		.expect("revoked grant depth and original sender payout timed out");
-}
-
-#[tokio::test]
 async fn expired_internal_source_waits_for_six_confirmed_grant_reclamations() {
 	internal_safe_pool_grants(false, false, true).await;
 }

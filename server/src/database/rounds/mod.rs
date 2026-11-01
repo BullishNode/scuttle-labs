@@ -466,6 +466,9 @@ impl<'t> Tx<'t> {
 		self.execute(&stmt, &[&round_id_str]).await?;
 
 		// Delete vtxos that were created by this round (output and internal tree vtxos).
+		// Remove only their ownership projection. Economic references must still
+		// refuse the VTXO delete and roll this entire undo transaction back.
+		self.execute("DELETE FROM coin_owner WHERE vtxo_id = ANY($1)", &[&output_vtxo_ids]).await?;
 		let stmt = self.prepare_typed(
 			"DELETE FROM vtxo WHERE vtxo_id = ANY($1)",
 			&[Type::TEXT_ARRAY],

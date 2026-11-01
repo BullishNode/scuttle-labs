@@ -44,6 +44,7 @@ use ark::offboard::{OffboardForfeitContext, OffboardForfeitError, OffboardReques
 use ark::vtxo::VtxoRef;
 use bitcoin_ext::{BlockDelta, TxStatus};
 use server_rpc::{protos, TryFromBytes};
+use server_rpc::protos::VtxoSpendState;
 
 use crate::{Wallet, WalletVtxo};
 use crate::actions::{
@@ -54,7 +55,7 @@ use crate::arkoor::split_change_amount;
 use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
 use crate::subsystem::{OffboardMovement, Subsystem};
-use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
+use crate::vtxo::{FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind};
 
 /// How long to sleep between confirmation polls while a tx is in
 /// mempool or has too few confirmations.
@@ -363,17 +364,30 @@ impl WalletAction for Offboard {
 				if let Some(progress) = adopted_progress {
 					return adopted(Offboard { progress, ..self });
 				}
-				// A lost finish session can re-enter prepare after fallback won.
-				// Only the authenticated terminal outcome for every original
-				// input permits cleanup; the old tx adoption check above wins.
-				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
+				// The first rejected input may be an ordinary spend rather than
+				// the fallback input, so assess the complete original set.
+				let decided = crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback);
+				if decided {
 					let movement = or_retry!(self, get_or_create_movement(
 						wallet, &self, offboard_vtxo_ids, iter::empty::<VtxoId>(),
 					).await);
 					or_retry!(self, cancel_superseded_movement(wallet, movement).await);
-					if or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await) {
-						return Advance::Failed(error);
+				}
+				let terminal = or_retry!(self, offboard_inputs_terminal(wallet, offboard_vtxo_ids).await);
+				if terminal == Some(true) {
+					if !decided {
+						let movement = or_retry!(self, get_or_create_movement(
+							wallet, &self, offboard_vtxo_ids, iter::empty::<VtxoId>(),
+						).await);
+						or_retry!(self, cancel_superseded_movement(wallet, movement).await);
 					}
+					return Advance::Failed(error);
+				}
+				if decided || terminal == Some(false) {
+					return Advance::Park {
+						state: self, wake_after: Some(CONFIRMATION_POLL_INTERVAL),
+						error: Some(error),
+					};
 				}
 				if rejection_proves_inputs_spendable(&error) {
 					// The server rejected the request itself (e.g. the fee
@@ -407,15 +421,29 @@ impl WalletAction for Offboard {
 				Advance::Failed(error)
 			},
 			Progress::OffboardTxPrepared { offboard_vtxo_ids, offboard_tx, movement_id, .. } => {
-				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
-					// The refused intent is canceled even while its financial
-					// claim still needs the signed checkpoint and holder.
+				let offboard_txid = offboard_tx.compute_txid();
+				let adopted_progress = or_retry!(self,
+					adopt_broadcast_offboard(wallet, &self, offboard_vtxo_ids, offboard_txid).await,
+				);
+				if let Some(progress) = adopted_progress {
+					return adopted(Offboard { progress, ..self });
+				}
+				let decided = crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback);
+				if decided {
+					// Preserve early cancellation of the refused intent while its
+					// financial claim still needs the signed checkpoint and holder.
 					or_retry!(self, cancel_superseded_movement(wallet, *movement_id).await);
-					if or_retry!(self, wallet.fallback_inputs_terminal(offboard_vtxo_ids).await) {
-						return Advance::Failed(error);
+				}
+				let terminal = or_retry!(self, offboard_inputs_terminal(wallet, offboard_vtxo_ids).await);
+				if terminal == Some(true) {
+					if !decided {
+						or_retry!(self, cancel_superseded_movement(wallet, *movement_id).await);
 					}
-					// Unknown or incomplete status preserves the signed checkpoint
-					// and holder. The original offboard never becomes successful.
+					return Advance::Failed(error);
+				}
+				if decided || terminal == Some(false) {
+					// Retain the original prepared body on an incomplete fallback
+					// even when another input masked its typed refusal.
 					return Advance::Park {
 						state: self, wake_after: Some(CONFIRMATION_POLL_INTERVAL),
 						error: Some(error),
@@ -428,13 +456,6 @@ impl WalletAction for Offboard {
 				// the session expired unfinished, and it is safe to prepare
 				// a fresh one: the expired session's forfeits can never be
 				// completed since the server's secret nonces died with it.
-				let offboard_txid = offboard_tx.compute_txid();
-				let adopted_progress = or_retry!(self,
-					adopt_broadcast_offboard(wallet, &self, offboard_vtxo_ids, offboard_txid).await,
-				);
-				if let Some(progress) = adopted_progress {
-					return adopted(Offboard { progress, ..self });
-				}
 				warn!("Offboard session for tx {} is gone and the tx is not on chain, \
 					going back to prepare a fresh session: {:#}", offboard_txid, error);
 				let progress = Progress::ReadyForOffboard {
@@ -452,6 +473,38 @@ impl WalletAction for Offboard {
 			},
 		}
 	}
+}
+
+/// An offboard can be superseded by a mixture of fallback and ordinary spends.
+/// Keep History through the authenticated query and the durable spend adoption.
+/// None preserves the original transaction's ambiguity without a fallback commitment.
+async fn offboard_inputs_terminal(wallet: &Wallet, ids: &[VtxoId]) -> anyhow::Result<Option<bool>> {
+	ensure!(!ids.is_empty(), "offboard has no retained inputs");
+	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
+	let mut terminal = true;
+	let mut fallback = false;
+	for id in ids {
+		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input is missing")?;
+		let key = wallet.get_vtxo_key(&coin.vtxo).await?;
+		let (state, committed) = wallet.fetch_vtxo_status_locked(*id, &key).await?;
+		fallback |= committed;
+		if !committed {
+			match state {
+				VtxoSpendState::Spent => wallet.trust_ordinary_spends(&[*id]).await?,
+				VtxoSpendState::Spendable => {},
+				_ => bail!("offboard input has an unresolved spend state"),
+			}
+		}
+		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input disappeared")?;
+		terminal &= if committed {
+			matches!(state, VtxoSpendState::Spent | VtxoSpendState::FallbackForfeited)
+				&& matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited))
+		} else {
+			state == VtxoSpendState::Spent && coin.fallback_status.is_none()
+				&& coin.state.kind() == VtxoStateKind::Spent
+		};
+	}
+	Ok(fallback.then_some(terminal))
 }
 
 /// Build a fresh [`Offboard`] in [`Progress::Start`]: pick inputs (for

@@ -74,7 +74,8 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 				message: Some(protos::mailbox_server::mailbox_message::Message::RecoveryVtxoIds(
 					protos::mailbox_server::RecoveryVtxoIdsMessage {
 						vtxo_ids: vtxo_ids.into_iter().map(|v| v.to_bytes().to_vec()).collect(),
-						owners,
+						// Locator posting authenticates the mailbox, not these coins.
+						owners: Vec::new(),
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -94,6 +95,29 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 				checkpoint: entry.checkpoint.into(),
 			}
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeMap;
+
+	use super::*;
+
+	#[test]
+	fn recovery_locator_does_not_serialize_owner_metadata() {
+		let id = VtxoId::from_slice(&[1; 36]).unwrap();
+		let owner = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
+		let message = new_mailbox_msg(MailboxEntry {
+			checkpoint: Checkpoint::from(1_u64),
+			payload: MailboxPayload::RecoveryVtxoIds { vtxo_ids: vec![id] },
+			owner_mailboxes: BTreeMap::from([(id, owner)]),
+		});
+		assert_eq!(message.checkpoint, 1);
+		let Some(protos::mailbox_server::mailbox_message::Message::RecoveryVtxoIds(hint)) = message.message
+			else { panic!("expected recovery locator"); };
+		assert_eq!(hint.vtxo_ids, vec![id.to_bytes().to_vec()]);
+		assert!(hint.owners.is_empty(), "even an enriched internal hint must not expose coin ownership");
 	}
 }
 

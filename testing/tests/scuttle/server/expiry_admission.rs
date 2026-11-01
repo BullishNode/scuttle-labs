@@ -539,6 +539,31 @@ async fn ownership_package_refusals_preserve_sources_and_isolated_prefixes() {
 	let mut ids = builder.build_unsigned_vtxos().map(|v| v.id()).collect::<Vec<_>>(); ids.push(source.id());
 	ids.extend(builder.build_unsigned_internal_vtxos().into_iter().map(|(v, _)| v.id()));
 	let txids = builder.virtual_transactions().map(|txid| txid.to_string()).collect::<Vec<_>>();
+	// Keep genuine known input/nonces and a supported common HTLC policy;
+	// only the untrusted wire totals overflow before package/proof validation.
+	let policy = VtxoPolicy::deserialize(&request.parts[0].outputs[0].policy).unwrap();
+	let overflow_builder = ArkoorPackageBuilder::new_with_checkpoints([source.clone()], vec![
+		ArkoorDestination { total_amount: sat(50_000), policy: policy.clone() },
+		ArkoorDestination { total_amount: sat(50_000), policy },
+	]).unwrap().generate_user_nonces(&[a]).unwrap();
+	let mut overflow = protos::ArkoorPackageCosignRequest::from(overflow_builder.cosign_request());
+	assert_eq!(overflow.parts.len(), 1);
+	assert_eq!(overflow.parts[0].outputs.len(), 2);
+	assert!(overflow.parts[0].isolated_outputs.is_empty());
+	for (output, amount) in overflow.parts[0].outputs.iter_mut().zip([u64::MAX, 1]) {
+		output.total_amount = amount;
+		output.owner_proof = Some(link.into());
+	}
+	let before = package_rows(&db, &ids, &txids, hash).await;
+	let owners = owner_rows(&db, &[htlc_key.public_key()]).await;
+	assert!(owners.is_empty());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+	let error = package_rpc(&mut srv.get_public_rpc().await, PackageAdmission::LightningSend, overflow).await.unwrap_err();
+	assert_eq!(error.code(), tonic::Code::InvalidArgument);
+	assert!(error.message().contains("HTLC amount overflow"), "{error}");
+	assert_eq!(package_rows(&db, &ids, &txids, hash).await, before);
+	assert_eq!(owner_rows(&db, &[htlc_key.public_key()]).await, owners);
 	let response = reject_package_proofs(&srv, &db, PackageAdmission::LightningSend, request, &htlc_key,
 		link, conflict, &ids, &txids, hash).await;
 	let htlcs = builder.user_cosign(&[a], response.try_into().unwrap()).unwrap().build_signed_vtxos();

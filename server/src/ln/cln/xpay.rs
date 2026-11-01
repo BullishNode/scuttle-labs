@@ -293,7 +293,6 @@ impl ClnXpayClient {
 			},
 		};
 
-		drop(dispatch);
 		// A later attempt for this hash, maybe on another node, is not ours to
 		// reconcile with this node's xpay result.
 		let attempt_res = self.db
@@ -309,8 +308,8 @@ impl ClnXpayClient {
 
 		match attempt_res {
 			Ok(Some(attempt)) => {
-				if let Err(e) = self.reconcile_payment_attempt(
-					attempt, pay_error.as_deref(), no_route.as_ref(), false,
+				if let Err(e) = self.reconcile_payment_attempt_locked(
+					attempt, pay_error.as_deref(), no_route.as_ref(), false, dispatch,
 				).await {
 					error!("Error syncing payment attempt status: {e:#}");
 				}
@@ -448,6 +447,17 @@ impl ClnXpayClient {
 		let payment_hash = attempt.payment_hash;
 		ensure!(attempt.lightning_node_id == self.node_id, "attempt belongs to a different native node");
 		let Some(dispatch) = self.payment_guards.try_lock_dispatch(payment_hash) else { return Ok(None); };
+		self.reconcile_payment_attempt_locked(attempt, pay_error, no_route, allow_redrive, dispatch).await
+	}
+
+	/// Consume a live result without releasing its dispatch lock to the monitor.
+	async fn reconcile_payment_attempt_locked(
+		&self, attempt: LightningPaymentAttempt, pay_error: Option<&str>,
+		no_route: Option<&NativeNoRoute>, allow_redrive: bool, dispatch: PaymentGuard,
+	) -> anyhow::Result<Option<Redrive>> {
+		let payment_hash = attempt.payment_hash;
+		ensure!(dispatch.payment_hash() == payment_hash, "dispatch guard belongs to a different payment hash");
+		ensure!(attempt.lightning_node_id == self.node_id, "attempt belongs to a different native node");
 		let error = pay_error.or(attempt.error.as_deref());
 		debug!("Lightning payment attempt ({}): with payment hash {} is being verified.",
 			attempt.id, payment_hash,

@@ -541,7 +541,14 @@ where
 	async fn finish_or_remove(self, wallet: &Wallet, release_locks: bool) -> anyhow::Result<()> {
 		// The driver consumes its in-memory action before advancing it. Read
 		// the original durable state under the action lock, not that empty slot.
-		let ids = match wallet.inner.db.get_wallet_action_checkpoint(&self.id).await? {
+		let checkpoint = wallet.inner.db.get_wallet_action_checkpoint(&self.id).await?;
+		let offboard = matches!(&checkpoint, Some(WalletActionCheckpoint::Offboard(_)));
+		let ids = match checkpoint {
+			Some(WalletActionCheckpoint::LightningSend(send)) => match send.progress {
+				lightning::pay::Progress::RevocableHtlcs { htlcs, .. } |
+				lightning::pay::Progress::RevocationStuck { htlcs, .. } => Some(htlcs.vtxo_ids),
+				_ => None,
+			},
 			Some(WalletActionCheckpoint::ArkoorSend(send)) => match &send.progress {
 				arkoor_send::Progress::Registration { signed_change_vtxos, .. } => Some(
 					send.input_vtxo_ids.iter().copied().chain(signed_change_vtxos.iter().map(|coin| coin.id())).collect::<Vec<_>>()),
@@ -563,7 +570,8 @@ where
 				let coin = wallet.inner.db.get_wallet_vtxo(id).await?
 					.context("protected action input or signed change is missing")?;
 				committed |= coin.fallback_status.is_some();
-				terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited));
+				terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited))
+					|| (offboard && coin.fallback_status.is_none() && coin.state.kind() == VtxoStateKind::Spent);
 			}
 			ensure!(!committed || terminal, "fallback input or signed change is unresolved; retaining its checkpoint");
 			Some(guard)

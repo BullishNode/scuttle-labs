@@ -16,6 +16,9 @@ use log::warn;
 
 use bitcoin_ext::AmountExt;
 
+#[cfg(feature = "socks5-proxy")]
+use crate::proxy::proxy_for_url;
+
 /// Verifies that a BOLT11 invoice returned by an LNURL-pay endpoint
 /// matches the request we made, since the endpoint is untrusted.
 fn verify_lnurlp_invoice(
@@ -63,14 +66,28 @@ pub(crate) async fn lnurlp_invoice(
 	lnurlp: &str,
 	amount: Amount,
 	comment: Option<impl AsRef<str>>,
+	#[cfg(feature = "socks5-proxy")] socks5_proxy: &Option<String>,
 ) -> anyhow::Result<Bolt11Invoice> {
-	let client = lnurllib::Builder::default().build_async().context("lnurl client error")?;
+	let builder = lnurllib::Builder::default();
+	#[cfg(feature = "socks5-proxy")]
+	let builder = match proxy_for_url(socks5_proxy, lnurlp)? {
+		Some(proxy) => builder.proxy(&proxy),
+		None => builder,
+	};
+	let client = builder.build_async().context("lnurl client error")?;
 	let resp = match client.make_request(lnurlp).await.context("failed to make lnurl request")? {
 		LnUrlResponse::LnUrlPayResponse(v) => v,
 		LnUrlResponse::LnUrlWithdrawResponse(_) => bail!("received lnurl withdraw"),
 		LnUrlResponse::LnUrlChannelResponse(_) => bail!("received lnurl channel"),
 	};
 
+	let builder = lnurllib::Builder::default();
+	#[cfg(feature = "socks5-proxy")]
+	let builder = match proxy_for_url(socks5_proxy, &resp.callback)? {
+		Some(proxy) => builder.proxy(&proxy),
+		None => builder,
+	};
+	let client = builder.build_async().context("lnurl client error")?;
 	let comment = comment.as_ref().map(|s| s.as_ref());
 	let invoice = client.get_invoice(&resp, amount.to_msat(), None, comment).await
 		.context("failed to fetch invoice from lnurlpay")?.pr;
@@ -91,9 +108,12 @@ pub(crate) async fn lnaddr_invoice(
 	addr: &LightningAddress,
 	amount: Amount,
 	comment: Option<impl AsRef<str>>,
+	#[cfg(feature = "socks5-proxy")] socks5_proxy: &Option<String>,
 ) -> anyhow::Result<Bolt11Invoice> {
 	let lnurl = addr.lnurlp_url();
-	Ok(lnurlp_invoice(&lnurl, amount, comment).await?)
+	Ok(lnurlp_invoice(&lnurl, amount, comment,
+		#[cfg(feature = "socks5-proxy")] socks5_proxy,
+	).await?)
 }
 
 #[cfg(test)]

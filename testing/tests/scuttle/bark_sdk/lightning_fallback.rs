@@ -391,7 +391,8 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	}).await.unwrap().into_inner();
 	assert_eq!(status.spend_state, protos::VtxoSpendState::Spendable as i32);
 	let registration = reopened.fallback_script();
-	assert!(registration.is_p2wpkh());
+	assert_eq!(registration, script, "the payout must use the original seed-derived app BIP86 script");
+	assert!(registration.is_p2tr());
 	let expected = source.amount() - ark_testing::sat(500_000);
 	let absent_height = ctx.bitcoind().get_block_count().await;
 	drop(reopened);
@@ -536,7 +537,7 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	let recovery = onchain.write().await.finish_psbt(signed).await.unwrap().extract_tx().unwrap();
 	assert_eq!(recovery.input.len(), 1, "seed recovery must spend only its actual fallback outpoint");
 	assert_eq!(recovery.input[0].previous_output, point);
-	assert_eq!(recovery.input[0].witness.len(), 2, "actual BIP84 ownership must authorize the recovery spend");
+	assert_eq!(recovery.input[0].witness.len(), 1, "actual BIP86 ownership must authorize the recovery spend");
 	assert_eq!(recovery.output.len(), 1);
 	assert_eq!(recovery.output[0].script_pubkey, destination.script_pubkey());
 	let recovered_value = expected - recovery_fee;

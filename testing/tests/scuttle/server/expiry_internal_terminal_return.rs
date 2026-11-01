@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::PaymentHash;
+use ark::attestations::VtxoStatusAttestation;
 use ark::vtxo::Full;
 use ark::vtxo::policy::signing::VtxoSigner;
 use ark::{ProtocolEncoding, Vtxo, VtxoPolicy};
@@ -78,6 +79,17 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	let sources=builder.user_cosign(&keys,ArkoorPackageCosignResponse::try_from(reply).unwrap()).unwrap().build_signed_vtxos();
 	assert_eq!(sources.len(),2);
 	assert!(sources.iter().all(|source|source.amount()==sat(100_000)));
+	// Sign the real source IDs while the original owner is still online; the
+	// status observations below do not reopen it after the offline cut.
+	let (status_queries,status_owner)=if reorg && partial {
+		let mut queries=Vec::new();
+		for source in &sources {
+			let key=sender.get_vtxo_key(source).await.unwrap();
+			queries.push(protos::VtxoStatusQuery {vtxo_id:source.id().to_bytes().to_vec(),
+				attestation:VtxoStatusAttestation::new(source.id(),&key).serialize()});
+		}
+		(queries,sender.mailbox_keypair().public_key().serialize().to_vec())
+	}else{(Vec::new(),Vec::new())};
 	sender.register_vtxo_transactions_with_server(&sources).await.unwrap();
 	lightning.sync().await;
 	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {invoice:invoice.to_string(),payment_amount_sat:180_000,
@@ -124,7 +136,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	srv.watchmand().start().await.unwrap();
 	// Funded operator closures must reach six confirmations before any sender
 	// reservation can be committed. Hold the resulting tip for capture.
-	tokio::time::timeout(Duration::from_secs(150),async {
+	let reservation_tip=tokio::time::timeout(Duration::from_secs(150),async {
 		loop {
 			let height=ctx.generate_blocks(1).await;
 			srv.wait_for_sync_height(height).await;
@@ -133,7 +145,11 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 			if let Some(closures) = super::expiry_lightning_terminal::confirmed_grant_closures(
 				&ctx, &db, &grants, &receive_spk,
 			).await {
-				if closures.values().all(|(_, closed)| closed.checked_add(6).is_some_and(|required| required <= height.to_u32())) { break; }
+				if closures.values().all(|(_, closed)| closed.checked_add(5).is_some_and(|required| required <= height.to_u32())) {
+					assert_eq!(Some(height.to_u32()), closures.values().map(|(_, closed)| closed.checked_add(5).unwrap()).max(),
+						"capture the first six-confirmation tip before another block can consume the pending refund");
+					break height;
+				}
 			}
 		}
 	}).await.expect("receive grants must close in funded operator payouts six confirmations deep");
@@ -166,6 +182,12 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("normal refund reservations were not committed");
+	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(reservation_tip.to_u32()),
+		"capture the original pending reservations before any further mining");
+	if reorg && partial {
+		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
+			&[protos::VtxoSpendState::FallbackPending;2],"reserved").await;
+	}
 	srv.watchmand().stop().await.unwrap();
 	// All physical conflicts and fee UTXOs precede the user-claim fork. Thus
 	// old reservations remain conflicted even when those claims are
@@ -217,7 +239,23 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	if reorg {
 		reorg_user_exit_claims(&ctx, &srv, &db, &claims, &[]).await;
 	}
-	ctx.generate_blocks(6).await;
+	if reorg && partial {
+		// Split the ORIGINAL six blocks at N5; no extra confirmation budget.
+		ctx.generate_blocks(5).await;
+		assert_eq!(chain.get_tx_out(&claims[0].compute_txid(),0,Some(true)).unwrap().unwrap().confirmations,5);
+		// B's untouched refund was broadcast before the user-claim branch.
+		// Prove its separate real payout is already terminal at this A-N5 cut.
+		let (_,paid_parent)=&reserved.by_source[&sources[1].id().to_string()];
+		let paid=chain.custom_get_raw_transaction_info(paid_parent.compute_txid(),None).unwrap().unwrap();
+		assert!(paid.confirmations.is_some_and(|n|n>=6));
+		assert_eq!(paid_parent.output.iter().filter(|o|o.script_pubkey==fallback)
+			.map(|o|o.value).sum::<bitcoin::Amount>(),sat(99_000));
+		srv.watchmand().start().await.unwrap();
+		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
+			&[protos::VtxoSpendState::FallbackPending,protos::VtxoSpendState::Spent],"n5").await;
+		srv.watchmand().stop().await.unwrap();
+		ctx.generate_blocks(1).await;
+	}else{ctx.generate_blocks(6).await;}
 	for claim in &claims {assert!(chain.get_tx_out(&claim.compute_txid(),0,Some(true)).unwrap().unwrap().confirmations>=6);}
 	drop(sender); drop(recipient); drop(rpc);
 	srv.watchmand().start().await.unwrap();
@@ -229,8 +267,53 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("every actual user claim must retain its canonical raw authorization");
+	if reorg && partial {
+		let expected=[protos::VtxoSpendState::Spent;2];
+		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,&expected,"n6").await;
+		let original_tip=chain.get_best_block_hash().unwrap();
+		let confirmed=chain.custom_get_raw_transaction_info(claims[0].compute_txid(),None).unwrap().unwrap();
+		assert_eq!(confirmed.confirmations,Some(6));
+		let confirming_block=confirmed.blockhash.unwrap();
+		let rights=db.read(async |t| Ok(t.query("SELECT DISTINCT e.id,e.vtxo_id,e.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
+			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+			WHERE e.id=ANY($1) ORDER BY e.id,c.fee_sat,c.payout_sat,c.forfeited_sat",
+			&[&reserved.entitlements.iter().copied().collect::<Vec<_>>()]).await?.into_iter()
+			.map(|row|(row.get::<_,i64>(0),row.get::<_,String>(1),row.get::<_,i64>(2),
+				row.get::<_,i64>(3),row.get::<_,i64>(4),row.get::<_,i64>(5))).collect::<Vec<_>>())).await.unwrap();
+		// This is a SECOND reorg, now after a proven authenticated N6 terminal
+		// result. Reconsidering the original branch needs no new blocks/funds.
+		chain.invalidate_block(&confirming_block).unwrap();
+		let (_,paid_parent)=&reserved.by_source[&sources[1].id().to_string()];
+		assert!(chain.custom_get_raw_transaction_info(paid_parent.compute_txid(),None).unwrap().unwrap()
+			.confirmations.is_some_and(|n|n>=6),"B's separate refund stays N6 on the retained branch");
+		assert!(chain.custom_get_raw_transaction_info(claims[0].compute_txid(),None).unwrap()
+			.is_none_or(|info|info.confirmations.unwrap_or(0)<=0));
+		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
+			&[protos::VtxoSpendState::FallbackPending,protos::VtxoSpendState::Spent],"disconnected").await;
+		chain.reconsider_block(&confirming_block).unwrap();
+		assert_eq!(chain.get_best_block_hash().unwrap(),original_tip);
+		assert_eq!(ctx.bitcoind().await_transaction(claims[0].compute_txid()).await,claims[0]);
+		assert_eq!(chain.get_tx_out(&claims[0].compute_txid(),0,Some(true)).unwrap().unwrap().confirmations,6);
+		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,&expected,"reconfirmed").await;
+		db.read(async |t| {
+			let actual=t.query("SELECT DISTINCT e.id,e.vtxo_id,e.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
+				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+				WHERE e.id=ANY($1) ORDER BY e.id,c.fee_sat,c.payout_sat,c.forfeited_sat",
+				&[&reserved.entitlements.iter().copied().collect::<Vec<_>>()]).await?.into_iter()
+				.map(|row|(row.get::<_,i64>(0),row.get::<_,String>(1),row.get::<_,i64>(2),
+					row.get::<_,i64>(3),row.get::<_,i64>(4),row.get::<_,i64>(5))).collect::<Vec<_>>();
+			assert_eq!(actual,rights,"same original principal and fee entitlements after reconfirmation");
+			assert_eq!(t.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=ANY($1)",
+				&[&original_ids]).await?.get::<_,i64>(0),2);
+			Ok(())
+		}).await.unwrap();
+	}
 	if partial {
 		confirm_reserved_partial(&ctx,&srv,&db,&sources,&claims[0],&fallback,&operator,&reserved).await;
+		if reorg {
+			assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
+				&[protos::VtxoSpendState::Spent;2],"both-terminal").await;
+		}
 		return;
 	}
 	confirm_operator_returns(&ctx,&srv,&db,&sources,&claims,&reserved).await;
@@ -386,4 +469,48 @@ async fn expiry_internal_reserved_partial_pays_remaining_source() {
 #[tokio::test]
 async fn expiry_internal_reserved_partial_replays_paid_source_after_reorg() {
 	Box::pin(reserved_terminal(true,true)).await;
+}
+
+/// Authenticated single and batch projections of these exact entitled IDs.
+/// A completed view must bind the actual Core branch before either read.
+async fn assert_user_claim_statuses(
+	ctx:&TestContext,srv:&Captaind,db:&Db,queries:&[protos::VtxoStatusQuery],owner:&[u8],
+	expected:&[protos::VtxoSpendState],phase:&str,
+) {
+	super::expiry_test::rebuilt(ctx,srv,db).await;
+	let mut rpc=srv.get_public_rpc().await;
+	let mut singles=Vec::new();
+	for query in queries {
+		singles.push(rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+			vtxo_id:query.vtxo_id.clone(),attestation:query.attestation.clone(),
+		}).await.unwrap().into_inner());
+	}
+	let batch=rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest {
+		vtxos:queries.to_vec(),
+	}).await.unwrap().into_inner();
+	// Retain actual public states before assertions, so the old product's
+	// Pending-at-N6 failure is distinguishable from setup/authentication errors.
+	tokio::fs::write(ctx.datadir.join(format!("user-claim-status-{phase}.json")),
+		serde_json::to_vec_pretty(&serde_json::json!({"phase":phase,
+			"single_states":singles.iter().map(|s|s.spend_state).collect::<Vec<_>>(),
+			"single_committed":singles.iter().map(|s|s.fallback_committed).collect::<Vec<_>>(),
+			"batch_ids":batch.vtxos.iter().map(|s|&s.vtxo_id).collect::<Vec<_>>(),
+			"batch_states":batch.vtxos.iter().map(|s|s.spend_state).collect::<Vec<_>>(),
+			"batch_committed":batch.vtxos.iter().map(|s|s.fallback_committed).collect::<Vec<_>>(),
+			"missing_ids":batch.missing_vtxo_ids,
+		})).unwrap(),
+	).await.unwrap();
+	assert_eq!(singles.len(),expected.len());
+	assert!(batch.missing_vtxo_ids.is_empty());
+	assert_eq!(batch.vtxos.len(),queries.len());
+	for (index,((single,query),expected)) in singles.iter().zip(queries).zip(expected).enumerate() {
+		assert_eq!(single.spend_state,*expected as i32,"single {phase} source {index}");
+		assert_eq!(single.owner_mailbox.as_slice(),owner);
+		assert!(single.fallback_committed,"the right remains fenced even when unconfirmed");
+		let batched=&batch.vtxos[index];
+		assert_eq!(batched.vtxo_id,query.vtxo_id);
+		assert_eq!(batched.spend_state,*expected as i32,"batch {phase} source {index}");
+		assert_eq!(batched.owner_mailbox.as_slice(),owner);
+		assert!(batched.fallback_committed);
+	}
 }

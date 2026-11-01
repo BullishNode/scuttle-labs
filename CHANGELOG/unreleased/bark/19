@@ -1,0 +1,9 @@
+- Keep nonspendable fallback VTXOs out of successful recovery results.
+  Report them as skipped while preserving their stored bodies and protections.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)
+- Report unsupported offer currencies without a parse panic.
+  Bitcoin offers, including amountless offers, retain their existing amount checks.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)
+- Classify confirmed conflicting spends by the requested scan window.
+  Emergency exits no longer treat an older Esplora result as a recent conflict.
+  [#19](https://github.com/BullishNode/scuttle/pull/19)

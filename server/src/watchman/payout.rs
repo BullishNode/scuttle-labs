@@ -28,7 +28,7 @@ const MAX_FEE_CHILD_VSIZE: usize = 1_000;
 
 /// The current anchor spender supplies only Core's replacement fee and inputs.
 /// Customer settlement depends on the immutable parent, not its fee sponsor.
-async fn mempool_child_fee(
+pub(super) async fn mempool_child_fee(
 	client: &bitcoind_async_client::Client, txid: Txid,
 ) -> anyhow::Result<Option<(Amount, Weight)>> {
 	#[derive(Debug, serde::Deserialize)]
