@@ -330,7 +330,6 @@ async fn dust_hold_across_two_groups_resolves() {
 	let sum = db.read(async |tx| Ok(tx.query_one("SELECT SUM(gross_sat)::BIGINT,SUM(fee_sat)::BIGINT, \
 		SUM(payout_sat)::BIGINT,SUM(forfeited_sat)::BIGINT FROM expiry_allocation_coin WHERE active", &[]).await?)).await.unwrap();
 	assert_eq!((sum.get::<_, i64>(0), sum.get::<_, i64>(1), sum.get::<_, i64>(2), sum.get::<_, i64>(3)), (2_500, 1_000, 1_500, 0));
-	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -353,7 +352,6 @@ async fn abandoned_exited_leaf_does_not_hold_siblings() {
 	let forfeited: i64 = db.read(async |tx| Ok(tx.query_one("SELECT c.forfeited_sat FROM expiry_allocation_coin c \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1", &[&small.leaf.id().to_string()]).await?.get(0))).await.unwrap();
 	assert_eq!(forfeited, 500);
-	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -372,7 +370,6 @@ async fn dust_hold_ends_at_deadline() {
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.forfeited_sat,c.fee_sat,c.payout_sat FROM expiry_allocation_coin c \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1", &[&small.leaf.id().to_string()]).await?)).await.unwrap();
 	assert_eq!((row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)), (500, 0, 0));
-	assert_eq!(db.read(async |tx| tx.expiry_hold_count().await).await.unwrap(), 0);
 }
 
 #[tokio::test]

@@ -127,7 +127,7 @@ impl ClnXpayClient {
 				WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&attempt.id]).await?;
 			ensure!(!sources.is_empty(), "payment attempt has no retained sources for its integrity hold");
 			for source in sources {
-				tx.hold_settlement_integrity(source.get::<_, &str>(0).parse()?, reason).await?;
+				tx.warn_settlement_integrity(source.get::<_, &str>(0).parse()?, reason);
 			}
 			Ok(())
 		}).await
@@ -223,7 +223,7 @@ impl ClnXpayClient {
 				let reason = if error.is::<RequestBindingRefusal>() { "lightning_request_binding_invalid" }
 					else { "lightning_dispatch_unqualified" };
 				if let Err(hold_error) = self.hold_dispatch_integrity(&attempt, reason).await {
-					error!(attempt_id, %hold_error, "Could not persist dispatch integrity hold");
+					error!(attempt_id, %hold_error, "Could not inspect dispatch integrity");
 				}
 				// No Xpay was called by this task. A later qualified same-node
 				// re-drive may resume it; refusal never supplies a terminal outcome.
@@ -239,7 +239,7 @@ impl ClnXpayClient {
 			},
 			Err(error) => {
 				if let Err(hold_error) = self.hold_dispatch_integrity(&attempt, "lightning_dispatch_admission_failed").await {
-					error!(attempt_id, %hold_error, "Could not persist dispatch integrity hold");
+					error!(attempt_id, %hold_error, "Could not inspect dispatch integrity");
 				}
 				error!(attempt_id, %payment_hash, %error, "Native dispatch was not admitted; retaining custody");
 				return;

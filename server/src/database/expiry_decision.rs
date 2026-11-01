@@ -283,7 +283,7 @@ impl Tx<'_> {
 				valid = self.can_cancel_expiry_participations(&cancellations).await?;
 			}
 			if valid { accepted.push(output); } else {
-				for coin in &output.coins { self.record_expiry_hold(coin.ownership.id, "decision_revalidation_changed").await?; }
+				for coin in &output.coins { self.observe_expiry_hold(coin.ownership.id, "decision_revalidation_changed"); }
 				dropped += 1;
 			}
 		}
@@ -328,7 +328,7 @@ impl Tx<'_> {
 					}
 					!hold
 				});
-				for id in held { self.record_expiry_hold(id, "dust_aggregation_pending").await?; }
+				for id in held { self.observe_expiry_hold(id, "dust_aggregation_pending"); }
 				if accepted.is_empty() { return Ok(None); }
 				if accepted.len() == count { break; }
 				let leaves = accepted.iter().flat_map(|o| &o.coins).filter_map(|c| c.payee.as_ref().map(|p| CustomerLeaf {
@@ -354,7 +354,6 @@ impl Tx<'_> {
 		}
 		for output in &accepted {
 			self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&output.root().id().to_string()]).await?;
-			self.clear_expiry_hold(output.root().id()).await?;
 			for coin in &output.coins {
 				let proposal = &coin.ownership;
 				let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
@@ -417,7 +416,6 @@ impl Tx<'_> {
 						&observed.to_string()
 					]).await?;
 				self.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&proposal.id.to_string()]).await?;
-				self.clear_expiry_hold(proposal.id).await?;
 			}
 		}
 		let inputs = accepted.len();

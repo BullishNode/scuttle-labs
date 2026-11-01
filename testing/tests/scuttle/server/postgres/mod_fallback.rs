@@ -348,20 +348,6 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		}).await.unwrap();
 		ids.push(coin.id());
 	}
-	// A dispatch diagnostic must not replace an unrelated integrity reason,
-	// which its later reason-limited terminal cleanup would otherwise erase.
-	db.write(async |t| t.record_expiry_hold(ids[0], "operator_unrelated_integrity").await).await.unwrap();
-	let hold = async || db.read(async |t| {
-		let row = t.query_one("SELECT reason,first_seen::TEXT,last_seen::TEXT FROM expiry_hold WHERE vtxo_id=$1",
-			&[&ids[0].to_string()]).await?;
-		Ok((row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2)))
-	}).await.unwrap();
-	let original_hold = hold().await;
-	for reason in ["lightning_request_binding_invalid", "lightning_dispatch_unqualified",
-		"lightning_dispatch_admission_failed", "lightning_multiple_dispatches_unresolved"] {
-		db.write(async |t| t.record_expiry_hold(ids[0], reason).await).await.unwrap();
-		assert_eq!(hold().await, original_hold, "dispatch diagnostics preserve the unrelated row and timestamps");
-	}
 	let invoice_key = SecretKey::from_slice(&[41; 32]).unwrap();
 	let secp = Secp256k1::new();
 	let bolt11 = InvoiceBuilder::new(Currency::Regtest)
@@ -514,8 +500,6 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		HtlcSettlementOrigin::Attempt(i64::MAX)).await).await.unwrap(), None);
 	for source in &ids {
 		assert_eq!(predicate(*source).await, SourceSettlement::Unknown);
-		assert_eq!(db.read(async |t| Ok(t.query_one("SELECT reason FROM expiry_hold WHERE vtxo_id=$1",
-			&[&source.to_string()]).await?.get::<_, String>(0))).await.unwrap(), "settlement_provenance_unknown");
 	}
 	for id in &attempts {
 		let before = db.read(async |t| t.get_lightning_payment_attempt_by_id(*id).await).await.unwrap().unwrap();

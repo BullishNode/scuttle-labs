@@ -125,14 +125,13 @@ impl Tx<'_> {
 		Ok(Some((records, sources)))
 	}
 
-	pub async fn hold_unknown_settlement(&self, source: VtxoId) -> anyhow::Result<()> {
-		self.hold_settlement_integrity(source, "settlement_provenance_unknown").await
+	pub(crate) fn warn_unknown_settlement(&self, source: VtxoId) {
+		self.warn_settlement_integrity(source, "settlement_provenance_unknown");
 	}
 
-	pub(crate) async fn hold_settlement_integrity(&self, source: VtxoId, reason: &str) -> anyhow::Result<()> {
-		self.record_expiry_hold(source, reason).await?;
+	pub(crate) fn warn_settlement_integrity(&self, source: VtxoId, reason: &str) {
+		self.observe_expiry_hold(source, reason);
 		tracing::error!(vtxo_id = %source, reason, "Settlement integrity is unresolved; holding principal");
-		Ok(())
 	}
 
 	pub async fn store_htlc_settlement_from(&self, preimage: Preimage, origin: HtlcSettlementOrigin)
@@ -149,7 +148,7 @@ impl Tx<'_> {
 			None => {
 				for row in self.query("SELECT v.vtxo_id FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1",
 					&[&hash.to_string()]).await? {
-					self.hold_unknown_settlement(row.get::<_, &str>(0).parse()?).await?;
+					self.warn_unknown_settlement(row.get::<_, &str>(0).parse()?);
 				}
 				tracing::error!(payment_hash = %hash, "Retained settlement with unknown origin");
 				BTreeSet::from([OriginRow { kind: "unknown".into(), attempt: None, subscription: None, vtxo: None }])

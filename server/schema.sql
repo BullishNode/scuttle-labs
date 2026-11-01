@@ -2343,18 +2343,6 @@ ALTER SEQUENCE scuttle.expiry_entitlement_id_seq OWNED BY scuttle.expiry_entitle
 
 
 --
--- Name: expiry_hold; Type: TABLE; Schema: scuttle; Owner: -
---
-
-CREATE TABLE scuttle.expiry_hold (
-    vtxo_id text NOT NULL,
-    reason text NOT NULL,
-    first_seen timestamp with time zone DEFAULT now() NOT NULL,
-    last_seen timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
 -- Name: expiry_lightning_receive_claim; Type: TABLE; Schema: scuttle; Owner: -
 --
 
@@ -2957,14 +2945,6 @@ ALTER TABLE ONLY scuttle.expiry_entitlement
 
 ALTER TABLE ONLY scuttle.expiry_entitlement
     ADD CONSTRAINT expiry_entitlement_vtxo_id_key UNIQUE (vtxo_id);
-
-
---
--- Name: expiry_hold expiry_hold_pkey; Type: CONSTRAINT; Schema: scuttle; Owner: -
---
-
-ALTER TABLE ONLY scuttle.expiry_hold
-    ADD CONSTRAINT expiry_hold_pkey PRIMARY KEY (vtxo_id);
 
 
 --
@@ -3746,14 +3726,6 @@ ALTER TABLE ONLY scuttle.expiry_allocation_payout
 
 ALTER TABLE ONLY scuttle.expiry_entitlement
     ADD CONSTRAINT expiry_entitlement_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
-
-
---
--- Name: expiry_hold expiry_hold_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: scuttle; Owner: -
---
-
-ALTER TABLE ONLY scuttle.expiry_hold
-    ADD CONSTRAINT expiry_hold_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
 
 
 --

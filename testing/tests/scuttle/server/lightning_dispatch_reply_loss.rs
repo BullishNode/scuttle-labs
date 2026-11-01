@@ -336,10 +336,8 @@ async fn external_success_with_fault(routed: bool, plugin_fault: bool, rpc_deadl
 			}
 			let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
 			let fences = db.read(async |tx| Ok(tx.query_one("SELECT \
-				(SELECT COUNT(*) FROM expiry_hold WHERE vtxo_id=ANY($1)), \
 				(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=ANY($1))", &[&ids]).await?)).await.unwrap();
 			assert_eq!(fences.get::<_,i64>(0), 0);
-			assert_eq!(fences.get::<_,i64>(1), 0);
 			tokio::fs::write(ctx.datadir.join("initial-zero-preflight-cut.json"), serde_json::to_vec_pretty(
 				&serde_json::json!({"payment_hash":hash.to_string(),"sources":ids,"native_tip":info.blockheight,
 					"processed_tip":processed.height.to_u32(),"source_htlc_expiry":policy_expiry.to_u32(),
@@ -1349,10 +1347,9 @@ async fn crash_before_first_native_rpc(
 			}
 			let ids = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
 			let prior = db.read(async |tx| Ok(tx.query_one("SELECT \
-				(SELECT COUNT(*) FROM expiry_hold WHERE vtxo_id=ANY($1)), \
 				(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=ANY($1))", &[&ids]).await?)).await?;
-			ensure!(prior.get::<_,i64>(0)==0 && prior.get::<_,i64>(1)==0,
-				"MISSED_TARGET: an existing hold or allocation would mask the zero-room predicate");
+			ensure!(prior.get::<_,i64>(0)==0,
+				"MISSED_TARGET: an existing allocation would mask the zero-room predicate");
 			// Normal all-node mining waits for captaind; it is intentionally
 			// reaped here. Mine only to the ACTUAL retained bound, then observe.
 			ctx.generate_blocks_unsynced(bound.checked_blocks_since(current).unwrap()).await;
@@ -1374,7 +1371,7 @@ async fn crash_before_first_native_rpc(
 			let info = node.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await?.into_inner();
 			ensure!(info.blockheight == bound.to_u32(), "native tip did not reach the actual recorded bound");
 			let hold = tokio::time::timeout(Duration::from_secs(40), async {
-				loop {
+				'observe: loop {
 					let rows = db.read(async |tx| server::database::xpay::get_xpays_by_payment_hash(&**tx, hash).await).await?;
 					ensure!(rows == vec![record.clone()], "zero room changed or admitted the original count-zero request");
 					let state = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await?.context("held attempt missing")?;
@@ -1387,22 +1384,15 @@ async fn crash_before_first_native_rpc(
 						&& state.retry_for == original.retry_for && state.max_routing_fee == original.max_routing_fee
 						&& state.created_at == original.created_at && state.updated_at == original.updated_at,
 						"elapsed height or missing native record altered the original attempt");
-					let held = db.read(async |tx| Ok(tx.query_opt("SELECT reason FROM expiry_hold WHERE vtxo_id=$1", &[&sources[0].to_string()]).await?
-						.map(|row|row.get::<_,String>(0)))).await?;
-					if let Some(reason) = held {
-						ensure!(reason == "lightning_dispatch_unqualified", "another hold masked the exact zero-room branch");
-						break Ok::<_,anyhow::Error>(reason);
+					while let Ok(alarm) = alarms.try_recv() {
+						if alarm.vtxo_id == sources[0] {
+							ensure!(alarm.reason == "lightning_dispatch_unqualified", "another alarm masked the exact zero-room branch");
+							break 'observe Ok::<_,anyhow::Error>(alarm.reason);
+						}
 					}
 					tokio::time::sleep(Duration::from_millis(20)).await;
 				}
 			}).await.context("the normal monitor did not hold the exhausted original request")??;
-			let alarm = tokio::time::timeout(Duration::from_secs(10), async {
-				loop {
-					let alarm = alarms.recv().await.context("expiry hold alarm stream closed")?;
-					if alarm.vtxo_id == sources[0] { break Ok::<_,anyhow::Error>(alarm); }
-				}
-			}).await.context("the real zero-room hold emitted no operator alarm")??;
-			ensure!(alarm.reason == hold, "durable hold and emitted alarm differ");
 			tokio::time::timeout(Duration::from_secs(10), async {
 				loop {
 					let original_log = tokio::fs::read_to_string(ctx.datadir.join("server/stdout.log")).await?;

@@ -72,7 +72,7 @@ pub struct OwnershipProposal {
 	/// Only a fully validated, expired HTLC settlement can request
 	/// signed progression. Missing ownership or path proof never does.
 	pub needs_chain_progress: bool,
-	/// The write-side readiness pass persists this integrity hold and alarms.
+	/// The write-side readiness pass warns when settlement integrity is unresolved.
 	pub settlement_integrity_hold: bool,
 }
 
@@ -89,6 +89,10 @@ impl OwnershipProposal {
 }
 
 impl Tx<'_> {
+	pub(crate) fn observe_expiry_hold(&self, id: VtxoId, reason: &str) {
+		slog!(ExpiryHoldObserved, vtxo_id: id, reason: reason.to_owned());
+	}
+
 	/// Resolve one selected economic terminal. The caller supplies its
 	/// funding transaction and must already have proved the complete partition.
 	pub async fn propose_expiry_ownership(
