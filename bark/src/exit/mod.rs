@@ -152,7 +152,7 @@ use crate::chain::ChainSource;
 use crate::exit::bdk::should_rbf;
 use crate::exit::transaction_manager::ExitTransactionManager;
 use crate::onchain::MakeCpfpFees;
-use crate::movement::{MovementDestination, MovementStatus, PaymentMethod};
+use crate::movement::{MovementDestination, MovementId, MovementStatus, PaymentMethod};
 use crate::movement::manager::MovementManager;
 use crate::movement::update::MovementUpdate;
 
@@ -264,6 +264,12 @@ impl ExitInner {
 				if let Err(error) = full_vtxo.check_standard() {
 					return Err(ExitError::NonStandardVtxo { vtxo: vtxo_id, error }.into());
 				}
+			}
+
+			// Finish the old history before replacing its only stored movement link.
+			if let Some(entry) = self.persister.get_exit_vtxo_entry(&vtxo_id).await? {
+				Exit::finish_exit_movement(&self.movement_manager, &entry.state, entry.movement_id).await
+					.context("failed to finalize the previous exit movement")?;
 			}
 
 			// Create the movement in a Pending state. It transitions to Successful once the
@@ -449,6 +455,9 @@ impl Exit {
 	pub(crate) async fn load(&self) -> anyhow::Result<()> {
 		let mut guard = self.inner.write().await;
 		let inner = &mut *guard;
+
+		// Repair history left pending after the exit state was durably finished.
+		Self::reconcile_finished_movements(&*inner.persister, &inner.movement_manager).await?;
 
 		// Finished exits never progress again, so don't track them.
 		let exit_vtxo_entries = inner.persister
@@ -676,9 +685,12 @@ impl Exit {
 				// Only live exits are in memory; check the store for a finished one.
 				let entry = inner.persister.get_exit_vtxo_entry(&vtxo_id).await
 					.map_err(|e| ExitError::InternalError { error: e.to_string() })?;
-				return match entry.map(|e| e.state.kind()) {
-					Some(ExitStateKind::Canceled) => Ok(()),
-					Some(kind) => Err(ExitError::CannotCancelExit { vtxo: vtxo_id, state: kind }),
+				return match entry {
+					Some(entry) if entry.state.kind() == ExitStateKind::Canceled => {
+						Self::finish_exit_movement(&inner.movement_manager, &entry.state, entry.movement_id).await
+							.map_err(|e| ExitError::InternalError { error: format!("{e:#}") })
+					},
+					Some(entry) => Err(ExitError::CannotCancelExit { vtxo: vtxo_id, state: entry.state.kind() }),
 					None => Err(ExitError::NotExiting { vtxo: vtxo_id }),
 				};
 			},
@@ -767,7 +779,6 @@ impl Exit {
 			}
 
 			info!("Progressing exit for VTXO {}", ev.id());
-			let pre_state = ev.state().clone();
 			let error = match ev.progress(
 				wallet,
 				&mut inner.tx_manager,
@@ -787,9 +798,8 @@ impl Exit {
 				}
 			};
 
-			let state_changed = ev.state() != &pre_state;
 			Self::reconcile_vtxo_and_movement(
-				wallet, &inner.movement_manager, ev, state_changed,
+				wallet, &inner.movement_manager, ev,
 			).await;
 
 			if !matches!(ev.state(), ExitState::Claimed(..)) {
@@ -811,13 +821,12 @@ impl Exit {
 	/// - finish the movement as `Canceled` when we detect the VTXO was already spent.
 	///
 	/// All updates are best-effort: failures are logged and don't abort progress. The VTXO
-	/// transition is idempotent; the movement transitions only fire on a fresh state change
-	/// to avoid notification spam.
+	/// transition and movement completion are idempotent, so an earlier failure can retry
+	/// without changing a completed movement or emitting another notification.
 	async fn reconcile_vtxo_and_movement(
 		wallet: &Wallet,
 		movements: &MovementManager,
 		ev: &ExitVtxo,
-		state_changed: bool,
 	) {
 		let paid_fallback = match wallet.inner.db.get_wallet_vtxo(ev.id()).await {
 			Ok(coin) => coin.is_some_and(|coin| matches!(coin.fallback_status,
@@ -833,21 +842,35 @@ impl Exit {
 			}
 		}
 
-		if !state_changed {
-			return;
+		if let Err(e) = Self::finish_exit_movement(movements, ev.state(), ev.movement_id()).await {
+			error!("Failed to finalize movement for exit {}: {e:#}", ev.id());
 		}
-		let Some(movement_id) = ev.movement_id() else { return };
-		let new_status = match ev.state() {
+	}
+
+	async fn finish_exit_movement(
+		movements: &MovementManager,
+		state: &ExitState,
+		movement_id: Option<MovementId>,
+	) -> anyhow::Result<()> {
+		let Some(movement_id) = movement_id else { return Ok(()) };
+		let status = match state {
 			ExitState::Claimed(_) => MovementStatus::Successful,
-			ExitState::VtxoAlreadySpent(_) => MovementStatus::Canceled,
-			_ => return,
+			ExitState::VtxoAlreadySpent(_) | ExitState::Canceled(_) => MovementStatus::Canceled,
+			_ => return Ok(()),
 		};
-		if let Err(e) = movements.finish_movement(movement_id, new_status).await {
-			error!(
-				"Failed to finalize exit movement {} as {:?}: {:#}",
-				movement_id, new_status, e,
-			);
+		movements.finish_movement(movement_id, status).await?;
+		Ok(())
+	}
+
+	async fn reconcile_finished_movements(
+		persister: &dyn BarkPersister,
+		movements: &MovementManager,
+	) -> anyhow::Result<()> {
+		for entry in persister.get_exit_vtxo_entries_with_states(ExitStateKind::FINISHED_STATES).await? {
+			Self::finish_exit_movement(movements, &entry.state, entry.movement_id).await
+				.with_context(|| format!("failed to finalize movement for exit {}", entry.vtxo_id))?;
 		}
+		Ok(())
 	}
 
 	/// For use when syncing. Pending exits will be initialized, the network status of each
@@ -867,15 +890,13 @@ impl Exit {
 				continue;
 			}
 
-			let pre_state = exit.state().clone();
 			if let Err(e) = exit.progress(
 				wallet, &mut inner.tx_manager, true,
 			).await {
 				error!("Error syncing exit for VTXO {}: {}", exit.id(), e);
 			}
-			let state_changed = exit.state() != &pre_state;
 			Self::reconcile_vtxo_and_movement(
-				wallet, &inner.movement_manager, exit, state_changed,
+				wallet, &inner.movement_manager, exit,
 			).await;
 		}
 		Ok(())
@@ -1255,5 +1276,124 @@ impl Exit {
 			groups.push(UnconfirmedExitParents { vtxo, parents });
 		}
 		Ok(groups)
+	}
+}
+
+#[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
+mod test {
+	use bitcoin::{BlockHash, SignedAmount};
+	use bitcoin::hashes::Hash;
+	use bitcoin_ext::BlockRef;
+	use futures::{FutureExt, StreamExt};
+
+	use crate::notification::{NotificationDispatch, WalletNotification};
+	use crate::persist::sqlite::SqliteClient;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn terminal_exit_history_retries_and_reloads() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("db.sqlite");
+		let db = Arc::new(SqliteClient::open(&path).unwrap());
+		let dispatch = NotificationDispatch::new();
+		let movements = MovementManager::new(db.clone(), dispatch.clone());
+		movements.register_subsystem(Subsystem::EXIT).await.unwrap();
+		let tip = BlockHeight::new(100);
+		// Persisted-state units: these literals do not establish onchain finality.
+		let states = [
+			(ExitState::new_claimed(tip, Txid::all_zeros(),
+				BlockRef { height: tip, hash: BlockHash::all_zeros() }), Some(MovementStatus::Successful)),
+			(ExitState::new_vtxo_already_spent(tip), Some(MovementStatus::Canceled)),
+			(ExitState::new_canceled(tip), Some(MovementStatus::Canceled)),
+			(ExitState::new_vtxo_swept(tip, vec![]), None),
+			(ExitState::new_start(tip), None),
+		];
+		let mut records = Vec::new();
+		for (index, (state, status)) in states.into_iter().enumerate() {
+			let id = movements.new_movement_with_update(Subsystem::EXIT, "start",
+				MovementUpdate::new().intended_and_effective_balance(SignedAmount::from_sat(-100_000))
+					.fee(Amount::from_sat(1_000))).await.unwrap();
+			let entry = StoredExit {
+				vtxo_id: VtxoId::from_slice(&[index as u8 + 1; 36]).unwrap(), state,
+				history: vec![ExitState::new_start(BlockHeight::new(99))], movement_id: Some(id),
+			};
+			db.store_exit_vtxo_entry(&entry).await.unwrap();
+			records.push((entry, db.get_movement_by_id(id).await.unwrap(), status));
+		}
+		let mut notifications = dispatch.subscribe();
+		let conn = rusqlite::Connection::open(&path).unwrap();
+		conn.execute_batch("CREATE TRIGGER reject_exit_history_completion BEFORE UPDATE ON bark_movements \
+			WHEN OLD.status = 'pending' AND NEW.status != 'pending' \
+			BEGIN SELECT RAISE(ABORT, 'exit movement write rejected'); END;").unwrap();
+
+		// The same terminal-state caller must propagate the actual failed write,
+		// and the one-time load must not silently drop that unfinished history.
+		let entry = &records[0].0;
+		let error = Exit::finish_exit_movement(&movements, &entry.state, entry.movement_id).await.unwrap_err();
+		assert!(format!("{error:#}").contains("exit movement write rejected"));
+		let error = Exit::reconcile_finished_movements(&*db, &movements).await.unwrap_err();
+		assert!(format!("{error:#}").contains("exit movement write rejected"));
+		// Cancellation retries and new-exit preflight use this same finalizer.
+		// A failed write must keep the canceled row's original Pending movement link.
+		let canceled = &records[2].0;
+		let error = Exit::finish_exit_movement(&movements, &canceled.state, canceled.movement_id).await.unwrap_err();
+		assert!(format!("{error:#}").contains("exit movement write rejected"));
+		for (entry, pending, _) in &records {
+			assert_eq!(db.get_movement_by_id(pending.id).await.unwrap(), *pending);
+			assert_eq!(db.get_exit_vtxo_entry(&entry.vtxo_id).await.unwrap().unwrap(), *entry);
+		}
+		assert!(notifications.next().now_or_never().is_none());
+		conn.execute_batch("DROP TRIGGER reject_exit_history_completion;").unwrap();
+
+		// Retry with the identical terminal state, without another state transition.
+		Exit::finish_exit_movement(&movements, &entry.state, entry.movement_id).await.unwrap();
+		let finished_live = db.get_movement_by_id(entry.movement_id.unwrap()).await.unwrap();
+		drop(movements);
+		drop(db);
+
+		// The remaining terminal records still have Pending movements across reopen.
+		let db = Arc::new(SqliteClient::open(&path).unwrap());
+		let movements = MovementManager::new(db.clone(), dispatch);
+		movements.register_subsystem(Subsystem::EXIT).await.unwrap();
+		Exit::reconcile_finished_movements(&*db, &movements).await.unwrap();
+		for (entry, pending, status) in &records {
+			let actual = db.get_movement_by_id(pending.id).await.unwrap();
+			let mut expected = pending.clone();
+			if let Some(status) = status {
+				assert!(actual.time.completed_at.is_some());
+				expected.status = *status;
+				expected.time.completed_at = actual.time.completed_at;
+			}
+			assert_eq!(actual, expected, "only the terminal status/completion time can change");
+			assert_eq!(db.get_exit_vtxo_entry(&entry.vtxo_id).await.unwrap().unwrap(), *entry);
+		}
+		assert_eq!(db.get_movement_by_id(finished_live.id).await.unwrap(), finished_live);
+		let mut updated = Vec::new();
+		while let Some(Some(notification)) = notifications.next().now_or_never() {
+			let WalletNotification::MovementUpdated { movement } = notification else {
+				panic!("unexpected notification: {notification:?}");
+			};
+			updated.push(movement.id);
+		}
+		let expected = records.iter().filter(|(_, _, status)| status.is_some())
+			.map(|(_, movement, _)| movement.id).collect::<HashSet<_>>();
+		assert_eq!(updated.len(), expected.len());
+		assert_eq!(updated.into_iter().collect::<HashSet<_>>(), expected);
+		Exit::reconcile_finished_movements(&*db, &movements).await.unwrap();
+		assert_eq!(db.get_movement_by_id(finished_live.id).await.unwrap(), finished_live);
+		assert!(notifications.next().now_or_never().is_none(), "completed history must stay idempotent");
+		// Only after finalizing the prior link can a new exit replace that row.
+		Exit::finish_exit_movement(&movements, &canceled.state, canceled.movement_id).await.unwrap();
+		let completed = db.get_movement_by_id(canceled.movement_id.unwrap()).await.unwrap();
+		assert_eq!(completed.status, MovementStatus::Canceled);
+		let replacement_id = movements.new_movement(Subsystem::EXIT, "start").await.unwrap();
+		let replacement = StoredExit {
+			vtxo_id: canceled.vtxo_id, state: ExitState::new_start(tip),
+			history: vec![], movement_id: Some(replacement_id),
+		};
+		db.store_exit_vtxo_entry(&replacement).await.unwrap();
+		assert_eq!(db.get_exit_vtxo_entry(&replacement.vtxo_id).await.unwrap().unwrap(), replacement);
+		assert_eq!(db.get_movement_by_id(completed.id).await.unwrap(), completed);
 	}
 }
