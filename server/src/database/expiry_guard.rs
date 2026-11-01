@@ -3,7 +3,7 @@
 use ark::VtxoId;
 use tokio_postgres::{Row, Transaction};
 
-/// Acquire the same coin locks as allocation, then re-read the durable fences.
+/// Serialize obligation changes with allocation, then re-read the durable fences.
 /// The locks live until the caller's transaction commits. Process-local flux
 /// locks alone cannot serialize the server against the separate watchman.
 pub(crate) async fn guard_obligation_changes(
@@ -12,7 +12,9 @@ pub(crate) async fn guard_obligation_changes(
 ) -> anyhow::Result<()> {
 	if ids.is_empty() { return Ok(()); }
 	let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-	tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id = ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
+	// These writers preserve VTXO keys. Permit mailbox hint FK checks while
+	// still excluding competing source mutations and allocation decisions.
+	tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id = ANY($1) ORDER BY vtxo_id FOR NO KEY UPDATE", &[&ids]).await?;
 	if let Some(row) = tx.query_opt(
 		"SELECT vtxo_id FROM (SELECT vtxo_id FROM expiry_entitlement WHERE vtxo_id=ANY($1) \
 			UNION SELECT vtxo_id FROM expiry_allocation_input WHERE vtxo_id=ANY($1)) fenced \
