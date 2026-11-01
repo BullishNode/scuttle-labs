@@ -131,6 +131,7 @@ async fn bark_pay_ln_succeeds() {
 		bark_1.pay_lightning_wait(invoice, None).await;
 		assert_eq!(checked.load(Ordering::SeqCst), 1, "the real server admission probe must execute before the normal send");
 		assert_eq!(bark_1.spendable_balance().await, btc(3));
+		bark_1.set_ark_url(&srv.ark_url()).await;
 	}
 
 	{
