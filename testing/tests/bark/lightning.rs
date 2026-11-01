@@ -123,8 +123,9 @@ async fn bark_pay_ln_succeeds() {
 			}
 		}
 		let checked = Arc::new(AtomicUsize::new(0));
+		let postgres = srv.config().postgres.clone();
 		let proxy = srv.start_proxy_no_mailbox(CheckFixedAmount { invoice: invoice.clone(),
-			db: Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap(),
+			db: Db::connect(&postgres, bitcoin::Network::Regtest).await.unwrap(),
 			node: lightning.internal.grpc_client().await, checked: checked.clone() }).await;
 		bark_1.set_ark_url(&proxy.address).await;
 		bark_1.pay_lightning_wait(invoice, None).await;
