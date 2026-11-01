@@ -283,6 +283,9 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 		// This is a SECOND reorg, now after a proven authenticated N6 terminal
 		// result. Reconsidering the original branch needs no new blocks/funds.
 		chain.invalidate_block(&confirming_block).unwrap();
+		let (_,paid_parent)=&reserved.by_source[&sources[1].id().to_string()];
+		assert!(chain.custom_get_raw_transaction_info(paid_parent.compute_txid(),None).unwrap().unwrap()
+			.confirmations.is_some_and(|n|n>=6),"B's separate refund stays N6 on the retained branch");
 		assert!(chain.custom_get_raw_transaction_info(claims[0].compute_txid(),None).unwrap()
 			.is_none_or(|info|info.confirmations.unwrap_or(0)<=0));
 		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
