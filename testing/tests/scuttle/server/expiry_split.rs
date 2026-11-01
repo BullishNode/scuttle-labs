@@ -137,6 +137,13 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 			assert!(child.vsize() < 1_000, "the real old TRUC child must fit Core policy");
 			assert!(initial_fee < target * (prefix.weight() + child.weight()),
 				"the old package must genuinely have a lower rate than the unchanged target");
+			// The RBF countercase requires the watchman's own Core to know the old child.
+			ctx.await_transactions_across_nodes([prefix.compute_txid(), child.compute_txid()],
+				[srv.watchmand().bitcoind().as_ref()]).await;
+			let watchman_core = srv.watchmand().bitcoind().sync_client();
+			assert!(watchman_core.get_mempool_entry(&child.compute_txid()).is_ok());
+			assert_eq!(watchman_core.get_mempool_spending_tx(prefix.fee_anchor().unwrap().0).unwrap(),
+				Some(child.compute_txid()));
 		}
 		assert!(db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_height FROM vtxo WHERE vtxo_id=$1",
 			&[&root.id().to_string()]).await?.get::<_, Option<i32>>(0))).await.unwrap().is_none());
