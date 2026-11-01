@@ -184,6 +184,10 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 	}).await.expect("normal refund reservations were not committed");
 	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(reservation_tip.to_u32()),
 		"capture the original pending reservations before any further mining");
+	if reorg && partial {
+		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
+			&[protos::VtxoSpendState::FallbackPending;2],"reserved").await;
+	}
 	srv.watchmand().stop().await.unwrap();
 	// All physical conflicts and fee UTXOs precede the user-claim fork. Thus
 	// old reservations remain conflicted even when those claims are
@@ -239,9 +243,16 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 		// Split the ORIGINAL six blocks at N5; no extra confirmation budget.
 		ctx.generate_blocks(5).await;
 		assert_eq!(chain.get_tx_out(&claims[0].compute_txid(),0,Some(true)).unwrap().unwrap().confirmations,5);
+		// B's untouched refund was broadcast before the user-claim branch.
+		// Prove its separate real payout is already terminal at this A-N5 cut.
+		let (_,paid_parent)=&reserved.by_source[&sources[1].id().to_string()];
+		let paid=chain.custom_get_raw_transaction_info(paid_parent.compute_txid(),None).unwrap().unwrap();
+		assert!(paid.confirmations.is_some_and(|n|n>=6));
+		assert_eq!(paid_parent.output.iter().filter(|o|o.script_pubkey==fallback)
+			.map(|o|o.value).sum::<bitcoin::Amount>(),sat(99_000));
 		srv.watchmand().start().await.unwrap();
 		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
-			&[protos::VtxoSpendState::FallbackPending;2],"n5").await;
+			&[protos::VtxoSpendState::FallbackPending,protos::VtxoSpendState::Spent],"n5").await;
 		srv.watchmand().stop().await.unwrap();
 		ctx.generate_blocks(1).await;
 	}else{ctx.generate_blocks(6).await;}
@@ -257,7 +268,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 		}
 	}).await.expect("every actual user claim must retain its canonical raw authorization");
 	if reorg && partial {
-		let expected=[protos::VtxoSpendState::Spent,protos::VtxoSpendState::FallbackPending];
+		let expected=[protos::VtxoSpendState::Spent;2];
 		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,&expected,"n6").await;
 		let original_tip=chain.get_best_block_hash().unwrap();
 		let confirmed=chain.custom_get_raw_transaction_info(claims[0].compute_txid(),None).unwrap().unwrap();
@@ -275,7 +286,7 @@ async fn reserved_terminal(reorg:bool,partial:bool) {
 		assert!(chain.custom_get_raw_transaction_info(claims[0].compute_txid(),None).unwrap()
 			.is_none_or(|info|info.confirmations.unwrap_or(0)<=0));
 		assert_user_claim_statuses(&ctx,&srv,&db,&status_queries,&status_owner,
-			&[protos::VtxoSpendState::FallbackPending;2],"disconnected").await;
+			&[protos::VtxoSpendState::FallbackPending,protos::VtxoSpendState::Spent],"disconnected").await;
 		chain.reconsider_block(&confirming_block).unwrap();
 		assert_eq!(chain.get_best_block_hash().unwrap(),original_tip);
 		assert_eq!(ctx.bitcoind().await_transaction(claims[0].compute_txid()).await,claims[0]);
