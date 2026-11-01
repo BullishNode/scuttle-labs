@@ -1,5 +1,5 @@
-# Warns after each `period`, kills after `terminate-after` periods.
-# e.g. period = "60s", terminate-after = 3 => warns at 60s and 120s, kills at 180s.
+# Warns after `period`, kills after `terminate-after` additional periods.
+# e.g. period = "60s", terminate-after = 3 => warns at 60s, kills at 4*60s = 240s.
 
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 3 }
