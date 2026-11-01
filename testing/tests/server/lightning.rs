@@ -197,6 +197,19 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 		}
 	}
 
+	let retry_fault = ctx.test_name == "lightningd/external_old_grant_pg_retry";
+	let mut retry_claim_block = None;
+	let failure_seen = Arc::new(AtomicBool::new(false));
+	let mut tracked = if retry_fault {
+		let observed = failure_seen.clone();
+		srv.watchmand().add_stdout_handler(move |line: &str| {
+			if line.contains("EX3 one-shot frontier WAL failure") {
+				observed.store(true, Ordering::SeqCst);
+			}
+			false
+		});
+		Some(srv.watchmand().subscribe_log::<server_log::WatchmanAddedVtxo>())
+	} else { None };
 	let proxy = srv.start_proxy_no_mailbox(BlockCooperativeSettlement).await;
 
 	// bark_recv connects through the proxy so cooperative settlement is blocked,
@@ -230,10 +243,113 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 			info!("Doing exit...");
 			complete_exit(&ctx, &bark_recv).await;
 
+			if retry_fault {
+				let hash = PaymentHash::from(&invoice);
+				let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+				let subscription = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+					.await.unwrap().unwrap();
+				let mut unobserved = subscription.htlc_vtxos.iter().copied().collect::<HashSet<_>>();
+				assert!(!unobserved.is_empty());
+				tokio::time::timeout(Duration::from_secs(15), async {
+					while !unobserved.is_empty() {
+						unobserved.remove(&tracked.as_mut().unwrap().recv().await.unwrap().id);
+					}
+				}).await.expect("the real grants must already be in watchmand's in-memory frontier");
+				// Real elapsed time, not a rewritten frontier_at: a failed cached
+				// spend must survive beyond the incremental DB reload's 60s window.
+				tokio::time::sleep(Duration::from_secs(61)).await;
+				let ids = subscription.htlc_vtxos.iter().map(ToString::to_string).collect::<Vec<_>>();
+				let ages = db.read(async |tx| Ok(tx.query("SELECT vtxo_id, \
+					frontier_at < clock_timestamp() - INTERVAL '60 seconds' AS aged, onchain_spent_txid \
+					FROM vtxo WHERE vtxo_id=ANY($1::TEXT[])", &[&ids]).await?)).await.unwrap();
+				assert_eq!(ages.len(), ids.len());
+				for row in ages {
+					assert!(row.get::<_, bool>("aged"));
+					assert!(row.get::<_, Option<String>>("onchain_spent_txid").is_none());
+				}
+				assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+				db.write(async |tx| {
+					tx.batch_execute(&format!("CREATE SEQUENCE ex3_frontier_wal_once;
+						CREATE FUNCTION ex3_frontier_wal_failure() RETURNS trigger AS $$
+						BEGIN
+						  IF NEW.payment_hash='{hash}' THEN
+						    IF nextval('ex3_frontier_wal_once')=1 THEN
+						      RAISE EXCEPTION 'EX3 one-shot frontier WAL failure';
+						    END IF;
+						  END IF;
+						  RETURN NEW;
+						END; $$ LANGUAGE plpgsql;
+						CREATE TRIGGER ex3_frontier_wal_failure BEFORE INSERT ON htlc_settlement
+						FOR EACH ROW EXECUTE FUNCTION ex3_frontier_wal_failure();")).await?;
+					Ok(())
+				}).await.unwrap();
+			}
+
 			bark_recv.claim_all_exits(bark_recv.get_onchain_address().await).await;
-			ctx.generate_blocks(1).await;
+			let height = ctx.generate_blocks(1).await;
+			if retry_fault {
+				retry_claim_block = Some((height,
+					ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap()));
+			}
 		},
 	);
+
+	if retry_fault {
+		let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+		let block_hash = ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap();
+		assert_eq!(retry_claim_block, Some((height, block_hash)));
+		srv.watchmand().wait_for_sync_height(height).await;
+		assert!(failure_seen.load(Ordering::SeqCst), "the real PostgreSQL failure must have been consumed");
+		let hash = PaymentHash::from(&Bolt11Invoice::from_str(&invoice_info.invoice).unwrap());
+		let db = Db::connect(&srv.config().postgres, Network::Regtest).await.unwrap();
+		let calls = db.read(async |tx| Ok(tx.query_one("SELECT last_value,is_called FROM ex3_frontier_wal_once", &[])
+			.await?.get::<_, i64>("last_value"))).await.unwrap();
+		assert!(calls >= 2, "the same real WAL insertion must be retried after the rolled-back transaction");
+		assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(height.to_u32()));
+		assert_eq!(ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap(), block_hash);
+		let subscription = tokio::time::timeout(Duration::from_secs(15), async {
+			loop {
+				let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+					.await.unwrap().unwrap();
+				if sub.status == server::database::ln::LightningHtlcSubscriptionStatus::Settled { break sub; }
+				tokio::time::sleep(Duration::from_millis(50)).await;
+			}
+		}).await.expect("the native settled invoice must converge in the original subscription");
+		assert!(!subscription.htlc_vtxos.is_empty());
+		for id in subscription.htlc_vtxos {
+			let grant = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, id).await)
+				.await.unwrap().unwrap();
+			assert_eq!(grant.direction(), HtlcDirection::Outgoing);
+			assert_eq!(grant.htlc.payment_hash, hash);
+			assert_eq!(grant.htlc.chain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Fulfilled));
+			let row = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid,onchain_spent_height \
+				FROM vtxo WHERE vtxo_id=$1", &[&id.to_string()]).await?)).await.unwrap();
+			let txid = row.get::<_, Option<&str>>("onchain_spent_txid").unwrap().parse().unwrap();
+			let spent_height = BlockHeight::try_from(row.get::<_, Option<i32>>("onchain_spent_height").unwrap()).unwrap();
+			assert_eq!(grant.htlc.chain_resolution_height, Some(spent_height));
+			assert_eq!(spent_height, height, "retry must persist the original claim block, with no extra mining");
+			let actual = ctx.bitcoind().await_transaction(txid).await;
+			let block = ctx.bitcoind().sync_client().get_block(&block_hash).unwrap();
+			assert!(block.txdata.contains(&actual));
+			let input = actual.input.iter().find(|input| input.previous_output == id.to_point()).unwrap();
+			let preimage = HashDelaySignClause::extract_preimage_from_witness(&input.witness, hash).unwrap();
+			let clause = grant.vtxo.vtxo.policy().as_server_htlc_recv().unwrap()
+				.user_reveals_preimage_clause(grant.vtxo.vtxo.exit_delta());
+			let leaf = input.witness.taproot_leaf_script().unwrap();
+			assert_eq!(leaf.version, bitcoin::taproot::LeafVersion::TapScript);
+			assert_eq!(leaf.script, clause.tapscript().as_script());
+			let origins = db.read(async |tx| Ok(tx.query("SELECT p.attempt_id,p.subscription_id,s.preimage \
+				FROM htlc_settlement_source p JOIN htlc_settlement s ON s.id=p.settlement_id \
+				WHERE s.payment_hash=$1 AND p.kind='onchain' AND p.vtxo_id=$2",
+				&[&hash.to_string(), &id.to_string()]).await?)).await.unwrap();
+			assert_eq!(origins.len(), 1);
+			assert_eq!(origins[0].get::<_, Option<i64>>("attempt_id"), None);
+			assert_eq!(origins[0].get::<_, Option<i64>>("subscription_id"), Some(subscription.id));
+			assert_eq!(origins[0].get::<_, &str>("preimage"), preimage.to_string());
+		}
+		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1",
+			&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
+	}
 
 	if ctx.test_name == "lightningd/intra_server_settles_invoice_from_on_chain_htlc_preimage" {
 		// Payment completion may follow the first witness while the remaining
@@ -308,6 +424,19 @@ lightning_test!(server_settles_invoice_from_on_chain_htlc_preimage, watchmand, |
 	// To make sure we don't sweep the vtxo before user can broadcast preimage
 	cfg.vtxopool.vtxo_lifetime = BlockDelta::new(2048);
 });
+
+#[tokio::test]
+async fn old_onchain_grant_retries_after_postgres_failure() {
+	let ctx = TestContext::new("lightningd/external_old_grant_pg_retry").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).watchmand().cfg(|cfg| {
+		cfg.receive_htlc_forward_timeout = Duration::from_secs(5 * 60);
+		cfg.vtxopool.vtxo_lifetime = BlockDelta::new(2048);
+	}).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+	let pay = async |invoice: String| { lightning.external.pay_bolt11(invoice).await; };
+	server_settles_invoice_from_on_chain_htlc_preimage(&ctx, &lightning, &srv, pay).await;
+}
 
 #[tokio::test]
 async fn hold_cancel_error_does_not_block_pass() {
