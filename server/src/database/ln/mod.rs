@@ -198,6 +198,46 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Recognize only the same recorded open obligation. This observes no
+	/// native node and never changes the original request or dispatches it.
+	pub(crate) async fn is_recorded_lightning_payment(
+		&self, invoice: &Invoice, amount: Amount, sources: &[VtxoId],
+	) -> anyhow::Result<bool> {
+		let Some(attempt) = self.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await?
+			else { return Ok(false); };
+		ensure!(invoice.amount_msat().is_none_or(|principal|
+			principal <= amount.to_msat() && principal >= amount.to_msat() / 2),
+			"recorded initiation amount exceeds invoice bounds");
+		ensure!(attempt.amount_msat == invoice.amount_msat().unwrap_or(amount.to_msat()),
+			"recorded payment principal differs from initiation");
+		let mut supplied = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+		supplied.sort_unstable();
+		let stored = self.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
+			WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&attempt.id]).await?
+			.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+		ensure!(!supplied.is_empty() && supplied == stored, "recorded payment sources differ from initiation");
+		if let Some(subscription) = attempt.lightning_htlc_subscription_id {
+			let subscription = self.get_htlc_subscription_by_id(subscription).await?
+				.context("recorded intra-Ark payment has no subscription")?;
+			ensure!(subscription.payment_hash == attempt.payment_hash
+				&& subscription.invoice.to_string() == invoice.to_string()
+				&& amount >= subscription.amount(), "recorded intra-Ark invoice differs from initiation");
+		} else {
+			let records = super::xpay::get_xpays_by_payment_hash(&**self, attempt.payment_hash).await?;
+			let label = attempt.id.to_string();
+			let mut matching = records.into_iter().filter(|record| record.label.as_deref() == Some(label.as_str()));
+			let record = matching.next().context("recorded payment has no original xpay request")?;
+			ensure!(matching.next().is_none(), "recorded payment has ambiguous original xpay requests");
+			ensure!(record.status == super::xpay::ClnXpayStatus::Pending
+				&& record.lightning_node_id == attempt.lightning_node_id
+				&& record.payment_hash == attempt.payment_hash
+				&& record.payment_amount_msat == amount.to_msat()
+				&& record.original_invoice()?.to_string() == invoice.to_string(),
+				"recorded xpay request differs from initiation");
+		}
+		Ok(true)
+	}
+
 	/// Get the open payment attempt initiated against the given htlc
 	/// subscription (an intra-Ark self-payment), if any.
 	pub async fn get_open_lightning_payment_attempt_by_subscription_id(

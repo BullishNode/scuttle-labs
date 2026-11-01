@@ -91,10 +91,6 @@ enum PayInvoiceRace {
 #[error("payment refused before recording an attempt: {0:#}")]
 struct PaymentPreflightRefusal(#[source] anyhow::Error);
 
-fn payment_error_reaches_caller(error: &anyhow::Error) -> bool {
-	error.is::<crate::error::FallbackRefusal>() || error.is::<PaymentPreflightRefusal>()
-}
-
 /// A proven refusal before any attempt exists is a rejection, so the client
 /// can use the existing signed revocation path rather than await an outcome.
 fn intra_ark_preflight_refusal(error: anyhow::Error) -> anyhow::Error {
@@ -285,7 +281,7 @@ impl LightningManager {
 
 		debug!("Sending payment to CLN for invoice: {}", invoice);
 
-		if let Err(e) = self.start_payment(
+		self.start_payment(
 			Box::new(invoice.clone()),
 			payment_amount,
 			max_routing_fee,
@@ -295,20 +291,8 @@ impl LightningManager {
 			user_fee,
 			attempt_block_height,
 			retry_for,
-		).await {
-			if payment_error_reaches_caller(&e) { return Err(e); }
-			// The attempt is already recorded as failed and the client sees the
-			// failure via CheckLightningPayment. Benign races (someone else paid
-			// or canceled the invoice first) surface as PayInvoiceRace and
-			// deserve a warn; anything else is a genuine server fault.
-			if e.downcast_ref::<PayInvoiceRace>().is_some() {
-				warn!("Bolt11 payment attempt superseded for invoice: {:#}", e);
-			} else {
-				error!("Error sending bolt11 payment for invoice: {:#}", e);
-			}
-		} else {
-			debug!("Bolt11 invoice sent for payment");
-		}
+		).await?;
+		debug!("Bolt11 invoice sent for payment");
 
 		Ok(())
 	}
@@ -456,15 +440,23 @@ impl LightningManager {
 
 			// Only a validated sender and an actual subscription promotion can
 			// reach these post-commit notifications and backend cancellation.
-			let res = self.finish_intra_ark_payment(sub).await;
+			let res = async {
+				let res = self.finish_intra_ark_payment(sub).await;
+				if let Err(e) = res {
+					trace!("Failed to update subscription status: {e:#}");
+					let attempt = self.db.read(async |t|
+						t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await
+					).await?.filter(|attempt| attempt.id == attempt_id)
+						.context("internal payment attempt disappeared")?;
+					self.payment_handler().fail_payment_attempt(&attempt, Some(&e.to_string())).await?;
+					return Err(e);
+				}
+				Ok::<_, anyhow::Error>(())
+			}.await;
 			if let Err(e) = res {
-				trace!("Failed to update subscription status: {e:#}");
-				let attempt = self.db.read(async |t|
-					t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await
-				).await?.filter(|attempt| attempt.id == attempt_id)
-					.context("internal payment attempt disappeared")?;
-				self.payment_handler().fail_payment_attempt(&attempt, Some(&e.to_string())).await?;
-				return Err(e);
+				// The creation COMMIT above succeeded. An error here must not
+				// claim the recorded payment was refused before initiation.
+				error!(attempt_id, error = %format!("{e:#}"), "Recorded intra-Ark payment needs reconciliation");
 			}
 
 			return Ok(());
@@ -1352,24 +1344,27 @@ mod preflight_test {
 			PayInvoiceRace::AlreadyBeingPaid(LightningHtlcSubscriptionStatus::HtlcsReady).into(),
 			anyhow::Error::new(crate::error::BadArgument::new("invoice does not match the receive"))] {
 			let refusal = intra_ark_preflight_refusal(error);
-			assert!(payment_error_reaches_caller(&refusal));
+			assert!(refusal.is::<PaymentPreflightRefusal>());
 			let status = Err::<(), _>(refusal).to_status().unwrap_err();
 			assert_eq!(status.code(), tonic::Code::InvalidArgument);
 			assert!(status.is_rejection(), "the SDK must abort initiation and enter signed revocation");
 		}
 		let backend = anyhow!("database connection failed");
-		assert!(!payment_error_reaches_caller(&backend));
 		assert_eq!(Err::<(), _>(backend).to_status().unwrap_err().code(), tonic::Code::Internal);
 	}
 
 	#[test]
-	fn pre_attempt_refusals_reach_the_client_without_reclassifying_recorded_outcomes() {
+	fn pre_attempt_backend_and_ambiguous_commit_errors_are_not_rejections() {
 		let refusal: anyhow::Error = PaymentPreflightRefusal(anyhow!("native mode acknowledgement refused")).into();
-		assert!(payment_error_reaches_caller(&refusal));
-		assert!(payment_error_reaches_caller(&refusal.context("before attempt write")));
+		assert!(refusal.context("before attempt write").is::<PaymentPreflightRefusal>());
 		let id = VtxoId::from_slice(&[0; 36]).unwrap();
-		assert!(payment_error_reaches_caller(&crate::error::FallbackRefusal::DecidedForFallback(id).into()));
-		assert!(!payment_error_reaches_caller(&PayInvoiceRace::Canceled.into()));
-		assert!(!payment_error_reaches_caller(&anyhow!("recorded intra-Ark outcome failed")));
+		let decided: anyhow::Error = crate::error::FallbackRefusal::DecidedForFallback(id).into();
+		assert!(Err::<(), _>(decided).to_status().unwrap_err().is_rejection());
+		for error in [anyhow!("database connection failed"), anyhow!("tx commit error"),
+			PaymentPreflightRefusal(anyhow!("native getinfo failed")).into()] {
+			let status = Err::<(), _>(error).to_status().unwrap_err();
+			assert_eq!(status.code(), tonic::Code::Internal);
+			assert!(!status.is_rejection(), "a backend error cannot authorize signed revocation");
+		}
 	}
 }

@@ -318,14 +318,18 @@ impl Server {
 		// while the payment is validated and handed to the lightning node.
 		let _guard = self.payment_guards.lock(payment_hash).await;
 
+		invoice.check_signature().context("invalid invoice signature")?;
 		let htlc_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&htlc_vtxo_ids).await).await?;
+		let recorded = self.db.read(async |t|
+			t.is_recorded_lightning_payment(&invoice, payment_amount, &htlc_vtxo_ids).await
+		).await?;
 
 		slog!(LightningPaymentInitRequested, payment_hash, htlc_vtxo_ids: htlc_vtxo_ids.clone());
 
 		let chain_tip = self.sync_manager.chain_tip().height;
 		let mut vtxos = vec![];
 		for htlc_vtxo in htlc_vtxos {
-			htlc_vtxo.check_htlc_send_spendable(chain_tip)?;
+			if !recorded { htlc_vtxo.check_htlc_send_spendable(chain_tip)?; }
 
 			let vtxo = htlc_vtxo.vtxo.clone();
 
@@ -345,6 +349,9 @@ impl Server {
 
 			vtxos.push(vtxo);
 		}
+		// An exact retry acknowledges existing work even if its node or a new
+		// admission view is now unavailable. The monitor owns any re-drive.
+		if recorded { return Ok(()); }
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
