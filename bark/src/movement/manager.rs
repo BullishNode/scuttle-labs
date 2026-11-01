@@ -362,11 +362,13 @@ impl MovementManager {
 			);
 		}
 
-		// Update the status and persist it.
-		guard.status = new_status;
-		guard.time.completed_at = Some(chrono::Local::now());
-		self.db.update_movement(&*guard).await
+		// Persist the new status before publishing it in the cache.
+		let mut movement = guard.clone();
+		movement.status = new_status;
+		movement.time.completed_at = Some(chrono::Local::now());
+		self.db.update_movement(&movement).await
 			.map_err(|e| MovementError::PersisterError { id, e })?;
+		*guard = movement;
 
 		self.notifications.dispatch_movement_updated(guard.clone());
 
