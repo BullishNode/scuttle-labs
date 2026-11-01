@@ -553,7 +553,7 @@ impl Wallet {
 				warn!("Invalid fallback recovery source {}: {error:#}", vtxo.id());
 				report.push_failed(vtxo.id(), Some(vtxo.amount()));
 			} else {
-				report.push_recovered(&vtxo);
+				report.push_skipped(&vtxo);
 				pending.push(vtxo);
 			}
 		}
