@@ -1343,8 +1343,8 @@ impl LightningManagerProcess {
 #[cfg(test)]
 mod preflight_test {
 	use super::*;
-	use server_rpc::error::StatusExt;
-	use crate::rpcserver::ToStatus;
+	use server_rpc::StatusExt;
+	use crate::rpcserver::ToStatusResult;
 
 	#[test]
 	fn proven_intra_ark_refusal_reaches_client_as_rejection() {
@@ -1353,13 +1353,13 @@ mod preflight_test {
 			anyhow::Error::new(crate::error::BadArgument::new("invoice does not match the receive"))] {
 			let refusal = intra_ark_preflight_refusal(error);
 			assert!(payment_error_reaches_caller(&refusal));
-			let status = refusal.to_status();
+			let status = Err::<(), _>(refusal).to_status().unwrap_err();
 			assert_eq!(status.code(), tonic::Code::InvalidArgument);
 			assert!(status.is_rejection(), "the SDK must abort initiation and enter signed revocation");
 		}
 		let backend = anyhow!("database connection failed");
 		assert!(!payment_error_reaches_caller(&backend));
-		assert_eq!(backend.to_status().code(), tonic::Code::Internal);
+		assert_eq!(Err::<(), _>(backend).to_status().unwrap_err().code(), tonic::Code::Internal);
 	}
 
 	#[test]

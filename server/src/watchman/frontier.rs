@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::Context;
 use bitcoin::{OutPoint, Txid, Witness};
 use bitcoin::taproot::LeafVersion;
 use tokio::sync::RwLock;
