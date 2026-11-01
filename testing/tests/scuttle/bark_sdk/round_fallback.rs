@@ -434,6 +434,7 @@ async fn recipient_round_links_and_owned_change_survive_restart() {
 	wallet.stop_daemon_wait().await.unwrap();
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	recipient.stop_daemon_wait().await.unwrap();
+	assert_ne!(recipient.mailbox_identifier(), wallet.mailbox_identifier());
 	let key = wallet.derive_store_next_keypair().await.unwrap().0;
 	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, srv.ark_info().await.mailbox_pubkey,
 		&recipient.mailbox_keypair(), &key).unwrap();
@@ -454,7 +455,31 @@ async fn recipient_round_links_and_owned_change_survive_restart() {
 	assert!(wallet.pending_round_state_ids().await.unwrap().is_empty());
 	let external_link = external_address.owner_link(bitcoin::Network::Regtest, srv.ark_info().await.mailbox_pubkey).unwrap().unwrap();
 	external.owner_proofs.insert(external_key, external_link);
-	let external_id = wallet.join_next_round(external.clone(), None).await.unwrap().id();
+	let history = wallet.history().await.unwrap();
+	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
+	let submitted = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM round_participation", &[]).await?.get::<_, i64>(0))).await.unwrap();
+	for delegated in [false, true] {
+		let error = if delegated {
+			wallet.join_next_round_delegated(external.clone(), Some(bark::subsystem::RoundMovement::Refresh)).await.err().unwrap()
+		} else {
+			wallet.join_next_round(external.clone(), Some(bark::subsystem::RoundMovement::Refresh)).await.err().unwrap()
+		};
+		assert!(error.to_string().contains("not found for requested round output"));
+		assert!(bark::FallbackRefusal::from_error(&error).is_none(), "valid ownership is distinct from signing-key availability");
+		assert!(wallet.pending_round_state_ids().await.unwrap().is_empty());
+		assert_eq!(wallet.history().await.unwrap(), history);
+		assert_eq!(wallet.get_vtxo_by_id(input.id()).await.unwrap().state, VtxoState::Spendable);
+		assert_eq!(wallet.get_full_vtxo(input.id()).await.unwrap().serialize(), input.serialize());
+		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM round_participation", &[]).await?.get::<_, i64>(0))).await.unwrap(), submitted);
+	}
+	// A locally held P can retain an independently authorized recipient M.
+	let recipient_participation = bark::round::RoundParticipation {
+		inputs: vec![input.clone()], outputs: vec![ark::VtxoRequest {
+			amount: sat(100_000), policy: ark::VtxoPolicy::new_pubkey(key.public_key()),
+		}], owner_proofs: std::collections::BTreeMap::from([(key.public_key(), link)]),
+		unblinded_mailbox_id: Some(wallet.mailbox_identifier()),
+	};
+	let recipient_id = wallet.join_next_round(recipient_participation.clone(), None).await.unwrap().id();
 	let participation = bark::round::RoundParticipation {
 		inputs: vec![input], outputs: vec![ark::VtxoRequest {
 			amount: sat(100_000), policy: ark::VtxoPolicy::new_pubkey(key.public_key()),
@@ -469,14 +494,13 @@ async fn recipient_round_links_and_owned_change_survive_restart() {
 	let persisted = reopened.pending_round_states().await.unwrap();
 	let stored = persisted.iter().find(|state| state.id() == id).unwrap();
 	assert_eq!(stored.state().participation().owner_proofs, participation.owner_proofs);
-	let stored_external = persisted.iter().find(|state| state.id() == external_id).unwrap();
-	assert_eq!(stored_external.state().participation().owner_proofs, external.owner_proofs);
-	assert_eq!(stored_external.state().participation().owner_proofs[&external_key], external_link);
-	reopened.cancel_pending_round(external_id).await.unwrap();
+	let stored_recipient = persisted.iter().find(|state| state.id() == recipient_id).unwrap();
+	assert_eq!(stored_recipient.state().participation().owner_proofs, recipient_participation.owner_proofs);
+	assert_eq!(stored_recipient.state().participation().owner_proofs[&key.public_key()], link);
+	reopened.cancel_pending_round(recipient_id).await.unwrap();
 	// Queue the same actual owned key through the delegated RPC path.
 	// Its mailbox is the wallet's own; the recipient proof stays distinct.
 	reopened.join_next_round_delegated(participation, None).await.unwrap();
-	let db = server::database::Db::connect(&srv.config().postgres, bitcoin::Network::Regtest).await.unwrap();
 	let owner = db.read(async |tx| tx.expiry_owner(key.public_key()).await).await.unwrap();
 	assert!(matches!(owner, server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
 		if mailbox_pk == reopened.mailbox_identifier().as_pubkey()));

@@ -2231,6 +2231,11 @@ impl Wallet {
 		let (_, info) = self.require_server().await?;
 		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
+		for output in &participation.outputs {
+			let key = output.policy.user_pubkey();
+			ensure!(self.pubkey_keypair(&key).await?.is_some(),
+				"keypair {} not found for requested round output", key);
+		}
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 
 		// The inputs are only locked at attempt start; here they must just
@@ -2289,6 +2294,11 @@ impl Wallet {
 		let (_, info) = self.require_server().await?;
 		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
+		for output in &participation.outputs {
+			let key = output.policy.user_pubkey();
+			ensure!(self.pubkey_keypair(&key).await?.is_some(),
+				"keypair {} not found for requested round output", key);
+		}
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 		self.check_inputs_spendable(&input_ids).await?;
 
