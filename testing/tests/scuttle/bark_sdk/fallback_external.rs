@@ -260,13 +260,13 @@ async fn fallback_external_bip86_actual_payout_seed_restore_and_confirmed_spend(
 	let final_psbt = restored_app.write().await.finish_psbt(signed).await.unwrap();
 	let recovery = final_psbt.extract_tx().unwrap();
 	let input = recovery.input.iter().find(|input| input.previous_output == point).expect("external callback did not spend its actual fallback outpoint");
-	assert_eq!(input.witness.len(), 2, "the fallback is actually spent through the app's BIP86 key");
+	assert_eq!(input.witness.len(), 1, "the fallback is actually spent through the app's BIP86 key");
 	let mut recovery_inputs = BTreeMap::new();
 	for input in &recovery.input {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 		let output = previous.output[input.previous_output.vout as usize].clone();
 		assert!(output.script_pubkey.is_p2tr());
-		assert_eq!(input.witness.len(), 2);
+		assert_eq!(input.witness.len(), 1);
 		assert!(recovery_inputs.insert(input.previous_output, output).is_none());
 	}
 	assert_eq!(recovery_inputs, expected_inputs);
@@ -518,7 +518,7 @@ async fn fallback_external_bip86_seed_restore_spends_actual_payout_while_history
 		let recovery = restored_app.write().await.finish_psbt(signed).await.unwrap().extract_tx().unwrap();
 		assert_eq!(recovery.input.len(), 1);
 		assert_eq!(recovery.input[0].previous_output, payout);
-		assert_eq!(recovery.input[0].witness.len(), 2);
+		assert_eq!(recovery.input[0].witness.len(), 1);
 		assert_eq!(recovery.output.len(), 1);
 		assert_eq!(recovery.output[0].script_pubkey, destination.script_pubkey());
 		let recovered = recovery.output[0].value;

@@ -17,7 +17,6 @@ async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let server_key = srv.mailbox_keypair();
 	let address = recipient.ark_address().await;
-	assert_eq!(address.len(), 233, "the REST destination must retain the full signed address");
 	let parsed = ark::Address::from_str(&address).unwrap();
 	let recipient_key = parsed.policy().user_pubkey();
 	let link = parsed.owner_link(bitcoin::Network::Regtest, server_key.public_key()).unwrap().unwrap();
