@@ -6,7 +6,8 @@ use ark::VtxoPolicy;
 use ark_testing::{sat, TestContext};
 use bitcoin::consensus::deserialize;
 use bitcoin::Transaction;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::{BlockDelta, BlockHeight, TransactionExt};
+use bitcoin_ext::bdk::TxBuilderExt;
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use bark::onchain::{MakeCpfpFees, OnchainWalletTrait};
 use server::database::Db;
@@ -37,22 +38,30 @@ async fn payout(db: &Db, id: ark::VtxoId) -> Transaction {
 /// its SQL checks; both daemon progression and subsequent payouts are automatic.
 #[tokio::test]
 async fn expiry_requested_split_preserves_mixed_siblings_and_eventual_refund() {
-	Box::pin(mixed_split(false, false)).await;
+	Box::pin(mixed_split(false, false, false)).await;
 }
 
 #[tokio::test]
 async fn mempool_pinned_root_is_fee_bumped() {
-	Box::pin(mixed_split(true, false)).await;
+	Box::pin(mixed_split(true, false, false)).await;
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn split_frontier_survives_crash_before_successor_commit() {
-	Box::pin(mixed_split(false, true)).await;
+	Box::pin(mixed_split(false, true, false)).await;
 }
 
-async fn mixed_split(pin: bool, crash_successor: bool) {
+#[tokio::test]
+async fn large_old_child_fee_is_preserved_when_bumping_pinned_root() {
+	Box::pin(mixed_split(true, false, true)).await;
+}
+
+async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
+	assert!(!crash_successor || !pin);
+	assert!(!large_child || pin);
 	let ctx = TestContext::new(if crash_successor { "server/split_frontier_successor_commit_crash" }
+		else if large_child { "server/large_old_child_pinned_root" }
 		else if pin { "server/mempool_pinned_root_is_fee_bumped" }
 		else { "server/expiry_requested_mixed_split" }).await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
@@ -110,14 +119,25 @@ async fn mixed_split(pin: bool, crash_successor: bool) {
 		assert_eq!(prefix.input.len(), 1);
 		assert_eq!(prefix.input[0].previous_output, root.point());
 		assert!(!prefix.input[0].witness.is_empty());
-		let child = sponsor.make_signed_p2a_cpfp(&prefix,
-			MakeCpfpFees::Effective(bitcoin::FeeRate::from_sat_per_vb(1).unwrap())).await.unwrap();
+		let target = srv.watchmand().config().fee_estimator.fallback_fee_rate_regular;
+		let child = if large_child {
+			assert_eq!(target, bitcoin::FeeRate::from_sat_per_vb(7).unwrap());
+			large_own_output_fee_child(&mut sponsor, &prefix).await
+		} else {
+			sponsor.make_signed_p2a_cpfp(&prefix,
+				MakeCpfpFees::Effective(bitcoin::FeeRate::from_sat_per_vb(1).unwrap())).await.unwrap()
+		};
 		sponsor.store_signed_p2a_cpfp(&child).await.unwrap();
 		drop(sponsor);
 		let core = ctx.bitcoind().sync_client();
 		assert_eq!(core.submit_package(&[&prefix, &child]).unwrap().package_msg, "success");
 		assert!(core.get_tx_out(&root.point().txid, root.point().vout, Some(true)).unwrap().is_none());
 		let initial_fee = super::expiry_test::actual_fee(&ctx, &child).await;
+		if large_child {
+			assert!(child.vsize() < 1_000, "the real old TRUC child must fit Core policy");
+			assert!(initial_fee < target * (prefix.weight() + child.weight()),
+				"the old package must genuinely have a lower rate than the unchanged target");
+		}
 		assert!(db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_height FROM vtxo WHERE vtxo_id=$1",
 			&[&root.id().to_string()]).await?.get::<_, Option<i32>>(0))).await.unwrap().is_none());
 		srv.watchmand().start().await.unwrap();
@@ -134,6 +154,17 @@ async fn mixed_split(pin: bool, crash_successor: bool) {
 			}
 		}).await.expect("the known pinned prefix did not receive its native watchman fee bump");
 		assert_ne!(bumped.compute_txid(), child.compute_txid());
+		if large_child {
+			let effective_floor = MakeCpfpFees::Effective(target).package_fee(prefix.weight(), bumped.weight());
+			assert!(child.weight() > bumped.weight());
+			assert!(initial_fee > effective_floor,
+				"the actual old fee must exceed the original Effective floor for this actual accepted smaller child");
+			let replacement_fee = super::expiry_test::actual_fee(&ctx, &bumped).await;
+			assert!(replacement_fee > initial_fee);
+			assert!(u128::from(replacement_fee.to_sat()) * u128::from((prefix.weight() + child.weight()).to_wu())
+				> u128::from(initial_fee.to_sat()) * u128::from((prefix.weight() + bumped.weight()).to_wu()));
+			assert!(core.get_mempool_entry(&bumped.compute_txid()).is_ok(), "the replacement must actually be accepted by Core");
+		}
 		assert_eq!(ctx.bitcoind().await_transaction(prefix.compute_txid()).await, prefix);
 		assert!(core.get_mempool_entry(&child.compute_txid()).is_err(), "the superseded fee child must not remain a second payment");
 		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT progress_txid FROM expiry_split_request WHERE vtxo_id=$1",
@@ -333,6 +364,54 @@ async fn crash_during_successor_registration(
 	assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(height.to_u32()));
 	assert_eq!(ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap(), hash);
 	height
+}
+
+/// A genuine low-rate, high-absolute-fee child using the original sponsor's
+/// confirmed funds. Extra outputs all return to this same native wallet.
+async fn large_own_output_fee_child(
+	sponsor: &mut bark::onchain::OnchainWallet,
+	parent: &Transaction,
+) -> Transaction {
+	let rate = bitcoin::FeeRate::from_sat_per_kwu(875); // 3.5 sat/vB, below the unchanged regular7.
+	let (anchor, anchor_output) = parent.fee_anchor().unwrap();
+	let mut outputs = Vec::new();
+	for _ in 0..15 {
+		let script = OnchainWalletTrait::address(sponsor).await.unwrap().script_pubkey();
+		assert!(script.is_p2tr());
+		assert!(OnchainWalletTrait::is_mine(sponsor, &script).await.unwrap());
+		outputs.push((script.clone(), script.minimal_non_dust()));
+	}
+	let change = OnchainWalletTrait::address(sponsor).await.unwrap().script_pubkey();
+	assert!(OnchainWalletTrait::is_mine(sponsor, &change).await.unwrap());
+	let confirmed = sponsor.list_unspent().into_iter().filter(|coin| coin.chain_position.is_confirmed())
+		.map(|coin| coin.outpoint).collect::<std::collections::HashSet<_>>();
+	assert!(!confirmed.is_empty());
+	let mut fee = rate * parent.weight();
+	for _ in 0..3 {
+		let psbt = {
+			let mut builder = sponsor.build_tx();
+			builder.only_witness_utxo().exclude_unconfirmed().version(3);
+			builder.add_fee_anchor_spend(anchor, anchor_output);
+			for (script, value) in &outputs { builder.add_recipient(script.clone(), *value); }
+			builder.drain_to(change.clone()).fee_absolute(fee);
+			builder.finish().unwrap()
+		};
+		let psbt = OnchainWalletTrait::sign_psbt(sponsor, psbt).await.unwrap();
+		let actual_fee = psbt.fee().unwrap();
+		let child = psbt.extract_tx().unwrap();
+		assert_eq!(child.input.iter().filter(|input| input.previous_output == anchor).count(), 1);
+		assert!(child.input.iter().filter(|input| input.previous_output != anchor)
+			.all(|input| confirmed.contains(&input.previous_output)));
+		assert!(child.vsize() < 1_000);
+		for output in &child.output {
+			assert!(output.value >= output.script_pubkey.minimal_non_dust());
+			assert!(OnchainWalletTrait::is_mine(sponsor, &output.script_pubkey).await.unwrap());
+		}
+		let required = rate * (parent.weight() + child.weight());
+		if actual_fee >= required { return child; }
+		fee = required;
+	}
+	panic!("native signed fee-child weight did not stabilize");
 }
 
 /// A key with no fallback registration keeps its backing while a registered
