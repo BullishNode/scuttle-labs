@@ -455,7 +455,9 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		assert_eq!(recoverable.round_seq, proposal.round_seq);
 		assert_eq!(recoverable.error, format!("tx body error: {}", server::FallbackRefusal::DecidedForFallback(source.id())));
 		// This typed log is emitted ONLY by RoundError::Recoverable, not by a
-		// generic Failed event, timeout or FatalStoringRound. Prove continuation too.
+		// generic Failed event, timeout or FatalStoringRound. The scheduler still
+		// waits for its normal next trigger; request it without mining another block.
+		srv.get_round_rpc().await.trigger_round(protos::Empty {}).await.unwrap();
 		let continued = empty.recv().wait(Duration::from_secs(15)).await.unwrap();
 		assert!(continued.round_seq > proposal.round_seq);
 		let client_error = refreshing.wait(Duration::from_secs(15)).await.unwrap().unwrap_err();
