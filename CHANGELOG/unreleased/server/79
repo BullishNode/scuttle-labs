@@ -2,3 +2,7 @@
   [#79](https://github.com/BullishNode/scuttle/pull/79)
   - **BREAKING:** Rust callers of `Db::create` and `Db::connect` now pass only
     the PostgreSQL configuration.
+- Remove the stored expiry-hold inventory, its admin listing and gauge, and
+  duplicate native payment diagnostic JSON. Custody checks and warnings remain;
+  persisted hold reasons and timestamps are no longer available.
+  [#79](https://github.com/BullishNode/scuttle/pull/79)
