@@ -393,6 +393,10 @@ impl ExitTransactionManager {
 		let mut deeply_spent = Vec::with_capacity(to_scan.len());
 		for input in to_scan {
 			match spends.get(&input) {
+				// Esplora can also return a spender older than the requested window.
+				Some((_, TxStatus::Confirmed(block))) if block.height < scan_start => {
+					deeply_spent.push(input);
+				},
 				Some((txid, TxStatus::Confirmed(_) | TxStatus::Mempool)) => {
 					warn!("Exit tx {} has a spend of input {} by {} within the last {} blocks, \
 						too recent to end the exit on", exit_txid, input, txid, SPEND_CONFIRMATIONS,
