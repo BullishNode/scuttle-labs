@@ -38,16 +38,27 @@ pub(crate) async fn guard_participation(
 	Ok(())
 }
 
-/// Run after the coin locks have been acquired, using the completed server tip
-/// read now rather than an RPC-task height captured before waiting for locks.
+/// Take validity before the coin locks, then use both completed processed tips
+/// rather than an RPC-task height captured before waiting for locks.
 pub(crate) async fn guard_new_lightning_inputs(
-	tx: &Transaction<'_>,
+	tx: &super::Tx<'_>,
 	ids: &[VtxoId],
 ) -> anyhow::Result<()> {
+	let row = tx.query_one("SELECT processed_height,processed_hash FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+	let view = tx.expiry_view().await?;
+	// A fresh store without a completed watchmand view keeps the captain-only
+	// admission floor. Once published, an invalidated/mismatched view is not
+	// permission to admit new work against a possibly older captain tip.
+	ensure!(view.is_some() || (row.get::<_, Option<i64>>("processed_height").is_none()
+		&& row.get::<_, Option<&str>>("processed_hash").is_none()),
+		"completed expiry view is not usable for new Lightning work");
+	let watchman_height = view.map_or(0_i64, |view| i64::from(view.processed.height));
 	guard_obligation_changes(tx, ids).await?;
 	let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 	if let Some(row) = tx.query_opt(
-		"SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) AND 			expiry <= COALESCE((SELECT MAX(height) FROM captaind_block), 0) 		ORDER BY vtxo_id LIMIT 1", &[&ids],
+		"SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) AND \
+			expiry <= GREATEST(COALESCE((SELECT MAX(height) FROM captaind_block), 0), $2) \
+			ORDER BY vtxo_id LIMIT 1", &[&ids, &watchman_height],
 	).await? {
 		return Err(crate::error::FallbackRefusal::ExpiredNewLightning(row.get::<_, &str>("vtxo_id").parse()?).into());
 	}
