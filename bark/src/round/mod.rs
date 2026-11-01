@@ -1313,6 +1313,14 @@ async fn hark_vtxo_swap(
 	sent_forfeit_sigs: bool,
 	checkpoint: &RoundCheckpoint,
 ) -> Result<(), HarkForfeitError> {
+	if let Some(output) = output_vtxos.iter().find(|v| v.unlock_hash() != Some(unlock_hash)) {
+		let error = anyhow!("round output {} has another participation's unlock hash", output.id());
+		return Err(if sent_forfeit_sigs {
+			HarkForfeitError::SentForfeits(error)
+		} else {
+			HarkForfeitError::Err(error)
+		});
+	}
 	let (mut srv, _) = wallet.require_server().await.map_err(HarkForfeitError::Err)?;
 
 	if sent_forfeit_sigs {
@@ -1857,7 +1865,7 @@ async fn progress_attempt(
 			}
 
 			match construct_new_vtxos(
-				part, unsigned_round_tx, vtxos_spec, cosign_sigs,
+				part, unsigned_round_tx, vtxos_spec, cosign_sigs, *unlock_hash,
 			).await {
 				Ok(v) => AttemptProgressResult::Finished {
 					funding_tx: signed_round_tx.clone(),
@@ -1954,6 +1962,7 @@ async fn construct_new_vtxos(
 	unsigned_round_tx: &Transaction,
 	vtxo_tree: &VtxoTreeSpec,
 	vtxo_cosign_sigs: &[schnorr::Signature],
+	unlock_hash: UnlockHash,
 ) -> anyhow::Result<Vec<Vtxo<Full>>> {
 	let round_txid = unsigned_round_tx.compute_txid();
 	let vtxos_utxo = OutPoint::new(round_txid, ROUND_TX_VTXO_TREE_VOUT);
@@ -1969,37 +1978,19 @@ async fn construct_new_vtxos(
 		.into_signed_tree(vtxo_cosign_sigs.to_vec())
 		.into_cached_tree();
 
-	let mut expected_vtxos = participation.outputs.iter().collect::<Vec<_>>();
-	let total_nb_expected_vtxos = expected_vtxos.len();
+	let leaf_idxs = signed_vtxos.spec.spec.leaf_idxs_for_participation(
+		unlock_hash, participation.outputs.iter(),
+	).context("our outputs not part of tree for this participation")?;
+	let mut new_vtxos = Vec::with_capacity(leaf_idxs.len());
+	for idx in leaf_idxs {
+		let vtxo = signed_vtxos.build_vtxo(idx);
+		check_vtxo_fails_hash_lock(unsigned_round_tx, &vtxo)
+			.context("constructed invalid vtxo from tree")?;
 
-	let mut new_vtxos = vec![];
-	for (idx, req) in signed_vtxos.spec.spec.vtxos.iter().enumerate() {
-		if let Some(expected_idx) = expected_vtxos.iter().position(|r| **r == req.vtxo) {
-			let vtxo = signed_vtxos.build_vtxo(idx);
-
-			// validate the received vtxos
-			// This is more like a sanity check since we crafted them ourselves.
-			check_vtxo_fails_hash_lock(unsigned_round_tx, &vtxo)
-				.context("constructed invalid vtxo from tree")?;
-
-			info!("New VTXO from round: {} ({}, {})",
-				vtxo.id(), vtxo.amount(), vtxo.policy_type(),
-			);
-
-			new_vtxos.push(vtxo);
-			expected_vtxos.swap_remove(expected_idx);
-		}
-	}
-
-	if !expected_vtxos.is_empty() {
-		if expected_vtxos.len() == total_nb_expected_vtxos {
-			// we must have done something wrong
-			bail!("None of our VTXOs were present in round!");
-		} else {
-			bail!("Server included some of our VTXOs but not all: {} missing: {:?}",
-				expected_vtxos.len(), expected_vtxos,
-			);
-		}
+		info!("New VTXO from round: {} ({}, {})",
+			vtxo.id(), vtxo.amount(), vtxo.policy_type(),
+		);
+		new_vtxos.push(vtxo);
 	}
 	Ok(new_vtxos)
 }
@@ -3179,6 +3170,40 @@ mod test {
 					"locked {:?} leaf vtxo should be accepted: {:#}", version, e,
 				));
 			}
+		}
+	}
+
+	#[tokio::test]
+	async fn constructed_round_outputs_bind_the_participation_hash() {
+		let secp = Secp256k1::new();
+		let mut rng = rand::thread_rng();
+		let user_key = Keypair::new(&secp, &mut rng);
+		let user_cosign_key = Keypair::new(&secp, &mut rng);
+		let server_key = Keypair::new(&secp, &mut rng);
+		let server_cosign_key = Keypair::new(&secp, &mut rng);
+		let unlock_hash = UnlockHash::hash(b"this participation");
+		let other_hash = UnlockHash::hash(b"another participation");
+		let request = VtxoRequest {
+			amount: Amount::from_sat(10_000),
+			policy: VtxoPolicy::new_pubkey(user_key.public_key()),
+		};
+		let participation = RoundParticipation {
+			inputs: vec![], outputs: vec![request.clone(), request],
+			owner_proofs: BTreeMap::new(), unblinded_mailbox_id: None,
+		};
+		for version in [HashlockVersion::V0, HashlockVersion::V1] {
+			let (tree, funding_tx) = ark::test_util::build_signed_tree(
+				version, participation.outputs.clone(),
+				&user_cosign_key, &server_key, &server_cosign_key, unlock_hash,
+			);
+			let outputs = construct_new_vtxos(&participation, &funding_tx,
+				&tree.spec, &tree.cosign_sigs, unlock_hash).await.unwrap();
+			assert_eq!(outputs.len(), 2);
+			assert_ne!(outputs[0].id(), outputs[1].id());
+			assert!(outputs.iter().all(|output| output.unlock_hash() == Some(unlock_hash)));
+			let error = construct_new_vtxos(&participation, &funding_tx,
+				&tree.spec, &tree.cosign_sigs, other_hash).await.unwrap_err();
+			assert!(error.to_string().contains("our outputs not part of tree for this participation"), "{error:#}");
 		}
 	}
 
