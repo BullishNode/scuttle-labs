@@ -29,7 +29,7 @@ async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	}).await.unwrap();
 	paid.unwrap(); claimed.unwrap();
 	assert!(checked.load(Ordering::SeqCst));
-	assert!(prepare_checked.load(Ordering::SeqCst), "the actual cached HtlcsReady grant must reject all prepare probes before collection");
+	assert!(prepare_checked.load(Ordering::SeqCst), "cached grants must reject invalid proofs and preserve exact bodies and owners on a valid read before collection");
 	recipient.sync_mailbox().await.unwrap();
 	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
 	assert_eq!(provider.balance().await.unwrap().spendable, Amount::ZERO);
