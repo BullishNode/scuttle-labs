@@ -569,10 +569,15 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 		VtxoState::Locked {holder:Some(VtxoLockHolder::Action {id:prepared.id.clone()})});}
 	assert!(owner.offboard_checkpoint(&prepared.id).await.unwrap().is_some_and(|cp|cp==retry));
 
-	// B inherits its original expiry. One ordinary refresh keeps the actual
-	// recipient value live through A's later confirmation tail for either ID order.
+	// B inherits its original expiry. Schedule the one ordinary refresh late
+	// enough that its real tip+lifetime expiry covers A's six-confirmation tail.
+	let refresh_tip=a.expiry_height().saturating_sub(srv.config().vtxo_lifetime)+BlockDelta::new(8);
+	let current=ctx.bitcoind().get_block_count().await as u32;
+	if current<refresh_tip.to_u32() {ctx.generate_blocks(refresh_tip.to_u32()-current).await;}
 	let tip=BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	assert!(tip<b.expiry_height());
+	assert!(tip+BlockDelta::new(ark_testing::constants::ROUND_CONFIRMATIONS.try_into().unwrap())<a.expiry_height());
+	recipient.chain().invalidate_caches().await;
 	let quote=recipient.ark_info().await.unwrap().unwrap().fees.refresh
 		.calculate([VtxoFeeInfo::from_vtxo_and_tip(&received,tip)]).unwrap();
 	let mut finished=srv.subscribe_log::<server_log::RoundFinished>();
