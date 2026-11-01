@@ -659,8 +659,9 @@ mod test {
 			match error {
 				MovementError::PersisterError { id: failed, e } => {
 					assert_eq!(failed, id);
-					assert!(e.downcast_ref::<rusqlite::Error>().is_some());
-					assert!(e.root_cause().to_string().contains("issue32 terminal movement write rejected"), "{e:#}");
+					assert!(matches!(e.downcast_ref::<rusqlite::Error>(),
+						Some(rusqlite::Error::SqliteFailure(_, Some(message)))
+							if message == "issue32 terminal movement write rejected"), "{e:#}");
 				},
 				other => panic!("expected the actual SQLite persistence failure, got {other}"),
 			}
