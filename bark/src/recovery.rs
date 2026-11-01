@@ -518,14 +518,13 @@ impl Wallet {
 				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
-				// Finishing the flow the VTXO is stuck in is what decides where it
-				// belongs, so nothing is stored. Arkoor mailbox messages only carry
-				// final Pubkey-policy VTXOs, so the replay cannot bring an in-flight
-				// one back.
+				// Keep bodies held by an existing flow so it can finish. Only an
+				// ordinary Spendable row is locked; the checked write cannot steal
+				// a concurrent holder. Fresh in-flight candidates remain absent.
 				Ok(ServerStatusAdoption::InFlight(state)) => {
 					debug!("Recovery vtxo {id} not spendable ({state:?}), skipping");
-					self.inner.db.remove_vtxo(id).await
-						.context("Failed to drop in-flight recovery vtxo")?;
+					self.lock_available_vtxos(std::slice::from_ref(&vtxo), None).await
+						.context("Failed to lock in-flight recovery vtxo")?;
 					report.push_skipped(&vtxo);
 				},
 				Err(e) => {
