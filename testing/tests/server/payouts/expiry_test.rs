@@ -341,3 +341,17 @@ pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch)
 	assert_eq!(wallet.get_full_vtxo(leaf.coin.id()).await.unwrap().serialize(), leaf.coin.serialize());
 	point
 }
+
+pub(super) async fn confirm_actual_path(ctx: &TestContext, leaf: &Vtxo<Full>, seen: &mut BTreeSet<bitcoin::Txid>) {
+	for step in leaf.transactions() {
+		let txid = step.tx.compute_txid();
+		if !seen.insert(txid) { continue; }
+		if ctx.bitcoind().sync_client().custom_get_raw_transaction_info(txid, None).unwrap()
+			.is_some_and(|info| info.confirmations.is_some_and(|depth| depth > 0))
+		{ continue; }
+		ctx.broadcast_cpfp(&step.tx).await;
+		ctx.generate_blocks(1).await;
+	}
+	assert!(ctx.bitcoind().sync_client().get_tx_out(&leaf.point().txid, leaf.point().vout, Some(true))
+		.unwrap().is_some_and(|output| output.confirmations > 0));
+}
