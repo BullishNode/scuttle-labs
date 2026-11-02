@@ -142,6 +142,12 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
 	let returned = reopen(&ctx, "recipient", &srv).await;
 	assert!(returned.history().await.unwrap().is_empty());
+	assert_eq!(returned.properties().await.unwrap().server_payouts, Some(true));
+	let err = returned.import_vtxo(&coins[0].vtxo, bark::ImportVtxoArgs {
+		skip_status_check: true, ..Default::default()
+	}).await.unwrap_err();
+	assert!(err.to_string().contains("require authenticated mailbox ownership and status"));
+	for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
 	returned.sync().await;
 	for coin in &coins {
 		assert_eq!(local.get_wallet_vtxo(coin.vtxo_id).await.unwrap().unwrap().state, VtxoState::Spent);

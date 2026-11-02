@@ -54,8 +54,8 @@ pub struct ImportVtxoArgs {
 	/// Default: none
 	pub gap_limit: Option<u32>,
 
-	/// Retired upstream bypass. Scuttle refuses true: a coin key alone cannot
-	/// establish mailbox ownership or override a committed fallback decision.
+	/// Skip the server query only when payouts are known to be disabled.
+	/// Payout servers require authenticated mailbox ownership and status.
 	///
 	/// Default: false
 	pub skip_status_check: bool,
@@ -159,6 +159,9 @@ impl Wallet {
 		args: &ImportVtxoArgs,
 	) -> Result<(VtxoState, Option<crate::vtxo::FallbackStatus>), ImportVtxoError> {
 		if args.skip_status_check {
+			if self.properties().await?.server_payouts == Some(false) {
+				return Ok((VtxoState::Spendable, None));
+			}
 			return Err(anyhow!("Scuttle imports require authenticated mailbox ownership and status").into());
 		}
 
