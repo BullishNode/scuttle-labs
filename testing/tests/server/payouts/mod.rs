@@ -12,9 +12,7 @@ mod expiry_internal_partial_terminal;
 mod expiry_internal_reclaim_reorg;
 mod expiry_lightning_native_status;
 mod expiry_lightning_terminal;
-#[path = "../../scuttle/server/expiry_operation_races.rs"]
 mod expiry_operation_races;
-#[path = "../../scuttle/server/expiry_oversize.rs"]
 mod expiry_oversize;
 mod expiry_ownership;
 mod expiry_partial_conflict_reorg;

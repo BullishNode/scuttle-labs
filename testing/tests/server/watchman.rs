@@ -1,4 +1,4 @@
-#[path = "../scuttle/server/watchman_fallback.rs"]
+#[path = "payouts/watchman_fallback.rs"]
 mod fallback;
 
 pub(super) use ark_testing::onchain::observed_payout_fee_child;
