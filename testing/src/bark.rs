@@ -563,27 +563,15 @@ impl Bark {
 			return balance;
 		}
 
-		let vtxos = serde_json::from_str::<Vec<WalletVtxoInfo>>(
-			&self.run(["vtxos", "--all", "--no-sync"]).await,
-		).expect("retained vtxos");
-
-		let commitments = vtxos.iter().filter(|coin| coin.fallback_status.is_some())
-			.map(|coin| coin.id).collect::<std::collections::HashSet<_>>();
-		let mut paths = Vec::new();
-		if !commitments.is_empty() {
-			for coin in &vtxos {
-				if coin.state != VtxoStateInfo::Spent {
-					paths.push((coin.id, self.raw_vtxo(coin.id).await.ancestor_ids()));
-				}
-			}
-		}
-		let principal = crate::balance::retained_principal(&vtxos, &commitments, &paths);
-		let spendable_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
-			&& coin.state == VtxoStateInfo::Spendable)
-			.map(|coin| principal[&coin.id]).sum::<Amount>();
-		let locked_vtxos = vtxos.iter().filter(|coin| principal.contains_key(&coin.id)
-			&& matches!(coin.state, VtxoStateInfo::Locked { .. }))
-			.map(|coin| principal[&coin.id]).sum::<Amount>();
+		let vtxos = self.vtxos_no_sync().await;
+		let spendable_vtxos = vtxos.iter()
+			.filter(|v| v.state == VtxoStateInfo::Spendable)
+			.map(|v| v.amount)
+			.sum::<Amount>();
+		let locked_vtxos = vtxos.iter()
+			.filter(|v| matches!(v.state, VtxoStateInfo::Locked { .. }))
+			.map(|v| v.amount)
+			.sum::<Amount>();
 
 		assert_eq!(balance.spendable + balance.needs_refresh, spendable_vtxos,
 			"{}: spendable and needs_refresh must equal the spendable VTXOs: {balance:?}",

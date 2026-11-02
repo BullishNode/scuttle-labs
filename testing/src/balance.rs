@@ -1,35 +1,10 @@
 //! Consistency checks for the [bark::Balance] of an in-process SDK wallet.
 
-use std::collections::{HashMap, HashSet};
-
 use bitcoin::Amount;
 
 use ark::VtxoId;
 use bark::actions::WalletAction;
 use bark::vtxo::VtxoState;
-use bark_json::primitives::{VtxoStateInfo, WalletVtxoInfo};
-
-/// Generic consistency checks cover Ark balances only. Known fallback
-/// commitments are status-only; their principal/output proof remains fixture-specific.
-pub(crate) fn retained_principal(
-	vtxos: &[WalletVtxoInfo], commitments: &HashSet<VtxoId>, paths: &[(VtxoId, Vec<VtxoId>)],
-) -> HashMap<VtxoId, Amount> {
-	let mut principal = HashMap::new();
-	for coin in vtxos {
-		if coin.state == VtxoStateInfo::Spent || coin.fallback_status.is_some() { continue; }
-		assert!(principal.insert(coin.id, coin.amount).is_none(), "duplicate retained VTXO ID");
-	}
-	let mut seen = HashSet::new();
-	for (child, path) in paths.iter().filter(|(id, _)| principal.contains_key(id)) {
-		assert!(seen.insert(*child), "duplicate signed ancestry body");
-		assert!(!path.iter().any(|ancestor| *ancestor != *child && principal.contains_key(ancestor)),
-			"overlapping retained ownership needs a fixture-specific conservation assertion");
-	}
-	if !commitments.is_empty() && principal.len() > 1 {
-		assert_eq!(seen.len(), principal.len(), "missing signed bodies for pending ownership check");
-	}
-	principal
-}
 
 /// Fetch the balance, syncing first when `sync` is set, and assert that it
 /// agrees with the wallet's VTXOs and operations: the spendable sats are the
@@ -42,25 +17,12 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 		wallet.sync().await;
 	}
 	let balance = wallet.balance().await.expect("balance");
-	let retained = wallet.all_vtxos().await.expect("retained vtxos");
-	let commitments = retained.iter().filter(|coin| coin.fallback_status.is_some())
-		.map(|coin| coin.id()).collect::<HashSet<_>>();
-	let infos = retained.iter().map(WalletVtxoInfo::from).collect::<Vec<_>>();
-	let mut paths = Vec::new();
-	if !commitments.is_empty() {
-		for coin in &retained {
-			if coin.state != VtxoState::Spent {
-				paths.push((coin.id(), wallet.get_full_vtxo(coin.id()).await.expect("signed body").ancestor_ids()));
-			}
-		}
-	}
-	let principal = retained_principal(&infos, &commitments, &paths);
-	let vtxos = retained.into_iter().filter(|coin| principal.contains_key(&coin.id())).collect::<Vec<_>>();
+	let vtxos = wallet.vtxos().await.expect("vtxos");
 
 	let locked_amount_of = |ids: &[VtxoId]| -> Amount {
 		vtxos.iter()
 			.filter(|v| ids.contains(&v.id()) && matches!(v.state, VtxoState::Locked { .. }))
-			.map(|v| principal[&v.id()])
+			.map(|v| v.amount())
 			.sum()
 	};
 
@@ -75,9 +37,8 @@ pub async fn assert_balance_consistent(wallet: &bark::Wallet, sync: bool) -> bar
 				needs_refresh += vtxo.amount()
 			},
 			VtxoState::Spendable => spendable += vtxo.amount(),
-			VtxoState::Locked { .. } => locked += principal[&vtxo.id()],
-			VtxoState::Exited => {},
-			VtxoState::Spent => unreachable!("historic spent body cannot establish ownership"),
+			VtxoState::Locked { .. } => locked += vtxo.amount(),
+			VtxoState::Spent | VtxoState::Exited => panic!("vtxos() returned a spent VTXO"),
 		}
 	}
 	assert_eq!(balance.spendable, spendable,
