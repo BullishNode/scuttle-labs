@@ -1,73 +1,43 @@
-# Fallback payouts for expired VTXOs
+# Expiry payouts
 
-Scuttle pays eligible expired customer VTXOs on-chain after it can establish
-who is owed them. Unresolved obligations stay held. `docs/scuttle-protocol.md`
-describes the client contract. This page describes the operator side.
+An Ark server can pay an expired customer VTXO to its owner instead of the
+operator. The server withholds a payout while its owner or payment outcome is
+unresolved.
 
-## Ownership and payout address
+## Enable payouts
 
-Every customer VTXO has an owner mailbox, fixed when the VTXO is created. The
-recipient address carries a proof signed by the VTXO key and by the mailbox
-key, in address delivery type `0x03`. The server checks both signatures once
-and stores the binding. A VTXO without a valid proof is refused.
+Set `expiry_payouts` before the server database is created. The default is
+`false`. The database records this choice and refuses a different value on
+reopen. With payouts enabled, the server requires protocol version 6 and a
+verified owner for every customer VTXO. With payouts disabled, it accepts the
+ordinary upstream protocol range.
 
-The economic stage selects the entitled spending key before the server resolves
-its mailbox. An unfinished transfer can still owe its input owner; a collected
-forwarded receive owes its committed claim destination. Birth ownership alone
-does not select the payee in these cases.
+Run captaind and watchmand against the same database. Keep the watchman fee
+wallet funded. Use the ordinary server and wallet migration runners.
 
-The payout goes to the BIP86 address of that mailbox key `M`: `tr(M)` with an
-empty script tree. A wallet that derives `M` at external index zero of its BIP86
-account sees the payout as an ordinary receive.
+## Destination and fees
 
-## Stores and protocol
+The server selects the entitled owner from the coin's current operation. An
+unfinished transfer can still owe its input owner. A collected forwarded
+receive owes its committed recipient, even if the recipient output is absent.
+The payout uses that owner's mailbox key to derive a BIP86 Taproot output.
 
-Use fresh server and wallet stores. The server and the wallet refuse a store
-from an earlier fork version. They do not convert it. Clients and the server
-must use protocol version 1000.
+Customer amounts follow the payout fee and dust policy. A dust-forfeited amount
+has no customer output. The operator's fee wallet sponsors miner fees through a
+separate child transaction. The payout parent remains unchanged when its fee
+child changes. A lack of usable fee-wallet bitcoin delays publication.
 
-## Run the payout engine
+## Payment outcomes
 
-Run captaind and watchmand against the same database. Fund the watchman fee
-wallet through its wallet admin RPC. The watchman pays each payout in an
-immutable parent transaction with no fee. Its wallet pays the fee in a separate
-child transaction. Without confirmed fee funds, payouts stay pending.
+An uncertain Lightning payment is not a refund. Missing native records,
+connection errors and elapsed time do not establish failure. Only the original
+payment task dispatches xpay; monitors and retries observe that recorded call.
+Use the private administrative operation only with evidence that the original
+backend has no remaining successful, pending or unknown work. Do not replace
+its store or node to make an unresolved payment disappear.
 
-Payouts in one allocation group that share a script and an expiry height pay a
-total fee of the larger of 1,000 sats and 1%, rounded up. Size limits can create
-several groups. An otherwise ready VTXO whose share is below its script's dust
-limit can wait up to 144 blocks after expiry for another ready VTXO with the same
-script and expiry. The dust policy then applies. This deadline does not release
-an unresolved payment, ownership or integrity hold.
-
-## Holds
-
-The server holds a VTXO when it cannot yet decide who is owed it, for example
-while a Lightning payment is unresolved. An undecided hold does not itself block
-ordinary spending, refresh or emergency exit. Existing Lightning and round
-restrictions still apply. A committed fallback claim is already fenced
-off-chain and must wait for its canonical payout or terminal forfeiture.
-
-- Monitor warning and error logs for held VTXO IDs and unresolved reasons.
-  Warnings may repeat while a reason remains unresolved.
-- A Lightning node that is not online while it has open payments or receives
-  logs an error on every node check. Those payments stay open until the node
-  is back.
-
-## Lightning
-
-Use the pinned Core Lightning 26.06.6 build with its xpay correction. Configure
-`xpay-slow-mode=true` and verify it with `lightning-cli listconfigs xpay-slow-mode`.
-Keep matching subdaemons and plugins.
-
-## Wallet behaviour
-
-A VTXO with a committed payout shows as fallback pending. The wallet requires
-six canonical confirmations and checks the actual payout script and value
-before it retires the claim. A reorg returns the claim to pending.
-
-The default wallet's seed phrase recovers its BIP86 mailbox account. An
-application that supplies an external mailbox must back up its original key,
-network, account, passphrase and discovery policy. The protocol does not prove
-that backup. Ordinary spent reports retain upstream server trust; a false
-ordinary-spent report can hide a still-valid claim. Keep wallet backups.
+The server uses six canonical confirmations for an on-chain terminal outcome.
+The client treats a fallback commitment as ordinary `Spent`, including while its
+payout is pending. Its optional fallback display does not add Ark or bitcoin
+balance. The bitcoin wallet discovers and spends actual on-chain outputs.
+See [ownership and client behavior](scuttle-protocol.md) for recovery limits.
