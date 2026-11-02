@@ -1,10 +1,12 @@
 use super::*;
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_boards() {
 	require_bark_version!(> "0.5.0");
 
-	let ctx = TestContext::new("server/watchman_sweeps_boards").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_boards").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -212,11 +214,13 @@ pub(super) async fn watchman_sweeps_boards() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_round_vtxos() {
 	require_bark_version!(> "0.5.0");
 
-	let ctx = TestContext::new("server/watchman_sweeps_round_vtxos").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_round_vtxos").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -555,9 +559,11 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
-	let ctx = TestContext::new("server/watchman_sweeps_arkoor_vtxos_sender_exit").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_arkoor_vtxos_sender_exit").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -967,9 +973,11 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
-	let ctx = TestContext::new("server/watchman_sweeps_arkoor_vtxos_receiver_exit").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_arkoor_vtxos_receiver_exit").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -1324,14 +1332,16 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_lightning_vtxos() {
 	require_bark_version!(> "0.5.0");
 
-	let ctx = TestContext::new("server/watchman_sweeps_lightning_vtxos").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_lightning_vtxos").await;
 	let ln = ctx.new_lightning_setup("ln").await;
 	// Observe and mine packages on the node used by both daemons.
 	// Zero-fee parent relay to another node has its own asynchronous delay.
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&ln.internal).funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 10, amount: sat(10_000) }];
@@ -1844,10 +1854,12 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 	require_bark_version!(> "0.5.0");
-	let ctx = TestContext::new("server/watchman_sweeps_round_leftovers_after_exits").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_round_leftovers_after_exits").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -2257,11 +2269,13 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	require_bark_version!(> "0.5.0");
-	let ctx = TestContext::new("server/watchman_sweeps_vtxopool_with_exit").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_vtxopool_with_exit").await;
 	let ln = ctx.new_lightning_setup("ln").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).funded(btc(10)).lightningd(&ln.internal).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![
 			VtxoTarget { count: 9, amount: sat(1_000) },
@@ -2666,9 +2680,11 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_offboard_connectors() {
-	let ctx = TestContext::new("server/watchman_sweeps_offboard_connectors").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_offboard_connectors").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -2972,10 +2988,12 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 
 
 
+#[tokio::test]
 pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	require_bark_version!(> "0.5.0");
-	let ctx = TestContext::new("server/watchman_sweeps_exit_after_oor_then_forfeit").await;
+	let ctx = TestContext::new("server/payouts/watchman_sweeps_exit_after_oor_then_forfeit").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
 		cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
@@ -3499,10 +3517,12 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	failures.assert_empty();
 }
 
+#[tokio::test]
 pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
-	let ctx = TestContext::new("server/watchman_doesnt_broadcast_htlc_recv_chain").await;
+	let ctx = TestContext::new("server/payouts/watchman_doesnt_broadcast_htlc_recv_chain").await;
 	let ln = ctx.new_lightning_setup("ln").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&ln.internal).funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		// The pool never issues a single vtxo at a time, so ask for the minimum of two.
 		cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
