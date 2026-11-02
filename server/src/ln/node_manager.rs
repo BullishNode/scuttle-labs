@@ -333,7 +333,7 @@ impl LightningManager {
 		// Refuse an unqualified external endpoint before committing an attempt.
 		// Dispatch still rechecks it: endpoint changes after commit stay unknown.
 		let info = if sub.is_none() {
-			node.xpay.qualify_before_attempt().await.map_err(PaymentPreflightRefusal)?
+			node.xpay.node_info().await.map_err(PaymentPreflightRefusal)?
 		} else {
 			unary_rpc(node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await
 				.context("failed to get info from rpc")?.into_inner()
