@@ -57,9 +57,9 @@ async fn external_mailbox_identity_routes_delivery_and_refuses_wrong_reopen() {
 		first.mailbox_identifier());
 	let properties = SqliteClient::open(ctx.datadir.join("external/db.sqlite")).unwrap()
 		.read_properties().await.unwrap().unwrap();
-	assert_eq!(properties.mailbox_identity, bark::MailboxIdentity {
+	assert_eq!(properties.mailbox_identity, Some(bark::MailboxIdentity {
 		network: Network::Regtest, public_key: key.public_key(),
-	});
+	}));
 	let config = first.config().clone();
 	let sender = ctx.bark_sdk("sender", &srv).boarded(ark_testing::sat(100_000)).create().await;
 	sender.send_arkoor_payment(&address, ark_testing::sat(10_000)).await.unwrap();
