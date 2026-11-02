@@ -1,3 +1,5 @@
+#[path = "payouts/watchman_fallback.rs"]
+mod fallback;
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -609,7 +611,7 @@ async fn watchman_sweeps_offboard_connectors() {
 #[tokio::test]
 async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
 	let ctx = TestContext::new("server/watchman_sweeps_offboard_forfeit_after_confiscation").await;
-	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).funded(btc(10)).cfg(|cfg| {
 		cfg.vtxo_lifetime = BlockDelta::new(144);
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
@@ -675,8 +677,13 @@ async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
 
 	// the forfeit output must actually be gone from the utxo set
 	let forfeit_point = msg.vtxo_ids[0].to_point();
-	let tip = ctx.generate_blocks(1).await;
+	let tip = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(tip).await;
+	wm.wait_for_sync_height(tip).await;
+	let claim = client.get_raw_transaction(&msg.txid, None).unwrap();
+	fallback::assert_canonical_watchman_tx(&ctx, &claim);
+	let forfeit = client.get_raw_transaction(&forfeit_point.txid, None).unwrap();
+	fallback::assert_canonical_watchman_tx(&ctx, &forfeit);
 	assert!(
 		client.get_tx_out(&forfeit_point.txid, forfeit_point.vout, Some(true)).unwrap().is_none(),
 		"forfeit output {} should be spent by the sweep", forfeit_point,
@@ -695,6 +702,7 @@ async fn watchman_sweeps_exit_after_forfeit() {
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
 		cfg.vtxopool.vtxo_targets = vec![];
 	}).watchmand_cfg(|cfg| {
+		cfg.postgres.max_connections = 1;
 		cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
 		cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
 	}).create().await;

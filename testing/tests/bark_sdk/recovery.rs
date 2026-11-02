@@ -185,6 +185,7 @@ struct VtxoRpcCounts {
 struct CountVtxoRpcs {
 	counts: Arc<VtxoRpcCounts>,
 	fail_status_batches: Arc<AtomicUsize>,
+
 }
 
 impl CountVtxoRpcs {
@@ -192,12 +193,14 @@ impl CountVtxoRpcs {
 		Self {
 			counts: counts.clone(),
 			fail_status_batches: Arc::new(AtomicUsize::new(fail_status_batches)),
+
 		}
 	}
 }
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for CountVtxoRpcs {
+
 	async fn get_vtxo(
 		&self, upstream: &mut ArkClient, req: protos::GetVtxoRequest,
 	) -> Result<protos::GetVtxoResponse, tonic::Status> {
