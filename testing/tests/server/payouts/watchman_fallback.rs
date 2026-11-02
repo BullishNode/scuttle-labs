@@ -42,6 +42,9 @@ pub(super) async fn watchman_sweeps_boards() {
 		.require_network(Network::Regtest).unwrap().script_pubkey();
 
 	ctx.refresh_all(&srv, &[&bark1]).await;
+	// Complete the refresh while its input can still be forfeited.
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	bark1.sync().await;
 
 	// Stop at the old-board maturity so six confirmation blocks do not
 	// also expire the later replacement.
@@ -51,9 +54,6 @@ pub(super) async fn watchman_sweeps_boards() {
 	let tip = ctx.generate_blocks(original.expiry_height().to_u32() + 1 - height).await;
 	let (_allocation, parent, child, _observed_fee, replacement, replacement_funding, _participation) =
 		tokio::time::timeout(Duration::from_secs(15), async {
-		// The refresh returns before funding confirmation; finish it only after
-		// the existing maturity mining, inside the original observation clock.
-		bark1.sync().await;
 		let client = bark1.client().await;
 		let replacements = client.vtxos().await.unwrap();
 		assert_eq!(replacements.len(), 1);

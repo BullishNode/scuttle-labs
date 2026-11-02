@@ -463,19 +463,12 @@ async fn partial_conflict_reorg() {
 	// Remove the FIRST root-spending block, not just the terminal-claim block.
 	// The full backing conflict and its descendant terminal claim disappear.
 	srv.watchmand().stop().await.unwrap();
+	// Upstream sync rejects a lower tip; restart only on the higher fork.
+	srv.stop().await.unwrap();
 	ctx.bitcoind().sync_client().invalidate_block(&conflict_block).unwrap();
 	let fork = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
 	let removed = old_tip.height.to_u32() - fork.height.to_u32();
 	assert!(removed > 0 && removed <= 32, "keep the real exit/claim branch bounded");
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let invalid = db.read(async |tx| tx.get_highest_block(BlockTable::Captaind).await).await.unwrap() == Some(fork);
-			if invalid { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("the actual conflict rollback must reach the canonical fork");
-	assert_eq!(decided_obligations(&db, &coins).await, permanent);
-	srv.stop().await.unwrap();
 	// Existing isolated-node crash/restart helper; no database edits and no
 	// third-party process is involved. Clearing orphaned mempool transactions
 	// prevents the discarded holder branch from being mined again by accident.
@@ -534,6 +527,14 @@ async fn partial_conflict_reorg() {
 	assert!(replacement_tip.height > old_tip.height);
 	srv.start().await.unwrap();
 	srv.watchmand().start().await.unwrap();
+	tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			let invalid = db.read(async |tx| tx.get_highest_block(BlockTable::Captaind).await).await.unwrap() == Some(replacement_tip);
+			if invalid { break; }
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}).await.expect("the actual conflict rollback must reach the higher canonical replacement tip");
+	assert_eq!(decided_obligations(&db, &coins).await, permanent);
 	rebuilt_generation(&db, replacement_tip).await;
 	assert_eq!(decided_obligations(&db, &coins).await, permanent);
 	let claims = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_terminal_claim p \
