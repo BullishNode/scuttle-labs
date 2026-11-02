@@ -292,93 +292,57 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 		},
 	);
 
-	if retry_fault {
+	if retry_fault || ctx.test_name == "lightningd/intra_server_settles_invoice_from_on_chain_htlc_preimage" {
 		let height = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 		let block_hash = ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap();
-		assert_eq!(retry_claim_block, Some((height, block_hash)));
+		if retry_fault { assert_eq!(retry_claim_block, Some((height, block_hash))); }
+		// Completion may follow the first witness before watchmand visits the
+		// remaining spends. Both paths must finish that actual block first.
 		srv.watchmand().wait_for_sync_height(height).await;
-		assert!(failure_seen.load(Ordering::SeqCst), "the real PostgreSQL failure must have been consumed");
 		let hash = PaymentHash::from(&Bolt11Invoice::from_str(&invoice_info.invoice).unwrap());
 		let db = Db::connect(&srv.config().postgres).await.unwrap();
-		let calls = db.read(async |tx| Ok(tx.query_one("SELECT last_value,is_called FROM ex3_frontier_wal_once", &[])
-			.await?.get::<_, i64>("last_value"))).await.unwrap();
-		assert!(calls >= 2, "the same real WAL insertion must be retried after the rolled-back transaction");
-		assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(height.to_u32()));
-		assert_eq!(ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap(), block_hash);
-		let subscription = tokio::time::timeout(Duration::from_secs(15), async {
-			loop {
-				let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
-					.await.unwrap().unwrap();
-				if sub.status == server::database::ln::LightningHtlcSubscriptionStatus::Settled { break sub; }
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-		}).await.expect("the native settled invoice must converge in the original subscription");
+		let subscription = if retry_fault {
+			assert!(failure_seen.load(Ordering::SeqCst), "the real PostgreSQL failure must have been consumed");
+			let calls = db.read(async |tx| Ok(tx.query_one("SELECT last_value,is_called FROM ex3_frontier_wal_once", &[])
+				.await?.get::<_, i64>("last_value"))).await.unwrap();
+			assert!(calls >= 2, "the same real WAL insertion must be retried after the rolled-back transaction");
+			assert_eq!(ctx.bitcoind().get_block_count().await, u64::from(height.to_u32()));
+			assert_eq!(ctx.bitcoind().sync_client().get_block_hash(u64::from(height.to_u32())).unwrap(), block_hash);
+			tokio::time::timeout(Duration::from_secs(15), async {
+				loop {
+					let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+						.await.unwrap().unwrap();
+					if sub.status == server::database::ln::LightningHtlcSubscriptionStatus::Settled { break sub; }
+					tokio::time::sleep(Duration::from_millis(50)).await;
+				}
+			}).await.expect("the native settled invoice must converge in the original subscription")
+		} else {
+			db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap()
+		};
+		assert_eq!(subscription.payment_hash, hash);
 		assert!(!subscription.htlc_vtxos.is_empty());
-		for id in subscription.htlc_vtxos {
-			let grant = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, id).await)
+		for id in &subscription.htlc_vtxos {
+			let grant = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, *id).await)
 				.await.unwrap().unwrap();
 			assert_eq!(grant.direction(), HtlcDirection::Outgoing);
 			assert_eq!(grant.htlc.payment_hash, hash);
 			assert_eq!(grant.htlc.chain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Fulfilled));
-			let row = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid,onchain_spent_height \
+			let row = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid,onchain_spent_height,lightning_htlc_subscription_id \
 				FROM vtxo WHERE vtxo_id=$1", &[&id.to_string()]).await?)).await.unwrap();
 			let txid = row.get::<_, Option<&str>>("onchain_spent_txid").unwrap().parse().unwrap();
 			let spent_height = BlockHeight::try_from(row.get::<_, Option<i32>>("onchain_spent_height").unwrap()).unwrap();
 			assert_eq!(grant.htlc.chain_resolution_height, Some(spent_height));
-			assert_eq!(spent_height, height, "retry must persist the original claim block, with no extra mining");
+			let actual_block = if retry_fault {
+				assert_eq!(spent_height, height, "retry must persist the original claim block, with no extra mining");
+				block_hash
+			} else {
+				assert_eq!(row.get::<_, Option<i64>>("lightning_htlc_subscription_id"), Some(subscription.id));
+				ctx.bitcoind().sync_client().get_block_hash(u64::from(spent_height.to_u32())).unwrap()
+			};
 			let actual = ctx.bitcoind().await_transaction(txid).await;
-			let block = ctx.bitcoind().sync_client().get_block(&block_hash).unwrap();
-			assert!(block.txdata.contains(&actual));
-			let input = actual.input.iter().find(|input| input.previous_output == id.to_point()).unwrap();
-			let preimage = HashDelaySignClause::extract_preimage_from_witness(&input.witness, hash).unwrap();
-			let clause = grant.vtxo.vtxo.policy().as_server_htlc_recv().unwrap()
-				.user_reveals_preimage_clause(grant.vtxo.vtxo.exit_delta());
-			let leaf = input.witness.taproot_leaf_script().unwrap();
-			assert_eq!(leaf.version, bitcoin::taproot::LeafVersion::TapScript);
-			assert_eq!(leaf.script, clause.tapscript().as_script());
-			assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
-		}
-		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1",
-			&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
-	}
-
-	if ctx.test_name == "lightningd/intra_server_settles_invoice_from_on_chain_htlc_preimage" {
-		// Payment completion may follow the first witness while the remaining
-		// spends in that block are still being visited by watchmand.
-		let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-		srv.watchmand().wait_for_sync_height(tip).await;
-		let hash = PaymentHash::from(&Bolt11Invoice::from_str(&invoice_info.invoice).unwrap());
-		let db = Db::connect(&srv.config().postgres).await.unwrap();
-		let subscription = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
-			.await.unwrap().unwrap();
-		assert_eq!(subscription.payment_hash, hash);
-		assert!(!subscription.htlc_vtxos.is_empty());
-		let attempt = db.read(async |tx| tx.get_lightning_payment_attempt_by_subscription_id(subscription.id).await)
-			.await.unwrap().expect("this intra-Ark receive has an actual funding attempt");
-		assert_eq!(attempt.payment_hash, hash);
-		assert_eq!(attempt.lightning_htlc_subscription_id, Some(subscription.id));
-		let sources = db.read(async |tx| Ok(tx.query("SELECT l.vtxo_id,h.payment_hash,h.direction::TEXT \
-			FROM lightning_payment_attempt_htlc_vtxo l JOIN vtxo v ON v.vtxo_id=l.vtxo_id \
-			JOIN htlc_vtxo h ON h.id=v.id WHERE l.lightning_payment_attempt_id=$1 ORDER BY l.vtxo_id",
-			&[&attempt.id]).await?)).await.unwrap();
-		assert!(!sources.is_empty());
-		for grant_id in &subscription.htlc_vtxos {
-			let grant = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, *grant_id).await)
-				.await.unwrap().unwrap();
-			assert_eq!(grant.direction(), HtlcDirection::Outgoing);
-			assert_eq!(grant.htlc.payment_hash, hash);
-			assert_eq!(grant.htlc.chain_resolution, Some(server::database::htlc_vtxo::HtlcResolution::Fulfilled));
-			let spent = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid,onchain_spent_height,lightning_htlc_subscription_id \
-				FROM vtxo WHERE vtxo_id=$1", &[&grant_id.to_string()]).await?)).await.unwrap();
-			assert_eq!(spent.get::<_, Option<i64>>("lightning_htlc_subscription_id"), Some(subscription.id));
-			let txid = spent.get::<_, Option<&str>>("onchain_spent_txid").unwrap().parse().unwrap();
-			let height = BlockHeight::try_from(spent.get::<_, Option<i32>>("onchain_spent_height").unwrap()).unwrap();
-			assert_eq!(grant.htlc.chain_resolution_height, Some(height));
-			let actual = ctx.bitcoind().await_transaction(txid).await;
-			let block = ctx.bitcoind().sync_client().get_block(&ctx.bitcoind().sync_client()
-				.get_block_hash(u64::from(height.to_u32())).unwrap()).unwrap();
+			let block = ctx.bitcoind().sync_client().get_block(&actual_block).unwrap();
 			assert!(block.txdata.contains(&actual), "the recorded grant resolution must be in its actual canonical block");
-			let input = actual.input.iter().find(|input| input.previous_output == grant_id.to_point()).unwrap();
+			let input = actual.input.iter().find(|input| input.previous_output == id.to_point()).unwrap();
 			let preimage = HashDelaySignClause::extract_preimage_from_witness(&input.witness, hash)
 				.expect("the actual outgoing grant spend reveals this payment's preimage");
 			let clause = grant.vtxo.vtxo.policy().as_server_htlc_recv().unwrap()
@@ -388,11 +352,25 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 			assert_eq!(leaf.script, clause.tapscript().as_script());
 			assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 		}
-		for source in sources {
-			assert_eq!(source.get::<_, &str>("payment_hash"), hash.to_string());
-			assert_eq!(source.get::<_, &str>("direction"), "incoming");
-			let id = source.get::<_, &str>("vtxo_id").parse().unwrap();
-			assert_eq!(db.read(async |tx| tx.source_settlement(hash, id).await).await.unwrap(), SourceSettlement::Funded);
+		if retry_fault {
+			assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1",
+				&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
+		} else {
+			let attempt = db.read(async |tx| tx.get_lightning_payment_attempt_by_subscription_id(subscription.id).await)
+				.await.unwrap().expect("this intra-Ark receive has an actual funding attempt");
+			assert_eq!(attempt.payment_hash, hash);
+			assert_eq!(attempt.lightning_htlc_subscription_id, Some(subscription.id));
+			let sources = db.read(async |tx| Ok(tx.query("SELECT l.vtxo_id,h.payment_hash,h.direction::TEXT \
+				FROM lightning_payment_attempt_htlc_vtxo l JOIN vtxo v ON v.vtxo_id=l.vtxo_id \
+				JOIN htlc_vtxo h ON h.id=v.id WHERE l.lightning_payment_attempt_id=$1 ORDER BY l.vtxo_id",
+				&[&attempt.id]).await?)).await.unwrap();
+			assert!(!sources.is_empty());
+			for source in sources {
+				assert_eq!(source.get::<_, &str>("payment_hash"), hash.to_string());
+				assert_eq!(source.get::<_, &str>("direction"), "incoming");
+				let id = source.get::<_, &str>("vtxo_id").parse().unwrap();
+				assert_eq!(db.read(async |tx| tx.source_settlement(hash, id).await).await.unwrap(), SourceSettlement::Funded);
+			}
 		}
 	}
 
@@ -953,16 +931,8 @@ async fn intra_ark_timeout_cancel_rolls_back_linked_attempt_failure() {
 		assert!(!invoice.is_expired());
 		let after = gate.query_one(SNAPSHOT, &[&sub.id, &attempt.id, &hash.to_string(), &source_ids])
 			.await?.get::<_, String>(0);
-		let calls = gate.query_one("SELECT last_value FROM issue15_cancel_once", &[]).await?.get::<_, i64>(0);
 		let observed_native = hold.list(hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) })
 			.await.unwrap().into_inner().invoices;
-		std::fs::write(ctx.datadir.join("issue15-cancel-fault-cut.json"), serde_json::to_vec_pretty(&serde_json::json!({
-			"subscription_id": sub.id, "attempt_id": attempt.id, "payment_hash": hash.to_string(),
-			"before": serde_json::from_str::<serde_json::Value>(&before).unwrap(),
-			"after": serde_json::from_str::<serde_json::Value>(&after).unwrap(),
-			"actual_timeout_reason": event.reason, "failed_update_calls": calls,
-			"native_hold_states": observed_native.iter().map(|invoice| format!("{:?}", invoice.state())).collect::<Vec<_>>(),
-		}))?).unwrap();
 		assert_eq!(observed_native, native);
 		assert_eq!(after, before, "the failed LPA write must roll back the entire linked cancellation");
 		assert_eq!(payer.lightning_send_checkpoint(hash).await.unwrap().unwrap().progress, send.progress);
@@ -4687,11 +4657,9 @@ async fn stalled_hold_node_does_not_block_healthy_settlement() {
 	payment_a.wait_millis(30_000).await.unwrap().unwrap();
 	assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash_a).await)
 		.await.unwrap() == Some(original_preimage));
-	assert_eq!(db.read(async |t| Ok(t.query_one(
-		"SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1", &[&hash_a.to_string()])
-		.await?.get::<_, i64>(0))).await.unwrap(), 1);
-	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT id FROM htlc_settlement WHERE payment_hash=$1",
-		&[&hash_a.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), wal_id);
+	assert_eq!(db.read(async |t| Ok(t.query("SELECT id FROM htlc_settlement WHERE payment_hash=$1",
+		&[&hash_a.to_string()]).await?.into_iter().map(|row| row.get::<_, i64>(0)).collect::<Vec<_>>()))
+		.await.unwrap(), vec![wal_id]);
 	Box::pin(receiver_a.try_claim_lightning_receive(hash_a, true)).await.unwrap();
 	assert_eq!(receiver_a.balance().await.unwrap().spendable, sat(50_000));
 	let paid_a = hold_a.list(hold::ListRequest { constraint: Some(
