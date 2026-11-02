@@ -441,24 +441,7 @@ impl LightningManager {
 
 			// Only a validated sender and an actual subscription promotion can
 			// reach these post-commit notifications and backend cancellation.
-			let res = async {
-				let res = self.finish_intra_ark_payment(sub).await;
-				if let Err(e) = res {
-					trace!("Failed to update subscription status: {e:#}");
-					let attempt = self.db.read(async |t|
-						t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await
-					).await?.filter(|attempt| attempt.id == attempt_id)
-						.context("internal payment attempt disappeared")?;
-					self.payment_handler().fail_payment_attempt(&attempt, Some(&e.to_string())).await?;
-					return Err(e);
-				}
-				Ok::<_, anyhow::Error>(())
-			}.await;
-			if let Err(e) = res {
-				// The creation COMMIT above succeeded. An error here must not
-				// claim the recorded payment was refused before initiation.
-				error!(attempt_id, error = %format!("{e:#}"), "Recorded intra-Ark payment needs reconciliation");
-			}
+			self.finish_intra_ark_payment(sub).await;
 
 			return Ok(());
 		}
@@ -494,7 +477,7 @@ impl LightningManager {
 	async fn finish_intra_ark_payment(
 		&self,
 		subscription: LightningHtlcSubscription,
-	) -> anyhow::Result<()> {
+	) {
 		let payment_hash = PaymentHash::from(&subscription.invoice);
 		// Wake check_lightning_receive so the client sees Accepted.
 		let _ = self.payment_update_tx.send(payment_hash);
@@ -547,7 +530,6 @@ impl LightningManager {
 			},
 		}
 
-		Ok(())
 	}
 
 	/// Gets the outcome of a complete, recorded payment input set.

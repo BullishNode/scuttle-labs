@@ -20,7 +20,7 @@ use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
 use log::debug;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use ark::{Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};

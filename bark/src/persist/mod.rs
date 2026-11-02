@@ -36,7 +36,7 @@ use lightning_invoice::Bolt11Invoice;
 #[cfg(feature = "onchain-bdk")]
 use bdk_wallet::ChangeSet;
 
-use ark::{ProtocolEncoding, Vtxo, VtxoId};
+use ark::{Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 

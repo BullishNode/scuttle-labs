@@ -291,13 +291,14 @@ impl ClnXpayClient {
 	/// updated (unless the DB status is already final, which is logged as an error).
 	/// Sends on `payment_update_tx` when the status changes.
 	///
-	/// `pay_error` is the error CLN returned for the xpay call this follows.
-	/// It supplies failure context, but cannot override an own Pending record.
-	/// The monitor loop passes `None`; it is reconciling attempts it did not make.
-	pub async fn sync_payment_attempt_status(
-		&self, attempt: LightningPaymentAttempt, pay_error: Option<&str>,
+	/// The monitor has no original live reply to supply failure evidence.
+	async fn sync_payment_attempt_status(
+		&self, attempt: LightningPaymentAttempt,
 	) -> anyhow::Result<()> {
-		self.reconcile_payment_attempt(attempt, pay_error).await
+		let payment_hash = attempt.payment_hash;
+		ensure!(attempt.lightning_node_id == self.node_id, "attempt belongs to a different native node");
+		let Some(dispatch) = self.payment_guards.try_lock_dispatch(payment_hash) else { return Ok(()); };
+		self.reconcile_payment_attempt_locked(attempt, None, None, false, dispatch).await
 	}
 
 	/// Observe existing work. Only privileged external confirmation of complete
@@ -310,15 +311,6 @@ impl ClnXpayClient {
 			.context("original dispatch is still active; attempt stays held")?;
 		self.node_info().await?;
 		self.reconcile_payment_attempt_locked(attempt, None, None, native_cold_restart_confirmed, dispatch).await
-	}
-
-	async fn reconcile_payment_attempt(
-		&self, attempt: LightningPaymentAttempt, pay_error: Option<&str>,
-	) -> anyhow::Result<()> {
-		let payment_hash = attempt.payment_hash;
-		ensure!(attempt.lightning_node_id == self.node_id, "attempt belongs to a different native node");
-		let Some(dispatch) = self.payment_guards.try_lock_dispatch(payment_hash) else { return Ok(()); };
-		self.reconcile_payment_attempt_locked(attempt, pay_error, None, false, dispatch).await
 	}
 
 	/// Consume a live result without releasing its dispatch lock to the monitor.
@@ -643,7 +635,7 @@ impl ClnXpayProcess {
 			}
 
 			let attempt_id = attempt.id;
-			if let Err(e) = self.client.sync_payment_attempt_status(attempt, None).await {
+			if let Err(e) = self.client.sync_payment_attempt_status(attempt).await {
 				error!("Error syncing payment attempt status: {e:#}");
 			} else {
 				self.update_next_attempt_check(attempt_id);

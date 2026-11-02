@@ -18,14 +18,13 @@
 //!
 //! Note that recovery is a trusted process. The server can withhold VTXOs
 //! or may falsely represent spendable VTXOs as spent. Its word on the spend
-//! state is authoritative for ordinary spends. Fallback allocations remain
-//! pending until independently verified on chain. An ordinary spent VTXO is
-//! stored without validation. Spendable and fallback-pending bodies are
-//! validated before contributing to the balance. Prefer to maintain back-ups and use recovery from the
+//! state is final for ordinary spends, whose history is stored without
+//! validation. Spendable bodies are validated and checked against the chain.
+//! Authenticated fallback bodies are validated and stored Spent; their last
+//! observed payout status is display-only. Prefer to maintain back-ups and use recovery from the
 //! mnemonic as a last resort.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;

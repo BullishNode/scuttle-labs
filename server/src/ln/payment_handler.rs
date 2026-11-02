@@ -30,25 +30,6 @@ impl<'a> PaymentAttemptHandler<'a> {
 		Self { db, mailbox_manager, payment_update_tx }
 	}
 
-	/// Mark a lightning payment attempt as failed.
-	///
-	/// Returns `None` if the optimistic-lock predicate missed.
-	pub async fn fail_payment_attempt(
-		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
-	) -> anyhow::Result<Option<DateTime<Local>>> {
-		let updated_at = self.db.write(async |t| {
-			t.lock_settlement_sources(attempt.payment_hash).await?;
-			t.lock_htlc_settlements().await?;
-			t.ensure_attempt_sources_allow_failure(attempt).await?;
-			Self::fail_attempt_in_tx(t, attempt, error).await
-		}).await?;
-
-		if updated_at.is_some() {
-			self.notify_payment_failed(attempt, error).await?;
-		}
-		Ok(updated_at)
-	}
-
 	/// Apply the existing failure write in a caller-owned transaction after
 	/// its validity/source/settlement locks and source failure predicate.
 	pub(crate) async fn fail_attempt_in_tx(
@@ -93,9 +74,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 			telemetry::LightningDirection::Send,
 			attempt.is_self_payment(),
 			attempt.user_agent.as_deref(),
-			// Falls back to the stored error: `update_..._status` keeps it
-			// when handed `None`.
-			Some(LightningFailureKind::classify(error.or(attempt.error.as_deref()))),
+			Some(failure),
 			None,
 		);
 		Ok(())

@@ -60,7 +60,7 @@ pub enum ServerStatusAdoption {
 	Spent,
 	/// Terminal fallback first discovered during recovery or import.
 	FallbackSpent,
-	/// Allocated customer principal awaiting independent payout verification.
+	/// Allocated customer principal; last observed server payout status is pending.
 	FallbackPending,
 	/// Canonical terminal policy result with no Bitcoin payout output.
 	Forfeited,
@@ -395,7 +395,7 @@ impl Wallet {
 		let (_idx, keypair) = self.pubkey_keypair(&stored.vtxo.user_pubkey()).await?
 			.with_context(|| format!("no key for vtxo {vtxo_id} in this wallet"))?;
 
-		let spend_state = self.fetch_vtxo_spend_state(vtxo_id, &keypair).await?;
+		let spend_state = self.fetch_vtxo_status(vtxo_id, &keypair).await?.0;
 		let adoption = ServerStatusAdoption::from_spend_state(spend_state)
 			.with_context(|| format!("cannot decide the state of vtxo {vtxo_id}"))?;
 

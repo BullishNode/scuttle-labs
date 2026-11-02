@@ -6,7 +6,6 @@ use anyhow::Context;
 use bitcoin::{Amount, Transaction, TxOut, Txid, Weight};
 use bitcoin_ext::TxStatus;
 use bitcoin_ext::{fee, TransactionExt, TxOutExt};
-use bitcoind_async_client::traits::Reader;
 use bitcoin_ext::bdk::WalletExt;
 use bitcoin_ext::cpfp::MakeCpfpFees;
 use tracing::warn;
@@ -76,7 +75,6 @@ impl Watchman {
 		if !claims.is_empty() { self.process_claims(claims).await?; }
 		// Operator-only claims above do not depend on customer view readiness.
 		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
-		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 		self.expiry_readiness_pass(view, sweeps).await?;
 		// Expired customer backing never reaches upstream's drain-only builder.
 		self.process_expiry_payouts(view).await?;

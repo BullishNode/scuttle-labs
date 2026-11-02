@@ -44,7 +44,7 @@ impl Tx<'_> {
 		&self, source: VtxoId, hash: PaymentHash, tip: BlockHeight,
 		watchman_tip: BlockHeight,
 	) -> anyhow::Result<Option<BlockRef>> {
-		let attempts = self.query("SELECT a.id,a.lightning_htlc_subscription_id,a.status::TEXT, \
+		let attempts = self.query("SELECT a.lightning_htlc_subscription_id,a.status::TEXT, \
 			s.payment_hash,s.status::TEXT AS subscription_status FROM lightning_payment_attempt a \
 			JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
 			JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id \

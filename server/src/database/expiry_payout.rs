@@ -5,7 +5,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::Context;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};

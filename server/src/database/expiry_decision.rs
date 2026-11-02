@@ -16,13 +16,11 @@ use super::expiry_payout::MAX_PAYOUT_VSIZE;
 use super::Tx;
 use crate::watchman::settlement::{allocate, CustomerLeaf};
 
-#[derive(Clone)]
 pub struct VerifiedPayee {
 	pub mailbox: PublicKey,
 	pub script: ScriptBuf,
 }
 
-#[derive(Clone)]
 pub struct ReadyCoin {
 	pub ownership: OwnershipProposal,
 	pub payee: Option<VerifiedPayee>,

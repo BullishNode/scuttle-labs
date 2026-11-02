@@ -1694,17 +1694,6 @@ impl Wallet {
 		vtxo.validate(&tx).map_err(VtxoValidationError::Invalid)
 	}
 
-	/// Ask the server for `vtxo_id`'s spend state.
-	///
-	/// `keypair` must be the VTXO's private key so we can prove ownership.
-	pub(crate) async fn fetch_vtxo_spend_state(
-		&self,
-		vtxo_id: VtxoId,
-		keypair: &Keypair,
-	) -> anyhow::Result<VtxoSpendState> {
-		Ok(self.fetch_vtxo_status(vtxo_id, keypair).await?.0)
-	}
-
 	/// Adopt authenticated commitments as Spent; retain the status only for display.
 	pub(crate) async fn fetch_vtxo_status(&self, vtxo_id: VtxoId, keypair: &Keypair)
 		-> anyhow::Result<(VtxoSpendState, bool)>
@@ -1732,13 +1721,6 @@ impl Wallet {
 	/// are absent from the result; `Ok` does not imply complete coverage.
 	/// Server admission, integrity checks and local adoption
 	/// or storage can return errors. Earlier adopted updates remain durable.
-	pub(crate) async fn fetch_vtxo_spend_states(
-		&self,
-		queries: &[(VtxoId, &Keypair)],
-	) -> anyhow::Result<HashMap<VtxoId, VtxoSpendState>> {
-		Ok(self.fetch_vtxo_statuses(queries).await?.into_iter().map(|(id,(state,_))| (id,state)).collect())
-	}
-
 	pub(crate) async fn fetch_vtxo_statuses(&self, queries: &[(VtxoId, &Keypair)])
 		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
 	{
@@ -2375,9 +2357,8 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = V>,
 		height: Option<BlockHeight>,
 	) -> anyhow::Result<Option<RoundParticipation>> {
-		let selected = vtxos.into_iter().collect::<Vec<_>>();
 		let (vtxos, total_amount) = {
-			let iter = selected.into_iter();
+			let iter = vtxos.into_iter();
 			let size_hint = iter.size_hint();
 			let mut vtxos = Vec::<Vtxo<Full>>::with_capacity(size_hint.1.unwrap_or(size_hint.0));
 			let mut amount = Amount::ZERO;

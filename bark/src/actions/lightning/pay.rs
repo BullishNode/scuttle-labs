@@ -31,7 +31,7 @@ use server_rpc::protos::{self, lightning_payment_status};
 use crate::Wallet;
 use crate::actions::{
 	abort, or_retry, Advance, AdvanceError, IntoAdvanceResult,
-	AdvanceResultExt, RetryUnlessRejected, WalletAction, WalletActionCheckpoint, WalletActionId,
+	RetryUnlessRejected, WalletAction, WalletActionCheckpoint, WalletActionId,
 };
 use crate::arkoor::{resolve_change_pieces, split_change_amount};
 use crate::movement::update::MovementUpdate;

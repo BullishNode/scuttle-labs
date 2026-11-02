@@ -35,11 +35,7 @@ impl Tx<'_> {
 		let OwnershipDisposition::Customer { user_pubkey } = &ownership.disposition
 			else { return Ok(Attribution::Unresolved); };
 		if ownership.evidence.is_none() { return Ok(Attribution::Unresolved); }
-		let Some(row) = self.query_opt("SELECT mailbox_pk FROM owner_key WHERE user_pubkey=$1",
-			&[&user_pubkey.to_string()]).await? else { return Ok(Attribution::Unresolved); };
-		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk")) else { return Ok(Attribution::Unresolved); };
-		Ok(Attribution::Owned { mailbox_pk: mailbox,
-			spk: ark::fallback::payout_script(mailbox) })
+		self.expiry_owner(*user_pubkey).await
 	}
 
 	/// Verify both holders once at admission and keep the first signed binding.

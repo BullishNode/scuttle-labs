@@ -18,7 +18,7 @@ impl Wallet {
 			}
 		}
 		let queries = keyed.iter().map(|(id,key)| (*id,key)).collect::<Vec<_>>();
-		self.fetch_vtxo_spend_states(&queries).await?;
+		self.fetch_vtxo_statuses(&queries).await?;
 		Ok(())
 	}
 }
