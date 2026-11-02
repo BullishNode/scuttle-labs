@@ -646,7 +646,8 @@ async fn finish_payouts(
 		assert_eq!(stored, canonical.to_string(), "payout history must name the actual canonical block");
 	}
 	let entitlements = db.read(async |tx| Ok(tx.query_one(
-		"SELECT COUNT(*) FROM expiry_allocation_coin WHERE disposition='customer' AND active", &[],
+		"SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+		WHERE c.disposition='customer' AND a.status<>'conflicted'", &[],
 	).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(entitlements, payees as i64, "intermediate coins cannot acquire extra customer payouts");
 	if mine_pending {
