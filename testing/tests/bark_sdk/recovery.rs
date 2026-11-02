@@ -10,7 +10,7 @@ use bark::vtxo::VtxoState;
 use server_rpc::protos;
 
 use ark_testing::{sat, TestContext};
-use ark_testing::daemon::captaind::{self, ArkClient};
+use ark_testing::daemon::captaind::{self, ArkClient, MailboxClient};
 
 /// The gap limit must tolerate a run of unused key indices *between* matches,
 /// not only before the first one.
