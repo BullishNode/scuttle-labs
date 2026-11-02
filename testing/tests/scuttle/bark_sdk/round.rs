@@ -56,6 +56,7 @@ struct RefreshTransport {
 	status_steps: Arc<AtomicUsize>,
 	status_faults: Arc<AtomicUsize>,
 	reject_nonces: Arc<AtomicBool>,
+	nonce_requests: Arc<AtomicUsize>,
 	accepted_forfeits: Arc<AtomicUsize>,
 }
 
@@ -64,6 +65,7 @@ impl captaind::proxy::ArkRpcProxy for RefreshTransport {
 	async fn request_forfeit_nonces(&self, upstream: &mut ArkClient, request: protos::ForfeitNoncesRequest)
 		-> Result<protos::ForfeitNoncesResponse, tonic::Status>
 	{
+		self.nonce_requests.fetch_add(1, Ordering::SeqCst);
 		if self.reject_nonces.load(Ordering::SeqCst) {
 			return Err(tonic::Status::unavailable("nonce transport unavailable before forwarding"));
 		}
