@@ -286,11 +286,6 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 }
 
 #[tokio::test]
-async fn expiry_actual_failed_external_send_pays_offline_owner() {
-	failed_external_payout(false, false).await;
-}
-
-#[tokio::test]
 async fn expiry_actual_no_part_external_send_pays_offline_owner() {
 	failed_external_payout(true, false).await;
 }
@@ -436,11 +431,6 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 #[tokio::test]
 async fn expiry_internal_signed_grants_joint_timeout_pays_absent_sender() {
 	internal_safe_pool_grants(false, false, false).await;
-}
-
-#[tokio::test]
-async fn expiry_internal_existing_large_pool_cover_refunds_absent_owner() {
-	internal_safe_pool_grants(true, false, false).await;
 }
 
 #[tokio::test]

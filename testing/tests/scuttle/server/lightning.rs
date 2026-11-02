@@ -60,24 +60,6 @@ async fn htlc_send_vtxo_ids(
 	ids
 }
 
-/// Force-release the HTLC vtxos back to `Spendable`, whichever holder
-/// currently owns each lock, so a test can drive them through spend paths
-/// the client would normally refuse. Already-Spendable vtxos are left
-/// alone.
-async fn force_unlock_htlc_vtxos(client: &Wallet, vtxo_ids: &[ark::VtxoId]) {
-	let states: std::collections::HashMap<_, _> = client.all_vtxos().await.unwrap()
-		.into_iter().map(|wv| (wv.vtxo.id(), wv.state)).collect();
-	for id in vtxo_ids {
-		let holder = match states.get(id) {
-			Some(bark::vtxo::VtxoState::Locked { holder }) => holder.clone(),
-			Some(bark::vtxo::VtxoState::Spendable) => continue,
-			other => panic!("expected HTLC vtxo {id} to be Locked or Spendable, was {other:?}"),
-		};
-		client.unlock_vtxos([*id], holder).await
-			.expect("it should be able to unlock vtxos on the db");
-	}
-}
-
 /// Build a "claim all" revocation request from the HTLC-send vtxos `client`
 /// still holds for `payment_hash`, send it straight to the server, and return
 /// the error the server responds with (the caller asserts on it).

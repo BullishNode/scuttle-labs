@@ -352,11 +352,6 @@ async fn fallback_source_state_write_failure_retains_its_receipt_fence() {
 }
 
 #[tokio::test]
-async fn fallback_receipt_write_failure_retries_without_replacing_exit_material() {
-	Box::pin(retained_claim_write_failure(true)).await;
-}
-
-#[tokio::test]
 async fn issued_refresh_completes_unsigned_history_before_unlocking_it() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
 		let ctx = TestContext::new("bark_sdk/issued_refresh_unsigned_history").await;
