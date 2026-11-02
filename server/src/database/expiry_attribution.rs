@@ -7,7 +7,7 @@ use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin::{Network, ScriptBuf};
 
 use ark::fallback::OwnerLink;
-use ark::{ProtocolEncoding, VtxoId};
+use ark::VtxoId;
 
 use crate::error::OwnershipRefusal;
 use super::expiry_ownership::{OwnershipDisposition, OwnershipProposal};
@@ -49,10 +49,9 @@ impl Tx<'_> {
 	) -> anyhow::Result<PublicKey> {
 		let mailbox = link.verify_joint(network, server_mailbox_key, user_pubkey)
 			.map_err(|_| OwnershipRefusal::Invalid(user_pubkey))?.as_pubkey();
-		self.execute("INSERT INTO owner_key (user_pubkey, mailbox_pk, blinded_id, joint_proof)
-			VALUES ($1, $2, $3, $4) ON CONFLICT (user_pubkey) DO NOTHING",
-			&[&user_pubkey.to_string(), &mailbox.to_string(),
-				&link.blinded_id.to_string(), &link.serialize_hex()]).await?;
+		self.execute("INSERT INTO owner_key (user_pubkey, mailbox_pk, blinded_id)
+			VALUES ($1, $2, $3) ON CONFLICT (user_pubkey) DO NOTHING",
+			&[&user_pubkey.to_string(), &mailbox.to_string(), &link.blinded_id.to_string()]).await?;
 		let canonical = self.query_one("SELECT mailbox_pk, blinded_id FROM owner_key WHERE user_pubkey=$1",
 			&[&user_pubkey.to_string()]).await?;
 		if canonical.get::<_, &str>("mailbox_pk") != mailbox.to_string()

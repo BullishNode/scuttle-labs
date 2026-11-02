@@ -79,7 +79,8 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	assert!(!grants.is_empty());
 	wait_for_subscription_status(&db, hash, "htlcs-ready").await;
 	let owner = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(), hash, super::test_owner_link(&srv, &owner).await).await;
+	let owner_proof = super::test_owner_link(&srv, &owner).await;
+	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(), hash, owner_proof).await;
 	wallet.register_vtxo_transactions_with_server(&sources).await.unwrap();
 	let refusal = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000,
@@ -99,8 +100,12 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		sources, ark::VtxoPolicy::new_pubkey(owner.public_key()),
 	).unwrap().generate_user_nonces(&keys).unwrap();
+	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.owner_proof = Some(owner_proof.into());
+	}
 	let reply = rpc.request_lightning_pay_htlc_revocation(
-		super::signed_package(&srv, &[&wallet], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await,
+		super::signed_package(&srv, &[&wallet], cosign_request).await,
 	).await.expect("the unsuccessful sender must retain its cooperative refund").into_inner();
 	let refund = builder.user_cosign(&keys,
 		ark::arkoor::package::ArkoorPackageCosignResponse::try_from(reply).unwrap())
@@ -154,8 +159,9 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		.await.unwrap().unwrap();
 	let incoming_expiry = subscription.lowest_incoming_htlc_expiry.unwrap();
 	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let owner_proof = super::test_owner_link(&srv, &receiver).await;
 	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(super::test_owner_link(&srv, &receiver).await.into()),
+		owner_proof: Some(owner_proof.into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 		htlc_recv_expiry: incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta).into(),
 		lightning_receive_anti_dos: None,
@@ -174,6 +180,11 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		grants.clone(), ark::VtxoPolicy::new_pubkey(receiver.public_key()),
 	).unwrap().generate_user_nonces(&[receiver]).unwrap();
 
+	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.owner_proof = Some(owner_proof.into());
+	}
+
 	// The backend is unavailable for the settlement call. The request
 	// must already be durable, but the server must not release its destination.
 	let original_node = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {})
@@ -181,7 +192,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	lightning.internal.stop().await.unwrap();
 	let error = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
-		cosign_request: Some(super::signed_package(&srv, &[], builder.cosign_request().into()).await),
+		cosign_request: Some(super::signed_package(&srv, &[], cosign_request).await),
 	}).wait_millis(10_000).await.expect_err("an unavailable original backend cannot collect the invoice");
 	assert!(error.message().contains("could not settle hold invoice"), "unexpected error: {error}");
 	assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));

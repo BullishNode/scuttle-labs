@@ -30,8 +30,8 @@ async fn assert_receive_start_refused(
 			(SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM htlc_vtxo WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE payment_hash=$1)", &[&hash.to_string()]).await?;
-		let owner = tx.query_opt("SELECT mailbox_pk, blinded_id, joint_proof FROM owner_key WHERE user_pubkey=$1",
-			&[&key.to_string()]).await?.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1), r.get::<_, String>(2)));
+		let owner = tx.query_opt("SELECT mailbox_pk, blinded_id FROM owner_key WHERE user_pubkey=$1",
+			&[&key.to_string()]).await?.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)));
 		Ok((subscription, counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2), owner))
 	}).await.unwrap();
 	let before = snapshot().await;

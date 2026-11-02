@@ -25,19 +25,18 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	assert_ne!(link.signature, resigned.signature);
 	assert_eq!(resigned.verify_joint(Network::Regtest, &server, coin.public_key()).unwrap().as_pubkey(), mailbox.public_key());
 	let binding_rows = async |key: PublicKey| db.read(async |tx| Ok(tx.query(
-		"SELECT user_pubkey,mailbox_pk,blinded_id,joint_proof,xmin::TEXT FROM owner_key WHERE user_pubkey=$1",
+		"SELECT user_pubkey,mailbox_pk,blinded_id,xmin::TEXT FROM owner_key WHERE user_pubkey=$1",
 		&[&key.to_string()],
 	).await?.into_iter().map(|row| (row.get::<_, String>(0), row.get::<_, String>(1),
-		row.get::<_, String>(2), row.get::<_, String>(3), row.get::<_, String>(4))).collect::<Vec<_>>())).await.unwrap();
+		row.get::<_, String>(2), row.get::<_, String>(3))).collect::<Vec<_>>())).await.unwrap();
 	let mut canonical_binding = None;
 	for proof in [&link, &resigned] {
 		assert_eq!(db.write(async |tx| tx.verify_owner_link(&server, coin.public_key(), proof, Network::Regtest).await)
 			.await.unwrap(), mailbox.public_key());
 		let rows = binding_rows(coin.public_key()).await;
 		assert_eq!(rows.len(), 1);
-		assert_eq!((&rows[0].0, &rows[0].1, &rows[0].2, &rows[0].3),
-			(&coin.public_key().to_string(), &mailbox.public_key().to_string(),
-				&link.blinded_id.to_string(), &link.serialize_hex()));
+		assert_eq!((&rows[0].0, &rows[0].1, &rows[0].2),
+			(&coin.public_key().to_string(), &mailbox.public_key().to_string(), &link.blinded_id.to_string()));
 		if let Some(canonical) = &canonical_binding { assert_eq!(&rows, canonical); }
 		canonical_binding = Some(rows);
 	}

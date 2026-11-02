@@ -121,8 +121,7 @@ CREATE TABLE expiry_lightning_receive_claim (
 CREATE TABLE owner_key (
 	user_pubkey TEXT PRIMARY KEY CHECK (length(user_pubkey) = 66),
 	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66),
-	blinded_id TEXT NOT NULL CHECK (length(blinded_id) = 66),
-	joint_proof TEXT NOT NULL CHECK (length(joint_proof) = 322)
+	blinded_id TEXT NOT NULL CHECK (length(blinded_id) = 66)
 );
 
 CREATE TABLE coin_owner (

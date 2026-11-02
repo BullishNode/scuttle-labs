@@ -42,26 +42,23 @@ async fn test_owner_link(srv: &Captaind, key: &Keypair) -> OwnerLink {
 }
 
 /// Carry real evidence through hand-built financial requests. Wallet outputs
-/// sign from their keystores; custom actors copy their previously signed link.
+/// sign from their keystores; custom actors supply their signed link.
 async fn signed_package(
 	srv: &Captaind, wallets: &[&Wallet], mut package: protos::ArkoorPackageCosignRequest,
 ) -> protos::ArkoorPackageCosignRequest {
-	let config = srv.config().postgres.clone();
-	let db = server::database::Db::connect(&config).await.unwrap();
+	if !srv.config().expiry_payouts { return package; }
 	let mut links = std::collections::BTreeMap::new();
 	for output in package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
 		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
 		if links.contains_key(&key) { continue; }
-		let mut link = None;
-		for wallet in wallets {
-			if wallet.pubkey_keypair(&key).await.unwrap().is_some() {
-				link = Some(wallet.owner_link(key).await.unwrap());
-				break;
-			}
-		}
+		let mut link = output.owner_proof.clone().map(|proof| OwnerLink::try_from(proof).unwrap());
 		if link.is_none() {
-			link = db.read(async |tx| Ok(tx.query_opt("SELECT joint_proof FROM owner_key WHERE user_pubkey=$1",
-				&[&key.to_string()]).await?.map(|row| OwnerLink::deserialize_hex(row.get("joint_proof")).unwrap()))).await.unwrap();
+			for wallet in wallets {
+				if wallet.pubkey_keypair(&key).await.unwrap().is_some() {
+					link = Some(wallet.owner_link(key).await.unwrap());
+					break;
+				}
+			}
 		}
 		let link = link.unwrap_or_else(|| panic!("hand-built output {key} needs its real signing key"));
 		link.verify_joint(bitcoin::Network::Regtest, &srv.mailbox_keypair(), key).unwrap();

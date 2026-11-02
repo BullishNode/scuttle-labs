@@ -15,11 +15,11 @@ pub(super) fn assert_owner_refusal(error: tonic::Status, key: PublicKey, reason:
 	assert_eq!(error.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
 }
 
-pub(super) async fn owner_rows(db: &Db, keys: &[PublicKey]) -> Vec<(String, String, String, String)> {
+pub(super) async fn owner_rows(db: &Db, keys: &[PublicKey]) -> Vec<(String, String, String)> {
 	let keys = keys.iter().map(ToString::to_string).collect::<Vec<_>>();
-	db.read(async |tx| Ok(tx.query("SELECT user_pubkey,mailbox_pk,blinded_id,joint_proof \
+	db.read(async |tx| Ok(tx.query("SELECT user_pubkey,mailbox_pk,blinded_id \
 		FROM owner_key WHERE user_pubkey=ANY($1) ORDER BY user_pubkey", &[&keys]).await?
-		.into_iter().map(|row| (row.get(0), row.get(1), row.get(2), row.get(3))).collect())).await.unwrap()
+		.into_iter().map(|row| (row.get(0), row.get(1), row.get(2))).collect())).await.unwrap()
 }
 
 pub(super) async fn source_rows(db: &Db, ids: &[ark::VtxoId]) -> Vec<String> {

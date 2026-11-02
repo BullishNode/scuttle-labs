@@ -85,14 +85,17 @@ async fn revoke_htlc_vtxos(
 	// Any pubkey works for the revocation output; the tests never claim it.
 	let revocation_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let revocation_pubkey = revocation_key.public_key();
-	super::test_owner_link(srv, &revocation_key).await;
+	let owner_proof = super::test_owner_link(srv, &revocation_key).await;
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		htlc_vtxos,
 		ark::VtxoPolicy::new_pubkey(revocation_pubkey),
 	).unwrap().generate_user_nonces(keypairs).unwrap();
 
-	let cosign_request =
-		super::signed_package(srv, &[], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await;
+	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.owner_proof = Some(owner_proof.into());
+	}
+	let cosign_request = super::signed_package(srv, &[], cosign_request).await;
 
 	let mut srv_rpc = srv.get_public_rpc().await;
 	srv_rpc.request_lightning_pay_htlc_revocation(cosign_request).await.map(|_| ())

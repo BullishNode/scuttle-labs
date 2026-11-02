@@ -59,7 +59,7 @@ fn owner() -> Owner {
 
 async fn native_node(
 	srv: &Captaind, client: &bark::Wallet, rpc: &mut ArkClient, input: Vtxo<Full>, key: Keypair,
-	destinations: Vec<ArkoorDestination>, payees: usize,
+	destinations: Vec<ArkoorDestination>, payees: usize, owners: &[Owner],
 ) -> (Vec<Vtxo<Full>>, Node) {
 	assert!(input.exit_depth() < 100);
 	assert!(!destinations.is_empty() && destinations.len() <= 4);
@@ -70,7 +70,15 @@ async fn native_node(
 	let expected = destinations.iter().map(|d| (d.policy.clone(), d.total_amount)).collect::<Vec<_>>();
 	let builder = ArkoorPackageBuilder::new_with_checkpoints([input], destinations).unwrap()
 		.generate_user_nonces(&[key]).unwrap();
-	let response = rpc.request_arkoor_cosign(super::signed_package(srv, &[client], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await)
+	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		let key = ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
+		if let Some(owner) = owners.iter().find(|owner| owner.key.public_key() == key) {
+			output.owner_proof = Some(OwnerLink::new_joint(Network::Regtest, srv.mailbox_keypair().public_key(),
+				&owner.mailbox_key, &owner.key).unwrap().into());
+		}
+	}
+	let response = rpc.request_arkoor_cosign(super::signed_package(srv, &[client], request).await)
 		.await.unwrap().into_inner();
 	let signed = builder.user_cosign(&[key], ArkoorPackageCosignResponse::try_from(response).unwrap()).unwrap();
 	let checkpoints = signed.build_signed_internal_vtxos().into_iter()
@@ -234,7 +242,7 @@ async fn split_leaves(
 			});
 			children.push((indices, child_key));
 		}
-		let (outputs, node) = native_node(srv, client, rpc, input, key, destinations, group.len()).await;
+		let (outputs, node) = native_node(srv, client, rpc, input, key, destinations, group.len(), owners).await;
 		nodes.push(node);
 		for (output, (indices, child_key)) in outputs.into_iter().zip(children) {
 			if bounded { assert!(output.exit_depth() <= 11); }
@@ -341,9 +349,9 @@ async fn bounded_round_inventory() {
 		max_evidence_bytes = max_evidence_bytes.max(evidence_bytes);
 		proof_db.write(async |tx| distinct.verify(tx, keys.iter().copied(), &mailbox_key, Network::Regtest).await).await.unwrap();
 		let one = &group[0];
-		let before = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,joint_proof FROM owner_key WHERE user_pubkey=$1",
+		let before = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id FROM owner_key WHERE user_pubkey=$1",
 			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
-		let canonical = (before.get::<_, String>(0), before.get::<_, String>(1));
+		let canonical = before.get::<_, String>(0);
 		let mut repeated = OwnerLinks::default();
 		let mut invalid = OwnerLinks::default();
 		for index in 0..batch_limit {
@@ -356,9 +364,9 @@ async fn bounded_round_inventory() {
 		proof_db.write(async |tx| repeated.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap();
 		let error = proof_db.write(async |tx| invalid.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap_err();
 		assert!(error.is::<server::OwnershipRefusal>(), "{error:#}");
-		let after = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,joint_proof FROM owner_key WHERE user_pubkey=$1",
+		let after = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id FROM owner_key WHERE user_pubkey=$1",
 			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
-		assert_eq!((after.get::<_, String>(0), after.get::<_, String>(1)), canonical);
+		assert_eq!(after.get::<_, String>(0), canonical);
 	}
 	proof_db.read(async |tx| {
 		for owner in &owners {
@@ -479,7 +487,7 @@ async fn automatic_multilevel_split() {
 		});
 		child_keys.push((group.len() > 1).then_some(key));
 	}
-	let (outputs, root_node) = native_node(&srv, &client, &mut rpc, source.clone(), source_key, destinations, PAYEES).await;
+	let (outputs, root_node) = native_node(&srv, &client, &mut rpc, source.clone(), source_key, destinations, PAYEES, &owners).await;
 	let mut terminals = Vec::new();
 	for ((output, key), group) in outputs.into_iter().zip(child_keys).zip(root_groups) {
 		if let Some(key) = key { jobs.push_back((output, key, group)); }
