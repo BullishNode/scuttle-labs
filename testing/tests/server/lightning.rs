@@ -3967,10 +3967,6 @@ async fn refuse_send_with_unlock_hash_as_payment_hash() {
 	assert!(msg.contains("unlock hash"), "unexpected error: {msg}");
 }
 
-/// The `status` of the `lightning_htlc_subscription` row for `payment_hash`.
-
-/// The `status` of the `lightning_payment_attempt` row for `payment_hash`.
-
 /// The `status` of the `cln_xpay` row for `payment_hash`.
 async fn cln_xpay_status(
 	db: &Db,
@@ -4010,8 +4006,6 @@ async fn is_preimage_recorded(
 	}).await.unwrap()
 }
 
-/// Waits until the server's htlc subscription for `payment_hash` reaches `status`.
-
 /// Waits until a settlement (preimage) for `payment_hash` is recorded.
 async fn wait_for_preimage_recorded(
 	db: &Db,
@@ -4025,8 +4019,6 @@ async fn wait_for_preimage_recorded(
 	}
 	panic!("preimage was never recorded");
 }
-
-/// Waits until the payment attempt for `payment_hash` reaches `status`.
 
 async fn wait_for_cln_xpay_status(
 	db: &Db,
