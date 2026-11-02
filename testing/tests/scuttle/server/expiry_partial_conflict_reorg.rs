@@ -97,13 +97,13 @@ async fn assert_physical_cut(
 		assert!(child_fee > Amount::ZERO);
 		fee_total += child_fee;
 		let persisted = db.read(async |tx| Ok(tx.query_one("SELECT status,sweep_tx,sweep_txid,confirmed_height,confirmed_hash \
-			FROM expiry_allocation WHERE id=$1", &[allocation]).await?)).await.unwrap();
+			FROM expiry_allocation_state WHERE id=$1", &[allocation]).await?)).await.unwrap();
 		assert_eq!(persisted.get::<_, String>("status"), "confirmed");
 		assert_eq!(deserialize::<Transaction>(persisted.get("sweep_tx")).unwrap(), *parent);
 		assert_eq!(persisted.get::<_, Option<String>>("sweep_txid"), Some(txid.to_string()));
 		assert_eq!(persisted.get::<_, Option<i64>>("confirmed_height"), Some(i64::from(point.height.to_u32())));
 		assert_eq!(persisted.get::<_, Option<String>>("confirmed_hash"), Some(hash.to_string()));
-		let payouts = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM expiry_allocation_payout WHERE allocation_id=$1", &[allocation]).await?)).await.unwrap();
+		let payouts = db.read(async |tx| Ok(tx.query("SELECT (ROW_NUMBER() OVER (ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts", &[allocation]).await?)).await.unwrap();
 		assert_eq!(payouts.len(), 1);
 		assert_eq!(payouts[0].get::<_, i32>(0), i32::try_from(payee_index).unwrap());
 		assert_eq!(payouts[0].get::<_, String>(1), customer.as_bytes().to_lower_hex_string());
@@ -124,10 +124,10 @@ async fn assert_physical_cut(
 	}
 	assert_eq!(actual_board_fee, board_fee);
 	fee_total += actual_board_fee;
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat AS entitlement_gross,c.disposition,c.owner_mailbox, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS entitlement_gross,c.disposition,c.owner_mailbox, \
 		c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.status,a.confirmed_height,a.confirmed_hash \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE c.active AND e.vtxo_id=ANY($1)", &[&coins]).await?)).await.unwrap();
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE a.status<>'conflicted' AND e.vtxo_id=ANY($1)", &[&coins]).await?)).await.unwrap();
 	assert_eq!(rows.len(), coins.len());
 	let mut attributed_payout = Amount::ZERO;
 	let mut attributed_fee = Amount::ZERO;
@@ -240,8 +240,8 @@ async fn assert_physical_cut(
 }
 
 async fn decided_obligations(db: &Db, coins: &[String]) -> BTreeMap<String, (i64, i64, String)> {
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.id,e.vtxo_id,e.gross_sat, \
-		e.irreversible_facts::TEXT AS facts,v.spend_state::TEXT AS spend_state, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.id,e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat, \
+		(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts,v.spend_state::TEXT AS spend_state, \
 		(SELECT COUNT(*) FROM expiry_entitlement d WHERE d.id=e.id) AS fences \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE e.vtxo_id=ANY($1)",
 		&[&coins],
@@ -263,9 +263,9 @@ async fn assert_final_outcome(
 	stored_parents: &BTreeMap<i64, Transaction>, canonical: &BTreeMap<Txid, BlockHash>,
 ) {
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id, \
-		(SELECT COUNT(*) FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.active) AS active, \
+		(SELECT COUNT(*) FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')) AS active, \
 		(SELECT COUNT(DISTINCT a.sweep_txid) FROM expiry_allocation_coin c \
-		 JOIN expiry_allocation a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id AND a.status='confirmed') AS payments, \
+		 JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id AND a.status='confirmed') AS payments, \
 		(SELECT COUNT(*) FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id) AS claims \
 		FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&coins],
 	).await?)).await.unwrap();
@@ -275,9 +275,9 @@ async fn assert_final_outcome(
 		assert_eq!(row.get::<_, i64>("active"), 1);
 		assert_eq!(row.get::<_, i64>("payments"), 1);
 		assert_eq!(row.get::<_, i64>("claims"), 0, "an orphaned terminal payment must not return asynchronously");
-		let active = db.read(async |tx| Ok(tx.query_one("SELECT a.sweep_txid FROM expiry_allocation a \
+		let active = db.read(async |tx| Ok(tx.query_one("SELECT a.sweep_txid FROM expiry_allocation_state a \
 			JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-			WHERE e.vtxo_id=$1 AND c.active", &[&coin],
+			WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&coin],
 		).await?.get::<_, String>(0))).await.unwrap();
 		assert_eq!(active, expected_payers[&coin].to_string(), "the active receipt must identify the actual canonical payer");
 	}
@@ -294,7 +294,7 @@ async fn assert_final_outcome(
 	// Include any new allocation created after the first observation, so an
 	// additional canonical payment cannot escape the immutable-parent oracle.
 	let parents = db.read(async |tx| Ok(tx.query("SELECT DISTINCT a.sweep_txid \
-		FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+		FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		WHERE e.vtxo_id=ANY($1) AND a.sweep_txid IS NOT NULL", &[&coins],
 	).await?)).await.unwrap();
@@ -401,7 +401,7 @@ async fn partial_conflict_reorg() {
 	let (original_id, original) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx \
-				FROM expiry_allocation a WHERE a.sweep_tx IS NOT NULL AND \
+				FROM expiry_allocation_state a WHERE a.sweep_tx IS NOT NULL AND \
 				(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e \
 				 ON e.id=c.entitlement_id WHERE c.allocation_id=a.id AND e.vtxo_id=ANY($1))=2",
 				&[&coins],
@@ -441,7 +441,7 @@ async fn partial_conflict_reorg() {
 			let row = db.read(async |tx| Ok(tx.query_one("SELECT status, \
 				(SELECT COUNT(*) FROM expiry_terminal_claim p JOIN expiry_entitlement e \
 				 ON e.id=p.entitlement_id WHERE e.vtxo_id=$2) AS claims \
-				FROM expiry_allocation WHERE id=$1", &[&original_id, &coins[0]],
+				FROM expiry_allocation_state WHERE id=$1", &[&original_id, &coins[0]],
 			).await?)).await.unwrap();
 			assert_eq!(row.get::<_, i64>("claims"), 0, "an intermediate exit is not terminal payment");
 			if row.get::<_, String>("status") == "conflicted" { break; }
@@ -461,11 +461,11 @@ async fn partial_conflict_reorg() {
 	let (regroup_id, regroup, claim_txid) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx,p.txid \
-				FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				JOIN expiry_entitlement claimed ON claimed.vtxo_id=$2 \
 				JOIN expiry_terminal_claim p ON p.entitlement_id=claimed.id \
-				WHERE e.vtxo_id=$1 AND c.active AND a.id<>$3 AND a.sweep_tx IS NOT NULL",
+				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.id<>$3 AND a.sweep_tx IS NOT NULL",
 				&[&coins[1], &coins[0], &original_id],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -575,7 +575,7 @@ async fn partial_conflict_reorg() {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT DISTINCT a.id,a.sweep_tx \
-				FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				WHERE e.vtxo_id=ANY($1) AND a.sweep_tx IS NOT NULL", &[&coins],
 			).await?)).await.unwrap();

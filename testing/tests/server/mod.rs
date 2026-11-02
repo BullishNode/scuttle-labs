@@ -2810,8 +2810,8 @@ async fn undo_round() {
 	// A constructed PG fence on the actual round output exercises only the
 	// transactional refusal. It rolls back together with the attempted undo.
 	let refused = db.write(async |tx| {
-		tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,$2)",
-			&[&fenced.id().to_string(), &(fenced.amount().to_sat() as i64)]).await?;
+		tx.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)",
+			&[&fenced.id().to_string()]).await?;
 		tx.undo_round(round_id).await
 	}).await.expect_err("economic references must still refuse the entire undo");
 	let error = refused.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();

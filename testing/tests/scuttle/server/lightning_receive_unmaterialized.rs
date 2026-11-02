@@ -185,7 +185,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 			if let Some(previous) = prefixes.insert(step.tx.compute_txid(), step.tx.clone()) { assert_eq!(previous, step.tx); }
 		}
 	}
-	let allocations = db.read(async |tx| Ok(tx.query("SELECT sweep_tx FROM expiry_allocation WHERE sweep_tx IS NOT NULL", &[])
+	let allocations = db.read(async |tx| Ok(tx.query("SELECT sweep_tx FROM expiry_allocation_state WHERE sweep_tx IS NOT NULL", &[])
 		.await?.into_iter().map(|row| deserialize::<Transaction>(row.get("sweep_tx")).unwrap())
 		.map(|tx| (tx.compute_txid(), tx)).collect::<BTreeMap<_, _>>())).await.unwrap();
 	let mut frontier = boundary.clone();
@@ -569,9 +569,9 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let parent = tokio::time::timeout(Duration::from_secs(30), async {
 		let mut confirmed_prefixes = 0;
 		'publication: loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT a.sweep_tx FROM expiry_allocation a \
+			let rows = db.read(async |tx| Ok(tx.query("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 				&[&original.source.id().to_string()]).await?)).await.unwrap();
 			assert!(rows.len() <= 1);
 			let mut candidates = Vec::new();
@@ -667,8 +667,8 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		}
 		rebuilt(&ctx, &db).await;
 		let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat, \
-			c.payout_sat,c.forfeited_sat,c.active,a.sweep_txid,a.status FROM expiry_allocation_coin c \
-			JOIN expiry_allocation a ON a.id=c.allocation_id \
+			c.payout_sat,c.forfeited_sat,a.sweep_txid,a.status FROM expiry_allocation_coin c \
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 			WHERE v.anchor_point=$1 AND c.disposition='customer'", &[&anchor.to_string()]).await?)).await.unwrap();
 		assert_eq!(rows.len(), 1, "old grant, provider checkpoint and recipient leaf cannot each get paid");
@@ -681,7 +681,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
 		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(payout.txid.to_string()));
 		canonical_cut(&ctx, &srv, &db, &boundary, &destination, &provider_destination, payout, &original.source, &operator_pool).await;

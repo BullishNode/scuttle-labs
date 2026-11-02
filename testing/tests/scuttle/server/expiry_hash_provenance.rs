@@ -185,7 +185,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 				JOIN expiry_allocation_coin c ON c.allocation_id = a.id
 				JOIN expiry_entitlement e ON e.id = c.entitlement_id
 				WHERE e.vtxo_id = $1
-				AND c.active
+				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
 				AND c.disposition = 'customer'
 				AND a.broadcast_at IS NOT NULL
 			",

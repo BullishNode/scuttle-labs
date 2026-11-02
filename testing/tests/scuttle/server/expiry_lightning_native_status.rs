@@ -146,9 +146,9 @@ async fn native_refund_status(two_sources: bool) {
 			let height = ctx.generate_blocks(1).await;
 			srv.wait_for_sync_height(height).await;
 			srv.watchmand().wait_for_sync_height(height).await;
-			let rows = db.read(async |t| Ok(t.query("SELECT e.vtxo_id,a.sweep_tx FROM expiry_allocation a \
+			let rows = db.read(async |t| Ok(t.query("SELECT e.vtxo_id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+				WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 				&[&source_ids]).await?)).await.unwrap();
 			for row in rows { parents.insert(row.get("vtxo_id"), deserialize(row.get("sweep_tx")).unwrap()); }
 			if two_sources && parents.len() == 1 && !checked_partial {

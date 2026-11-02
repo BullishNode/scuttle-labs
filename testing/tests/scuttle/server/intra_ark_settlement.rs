@@ -359,7 +359,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 			&[&hash.to_string()]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>();
 		assert_eq!(tx.query_one("SELECT COUNT(*) FROM vtxo WHERE vtxo_id=ANY($1) AND onchain_spent_txid IS NOT NULL",
 			&[&same_hash]).await?.get::<_, i64>(0),0);
-		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND a.broadcast_at IS NOT NULL",
 			&[&same_hash]).await?.get::<_,i64>(0),0);
 		Ok(())

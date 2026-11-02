@@ -388,7 +388,7 @@ async fn restored_finish() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT a.sweep_tx,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat \
 				FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 				&[&control_id.to_string()]).await?)).await.unwrap();
 			for row in rows {
 				let Some(bytes) = row.get::<_, Option<Vec<u8>>>("sweep_tx") else { continue; };
@@ -417,7 +417,7 @@ async fn restored_finish() {
 	assert_eq!(ctx.bitcoind().await_transaction(control_txid).await, control_parent);
 	let confirmed_controls = db.read(async |tx| Ok(tx.query("SELECT a.sweep_tx,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.confirmed_hash \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed' AND a.sweep_txid IS NOT NULL",
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed' AND a.sweep_txid IS NOT NULL",
 		&[&control_id.to_string()]).await?)).await.unwrap();
 	assert_eq!(confirmed_controls.len(), 1, "the positive control must have one confirmed economic allocation");
 	let row = &confirmed_controls[0];

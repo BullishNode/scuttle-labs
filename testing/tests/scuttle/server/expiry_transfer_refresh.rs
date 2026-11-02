@@ -91,9 +91,9 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 			.checked_mul(blocks_per_prefix).expect("signed received path block budget must fit");
 		let mut mined_prefix_blocks = 0_u32;
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.sweep_tx,e.vtxo_id FROM expiry_allocation a \
+			let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.sweep_tx,e.vtxo_id FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids]).await?)).await.unwrap();
+				WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids]).await?)).await.unwrap();
 			if rows.len() == 2 {
 				assert_ne!(rows[0].get::<_, String>("vtxo_id"), rows[1].get::<_, String>("vtxo_id"));
 				break rows.into_iter().map(|row| (row.get::<_, i64>("id"), deserialize::<Transaction>(row.get("sweep_tx")).unwrap()))

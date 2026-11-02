@@ -86,9 +86,9 @@ pub(super) async fn watchman_sweeps_boards() {
 		// Height alone can precede captaind's background ownership decision.
 		loop {
 			if db.read(async |tx| {
-				let authorized = tx.query_opt("SELECT id FROM expiry_entitlement WHERE vtxo_id=$1 AND gross_sat=100000 \
-					AND irreversible_facts->>'kind'='exchange' AND irreversible_facts->>'forfeited'='true' \
-					AND irreversible_facts->>'operator'='true' AND irreversible_facts->>'participation_id'=$2",
+				let authorized = tx.query_opt("SELECT e.id FROM expiry_entitlement e JOIN LATERAL (SELECT gross_sat,evidence,disposition FROM expiry_allocation_coin WHERE entitlement_id=e.id ORDER BY allocation_id LIMIT 1) first_coin ON TRUE WHERE e.vtxo_id=$1 AND first_coin.gross_sat=100000 \
+					AND first_coin.evidence->>'kind'='exchange' AND first_coin.evidence->>'forfeited'='true' \
+					AND first_coin.disposition='operator' AND first_coin.evidence->>'participation_id'=$2",
 					&[&original.id().to_string(), &participation]).await?.is_some();
 				if !authorized { return Ok(false); }
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -102,8 +102,8 @@ pub(super) async fn watchman_sweeps_boards() {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=$1 AND c.active AND c.disposition='operator' AND a.broadcast_at IS NOT NULL \
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.broadcast_at IS NOT NULL \
 				ORDER BY a.id DESC LIMIT 1", &[&original.id().to_string()]).await?)).await.unwrap();
 			if let Some(row) = row {
 				let parent: Transaction = deserialize(row.get("sweep_tx")).unwrap();
@@ -188,7 +188,7 @@ pub(super) async fn watchman_sweeps_boards() {
 	}
 	assert_eq!(sat(200_000), sat(100_000) + child_outputs + actual_fee,
 		"only the exact old board and declared sponsor fund this closed cut");
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.gross_sat,e.irreversible_facts::TEXT AS facts, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT (SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
 		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 		WHERE e.vtxo_id=$1", &[&original.id().to_string()]).await?)).await.unwrap();
@@ -200,9 +200,9 @@ pub(super) async fn watchman_sweeps_boards() {
 	let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
 	assert_eq!(facts["kind"], "exchange");
 	assert_eq!(facts["forfeited"], true);
-	assert_eq!(facts["operator"], true);
+
 	assert_eq!(facts["participation_id"].as_i64(), Some(participation));
-	assert!(facts.get("customer_key").is_none());
+
 	assert_eq!(row.get::<_, String>("disposition"), "operator");
 	for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 	for field in ["fee_sat", "payout_sat", "forfeited_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }
@@ -352,7 +352,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 				// The one manual sweep must observe every committed ownership decision.
 				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
+					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected_sources { return Ok(false); }
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -366,8 +366,8 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -419,7 +419,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 			}
 		}
 		assert_eq!(anchors.len(), 1);
-		let rows = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM expiry_allocation_payout WHERE allocation_id=$1",
+		let rows = db.read(async |tx| Ok(tx.query("SELECT (ROW_NUMBER() OVER (ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts",
 			&[allocation]).await?)).await.unwrap();
 		assert_eq!(rows.len(), actual_payouts.len());
 		for row in rows {
@@ -496,8 +496,8 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 		}
 	}
 	let backing_anchors = frontiers.keys().map(|point| point.to_string()).collect::<Vec<_>>();
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
 	assert_eq!(rows.len(), 4, "all three original backings have exactly two operator and two customer rights");
@@ -505,7 +505,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 	for row in rows {
 		let id = row.get::<_, String>("vtxo_id");
 		assert!(ledger_sources.insert(id.clone()));
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("gross_sat"), 200_000);
 		assert_eq!(row.get::<_, i64>("allocated"), 200_000);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
@@ -516,9 +516,9 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 			assert!(parent.input.iter().any(|input| input.previous_output == original.chain_anchor()));
 			assert_eq!(facts["kind"], "exchange");
 			assert_eq!(facts["forfeited"], true);
-			assert_eq!(facts["operator"], true);
+
 			assert_eq!(facts["participation_id"].as_i64(), Some(participations[&id]));
-			assert!(facts.get("customer_key").is_none());
+
 			assert_eq!(row.get::<_, String>("disposition"), "operator");
 			for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 			for field in ["fee_sat", "payout_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }
@@ -526,9 +526,9 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 			let owner = replacements.iter().position(|coin| coin.id().to_string() == id).unwrap();
 			let source = &replacements[owner];
 			assert!(parent.input.iter().any(|input| input.previous_output == round_anchor));
-			assert_ne!(facts["operator"], true);
+
 			let key = source.user_pubkey().to_string();
-			assert_eq!(facts["customer_key"].as_str(), Some(key.as_str()));
+
 			assert_eq!(row.get::<_, String>("disposition"), "customer");
 			assert_eq!(row.get::<_, String>("owner_mailbox"), mailboxes[owner].to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), key);
@@ -746,8 +746,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		assert_eq!(core.get_block_count().unwrap(), u64::from(tip.to_u32()));
 		// Captaind must commit both live receiver rights before the single trigger.
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id,gross_sat,irreversible_facts::TEXT AS facts \
-				FROM expiry_entitlement WHERE vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
+			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
+				FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
 			if rows.len() == expected_sources.len() {
 				let mut seen = BTreeSet::new();
 				for row in rows {
@@ -756,8 +756,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 					let source = customer_sources.iter().find(|source| source.id().to_string() == id).unwrap();
 					assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-					assert_eq!(facts["customer_key"], source.user_pubkey().to_string());
-					assert_ne!(facts["operator"], true);
+
+
 				}
 				assert_eq!(seen, expected_sources);
 				break;
@@ -770,7 +770,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 				// The one manual sweep must observe every committed ownership decision.
 				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
+					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected_sources { return Ok(false); }
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -784,8 +784,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -863,7 +863,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		for (index, _) in child.output.iter().enumerate() {
 			assert!(child_change.insert(OutPoint::new(child.compute_txid(), index as u32)));
 		}
-		let payouts = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM expiry_allocation_payout \
+		let payouts = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM (SELECT allocation_id,(ROW_NUMBER() OVER (PARTITION BY allocation_id ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat FROM (SELECT allocation_id,spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE disposition='customer' GROUP BY allocation_id,spk HAVING SUM(payout_sat)>0) grouped) payouts \
 			WHERE allocation_id=$1", &[allocation]).await?)).await.unwrap();
 		assert_eq!(payouts.len(), 1);
 		assert_eq!(payouts[0].get::<_, i32>("output_index"), payout.vout as i32);
@@ -947,8 +947,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 	}
 	assert_eq!(observed_payouts, expected_payouts);
 	assert_eq!(observed_claims, BTreeMap::from([(OutPoint::new(claim.compute_txid(), 0), claim.output[0].value)]));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)",
 		&[&backing_anchors]).await?)).await.unwrap();
@@ -962,13 +962,13 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		let allocation = row.get::<_, i64>("allocation_id");
 		let parent = &packages.get(&allocation).unwrap().0;
 		assert!(parent.input.iter().any(|input| input.previous_output == source_frontiers[&id]));
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("allocated"), source.amount().to_sat() as i64);
 		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
 		let user_key = source.user_pubkey().to_string();
-		assert_eq!(facts["customer_key"].as_str(), Some(user_key.as_str()));
-		assert_ne!(facts["operator"], true);
+
+
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
 		assert_eq!(row.get::<_, String>("user_pubkey"), source.user_pubkey().to_string());
@@ -1141,8 +1141,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		// Captaind must commit both live sender rights before the single trigger.
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id,gross_sat,irreversible_facts::TEXT AS facts \
-				FROM expiry_entitlement WHERE vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
+			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
+				FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
 			if rows.len() == expected_sources.len() {
 				let mut seen = BTreeSet::new();
 				for row in rows {
@@ -1151,8 +1151,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 					let source = changes.iter().find(|source| source.id().to_string() == id).unwrap();
 					assert_eq!(row.get::<_, i64>("gross_sat"), 125_000);
 					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-					assert_eq!(facts["customer_key"], source.user_pubkey().to_string());
-					assert_ne!(facts["operator"], true);
+
+
 				}
 				assert_eq!(seen, expected_sources);
 				break;
@@ -1164,7 +1164,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 				// The one manual sweep must observe every committed ownership decision.
 				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
+					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected_sources { return Ok(false); }
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -1177,8 +1177,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -1252,7 +1252,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		for (index, _) in child.output.iter().enumerate() {
 			assert!(child_change.insert(OutPoint::new(child.compute_txid(), index as u32)));
 		}
-		let payouts = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM expiry_allocation_payout \
+		let payouts = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM (SELECT allocation_id,(ROW_NUMBER() OVER (PARTITION BY allocation_id ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat FROM (SELECT allocation_id,spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE disposition='customer' GROUP BY allocation_id,spk HAVING SUM(payout_sat)>0) grouped) payouts \
 			WHERE allocation_id=$1", &[allocation]).await?)).await.unwrap();
 		assert_eq!(payouts.len(), 1);
 		assert_eq!(payouts[0].get::<_, i32>("output_index"), payout.vout as i32);
@@ -1333,8 +1333,8 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 	}
 	assert_eq!(observed_payouts, expected_payouts);
 	assert_eq!(observed_claims, BTreeMap::from([(OutPoint::new(claim.compute_txid(), 0), claim.output[0].value)]));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)",
 		&[&backing_anchors]).await?)).await.unwrap();
@@ -1348,13 +1348,13 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		let allocation = row.get::<_, i64>("allocation_id");
 		let parent = &packages.get(&allocation).unwrap().0;
 		assert!(parent.input.iter().any(|input| input.previous_output == source_frontiers[&id]));
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("gross_sat"), 125_000);
 		assert_eq!(row.get::<_, i64>("allocated"), 125_000);
 		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
 		let user_key = source.user_pubkey().to_string();
-		assert_eq!(facts["customer_key"].as_str(), Some(user_key.as_str()));
-		assert_ne!(facts["operator"], true);
+
+
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
 		assert_eq!(row.get::<_, String>("user_pubkey"), source.user_pubkey().to_string());
@@ -1648,7 +1648,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 				// The one manual sweep must observe every committed ownership decision.
 				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
+					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 				if allocated != expected { return Ok(false); }
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -1668,8 +1668,8 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 			}).await.unwrap();
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -1723,7 +1723,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 			}
 		}
 		assert_eq!(anchors.len(), 1);
-		let rows = db.read(async |tx| Ok(tx.query("SELECT output_index,spk,amount_sat FROM expiry_allocation_payout WHERE allocation_id=$1",
+		let rows = db.read(async |tx| Ok(tx.query("SELECT (ROW_NUMBER() OVER (ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts",
 			&[allocation]).await?)).await.unwrap();
 		assert_eq!(rows.len(), actual_payouts.len());
 		for row in rows {
@@ -1803,8 +1803,8 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 		}
 	}
 	let backing_anchors = frontiers.keys().map(|point| point.to_string()).collect::<Vec<_>>();
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
 	assert_eq!(rows.len(), source_ids.len(), "no extra customer grant or operator entitlement on these backings");
@@ -1814,7 +1814,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 	for row in rows {
 		let id = row.get::<_, String>("vtxo_id");
 		assert!(ledger_sources.insert(id.clone()));
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 		let allocation = row.get::<_, i64>("allocation_id");
 		let parent = &packages[&allocation].0;
@@ -1824,8 +1824,8 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 			assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 			assert_eq!(row.get::<_, i64>("allocated"), source.amount().to_sat() as i64);
 			let key = source.user_pubkey().to_string();
-			assert_eq!(facts["customer_key"].as_str(), Some(key.as_str()));
-			assert_ne!(facts["operator"], true);
+
+
 			assert_eq!(row.get::<_, String>("disposition"), "customer");
 			assert_eq!(row.get::<_, String>("owner_mailbox"), mailboxes[*owner].to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), key);
@@ -1844,8 +1844,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 			assert!(parent.input.iter().any(|input| input.previous_output == source.chain_anchor()));
 			assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 			assert_eq!(row.get::<_, i64>("allocated"), source.amount().to_sat() as i64);
-			assert_eq!(facts["operator"], true);
-			assert!(facts.get("customer_key").is_none());
+
 			if incoming_ids.contains(&id) {
 				assert_eq!(facts["kind"], "htlc_source_discharged");
 				assert_eq!(facts["payment_hash"], hash.to_string());
@@ -2096,20 +2095,16 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 		}
 		let source_ids = expected.keys().cloned().collect::<Vec<_>>();
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id,gross_sat,irreversible_facts::TEXT AS facts FROM expiry_entitlement WHERE vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
+			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
 			if rows.len() == expected.len() {
 				for row in rows {
-					let (_, owner, _) = &expected[&row.get::<_, String>("vtxo_id")];
-					assert_eq!(row.get::<_, i64>("gross_sat"), 200_000);
-					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-					if let Some(owner) = owner { assert_eq!(facts["customer_key"], replacements[*owner].user_pubkey().to_string()); }
-					else { assert_eq!(facts["operator"], true); }
+										assert_eq!(row.get::<_, i64>("gross_sat"), 200_000);
 				}
 				if db.read(async |tx| {
 					// The one manual sweep must observe every committed ownership decision.
 					let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
 						JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-						WHERE e.vtxo_id=ANY($1) AND c.active", &[&source_ids]).await?
+						WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 						.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
 					if allocated != expected.keys().cloned().collect::<BTreeSet<_>>() { return Ok(false); }
 					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -2122,8 +2117,8 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -2234,8 +2229,8 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 	assert_eq!(sat(3_800_000), terminal_outputs.values().map(|output| output.value).sum::<Amount>()
 		+ change.values().map(|output| output.value).sum::<Amount>() + miner);
 	assert_eq!(operator, sat(10 * 200_000 + 8 * 2_000));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
 	let mut seen = BTreeSet::new();
@@ -2245,7 +2240,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 		let (coin, owner, point) = &expected[&id];
 		let allocation = row.get::<_, i64>("allocation_id");
 		assert!(packages[&allocation].0.input.iter().any(|input| input.previous_output == *point));
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("gross_sat"), 200_000);
 		assert_eq!(row.get::<_, i64>("allocated"), 200_000);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
@@ -2255,8 +2250,8 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 			assert_eq!(row.get::<_, String>("owner_mailbox"), mailboxes[*owner].to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), replacements[*owner].user_pubkey().to_string());
 			assert_eq!(row.get::<_, String>("spk"), destinations[*owner].as_bytes().to_lower_hex_string());
-			assert_eq!(facts["customer_key"], replacements[*owner].user_pubkey().to_string());
-			assert_ne!(facts["operator"], true);
+
+
 			assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 			assert_eq!(row.get::<_, i64>("payout_sat"), 198_000);
 		} else {
@@ -2264,7 +2259,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 			assert_eq!(row.get::<_, String>("disposition"), "operator");
 			assert_eq!(facts["kind"], "exchange");
 			assert_eq!(facts["forfeited"], true);
-			assert_eq!(facts["operator"], true);
+
 			for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 			for field in ["fee_sat", "payout_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }
 		}
@@ -2487,7 +2482,7 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	let operator_ids = operators.keys().cloned().collect::<Vec<_>>();
 	let before_expiry = ctx.bitcoind().get_block_count().await as u32;
 	assert!(operators.values().all(|coin| coin.expiry_height().to_u32() > before_expiry));
-	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS n FROM expiry_entitlement WHERE vtxo_id=ANY($1)",
+	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS n FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)",
 		&[&operator_ids]).await?.get::<_, i64>("n"))).await.unwrap();
 	assert_eq!(early, 0, "unexpired pool and discharged source must not receive an expiry allocation");
 	let tip = ctx.generate_blocks(150).await;
@@ -2532,7 +2527,7 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 		loop {
 			let ready = db.read(async |tx| {
 				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					WHERE e.vtxo_id=ANY($1) AND c.active", &[&operator_ids]).await?.into_iter().map(|row| row.get::<_, String>(0)).collect::<BTreeSet<_>>();
+					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&operator_ids]).await?.into_iter().map(|row| row.get::<_, String>(0)).collect::<BTreeSet<_>>();
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
 				Ok(allocated == operator_ids.iter().cloned().collect() && view.height == tip
 					&& view.hash == hash)
@@ -2546,8 +2541,8 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 		wm.trigger_sweep().await;
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&operator_ids]).await?)).await.unwrap();
+				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&operator_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -2622,8 +2617,8 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	tokio::time::timeout(Duration::from_secs(10), async {
 		loop {
 			let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS n FROM expiry_entitlement e \
-				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.status='confirmed' AND a.confirmed_hash IS NOT NULL",
+				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.status='confirmed' AND a.confirmed_hash IS NOT NULL",
 				&[&operator_ids]).await?.get::<_, i64>("n"))).await.unwrap();
 			if confirmed == operator_ids.len() as i64 && retained.is_subset(&watchman_confirmed_outpoints(wm).await) { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2697,10 +2692,10 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	}
 	assert_eq!(capital.values().map(|output| output.value).sum::<Amount>(), terminal_value + graph_fees);
 	assert!(graph_fees >= fees);
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active,a.status,a.confirmed_hash \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,a.status,a.confirmed_hash \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-		LEFT JOIN expiry_allocation a ON a.id=c.allocation_id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
+		LEFT JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
 	let mut seen = BTreeSet::new();
 	for row in rows {
 		let id = row.get::<_, String>("vtxo_id");
@@ -2712,12 +2707,12 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 		let source = &operators[&id];
 		assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("allocated"), source.amount().to_sat() as i64);
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
 		assert!(row.get::<_, Option<String>>("confirmed_hash").is_some());
 		assert_eq!(row.get::<_, String>("disposition"), "operator");
 		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-		assert_eq!(facts["operator"], true);
+
 		assert_eq!(facts["kind"], if incoming_ids.contains(&id) { "htlc_source_discharged" } else { "pool" });
 		for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 		for field in ["fee_sat", "payout_sat", "forfeited_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }
@@ -2842,8 +2837,8 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 			let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 			// Captaind produces these operator rights independently of the single sweep trigger.
 			loop {
-				let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id,gross_sat,irreversible_facts::TEXT AS facts \
-					FROM expiry_entitlement WHERE vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
+				let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
+					FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
 				if rows.len() == source_ids.len() {
 					let mut seen = BTreeSet::new();
 					for row in rows {
@@ -2851,7 +2846,7 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 						assert!(seen.insert(id.clone()) && source_ids.contains(&id));
 						assert_eq!(row.get::<_, i64>("gross_sat"), if late { 1_320 } else { 200_000 });
 						let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-						assert_eq!(facts["operator"], true);
+
 						assert_eq!(facts["kind"], if late { "forfeit" } else { "offboard" });
 						if !late { assert_eq!(facts["txid"], offboard_txid.to_string()); }
 					}
@@ -2879,8 +2874,8 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 			loop {
 				let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 					FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					JOIN expiry_allocation a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 				let mut seen = BTreeSet::new();
 				let mut packages = BTreeMap::new();
 				for row in rows {
@@ -2986,8 +2981,8 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	}
 	assert_eq!(operator_total, sat(801_320));
 	let backing_anchors = board_roots.keys().chain(std::iter::once(&connector_point)).map(|point| point.to_string()).collect::<Vec<_>>();
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
 	assert_eq!(rows.len(), 5);
@@ -3003,12 +2998,12 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 		assert!(all_packages[&row.get::<_, i64>("allocation_id")].0.input.iter().any(|input| input.previous_output == point));
 		assert_eq!(row.get::<_, i64>("gross_sat"), gross);
 		assert_eq!(row.get::<_, i64>("allocated"), gross);
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, String>("disposition"), "operator");
 		for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 		for field in ["fee_sat", "payout_sat", "forfeited_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }
 		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-		assert_eq!(facts["operator"], true);
+
 		assert_eq!(facts["kind"], if is_connector { "forfeit" } else { "offboard" });
 		if !is_connector { assert_eq!(facts["txid"], offboard_txid.to_string()); }
 	}
@@ -3668,14 +3663,12 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		let source_ids = expected.keys().cloned().collect::<Vec<_>>();
 		// Captaind produces these entitlements independently; no trigger-created parent is a prerequisite.
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id,gross_sat,irreversible_facts::TEXT AS facts FROM expiry_entitlement WHERE vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
+			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
 			if rows.len() == expected.len() {
 				for row in rows {
-					let (coin, owner, _) = &expected[&row.get::<_, String>("vtxo_id")];
+					let (coin, _, _) = &expected[&row.get::<_, String>("vtxo_id")];
 					assert_eq!(row.get::<_, i64>("gross_sat"), coin.amount().to_sat() as i64);
 					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-					if owner.is_none() { assert_eq!(facts["operator"], true); }
-					else { assert_eq!(facts["customer_key"], coin.clone().try_into_user_vtxo().unwrap().user_pubkey().to_string()); }
 					if coin.id() == padding.id() { assert_eq!(facts["kind"], "padding"); }
 				}
 				if db.read(async |tx| {
@@ -3689,8 +3682,8 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -3808,10 +3801,10 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	}
 	assert_eq!(roots.iter().map(|root| root.amount()).sum::<Amount>() + sat(100_000),
 		expected_outputs.values().map(|output| output.value).sum::<Amount>() + change.values().map(|output| output.value).sum::<Amount>() + miner);
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active,a.broadcast_at IS NOT NULL AS published \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,a.broadcast_at IS NOT NULL AS published \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
-		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id LEFT JOIN expiry_allocation a ON a.id=c.allocation_id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
+		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id LEFT JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE v.anchor_point=ANY($1)", &[&backing_anchors]).await?)).await.unwrap();
 	let mut seen = BTreeSet::new();
 	let mut groups = BTreeMap::new();
 	let mut charged_by_expiry = BTreeMap::<(usize, u32), u64>::new();
@@ -3823,7 +3816,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			assert_eq!(row.get::<_, i64>("gross_sat"), 330);
 			let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
 			assert_eq!(facts["kind"], "padding");
-			assert_eq!(facts["operator"], true);
+
 			if row.get::<_, Option<i64>>("allocation_id").is_some() {
 				assert_eq!(row.get::<_, String>("disposition"), "operator");
 				for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
@@ -3843,15 +3836,15 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			}
 			assert_eq!(row.get::<_, i64>("gross_sat"), 250_000);
 			let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-			assert_eq!(facts["customer_key"], replacement.user_pubkey().to_string());
-			assert_ne!(facts["operator"], true);
+
+
 			assert!(seen.remove(&id));
 			continue;
 		}
 		let (coin, owner, root) = &expected[&id];
 		let allocation = row.get::<_, i64>("allocation_id");
 		assert!(packages[&allocation].0.input.iter().any(|input| input.previous_output == *root));
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("gross_sat"), coin.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("allocated"), coin.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
@@ -3862,8 +3855,8 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			assert_eq!(row.get::<_, String>("owner_mailbox"), mailboxes[*owner].to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), user.user_pubkey().to_string());
 			assert_eq!(row.get::<_, String>("spk"), destinations[*owner].as_bytes().to_lower_hex_string());
-			assert_eq!(facts["customer_key"], user.user_pubkey().to_string());
-			assert_ne!(facts["operator"], true);
+
+
 			let fee = row.get::<_, i64>("fee_sat");
 			let payout = row.get::<_, i64>("payout_sat");
 			assert!(fee >= 0 && payout > 0);
@@ -3873,7 +3866,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			total.0 += fee; total.1 += payout;
 		} else {
 			assert_eq!(row.get::<_, String>("disposition"), "operator");
-			assert_eq!(facts["operator"], true);
+
 			if id == padding.id().to_string() { assert_eq!(facts["kind"], "padding"); }
 			for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 			for field in ["fee_sat", "payout_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }
@@ -4123,7 +4116,7 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		let source_ids = expected.keys().cloned().collect::<Vec<_>>();
 		loop {
 			let allocated = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
-				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=ANY($1) AND c.active",
+				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')",
 				&[&source_ids]).await?.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>())).await.unwrap();
 			let synced = db.read(async |tx| {
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
@@ -4143,8 +4136,8 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
 			let mut seen = BTreeSet::new();
 			let mut packages = BTreeMap::new();
 			for row in rows {
@@ -4267,8 +4260,8 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 	}
 	assert_eq!(sat(1_200_000), oldest.amount() + customer_paid + operator_paid
 		+ change.values().map(|output| output.value).sum::<Amount>() + miner);
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,e.gross_sat,e.irreversible_facts::TEXT AS facts, \
-		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=$1", &[&anchor.to_string()]).await?)).await.unwrap();
 	let mut seen = BTreeSet::new();
@@ -4277,7 +4270,7 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		let id = row.get::<_, String>("vtxo_id");
 		assert!(seen.insert(id.clone()));
 		let (coin, root) = &expected[&id];
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, i64>("gross_sat"), coin.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("allocated"), coin.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
@@ -4286,8 +4279,8 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
 		if customers.contains_key(&id) {
 			assert_eq!(row.get::<_, String>("disposition"), "customer");
-			assert_eq!(facts["customer_key"], coin.user_pubkey().to_string());
-			assert_ne!(facts["operator"], true);
+
+
 			assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), coin.user_pubkey().to_string());
 			assert_eq!(row.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
@@ -4300,7 +4293,7 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		} else {
 			assert!(operators.contains_key(&id));
 			assert_eq!(facts["kind"], "pool");
-			assert_eq!(facts["operator"], true);
+
 			assert_eq!(row.get::<_, String>("disposition"), "operator");
 			for field in ["owner_mailbox", "user_pubkey", "spk"] { assert!(row.get::<_, Option<String>>(field).is_none()); }
 			for field in ["fee_sat", "payout_sat"] { assert_eq!(row.get::<_, i64>(field), 0); }

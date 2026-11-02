@@ -329,7 +329,7 @@ async fn fallback_dust_forfeiture_is_confirmed_and_reorgs_without_server() {
 	let allocations = db.read(async |tx| Ok(tx.query(
 		"SELECT a.sweep_txid,c.disposition,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.active",
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')",
 		&[&coin.id().to_string()],
 	).await?)).await.unwrap();
 	assert_eq!(allocations.len(), 1);

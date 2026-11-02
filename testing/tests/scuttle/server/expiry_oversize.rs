@@ -400,7 +400,7 @@ async fn bounded_round_inventory() {
 	finish_payouts(&ctx, &srv, &db, &owners, &terminals, &signed_paths,
 		&BTreeSet::from([anchor, original_anchor]), &sponsor_funding, BTreeMap::new(), true).await;
 	let allocations = db.read(async |tx| Ok(tx.query(
-		"SELECT e.gross_sat,e.irreversible_facts::TEXT AS facts,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk, \
+		"SELECT (SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk, \
 		c.fee_sat,c.payout_sat,c.forfeited_sat FROM expiry_entitlement e \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1",
 		&[&original.id().to_string()],
@@ -409,10 +409,10 @@ async fn bounded_round_inventory() {
 		assert_eq!(allocation.get::<_, i64>("gross_sat"), (COUNT as u64 * LEAF_SAT) as i64);
 		let facts: serde_json::Value = serde_json::from_str(allocation.get("facts")).unwrap();
 		assert_eq!(facts["kind"], "exchange");
-		assert_eq!(facts["operator"], true);
+
 		assert_eq!(facts["forfeited"], true);
 		assert_eq!(facts["participation_id"].as_i64(), Some(forfeit.get::<_, i64>("id")));
-		assert!(facts.get("customer_key").is_none());
+
 		if let Some(disposition) = allocation.get::<_, Option<String>>("disposition") {
 			assert_eq!(disposition, "operator");
 			for field in ["owner_mailbox", "user_pubkey", "spk"] {
@@ -617,8 +617,8 @@ async fn finish_payouts(
 		let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx,c.gross_sat,c.fee_sat, \
 			c.payout_sat,c.forfeited_sat,c.spk,c.owner_mailbox,c.user_pubkey FROM expiry_entitlement e \
 			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			JOIN expiry_allocation a ON a.id=c.allocation_id \
-			WHERE e.vtxo_id=ANY($1) AND c.active AND a.broadcast_at IS NOT NULL", &[&terminal_ids],
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+			WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&terminal_ids],
 		).await?)).await.unwrap();
 		assert!(rows.len() <= payees);
 		if rows.len() == payees { break rows; }
@@ -676,8 +676,8 @@ async fn finish_payouts(
 	loop {
 		let row = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS n,COUNT(DISTINCT e.vtxo_id) AS coins \
 			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
-			AND c.active AND a.status='confirmed' AND a.sweep_txid IS NOT NULL AND a.confirmed_hash IS NOT NULL",
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
+			AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_txid IS NOT NULL AND a.confirmed_hash IS NOT NULL",
 			&[&terminal_ids],
 		).await?)).await.unwrap();
 		assert!(row.get::<_, i64>("n") <= payees as i64);
@@ -687,7 +687,7 @@ async fn finish_payouts(
 	for txid in payouts.keys() {
 		let canonical = core.custom_get_raw_transaction_info(*txid, None).unwrap().unwrap().blockhash.unwrap();
 		let stored = db.read(async |tx| Ok(tx.query_one(
-			"SELECT confirmed_hash FROM expiry_allocation WHERE sweep_txid=$1", &[&txid.to_string()],
+			"SELECT confirmed_hash FROM expiry_allocation_state WHERE sweep_txid=$1", &[&txid.to_string()],
 		).await?.get::<_, String>(0))).await.unwrap();
 		assert_eq!(stored, canonical.to_string(), "payout history must name the actual canonical block");
 	}

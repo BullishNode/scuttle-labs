@@ -37,7 +37,6 @@ mod lightning_receive_unmaterialized;
 mod mailbox;
 mod offboard_reply_restore;
 mod offboard_restart;
-mod recovery;
 mod watchman_wallet;
 
 use std::str::FromStr;

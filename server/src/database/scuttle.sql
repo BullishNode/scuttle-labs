@@ -9,8 +9,6 @@ CREATE INDEX expiry_vtxo_anchor_point_ix ON vtxo (anchor_point, vtxo_id);
 CREATE TABLE expiry_entitlement (
 	id BIGSERIAL PRIMARY KEY,
 	vtxo_id TEXT NOT NULL UNIQUE REFERENCES vtxo(vtxo_id),
-	gross_sat BIGINT NOT NULL CHECK (gross_sat > 0),
-	irreversible_facts JSONB NOT NULL DEFAULT '{}'::jsonb,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -21,19 +19,15 @@ CREATE TABLE expiry_cancelled_participation (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Financial decisions are immutable; active links follow canonical watchmand observations.
+-- Financial decisions are immutable; frontier spends determine their status.
 CREATE TABLE expiry_allocation (
 	id BIGSERIAL PRIMARY KEY,
 	expiry_height INTEGER NOT NULL CHECK (expiry_height >= 0),
-	status TEXT NOT NULL CHECK (status IN ('pending', 'confirmed', 'conflicted')),
 	sweep_txid TEXT UNIQUE,
 	sweep_tx BYTEA,
 	broadcast_at TIMESTAMPTZ,
-	confirmed_height BIGINT,
-	confirmed_hash TEXT,
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	CHECK ((sweep_txid IS NULL) = (sweep_tx IS NULL)),
-	CHECK ((confirmed_height IS NULL) = (confirmed_hash IS NULL))
+	CHECK ((sweep_txid IS NULL) = (sweep_tx IS NULL))
 );
 
 CREATE TABLE expiry_allocation_input (
@@ -53,24 +47,12 @@ CREATE TABLE expiry_allocation_coin (
 	fee_sat BIGINT NOT NULL CHECK (fee_sat >= 0),
 	payout_sat BIGINT NOT NULL CHECK (payout_sat >= 0),
 	forfeited_sat BIGINT NOT NULL CHECK (forfeited_sat >= 0),
-	active BOOLEAN NOT NULL DEFAULT TRUE,
 	evidence JSONB NOT NULL,
 	PRIMARY KEY (allocation_id, entitlement_id),
 	CHECK ((disposition = 'customer' AND owner_mailbox IS NOT NULL AND user_pubkey IS NOT NULL
 		AND spk IS NOT NULL AND gross_sat = fee_sat + payout_sat + forfeited_sat)
 		OR (disposition = 'operator' AND fee_sat = 0 AND payout_sat = 0 AND forfeited_sat = 0))
 );
-CREATE UNIQUE INDEX expiry_one_active_allocation_per_coin ON expiry_allocation_coin(entitlement_id) WHERE active;
-
-CREATE TABLE expiry_allocation_payout (
-	allocation_id BIGINT NOT NULL REFERENCES expiry_allocation(id),
-	output_index INTEGER NOT NULL CHECK (output_index >= 0),
-	spk TEXT NOT NULL,
-	amount_sat BIGINT NOT NULL CHECK (amount_sat > 0),
-	PRIMARY KEY (allocation_id, output_index),
-	UNIQUE (allocation_id, spk)
-);
-
 -- Splitting is a chain action, not another payout decision or customer fee.
 CREATE TABLE expiry_split_request (
 	vtxo_id TEXT PRIMARY KEY REFERENCES vtxo(vtxo_id),
@@ -84,6 +66,38 @@ CREATE TABLE expiry_terminal_claim (
 	height BIGINT NOT NULL CHECK (height >= 0),
 	hash TEXT NOT NULL
 );
+
+-- Canonical frontier spends are the source of allocation state. The first
+-- coin row retains ownership; a winner also closes competing allocation links.
+CREATE VIEW expiry_allocation_state AS
+WITH observed AS (
+	SELECT a.id,
+		COUNT(i.vtxo_id)>0 AND BOOL_AND(COALESCE(v.onchain_spent_txid=a.sweep_txid, FALSE)
+			AND b.height IS NOT NULL) AS confirmed,
+		BOOL_OR(v.onchain_spent_txid IS NOT NULL
+			AND v.onchain_spent_txid IS DISTINCT FROM a.sweep_txid) AS conflicted,
+		MIN(b.height) AS height
+	FROM expiry_allocation a
+	LEFT JOIN expiry_allocation_input i ON i.allocation_id=a.id
+	LEFT JOIN public.vtxo v ON v.vtxo_id=i.vtxo_id
+	LEFT JOIN public.watchmand_block b ON b.height=v.onchain_spent_height
+	GROUP BY a.id
+)
+SELECT a.id,a.expiry_height,a.sweep_txid,a.sweep_tx,a.broadcast_at,a.created_at,
+	CASE WHEN o.confirmed THEN 'confirmed'
+		WHEN o.conflicted OR EXISTS (
+			SELECT 1 FROM expiry_allocation_coin c WHERE c.allocation_id=a.id AND (
+				EXISTS(SELECT 1 FROM expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id)
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin paid JOIN observed winner ON winner.id=paid.allocation_id
+					WHERE paid.entitlement_id=c.entitlement_id AND winner.confirmed AND winner.id<>a.id)
+				OR (c.evidence->>'kind'='htlc_internal_grants_reclaimed' AND NOT EXISTS(
+					SELECT 1 FROM public.watchmand_block b WHERE b.height=(c.evidence->>'height')::BIGINT
+						AND b.hash=c.evidence->>'hash'))))
+		THEN 'conflicted' ELSE 'pending' END AS status,
+	CASE WHEN o.confirmed THEN o.height END AS confirmed_height,
+	CASE WHEN o.confirmed THEN b.hash END AS confirmed_hash
+FROM expiry_allocation a JOIN observed o ON o.id=a.id
+LEFT JOIN public.watchmand_block b ON b.height=o.height;
 
 -- A collected forwarding receive names its final payee independently of the
 -- provider's grant key. Outcome remains the upstream subscription's status.

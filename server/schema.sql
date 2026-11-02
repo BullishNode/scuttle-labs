@@ -2195,17 +2195,12 @@ CREATE TABLE scuttle.coin_owner (
 CREATE TABLE scuttle.expiry_allocation (
     id bigint NOT NULL,
     expiry_height integer NOT NULL,
-    status text NOT NULL,
     sweep_txid text,
     sweep_tx bytea,
     broadcast_at timestamp with time zone,
-    confirmed_height bigint,
-    confirmed_hash text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT expiry_allocation_check CHECK (((sweep_txid IS NULL) = (sweep_tx IS NULL))),
-    CONSTRAINT expiry_allocation_check1 CHECK (((confirmed_height IS NULL) = (confirmed_hash IS NULL))),
-    CONSTRAINT expiry_allocation_expiry_height_check CHECK ((expiry_height >= 0)),
-    CONSTRAINT expiry_allocation_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'confirmed'::text, 'conflicted'::text])))
+    CONSTRAINT expiry_allocation_expiry_height_check CHECK ((expiry_height >= 0))
 );
 
 
@@ -2224,7 +2219,6 @@ CREATE TABLE scuttle.expiry_allocation_coin (
     fee_sat bigint NOT NULL,
     payout_sat bigint NOT NULL,
     forfeited_sat bigint NOT NULL,
-    active boolean DEFAULT true NOT NULL,
     evidence jsonb NOT NULL,
     CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND (user_pubkey IS NOT NULL) AND (spk IS NOT NULL) AND (gross_sat = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0)))),
     CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
@@ -2266,20 +2260,6 @@ CREATE TABLE scuttle.expiry_allocation_input (
 
 
 --
--- Name: expiry_allocation_payout; Type: TABLE; Schema: scuttle; Owner: -
---
-
-CREATE TABLE scuttle.expiry_allocation_payout (
-    allocation_id bigint NOT NULL,
-    output_index integer NOT NULL,
-    spk text NOT NULL,
-    amount_sat bigint NOT NULL,
-    CONSTRAINT expiry_allocation_payout_amount_sat_check CHECK ((amount_sat > 0)),
-    CONSTRAINT expiry_allocation_payout_output_index_check CHECK ((output_index >= 0))
-);
-
-
---
 -- Name: expiry_cancelled_participation; Type: TABLE; Schema: scuttle; Owner: -
 --
 
@@ -2298,10 +2278,7 @@ CREATE TABLE scuttle.expiry_cancelled_participation (
 CREATE TABLE scuttle.expiry_entitlement (
     id bigint NOT NULL,
     vtxo_id text NOT NULL,
-    gross_sat bigint NOT NULL,
-    irreversible_facts jsonb DEFAULT '{}'::jsonb NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT expiry_entitlement_gross_sat_check CHECK ((gross_sat > 0))
+    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -2858,22 +2835,6 @@ ALTER TABLE ONLY scuttle.expiry_allocation_input
 
 
 --
--- Name: expiry_allocation_payout expiry_allocation_payout_allocation_id_spk_key; Type: CONSTRAINT; Schema: scuttle; Owner: -
---
-
-ALTER TABLE ONLY scuttle.expiry_allocation_payout
-    ADD CONSTRAINT expiry_allocation_payout_allocation_id_spk_key UNIQUE (allocation_id, spk);
-
-
---
--- Name: expiry_allocation_payout expiry_allocation_payout_pkey; Type: CONSTRAINT; Schema: scuttle; Owner: -
---
-
-ALTER TABLE ONLY scuttle.expiry_allocation_payout
-    ADD CONSTRAINT expiry_allocation_payout_pkey PRIMARY KEY (allocation_id, output_index);
-
-
---
 -- Name: expiry_allocation expiry_allocation_pkey; Type: CONSTRAINT; Schema: scuttle; Owner: -
 --
 
@@ -3363,13 +3324,6 @@ CREATE INDEX wallet_changeset_kind_ix ON public.wallet_changeset USING btree (ki
 
 
 --
--- Name: expiry_one_active_allocation_per_coin; Type: INDEX; Schema: scuttle; Owner: -
---
-
-CREATE UNIQUE INDEX expiry_one_active_allocation_per_coin ON scuttle.expiry_allocation_coin USING btree (entitlement_id) WHERE active;
-
-
---
 -- Name: vtxo customer_coin_owner; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -3688,14 +3642,6 @@ ALTER TABLE ONLY scuttle.expiry_allocation_input
 
 
 --
--- Name: expiry_allocation_payout expiry_allocation_payout_allocation_id_fkey; Type: FK CONSTRAINT; Schema: scuttle; Owner: -
---
-
-ALTER TABLE ONLY scuttle.expiry_allocation_payout
-    ADD CONSTRAINT expiry_allocation_payout_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES scuttle.expiry_allocation(id);
-
-
---
 -- Name: expiry_entitlement expiry_entitlement_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: scuttle; Owner: -
 --
 
@@ -3771,4 +3717,39 @@ ALTER TABLE ONLY scuttle.htlc_settlement_source
 -- PostgreSQL database dump complete
 --
 
+
+
+--
+-- Name: expiry_allocation_state; Type: VIEW; Schema: scuttle; Owner: -
+--
+
+CREATE VIEW scuttle.expiry_allocation_state AS
+WITH observed AS (
+	SELECT a.id,
+		COUNT(i.vtxo_id)>0 AND BOOL_AND(COALESCE(v.onchain_spent_txid=a.sweep_txid, FALSE)
+			AND b.height IS NOT NULL) AS confirmed,
+		BOOL_OR(v.onchain_spent_txid IS NOT NULL
+			AND v.onchain_spent_txid IS DISTINCT FROM a.sweep_txid) AS conflicted,
+		MIN(b.height) AS height
+	FROM scuttle.expiry_allocation a
+	LEFT JOIN scuttle.expiry_allocation_input i ON i.allocation_id=a.id
+	LEFT JOIN public.vtxo v ON v.vtxo_id=i.vtxo_id
+	LEFT JOIN public.watchmand_block b ON b.height=v.onchain_spent_height
+	GROUP BY a.id
+)
+SELECT a.id,a.expiry_height,a.sweep_txid,a.sweep_tx,a.broadcast_at,a.created_at,
+	CASE WHEN o.confirmed THEN 'confirmed'
+		WHEN o.conflicted OR EXISTS (
+			SELECT 1 FROM scuttle.expiry_allocation_coin c WHERE c.allocation_id=a.id AND (
+				EXISTS(SELECT 1 FROM scuttle.expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id)
+				OR EXISTS(SELECT 1 FROM scuttle.expiry_allocation_coin paid JOIN observed winner ON winner.id=paid.allocation_id
+					WHERE paid.entitlement_id=c.entitlement_id AND winner.confirmed AND winner.id<>a.id)
+				OR (c.evidence->>'kind'='htlc_internal_grants_reclaimed' AND NOT EXISTS(
+					SELECT 1 FROM public.watchmand_block b WHERE b.height=(c.evidence->>'height')::BIGINT
+						AND b.hash=c.evidence->>'hash'))))
+		THEN 'conflicted' ELSE 'pending' END AS status,
+	CASE WHEN o.confirmed THEN o.height END AS confirmed_height,
+	CASE WHEN o.confirmed THEN b.hash END AS confirmed_hash
+FROM scuttle.expiry_allocation a JOIN observed o ON o.id=a.id
+LEFT JOIN public.watchmand_block b ON b.height=o.height;
 

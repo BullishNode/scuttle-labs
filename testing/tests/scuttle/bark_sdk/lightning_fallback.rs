@@ -157,7 +157,7 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 		// Once the watchman resumes, expiry may decide the surrendered old
 		// backing for the operator. It must never pay that principal again.
 		let allocations = db.read(async |tx| Ok(tx.query(
-			"SELECT e.gross_sat,e.irreversible_facts::TEXT AS facts,c.gross_sat AS allocated_gross_sat,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk, \
+			"SELECT (SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts,c.gross_sat AS allocated_gross_sat,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk, \
 			c.fee_sat,c.payout_sat,c.forfeited_sat FROM expiry_entitlement e \
 			LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1",
 			&[&source.id().to_string()],
@@ -167,10 +167,10 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 			assert_eq!(allocation.get::<_, i64>("gross_sat"), i64::try_from(board_amount.to_sat()).unwrap());
 			let facts: serde_json::Value = serde_json::from_str(allocation.get("facts")).unwrap();
 			assert_eq!(facts["kind"], "exchange");
-			assert_eq!(facts["operator"], true);
+
 			assert_eq!(facts["forfeited"], true);
 			assert_eq!(facts["participation_id"].as_i64(), Some(forfeit.get::<_, i64>("id")));
-			assert!(facts.get("customer_key").is_none());
+
 			if let Some(disposition) = allocation.get::<_, Option<String>>("disposition") {
 				assert_eq!(disposition, "operator");
 				assert_eq!(allocation.get::<_, i64>("allocated_gross_sat"), i64::try_from(board_amount.to_sat()).unwrap());
@@ -427,10 +427,10 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 		let mut mined_prefix_blocks = 0_u32;
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt(
-				"SELECT a.sweep_tx FROM expiry_allocation a \
+				"SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND a.broadcast_at IS NOT NULL \
+				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL \
 				ORDER BY a.id DESC LIMIT 1", &[&source.id().to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {

@@ -125,8 +125,8 @@ async fn unseen_paid_mailbox(recover_spent_first: bool) {
 		loop {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.sweep_txid,a.sweep_tx \
 				FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND c.disposition='customer' \
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' \
 				AND a.broadcast_at IS NOT NULL", &[&original_ids]).await?)).await.unwrap();
 			assert!(rows.len() <= ids.len());
 			if rows.len() == ids.len() {
@@ -649,8 +649,8 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
 				let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \
-					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND c.active \
-					JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) AND a.status='confirmed'",
+					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') \
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) AND a.status='confirmed'",
 					&[&ids]).await?.get::<_, i64>(0))).await.unwrap();
 				if usize::try_from(confirmed).unwrap() == leaves.len() { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;

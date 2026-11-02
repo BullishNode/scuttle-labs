@@ -463,9 +463,9 @@ async fn registered_receive_fallback() {
 							.is_some_and(|info| info.confirmations.unwrap_or(0) >= 6)
 					}).cloned()
 				};
-				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
 					JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-					WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+					WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 					&[&source_id],
 				).await?)).await.unwrap();
 				let mut a_confirmed = false;
@@ -526,9 +526,9 @@ async fn registered_receive_fallback() {
 		}
 		assert!(b_isolated_confirmed(), "B's current isolated signed economic frontier must be six-confirmed within the fixed schedule");
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT a.sweep_tx FROM expiry_allocation a \
+			let rows = db.read(async |tx| Ok(tx.query("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 				&[&source_id],
 			).await?)).await.unwrap();
 			assert!(rows.len() <= 1, "one registered recipient coin cannot have duplicate active payouts");
@@ -624,8 +624,8 @@ async fn registered_receive_fallback() {
 			&[&unknown_key.to_string()]).await?.get::<_,i64>(0))).await.unwrap(), 0,
 			"unresolved backing must not synthesize mailbox authorization");
 		let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk, \
-			c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active,a.sweep_txid,a.status FROM expiry_allocation_coin c \
-			JOIN expiry_allocation a ON a.id=c.allocation_id \
+			c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.status FROM expiry_allocation_coin c \
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 			WHERE v.anchor_point=ANY($1) AND c.disposition='customer'", &[&root_ids],
 		).await?)).await.unwrap();
@@ -639,10 +639,10 @@ async fn registered_receive_fallback() {
 		assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), expected.to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
-		assert!(row.get::<_, bool>("active"));
+
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
 		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(payout.txid.to_string()));
-		let allocations = db.read(async |tx| Ok(tx.query("SELECT DISTINCT a.sweep_tx FROM expiry_allocation a \
+		let allocations = db.read(async |tx| Ok(tx.query("SELECT DISTINCT a.sweep_tx FROM expiry_allocation_state a \
 			JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 			JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=ANY($1) AND a.sweep_tx IS NOT NULL",
 			&[&root_ids],
@@ -774,7 +774,7 @@ async fn registered_receive_fallback() {
 	// The ledger only locates candidate parents. Their canonical
 	// inputs, recovery witnesses and exact outputs are proved below.
 	let recorded = db.read(async |tx| Ok(tx.query(
-		"SELECT sweep_tx FROM expiry_allocation WHERE sweep_tx IS NOT NULL", &[],
+		"SELECT sweep_tx FROM expiry_allocation_state WHERE sweep_tx IS NOT NULL", &[],
 	).await?)).await.unwrap();
 	let allocation_parents = recorded.iter().map(|row| {
 		let tx = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();

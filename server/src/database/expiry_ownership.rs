@@ -109,12 +109,11 @@ impl Tx<'_> {
 		// our own "spent" status as proof that the customer disappeared.
 		if state.spend_state == SpendState::Spent {
 			if let Some(row) = self.query_opt("
-				SELECT e.id,e.irreversible_facts::TEXT AS irreversible_facts
-				FROM expiry_entitlement e
-				WHERE e.vtxo_id=$1
+				SELECT e.id,c.disposition,c.user_pubkey,c.evidence->>'kind' AS kind
+				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
+				WHERE e.vtxo_id=$1 ORDER BY c.allocation_id LIMIT 1
 			", &[&state.vtxo_id.to_string()]).await? {
-				let facts: serde_json::Value = serde_json::from_str(row.get("irreversible_facts"))?;
-				let kind = facts.get("kind").and_then(serde_json::Value::as_str);
+				let kind: Option<&str> = row.get("kind");
 				if matches!(kind, Some(
 					"pubkey"
 						| "input_owner"
@@ -128,9 +127,10 @@ impl Tx<'_> {
 						| "htlc_external_failed"
 						| "htlc_source_discharged"
 				)) {
-					proposal.disposition = if let Some(key) = facts.get("customer_key").and_then(serde_json::Value::as_str) {
+					proposal.disposition = if row.get::<_, &str>("disposition") == "customer" {
+						let key: &str = row.get("user_pubkey");
 						OwnershipDisposition::Customer { user_pubkey: key.parse()? }
-					} else if facts.get("operator") == Some(&serde_json::Value::Bool(true)) {
+					} else if row.get::<_, &str>("disposition") == "operator" {
 						OwnershipDisposition::Operator
 					} else { return Ok(proposal); };
 					proposal.evidence = Some(OwnershipEvidence::IrreversibleEntitlement { entitlement_id: row.get("id") });

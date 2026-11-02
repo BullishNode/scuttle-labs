@@ -256,9 +256,9 @@ async fn failed_swap_during_restart() {
 	srv.watchmand().wait_for_sync_height(expired).await;
 	let (allocation, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation a \
+			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 				&[&source.to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row { break (row.get::<_, i64>("id"), deserialize::<Transaction>(row.get("sweep_tx")).unwrap()); }
@@ -289,17 +289,17 @@ async fn failed_swap_during_restart() {
 	let child_txid = child.compute_txid();
 	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone()), (child_txid, child)]);
 	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid,a.confirmed_height,a.confirmed_hash, \
-		c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,c.active, \
-		e.vtxo_id,e.gross_sat AS entitlement_gross_sat, \
-		e.irreversible_facts::TEXT AS irreversible_facts \
-		FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+		c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
+		e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS entitlement_gross_sat, \
+		(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS irreversible_facts \
+		FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		WHERE v.anchor_point=$1", &[&root.to_string()],
 	).await?)).await.unwrap();
 	let mut active = 0;
 	for row in rows {
 		assert_eq!(row.get::<_, String>("disposition"), "customer", "failed user funds must never be assigned to the operator");
-		if row.get::<_, bool>("active") {
+		if row.get::<_, String>("status") == "confirmed" {
 			active += 1;
 			assert_eq!(row.get::<_, i64>("id"), allocation);
 			assert_eq!(row.get::<_, String>("vtxo_id"), source.to_string());
@@ -319,13 +319,13 @@ async fn failed_swap_during_restart() {
 			assert_eq!(facts["kind"], "htlc_external_failed");
 			assert_eq!(facts["payment_hash"], hash.to_string());
 			assert_eq!(facts["htlc_expiry"], deadline.to_u32());
-			assert_eq!(facts["customer_key"], key.public_key().to_string());
+
 			assert_eq!(facts["stored_preimage"], false);
 			let recorded = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 			assert_eq!(recorded, parent, "the exact rightful payout must be its stored attributed parent");
 		}
 		let Some(raw) = row.get::<_, Option<&[u8]>>("sweep_tx") else {
-			assert!(!row.get::<_, bool>("active"), "an active confirmed allocation must have its exact parent");
+			assert_ne!(row.get::<_, String>("status"), "confirmed", "a confirmed allocation must have its exact parent");
 			continue;
 		};
 		let recorded = deserialize::<Transaction>(raw).unwrap();
@@ -340,7 +340,7 @@ async fn failed_swap_during_restart() {
 	}
 	assert_eq!(active, 1);
 	let payee = db.read(async |tx| Ok(tx.query_one("SELECT output_index,spk,amount_sat \
-		FROM expiry_allocation_payout WHERE allocation_id=$1", &[&allocation],
+		FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts", &[&allocation],
 	).await?)).await.unwrap();
 	assert_eq!(payee.get::<_, i32>("output_index"), i32::try_from(payout.vout).unwrap());
 	assert_eq!(payee.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());

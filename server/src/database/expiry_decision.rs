@@ -183,8 +183,8 @@ impl Tx<'_> {
 					},
 				};
 				if let Some(row) = self.query_opt("SELECT e.id,EXISTS(SELECT 1 FROM expiry_allocation_coin c \
-					JOIN expiry_allocation a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id \
-					AND ((c.active AND a.status<>'conflicted') OR a.status='confirmed')) AS reserved, \
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id \
+					AND a.status<>'conflicted') AS reserved, \
 					EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id) AS claimed \
 					FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&ownership.id.to_string()]).await? {
 					valid &= !row.get::<_, bool>("reserved") && !row.get::<_, bool>("claimed");
@@ -215,7 +215,7 @@ impl Tx<'_> {
 		})).collect();
 		let paid = self.query("
 			SELECT c.spk,SUM(c.gross_sat)::BIGINT AS gross,SUM(c.fee_sat)::BIGINT AS fee
-			FROM expiry_allocation_coin c JOIN expiry_allocation a ON a.id=c.allocation_id
+			FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id
 			WHERE a.expiry_height=$1 AND a.status<>'conflicted'
 				AND c.disposition='customer' AND c.forfeited_sat=0
 			GROUP BY c.spk
@@ -236,40 +236,23 @@ impl Tx<'_> {
 		}
 		let policy = plan.forfeits.iter().chain(plan.recipients.iter().flat_map(|r| &r.leaves))
 			.map(|a| (a.id,a)).collect::<BTreeMap<_, _>>();
-		let id: i64 = self.query_one("INSERT INTO expiry_allocation(expiry_height,status) VALUES($1,'pending') RETURNING id",
+		let id: i64 = self.query_one("INSERT INTO expiry_allocation(expiry_height) VALUES($1) RETURNING id",
 			&[&i32::try_from(expiry.to_u32())?]).await?.get(0);
-		for (index, recipient) in plan.recipients.iter().enumerate() {
-			self.execute("INSERT INTO expiry_allocation_payout(allocation_id,output_index,spk,amount_sat) VALUES($1,$2,$3,$4)",
-				&[&id,&i32::try_from(index)?,&recipient.output.script_pubkey.as_bytes().to_lower_hex_string(),&i64::try_from(recipient.output.value.to_sat())?]).await?;
-		}
 		for output in &accepted {
 			self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&output.0.id().to_string()]).await?;
 			for coin in &output.1 {
 				let proposal = &coin.ownership;
 				let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
 				let observed = evidence_json(evidence, proposal.has_stored_preimage);
-				let conditional = matches!(evidence, OwnershipEvidence::HtlcInternalGrantsReclaimed { .. }
-					| OwnershipEvidence::HtlcRecvExpired { .. });
-				let mut stable = if conditional {
-					serde_json::json!({"stored_preimage": proposal.has_stored_preimage})
-				} else { observed.clone() };
-				if !conditional {
-					match &proposal.disposition {
-						OwnershipDisposition::Customer { user_pubkey,.. } => stable["customer_key"] = serde_json::json!(user_pubkey.to_string()),
-						OwnershipDisposition::Operator => stable["operator"] = serde_json::json!(true),
-						OwnershipDisposition::Unresolved(_) => bail!("readiness contains unresolved ownership"),
-					}
-				}
 				let entitlement = if let Some(existing) = existing_entitlements.get(&proposal.id) {
-					self.execute("UPDATE expiry_allocation_coin SET active=FALSE WHERE entitlement_id=$1 AND active", &[existing]).await?;
 					*existing
 				} else {
 					self.query_one("
-						INSERT INTO expiry_entitlement(vtxo_id,gross_sat,irreversible_facts)
-						VALUES($1,$2,$3::TEXT::JSONB)
+						INSERT INTO expiry_entitlement(vtxo_id)
+						VALUES($1)
 						RETURNING id
 					",
-						&[&proposal.id.to_string(),&i64::try_from(proposal.gross.to_sat())?,&stable.to_string()]).await?.get(0)
+						&[&proposal.id.to_string()]).await?.get(0)
 				};
 				let allocation = policy.get(&proposal.id);
 				let fee = allocation.map_or(Amount::ZERO, |a| a.fee).to_sat();

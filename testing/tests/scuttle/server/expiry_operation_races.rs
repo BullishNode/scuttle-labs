@@ -168,7 +168,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
 					WHERE e.vtxo_id=$1
-					AND c.active
+					AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
 					AND a.broadcast_at IS NOT NULL
 				", &[&id.to_string()]).await?)).await.unwrap();
 				if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
@@ -421,7 +421,7 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id
 				WHERE e.vtxo_id=$1
-				AND c.active
+				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
 				AND a.broadcast_at IS NOT NULL
 			", &[&refunds[0].id().to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
@@ -612,9 +612,9 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	super::expiry_test::rebuilt(&ctx,&srv,&db).await;
 	let parent:Transaction=tokio::time::timeout(Duration::from_secs(20),async {
 		loop {
-			let row=db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+			let row=db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND a.broadcast_at IS NOT NULL",&[&a.id().to_string()]).await?)).await.unwrap();
+				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",&[&a.id().to_string()]).await?)).await.unwrap();
 			if let Some(row)=row {break deserialize(row.get("sweep_tx")).unwrap();}
 			tokio::time::sleep(Duration::from_millis(25)).await;
 		}
@@ -654,13 +654,13 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	assert_eq!(owner.get_vtxo_by_id(a.id()).await.unwrap().fallback_status,Some(bark::vtxo::FallbackStatus::Pending));
 	assert_eq!(owner.get_vtxo_by_id(a.id()).await.unwrap().state,VtxoState::Locked {holder:Some(VtxoLockHolder::Action {id:prepared.id.clone()})});
 	let allocations=db.read(async |tx| Ok(tx.query("SELECT e.id,c.gross_sat,c.fee_sat,c.payout_sat,a.sweep_tx \
-		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
+		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		WHERE e.vtxo_id=$1 ORDER BY a.id",&[&a.id().to_string()]).await?.into_iter().map(|row|
 		(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,Vec<u8>>(4))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(allocations.len(),1); assert_eq!((allocations[0].1,allocations[0].2,allocations[0].3),(100_000,1_000,99_000));
 	let operator_rows=db.read(async |tx| Ok(tx.query("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid \
 		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='operator'",
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator'",
 		&[&received.id().to_string()]).await?.into_iter().map(|row|(row.get::<_,i64>(0),row.get::<_,i64>(1),
 			row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,String>(4))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(operator_rows,vec![(100_000,0,0,0,parent.compute_txid().to_string())]);
@@ -725,7 +725,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	assert!(owner.offboard_checkpoint(&prepared.id).await.unwrap().is_none());
 	assert_eq!(chain.get_raw_mempool().unwrap(),mempool);
 	let after=db.read(async |tx| Ok(tx.query("SELECT e.id,c.gross_sat,c.fee_sat,c.payout_sat,a.sweep_tx \
-		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
+		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		WHERE e.vtxo_id=$1 ORDER BY a.id",&[&a.id().to_string()]).await?.into_iter().map(|row|
 		(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,Vec<u8>>(4))).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(after,allocations,"same original A entitlement, parent and fee once");

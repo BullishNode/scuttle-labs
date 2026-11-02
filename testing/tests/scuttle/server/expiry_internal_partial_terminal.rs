@@ -271,9 +271,9 @@ async fn partial_terminal(case: TerminalCase) {
 			srv.wait_for_sync_height(height).await;
 			srv.watchmand().wait_for_sync_height(height).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
-			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND a.broadcast_at IS NOT NULL", &[&unpaid.to_string()]).await?)).await.unwrap();
+				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&unpaid.to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { return deserialize(row.get("sweep_tx")).unwrap(); }
 		}
 		panic!("the genuinely unpaid original source still requires an absent user");
@@ -383,8 +383,8 @@ pub(super) async fn wait_partial_confirmation(
 				{ return Ok(false); }
 				t.lock_watchman_tip(view).await?;
 				let recorded = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=$1 AND c.active AND a.status='confirmed' AND a.sweep_tx=$2",
+					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_tx=$2",
 					&[&unpaid.to_string(), &bitcoin::consensus::serialize(parent)]).await?.get::<_, i64>(0);
 				if recorded != 1 { return Ok(false); }
 				let source = t.query_one("SELECT v.onchain_spent_txid,h.offchain_resolution::TEXT,h.chain_resolution::TEXT \
@@ -394,7 +394,7 @@ pub(super) async fn wait_partial_confirmation(
 				assert!(source.get::<_,Option<&str>>("offchain_resolution").is_none(),
 					"an actual user claim cannot be manufactured into permanent off-chain cancellation");
 				let duplicate = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation a ON a.id=c.allocation_id \
+					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 					WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed'", &[&paid_source]).await?
 					.get::<_, i64>(0);
 				assert_eq!(duplicate, 0, "the actual prior user receipt must not receive a second fallback");

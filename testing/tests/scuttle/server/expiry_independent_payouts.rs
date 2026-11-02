@@ -109,9 +109,9 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 		loop {
 			assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx \
-				FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' \
+				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' \
 				AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1", &[&ready.id().to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -178,8 +178,8 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_one("SELECT a.status,a.sweep_tx, \
 				(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e \
-				 ON e.id=c.entitlement_id WHERE e.vtxo_id=$2 AND c.active) AS active \
-				FROM expiry_allocation a WHERE a.id=$1", &[&allocation, &ready.id().to_string()],
+				 ON e.id=c.entitlement_id WHERE e.vtxo_id=$2 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')) AS active \
+				FROM expiry_allocation_state a WHERE a.id=$1", &[&allocation, &ready.id().to_string()],
 			).await?)).await.unwrap();
 			assert_eq!(row.get::<_, i64>("active"), 1, "one ready entitlement has one active allocation");
 			assert_eq!(deserialize::<Transaction>(row.get("sweep_tx")).unwrap(), parent);

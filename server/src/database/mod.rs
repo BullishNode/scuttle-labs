@@ -215,16 +215,22 @@ impl Db {
 				 AND to_regclass('public.expiry_sync_ack') IS NULL \
 				 AND to_regclass('scuttle.expiry_sync_ack') IS NULL \
 				 AND to_regclass('scuttle.expiry_hold') IS NULL \
+				 AND to_regclass('scuttle.expiry_allocation_payout') IS NULL \
+				 AND to_regclass('scuttle.expiry_allocation_state') IS NOT NULL \
+				 AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='scuttle' \
+					AND ((table_name='expiry_allocation' AND column_name IN ('status','confirmed_height','confirmed_hash')) \
+					OR (table_name='expiry_entitlement' AND column_name IN ('gross_sat','irreversible_facts')) \
+					OR (table_name='expiry_allocation_coin' AND column_name='active'))) \
 				 AND EXISTS(SELECT 1 FROM pg_trigger WHERE tgname='customer_coin_owner' \
 				 AND tgrelid=to_regclass('public.vtxo') AND tgdeferrable AND tginitdeferred)", &[],
 			).await?.get(0);
 			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
 			let complete: bool = conn.query_one(
-				"SELECT COUNT(*)=12 FROM information_schema.tables WHERE table_schema='scuttle' \
+				"SELECT COUNT(*)=11 FROM information_schema.tables WHERE table_schema='scuttle' \
 				 AND table_type='BASE TABLE' AND table_name IN ( \
 				 'owner_key','coin_owner','expiry_entitlement','expiry_cancelled_participation', \
 				 'expiry_allocation','expiry_allocation_input','expiry_allocation_coin', \
-				 'expiry_allocation_payout','expiry_split_request','expiry_terminal_claim', \
+				 'expiry_split_request','expiry_terminal_claim', \
 				 'expiry_lightning_receive_claim','htlc_settlement_source')", &[],
 			).await?.get(0);
 			ensure!(complete, "incomplete Scuttle schema; use a fresh store");

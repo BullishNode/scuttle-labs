@@ -54,7 +54,7 @@ async fn expiry_internal_reclaim_reorg_five_blocks_before_refund_pays_receiver_o
 }
 
 async fn customer_allocations(db: &Db, source: &str, status: &str) -> Vec<(i64, Transaction)> {
-	db.read(async |t| Ok(t.query("SELECT a.id,a.sweep_tx FROM expiry_allocation a \
+	db.read(async |t| Ok(t.query("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 		JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status=$2 AND a.sweep_tx IS NOT NULL",
 		&[&source, &status]).await?.into_iter()

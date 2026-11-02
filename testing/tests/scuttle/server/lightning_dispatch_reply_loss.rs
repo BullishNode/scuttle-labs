@@ -272,7 +272,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		srv.watchmand().wait_for_sync_height(expired).await;
 		let parent = tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
-				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&old_source.id().to_string()]).await?)).await.unwrap();
+				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&old_source.id().to_string()]).await?)).await.unwrap();
 				if let Some(row) = row { break deserialize::<Transaction>(row.get(0)).unwrap(); }
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
@@ -291,7 +291,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		tokio::time::timeout(Duration::from_secs(30),async {
 			loop {
-				let confirmed=db.read(async |tx| Ok(tx.query_opt("SELECT a.id FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.status='confirmed' AND a.sweep_txid=$2",&[&old_source.id().to_string(),&parent.compute_txid().to_string()]).await?.is_some())).await.unwrap();
+				let confirmed=db.read(async |tx| Ok(tx.query_opt("SELECT a.id FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.status='confirmed' AND a.sweep_txid=$2",&[&old_source.id().to_string(),&parent.compute_txid().to_string()]).await?.is_some())).await.unwrap();
 				if confirmed { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}

@@ -179,7 +179,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
 					WHERE i.vtxo_id=$1
 					AND e.vtxo_id=$2
-					AND c.active
+					AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
 					AND a.status<>'conflicted'
 					AND a.broadcast_at IS NOT NULL
 				",
@@ -205,7 +205,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 			loop {
 				let row = db.read(async |tx| Ok(tx.query_one("
 					SELECT status
-					FROM expiry_allocation
+					FROM expiry_allocation_state
 					WHERE id=$1
 				", &[&allocation]).await?)).await.unwrap();
 				if row.get::<_, String>("status") == "confirmed" { break; }
@@ -236,7 +236,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
 					WHERE e.vtxo_id=$1
-					AND c.active
+					AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
 					AND a.broadcast_at IS NOT NULL
 				", &[&original.id().to_string()]).await?)).await.unwrap();
 				if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
@@ -419,9 +419,9 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 			loop {
 				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id, c.owner_mailbox,
 					c.user_pubkey,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,c.spk
-					FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+					FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
-					WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.status<>'conflicted'",
+					WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.status<>'conflicted'",
 					&[&source.id().to_string()]).await?)).await.unwrap();
 				if let Some(row) = row { break row; }
 				tokio::time::sleep(Duration::from_millis(20)).await;
@@ -507,7 +507,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		assert_eq!(wallet.history().await.unwrap(), history);
 		assert_eq!(no_persistence().await, (0, 0, 0));
 		let count = db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM expiry_allocation_coin c
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.active",
+			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')",
 			&[&source.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap();
 		assert_eq!(count, 1);
 		tokio::fs::write(ctx.datadir.join("a6-recoverable-result.json"), serde_json::to_vec_pretty(&json!({

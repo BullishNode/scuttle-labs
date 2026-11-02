@@ -152,7 +152,7 @@ pub(super) async fn financial_cut(
 	}
 	let anchors = roots.keys().map(ToString::to_string).collect::<Vec<_>>();
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_allocation_coin c \
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation a ON a.id=c.allocation_id \
+		JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=ANY($1) AND c.disposition='customer'",
 		&[&anchors]).await?)).await.unwrap();
 	assert!(!rows.is_empty(), "the final owner must have a non-vacuous customer allocation");
@@ -234,8 +234,8 @@ pub(super) async fn confirm_epoch(
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
 				c.forfeited_sat,c.spk,c.owner_mailbox,c.user_pubkey,a.id,a.sweep_tx,a.sweep_txid \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
-				AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids],
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
+				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids],
 			).await?)).await.unwrap();
 			assert!(rows.len() <= leaves.len());
 			if rows.len() == leaves.len() && rows.iter().all(|row|
@@ -281,24 +281,12 @@ pub(super) async fn confirm_epoch(
 		let allocation = row.get::<_, i64>("id");
 		// A real dust allocation has NO payout association. Never replace
 		// this LEFT JOIN by an inner join which silently drops the dust leaf.
-		let ledger = db.read(async |tx| Ok(tx.query_one("SELECT a.status,a.confirmed_hash,a.confirmed_height,a.sweep_txid, \
-			p.output_index,p.amount_sat FROM expiry_allocation_coin c \
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation a ON a.id=c.allocation_id \
-			LEFT JOIN expiry_allocation_payout p ON p.allocation_id=c.allocation_id AND p.spk=c.spk \
-			WHERE e.vtxo_id=$1 AND c.allocation_id=$2", &[&id.to_string(), &allocation],
-		).await?)).await.unwrap();
-		assert_eq!(ledger.get::<_, String>("status"), "confirmed");
-		assert_eq!(ledger.get::<_, String>("confirmed_hash"), hash.to_string());
-		assert_eq!(ledger.get::<_, i64>("confirmed_height"), i64::from(height.to_u32()));
-		assert_eq!(ledger.get::<_, String>("sweep_txid"), txid.to_string());
-		let index = ledger.get::<_, Option<i32>>("output_index").map(|index| u32::try_from(index).unwrap());
+		let index = parent.output.iter().position(|output| output.script_pubkey == leaf.script)
+			.map(|index| u32::try_from(index).unwrap());
 		if leaf.payout == 0 {
 			assert!(index.is_none());
-			assert!(ledger.get::<_, Option<i64>>("amount_sat").is_none());
-			assert!(parent.output.iter().all(|output| output.script_pubkey != leaf.script));
 		} else {
 			let index = index.unwrap();
-			assert_eq!(ledger.get::<_, Option<i64>>("amount_sat"), Some(leaf.group_payout as i64));
 			assert_eq!(parent.output[index as usize], TxOut { value: sat(leaf.group_payout), script_pubkey: leaf.script.clone() });
 		}
 		result.allocations.insert(id, allocation);

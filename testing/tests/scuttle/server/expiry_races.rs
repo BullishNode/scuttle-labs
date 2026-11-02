@@ -65,10 +65,10 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 				Ok::<_, anyhow::Error>(())
 			}).await.expect("competing writer must reach actual coin lock")?;
 			t.query_one("
-				INSERT INTO expiry_entitlement(vtxo_id, gross_sat)
-				VALUES($1, $2)
+				INSERT INTO expiry_entitlement(vtxo_id)
+				VALUES($1)
 				RETURNING id
-			", &[&coin.id().to_string(), &i64::try_from(coin.amount().to_sat())?]).await?;
+			", &[&coin.id().to_string()]).await?;
 			t.execute("
 				UPDATE vtxo
 				SET spend_state = 'spent', updated_at = NOW()

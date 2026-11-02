@@ -194,8 +194,8 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 		tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
 				let decided = db.read(async |tx| Ok(tx.query_one("SELECT EXISTS(SELECT 1 FROM expiry_entitlement e \
-					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=$1 AND c.active AND a.status<>'conflicted')", &[&htlc.id().to_string()]).await?
+					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.status<>'conflicted')", &[&htlc.id().to_string()]).await?
 					.get::<_, bool>(0))).await.unwrap();
 				if decided {
 					break;

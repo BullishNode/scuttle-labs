@@ -287,10 +287,10 @@ async fn pay_hold_refused() {
 				let mut mined_prefix_blocks = 0_u32;
 				loop {
 					let row = db.read(async |tx| Ok(tx.query_opt(
-						"SELECT a.sweep_tx FROM expiry_allocation a \
+						"SELECT a.sweep_tx FROM expiry_allocation_state a \
 						JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 						JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-						WHERE e.vtxo_id=$1 AND c.active AND a.broadcast_at IS NOT NULL \
+						WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL \
 						ORDER BY a.id DESC LIMIT 1", &[&source.id().to_string()],
 					).await?)).await.unwrap();
 					if let Some(row) = row {

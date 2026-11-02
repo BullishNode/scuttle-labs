@@ -105,7 +105,7 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	let (allocation, parent, child, observed_child_fee) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt(
-				"SELECT a.id,a.sweep_tx FROM expiry_allocation a \
+				"SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
@@ -230,7 +230,7 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	assert!(ctx.bitcoind().get_received_by_address(&recovery_address) > sat(0));
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent_txid, payout_point.vout, Some(true)).unwrap().is_none());
 	assert_eq!(ctx.bitcoind().await_transaction(recovery.compute_txid()).await, recovery);
-	let raw = db.read(async |t| Ok(t.query_one("SELECT sweep_tx FROM expiry_allocation WHERE id=$1", &[&allocation]).await?
+	let raw = db.read(async |t| Ok(t.query_one("SELECT sweep_tx FROM expiry_allocation_state WHERE id=$1", &[&allocation]).await?
 		.get::<_, Vec<u8>>(0))).await.unwrap();
 	assert_eq!(deserialize::<Transaction>(&raw).unwrap(), parent, "confirmation/recovery must not rewrite the payout parent");
 	// Preserve the original one-block spend check above, then independently

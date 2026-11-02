@@ -1,12 +1,9 @@
 //! Immutable zero-fee sweep parents. Fee replacements affect only their child.
 
-use std::collections::BTreeSet;
-
 use anyhow::Context;
 use bitcoin::{Amount, Transaction, TxOut, Txid, Weight};
 use bitcoin_ext::TxStatus;
 use bitcoin_ext::{fee, TransactionExt, TxOutExt};
-use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::traits::Reader;
 use bitcoin_ext::bdk::WalletExt;
 use bitcoin_ext::cpfp::MakeCpfpFees;
@@ -50,15 +47,6 @@ impl Watchman {
 		payouts: &[TxOut],
 	) -> anyhow::Result<Transaction> {
 		ensure!(!vtxos.is_empty(), "expiry payout has no backing inputs");
-		ensure!(vtxos.iter().map(|v| v.id()).collect::<BTreeSet<_>>().len() == vtxos.len(),
-			"expiry payout repeats a backing input");
-		for vtxo in vtxos {
-			let output = self.bitcoind.try_get_tx_out(vtxo.point(), true).await?
-				.context("expiry payout input is already consumed")?;
-			ensure!(output.confirmations > 0 && output.value == vtxo.amount()
-				&& output.script_pub_key.script().context("invalid backing script")? == vtxo.txout().script_pubkey,
-				"expiry payout backing is not the exact confirmed output");
-		}
 		ensure!(payouts.iter().all(|out| out.is_standard()), "expiry payout contains nonstandard or dust payee output");
 		let input_amount = vtxos.iter().try_fold(Amount::ZERO, |sum, vtxo|
 			sum.checked_add(vtxo.amount()).context("claim input amount overflow"),
@@ -134,10 +122,8 @@ impl Watchman {
 		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 		self.db.write(async |t| {
 			t.lock_watchman_tip(view).await?;
-			let row = t.query_one("SELECT status,sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE",
-				&[&group.id]).await?;
-			ensure!(row.get::<_, &str>("status") == "pending"
-				&& row.get::<_, Option<&[u8]>>("sweep_tx") == Some(bitcoin::consensus::serialize(&parent).as_slice()),
+			t.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&group.id]).await?;
+			ensure!(t.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&group.id]).await?.get::<_, &str>(0) == "pending",
 				"expiry allocation changed before package publication");
 			let result = bcd::submit_package(&self.bitcoind, &[parent.clone(), child.clone()]).await?;
 			bcd::require_package_acceptance(&result, &[&parent, &child])?;

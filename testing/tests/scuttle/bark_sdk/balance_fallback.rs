@@ -31,7 +31,7 @@ async fn fallback_balance_completed_refresh_and_operator_backing_conserve_one_pr
 		loop {
 			let operator = database.read(async |tx| Ok(tx.query_opt("SELECT e.id FROM expiry_entitlement e \
 				JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1 \
-				AND e.irreversible_facts->>'operator'='true' LIMIT 1", &[&original[0].chain_anchor().to_string()]).await?)).await.unwrap();
+				AND (SELECT disposition FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1)='operator' LIMIT 1", &[&original[0].chain_anchor().to_string()]).await?)).await.unwrap();
 			if operator.is_some() { break; }
 			tokio::time::sleep(poll_interval()).await;
 		}

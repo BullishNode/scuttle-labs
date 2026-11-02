@@ -1226,8 +1226,8 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 			let rows = db.read(async |t| Ok(t.query(
 				"SELECT DISTINCT e.vtxo_id,a.sweep_tx,a.sweep_txid,a.status='confirmed' AS confirmed \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND c.active AND c.disposition='operator' AND a.broadcast_at IS NOT NULL",
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.broadcast_at IS NOT NULL",
 				&[&grant_ids],
 			).await?)).await.unwrap();
 			let mut covered = HashSet::new();
@@ -1502,7 +1502,7 @@ impl ParkedReceive {
 		let db = Db::connect(&self.srv.config().postgres.clone()).await.unwrap();
 		let open = db.read(async |t| { Ok(t.query_one("SELECT COUNT(*) AS grants, \
 			BOOL_AND(v.confirmed_height IS NULL AND h.offchain_resolution IS NULL AND h.chain_resolution IS NULL \
-			AND NOT EXISTS(SELECT 1 FROM expiry_allocation a \
+			AND NOT EXISTS(SELECT 1 FROM expiry_allocation_state a \
 			JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 			WHERE e.vtxo_id=v.vtxo_id AND c.disposition='operator' AND a.status='confirmed')) AS open \

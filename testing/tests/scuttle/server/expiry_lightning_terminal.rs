@@ -49,9 +49,9 @@ pub(super) async fn confirmed_grant_closures(
 	let mut closures = std::collections::BTreeMap::new();
 	for grant in grants {
 		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
-			(SELECT a.sweep_txid FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
-			AND c.active AND c.disposition='operator' AND a.status='confirmed') AS swept \
+			AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept \
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();
 		let txid = match (row.get::<_, Option<&str>>("chain_resolution"), row.get::<_, Option<&str>>("swept")) {
 			(Some("revoked"), _) => row.get::<_, Option<&str>>("onchain_spent_txid")
@@ -78,9 +78,9 @@ pub(super) async fn assert_grants_reclaimed(ctx: &TestContext, db: &Db, grants: 
 	let chain = ctx.bitcoind().sync_client();
 	for grant in grants {
 		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
-			(SELECT a.sweep_txid FROM expiry_allocation a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
-				AND c.active AND c.disposition='operator' AND a.status='confirmed') AS swept, \
+				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept, \
 			h.payment_hash,h.direction::TEXT AS direction \
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();
 		assert_eq!(row.get::<_, &str>("payment_hash"), grant.policy().as_server_htlc_recv().unwrap().payment_hash.to_string());
@@ -260,7 +260,7 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 	srv.watchmand().wait_for_sync_height(expired).await;
 	let parent: Transaction = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL", &[&id.to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
@@ -391,7 +391,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	srv.watchmand().wait_for_sync_height(expired).await;
 	let parent: Transaction = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL", &[&source.to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
@@ -414,7 +414,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 		EXISTS(SELECT 1 FROM lightning_payment_attempt WHERE id=$1 AND lightning_htlc_subscription_id=$2) AS funding, \
 		(SELECT COUNT(*) FROM vtxo WHERE lightning_htlc_subscription_id=$2) AS grants, \
 		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-			WHERE e.vtxo_id=$3 AND c.active AND c.disposition='customer') AS paid_once",
+			WHERE e.vtxo_id=$3 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer') AS paid_once",
 		&[&attempt,&subscription,&source.to_string()]).await?)).await.unwrap();
 	assert!(kept.get::<_, bool>("funding"));
 	assert_eq!(kept.get::<_, i64>("grants"), 0);
@@ -586,8 +586,8 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 				srv.watchmand().wait_for_sync_height(height).await;
 				let row = db.read(async |t| Ok(t.query_one("SELECT COUNT(DISTINCT e.vtxo_id) AS reclaimed,MAX(a.confirmed_height) AS height
 					FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
-					JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
-					AND c.active AND c.disposition='operator' AND a.status='confirmed'", &[&ids]).await?)).await.unwrap();
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
+					AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed'", &[&ids]).await?)).await.unwrap();
 				if row.get::<_, i64>("reclaimed") == grants.len() as i64 { break u32::try_from(row.get::<_, i64>("height")).unwrap(); }
 				tokio::time::sleep(Duration::from_millis(100)).await;
 			}
@@ -730,7 +730,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 			srv.wait_for_sync_height(height).await;
 			srv.watchmand().wait_for_sync_height(height).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
-			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation a \
+			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL", &[&source.to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { return deserialize(row.get("sweep_tx")).unwrap(); }
@@ -1057,8 +1057,8 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 									.query(
 										"SELECT c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_tx \
 						FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-						JOIN expiry_allocation a ON a.id=c.allocation_id \
-						WHERE e.vtxo_id=$1 AND c.active AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+						JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+						WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 										&[&coin.id().to_string()],
 									)
 									.await?)

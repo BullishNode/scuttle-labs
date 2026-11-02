@@ -56,26 +56,14 @@ struct RefreshTransport {
 	status_steps: Arc<AtomicUsize>,
 	status_faults: Arc<AtomicUsize>,
 	reject_nonces: Arc<AtomicBool>,
-	nonce_requests: Arc<AtomicUsize>,
-	lose_forfeit_reply: Arc<AtomicBool>,
 	accepted_forfeits: Arc<AtomicUsize>,
-	forfeit_requests: Arc<AtomicUsize>,
-	registrations: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for RefreshTransport {
-	async fn register_vtxo_transactions(&self, upstream: &mut ArkClient, request: protos::RegisterVtxoTransactionsRequest)
-		-> Result<protos::Empty, tonic::Status>
-	{
-		self.registrations.fetch_add(1, Ordering::SeqCst);
-		Ok(upstream.register_vtxo_transactions(request).await?.into_inner())
-	}
-
 	async fn request_forfeit_nonces(&self, upstream: &mut ArkClient, request: protos::ForfeitNoncesRequest)
 		-> Result<protos::ForfeitNoncesResponse, tonic::Status>
 	{
-		self.nonce_requests.fetch_add(1, Ordering::SeqCst);
 		if self.reject_nonces.load(Ordering::SeqCst) {
 			return Err(tonic::Status::unavailable("nonce transport unavailable before forwarding"));
 		}
@@ -85,12 +73,8 @@ impl captaind::proxy::ArkRpcProxy for RefreshTransport {
 	async fn forfeit_vtxos(&self, upstream: &mut ArkClient, request: protos::ForfeitVtxosRequest)
 		-> Result<protos::ForfeitVtxosResponse, tonic::Status>
 	{
-		self.forfeit_requests.fetch_add(1, Ordering::SeqCst);
 		let response = upstream.forfeit_vtxos(request).await?.into_inner();
 		self.accepted_forfeits.fetch_add(1, Ordering::SeqCst);
-		if self.lose_forfeit_reply.swap(false, Ordering::SeqCst) {
-			return Err(tonic::Status::unavailable("accepted forfeit reply lost"));
-		}
 		Ok(response)
 	}
 

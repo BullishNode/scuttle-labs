@@ -274,7 +274,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	srv.watchmand().wait_for_sync_height(expired).await;
 	let (allocation, parent) = async {
 		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation a \
+			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
 				&[&grant.id().to_string()],
@@ -362,7 +362,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	async {
 		loop {
 			let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT status='confirmed' \
-				FROM expiry_allocation WHERE id=$1", &[&allocation],
+				FROM expiry_allocation_state WHERE id=$1", &[&allocation],
 			).await?.get::<_, bool>(0))).await.unwrap();
 			if confirmed { break; }
 			tokio::time::sleep(poll_interval()).await;
@@ -373,7 +373,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1 AND c.disposition<>'operator') AS customers, \
 		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=$2 AND a.status='confirmed') AS allocations",
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$2 AND a.status='confirmed') AS allocations",
 		&[&root.to_string(), &grant.id().to_string()],
 	).await?)).await.unwrap();
 	for field in ["splits", "customers"] { assert_eq!(final_state.get::<_, i64>(field), 0, "{field}"); }

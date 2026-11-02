@@ -64,10 +64,10 @@ impl Tx<'_> {
 			let grants = self.query("
 				SELECT h.payment_hash,h.direction::TEXT,h.offchain_resolution::TEXT,
 					h.chain_resolution::TEXT,h.chain_resolution_height,
-					(SELECT MIN(a.confirmed_height) FROM expiry_allocation a
+					(SELECT MIN(a.confirmed_height) FROM expiry_allocation_state a
 						JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 						JOIN expiry_entitlement e ON e.id=c.entitlement_id
-						WHERE e.vtxo_id=v.vtxo_id AND c.active
+						WHERE e.vtxo_id=v.vtxo_id
 						AND c.disposition='operator' AND a.status='confirmed') AS swept_height
 				FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id
 				WHERE v.lightning_htlc_subscription_id=$1 ORDER BY v.vtxo_id
