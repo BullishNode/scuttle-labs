@@ -132,6 +132,17 @@ impl Htlc {
 	}
 }
 
+/// A grant's canonical reclamation is terminal only after six blocks in both
+/// completed daemon views. Resolution heights are rolled back with the view.
+pub(crate) fn grant_reclamation_confirmed(
+	height: BlockHeight,
+	tip: BlockHeight,
+	watchman_tip: Option<BlockHeight>,
+) -> bool {
+	watchman_tip.is_some_and(|watchman| tip.min(watchman).to_u32().checked_sub(height.to_u32())
+		.is_some_and(|depth| depth >= 5))
+}
+
 /// An htlc vtxo: the vtxo state joined with its htlc data.
 #[derive(Debug)]
 pub struct HtlcVtxo {
@@ -190,6 +201,7 @@ const HTLC_VTXO_COLUMNS: &str = "
 	v.id, v.vtxo_id, v.vtxo, v.expiry, v.oor_spent_txid, v.spent_in_round,
 	v.offboarded_in, v.banned_until_height, v.confirmed_height,
 	v.spend_state::TEXT AS spend_state, v.created_at, v.updated_at,
+	EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=v.vtxo_id) AS decided_for_fallback,
 	hv.payment_hash, hv.htlc_expiry,
 	hv.direction::TEXT AS direction,
 	hv.offchain_resolution::TEXT AS offchain_resolution,

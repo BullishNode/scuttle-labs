@@ -12,7 +12,6 @@ use crate::ln::LightningFailureKind;
 use crate::ln::settler::HtlcSettler;
 use crate::telemetry;
 
-
 /// Borrows the DB, mailbox manager, and payment update broadcast channel
 /// so that every payment-attempt status change is consistently followed by
 /// a broadcast and (for final states) a mailbox notification.
@@ -37,71 +36,69 @@ impl<'a> PaymentAttemptHandler<'a> {
 	pub async fn fail_payment_attempt(
 		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
 	) -> anyhow::Result<Option<DateTime<Local>>> {
-		self.fail_attempt(attempt, error, false).await
-	}
-
-	/// Mark an intra-Ark payment attempt that its receive refused as failed,
-	/// and unlink it from that receive in the same transaction.
-	///
-	/// Revoking the attempt's HTLCs must never see it failed while still
-	/// linked, or the revoke cancels a receive that this payment never paid.
-	///
-	/// Returns `None` if the optimistic-lock predicate missed.
-	pub async fn fail_refused_payment_attempt(
-		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
-	) -> anyhow::Result<Option<DateTime<Local>>> {
-		self.fail_attempt(attempt, error, true).await
-	}
-
-	async fn fail_attempt(
-		&self, attempt: &LightningPaymentAttempt, error: Option<&str>, unlink_subscription: bool,
-	) -> anyhow::Result<Option<DateTime<Local>>> {
-		let new_status = LightningPaymentStatus::Failed;
-		let updated_at = self.db.write(async |t| if unlink_subscription {
-			t.fail_refused_lightning_payment_attempt(attempt, error).await
-		} else {
-			let updated_at = t.update_lightning_payment_attempt_status(
-				attempt, new_status, error,
-			).await?;
-			if updated_at.is_some() {
-				end_xpay(t, attempt, ClnXpayOutcome::Fail { error_code: None }).await?;
-			}
-			Ok(updated_at)
+		let updated_at = self.db.write(async |t| {
+			t.lock_settlement_sources(attempt.payment_hash).await?;
+			t.lock_htlc_settlements().await?;
+			t.ensure_attempt_sources_allow_failure(attempt).await?;
+			Self::fail_attempt_in_tx(t, attempt, error).await
 		}).await?;
 
 		if updated_at.is_some() {
-			trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",
-				attempt.id, new_status, attempt.payment_hash,
-			);
+			self.notify_payment_failed(attempt, error).await?;
+		}
+		Ok(updated_at)
+	}
 
-			self.payment_update_tx.send(attempt.payment_hash)
-				.context("payment update channel broken")?;
+	/// Apply the existing failure write in a caller-owned transaction after
+	/// its validity/source/settlement locks and source failure predicate.
+	pub(crate) async fn fail_attempt_in_tx(
+		t: &database::Tx<'_>, attempt: &LightningPaymentAttempt,
+		error: Option<&str>,
+	) -> anyhow::Result<Option<DateTime<Local>>> {
+		let updated_at = t.update_lightning_payment_attempt_status(
+			attempt, LightningPaymentStatus::Failed, error,
+		).await?;
+		if updated_at.is_some() {
+			end_xpay(t, attempt, ClnXpayOutcome::Fail { error_code: None }).await?;
+		}
+		Ok(updated_at)
+	}
 
+	/// Notify only after the caller's failure transaction committed.
+	pub(crate) async fn notify_payment_failed(
+		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
+	) -> anyhow::Result<()> {
+		let new_status = LightningPaymentStatus::Failed;
+		trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",
+			attempt.id, new_status, attempt.payment_hash,
+		);
+
+		self.payment_update_tx.send(attempt.payment_hash)
+			.context("payment update channel broken")?;
+
+		// Falls back to the stored error: `update_..._status` keeps it
+		// when handed `None`.
+		let failure = LightningFailureKind::classify(error.or(attempt.error.as_deref()));
+
+		self.post_lightning_send_finished(
+			attempt, None, Some(failure),
+		).await;
+
+		// Attempted amount (not final_amount_msat) so failed/succeeded
+		// volumes stay comparable.
+		telemetry::add_lightning_payment(
+			attempt.lightning_node_id,
+			attempt.amount_msat,
+			telemetry::LightningPaymentMetricStatus::Failed,
+			telemetry::LightningDirection::Send,
+			attempt.is_self_payment(),
+			attempt.user_agent.as_deref(),
 			// Falls back to the stored error: `update_..._status` keeps it
 			// when handed `None`.
-			let failure = LightningFailureKind::classify(error.or(attempt.error.as_deref()));
-
-			self.post_lightning_send_finished(
-				attempt.payment_hash, None, Some(failure),
-			).await;
-
-			// Attempted amount (not final_amount_msat) so failed/succeeded
-			// volumes stay comparable.
-			telemetry::add_lightning_payment(
-				attempt.lightning_node_id,
-				attempt.amount_msat,
-				telemetry::LightningPaymentMetricStatus::Failed,
-				telemetry::LightningDirection::Send,
-				attempt.is_self_payment(),
-				attempt.user_agent.as_deref(),
-				// Falls back to the stored error: `update_..._status` keeps it
-				// when handed `None`.
-				Some(LightningFailureKind::classify(error.or(attempt.error.as_deref()))),
-				None,
-			);
-		}
-
-		Ok(updated_at)
+			Some(LightningFailureKind::classify(error.or(attempt.error.as_deref()))),
+			None,
+		);
+		Ok(())
 	}
 
 	/// Verify and update a lightning payment attempt, broadcast the update, and
@@ -121,21 +118,53 @@ impl<'a> PaymentAttemptHandler<'a> {
 		final_amount_msat: Option<u64>,
 		preimage: Option<Preimage>,
 	) -> anyhow::Result<()> {
-		// Store the preimage in the settlement table so the
-		// watchman can use it to claim HTLC VTXOs on-chain.
+		self.process_attempt(settler, attempt, status, payment_error, final_amount_msat, preimage, None).await
+	}
+
+	/// An original live reply or privileged cold-lifecycle reconciliation may
+	/// retire an empty native attempt through the same source-guarded commit.
+	pub(crate) async fn process_native_failure(
+		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
+		error: Option<&str>, record: &crate::database::xpay::ClnXpayRecord, code: Option<i32>,
+	) -> anyhow::Result<()> {
+		ensure!(code.is_none_or(|code| matches!(code, 205 | 206 | 207)), "unsupported native zero-part code");
+		self.process_attempt(settler, attempt, LightningPaymentStatus::Failed,
+			error, None, None, Some((record, code))).await
+	}
+
+	async fn process_attempt(
+		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
+		status: LightningPaymentStatus, payment_error: Option<&str>,
+		final_amount_msat: Option<u64>, preimage: Option<Preimage>,
+		zero_part: Option<(&crate::database::xpay::ClnXpayRecord, Option<i32>)>,
+	) -> anyhow::Result<()> {
+		// Native success is authoritative even when an optimistic status write
+		// loses its race. Its actual attempt provenance and WAL commit together.
 		if let Some(preimage) = preimage {
-			debug_assert!(
+			ensure!(
 				matches!(status, LightningPaymentStatus::Succeeded),
 				"payment is succeeded if preimage is known, not {}", status,
 			);
-			debug_assert!(
+			ensure!(
 				preimage.compute_payment_hash() == attempt.payment_hash,
 				"preimage must match payment hash",
 			);
-			settler.settle(preimage).await?;
 		}
 
-		let updated = self.db.write(async |t| {
+		let (updated, checkpoint) = self.db.write(async |t| {
+			let checkpoint = if let Some(preimage) = preimage {
+				t.store_htlc_settlement(preimage).await?
+			} else {
+				t.lock_settlement_sources(attempt.payment_hash).await?;
+				None
+			};
+			if status == LightningPaymentStatus::Failed {
+				t.lock_htlc_settlements().await?;
+				t.ensure_attempt_sources_allow_failure(attempt).await?;
+			}
+			if zero_part.is_some() {
+				t.ensure_not_settled(attempt.payment_hash).await?;
+			}
 			let updated = t.verify_and_update_payment_attempt(
 				attempt, status, payment_error, final_amount_msat
 			).await?;
@@ -151,7 +180,20 @@ impl<'a> PaymentAttemptHandler<'a> {
 					},
 					_ => ClnXpayOutcome::Fail { error_code: None },
 				};
-				end_xpay(t, attempt, outcome).await?;
+				if let Some((record, code)) = zero_part {
+					ensure!(record.label.as_deref() == Some(attempt.id.to_string().as_str())
+						&& record.lightning_node_id == attempt.lightning_node_id
+						&& record.payment_hash == attempt.payment_hash && !attempt.is_self_payment(),
+						"live native result belongs to another attempt");
+					let current = crate::database::xpay::get_xpay_by_id(&**t, record.id).await?
+						.context("live native result lost its original request")?;
+					ensure!(current == *record && current.status == crate::database::xpay::ClnXpayStatus::Pending
+						&& current.error_code.is_none(), "native request changed during its original call");
+					ensure!(crate::database::xpay::mark_xpay_fail(&**t, current.id, code).await?.is_some(),
+						"live native result lost its pending request");
+				} else {
+					end_xpay(t, attempt, outcome).await?;
+				}
 			}
 
 			// Only mark linked HTLC-send vtxos as ln-spent once the attempt
@@ -159,7 +201,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 			// optimistic-lock race would otherwise leave the vtxos flagged
 			// ln-spent for an attempt we did not transition.
 			if updated && preimage.is_some() {
-				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.payment_hash).await?;
+				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.id).await?;
 				if !not_spendable.is_empty() {
 					warn!(
 						"Lightning payment attempt ({}): HTLC-send vtxos for payment hash {} \
@@ -169,8 +211,9 @@ impl<'a> PaymentAttemptHandler<'a> {
 				}
 			}
 
-			Ok(updated)
+			Ok((updated, checkpoint))
 		}).await?;
+		settler.notify_stored(checkpoint, attempt.payment_hash);
 
 		if updated {
 			trace!("Lightning payment attempt ({}): status updated to {} for payment hash {}.",
@@ -186,7 +229,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 
 			if status.is_final() {
 				self.post_lightning_send_finished(
-					attempt.payment_hash, preimage, failure,
+					attempt, preimage, failure,
 				).await;
 			}
 
@@ -229,12 +272,13 @@ impl<'a> PaymentAttemptHandler<'a> {
 	/// Post a lightning send finished notification to the sender's mailbox.
 	async fn post_lightning_send_finished(
 		&self,
-		payment_hash: PaymentHash,
+		attempt: &LightningPaymentAttempt,
 		preimage: Option<Preimage>,
 		failure: Option<LightningFailureKind>,
 	) {
+		let payment_hash = attempt.payment_hash;
 		let mailbox_id = match self.db.read(async |t|
-			t.get_lightning_sender_mailbox_id(payment_hash).await
+			t.get_lightning_sender_mailbox_id(attempt.id).await
 		).await {
 			Ok(Some(id)) => id,
 			Ok(None) => return,
@@ -276,7 +320,7 @@ async fn end_xpay(
 	let ended = xpay::end_pending_xpay_by_payment_hash(&**tx, attempt.payment_hash, outcome)
 		.await?;
 	if ended.is_none() {
-		// A pre-V75 attempt never had one; anything else has two writers
+		// A pre-V76 attempt never had one; anything else has two writers
 		// disagreeing on which attempt is open, which the attempt's own
 		// optimistic lock should have prevented.
 		warn!("Lightning payment attempt ({}): no pending cln_xpay row to end for \

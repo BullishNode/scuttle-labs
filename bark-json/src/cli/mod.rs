@@ -347,7 +347,7 @@ pub struct BalanceSummary {
 	#[serde(rename = "needs_refresh_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub needs_refresh: Amount,
-	/// Sats held by operations in progress: the sum of the `pending_*_sat`
+	/// Sats held by operations: the sum of the `pending_*_sat`
 	/// fields of [Balance]. They either come back as spendable or leave the
 	/// wallet, for example to the on-chain wallet.
 	#[serde(rename = "pending_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -614,7 +614,7 @@ pub struct LightningReceiveInfo {
 	/// The payment hash linked to the lightning receive
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the receive
+	/// Lifecycle phase of the invoice.
 	pub state: LightningReceiveStateKind,
 	/// The invoice string, if known.
 	pub invoice: String,
@@ -787,6 +787,27 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 mod test {
 	use bitcoin::FeeRate;
 	use super::*;
+
+	#[test]
+	fn ordinary_pending_balance_counts_each_bucket_once() {
+		let balance = Balance {
+			spendable: Amount::from_sat(2_000),
+			needs_refresh: Amount::ZERO,
+			pending_lightning_send: Amount::ZERO,
+			claimable_lightning_receive: Amount::ZERO,
+			pending_in_round: Amount::ZERO,
+			pending_board: Amount::ZERO,
+			pending_arkoor_send: Amount::ZERO,
+			pending_offboard: Amount::from_sat(5_000),
+			pending_exit: Amount::ZERO,
+		};
+		let summary = BalanceSummary::from(&balance);
+		assert_eq!(summary.spendable, Amount::from_sat(2_000));
+		assert_eq!(summary.pending, Amount::from_sat(5_000));
+		assert_eq!(summary.total, Amount::from_sat(7_000));
+		let encoded = serde_json::to_value(&summary).unwrap();
+		assert!(encoded.get("awaiting_settlement_sat").is_none());
+	}
 
 	fn lightning_receive_base_json() -> serde_json::Value {
 		serde_json::json!({

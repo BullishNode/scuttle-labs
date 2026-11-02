@@ -2,7 +2,6 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
@@ -20,7 +19,7 @@ use ark::integration::{TokenStatus, TokenType};
 use ark::VtxoId;
 use server::{bitcoind as bcd, filters, Config, Server, CAPTAIND_CLI_API_KEY};
 use server::utils::block_duration;
-use server_rpc::{self as rpc, protos};
+use server_rpc::{self as rpc, protos, RequestExt};
 
 /// Defaults to our default port on localhost.
 const DEFAULT_ADMIN_RPC_ADDR: &str = "127.0.0.1:3536";
@@ -115,6 +114,15 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum RpcCommand {
+	/// Observe an existing Lightning attempt on its recorded online node.
+	#[command()]
+	ReconcileLightningAttempt {
+		attempt_id: i64,
+		/// Confirm the whole original CLN/plugin process group was stopped/reaped,
+		/// its same persistent backend restarted, and new dispatch excluded.
+		#[arg(long)]
+		native_cold_restart_confirmed: bool,
+	},
 	/// Report server wallet status
 	#[command()]
 	Wallet,
@@ -683,13 +691,28 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 	debug!("Query admin rpc-endpoint at {}", endpoint);
 
 	match cmd {
+		RpcCommand::ReconcileLightningAttempt { attempt_id, native_cold_restart_confirmed } => {
+			let mut rpc = rpc::admin::LightningAdminServiceClient::connect(endpoint)
+				.await.context("failed to connect to operator rpc")?;
+			let request = protos::ReconcileLightningAttemptRequest { attempt_id, native_cold_restart_confirmed };
+			let response = rpc.reconcile_lightning_attempt(request).await?.into_inner();
+			serde_json::to_writer_pretty(std::io::stdout(), &serde_json::json!({
+				"attempt_id": response.attempt_id,
+				"payment_hash": ark::lightning::PaymentHash::from_slice(&response.payment_hash)?.to_string(),
+				"status": response.status,
+			}))?;
+			println!();
+		},
 		RpcCommand::Wallet => {
 			let mut rpc = rpc::admin::WalletAdminServiceClient::connect(endpoint)
 				.await.context("failed to connect to rpc")?;
 
 			let res = rpc.wallet_status(protos::Empty {}).await?.into_inner();
 			let ret = serde_json::json!({
-				"rounds": WalletStatus(res.rounds.unwrap().try_into().expect("invalid response")),
+				"rounds": res.rounds.map(rpc::WalletStatus::try_from).transpose()
+					.context("invalid rounds wallet status")?.map(WalletStatus),
+				"watchman": res.watchman.map(rpc::WalletStatus::try_from).transpose()
+					.context("invalid watchman wallet status")?.map(WalletStatus),
 			});
 			serde_json::to_writer_pretty(std::io::stdout(), &ret).unwrap();
 			println!("");

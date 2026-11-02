@@ -37,8 +37,10 @@ use ark::tree::signed::{LeafVtxoCosignRequest, UnlockHash, UnlockPreimage};
 use ark::vtxo::Full;
 use ark::vtxo::policy::check_block_height;
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use server_rpc::{self as rpc, protos, RequestExt, TryFromBytes};
+use server_rpc::{self as rpc, protos, TryFromBytes};
 use crate::database::SpendState;
+use crate::database::expiry_payout::FallbackOutcome;
+use crate::owner_proof::OwnerLinks;
 
 use crate::database::rounds::StoredRoundOutput;
 use crate::recovery::NB_NORMAL_CHILDREN;
@@ -60,16 +62,16 @@ use crate::secret::Secret;
 use crate::rpcserver::macros;
 use crate::telemetry;
 
-
 /// Map an internal [`SpendState`] to the client-facing [`protos::VtxoSpendState`].
 ///
 /// Returns `None` for server-internal states (pool, forfeit, connector). A user
 /// can never prove ownership of such a vtxo, so the `get_vtxo_status` endpoint
 /// reports those as not found rather than leaking their existence.
-fn client_spend_state(spend_state: SpendState) -> Option<protos::VtxoSpendState> {
+fn client_spend_state(spend_state: SpendState, fallback_pending: bool) -> Option<protos::VtxoSpendState> {
 	match spend_state {
 		SpendState::Spendable => Some(protos::VtxoSpendState::Spendable),
 		SpendState::HtlcRecvUnclaimed => Some(protos::VtxoSpendState::HtlcRecvUnclaimed),
+		SpendState::Spent if fallback_pending => Some(protos::VtxoSpendState::FallbackPending),
 		SpendState::Spent => Some(protos::VtxoSpendState::Spent),
 		SpendState::LnSpent => Some(protos::VtxoSpendState::Spent),
 		SpendState::Unclaimed => Some(protos::VtxoSpendState::Unclaimed),
@@ -78,6 +80,17 @@ fn client_spend_state(spend_state: SpendState) -> Option<protos::VtxoSpendState>
 		| SpendState::RoundForfeit
 		| SpendState::OffboardForfeit
 		| SpendState::OffboardConnector => None,
+	}
+}
+
+fn fallback_spend_state(state: protos::VtxoSpendState,
+	outcome: Option<&FallbackOutcome>) -> protos::VtxoSpendState
+{
+	match outcome {
+		Some(FallbackOutcome::Forfeited) => protos::VtxoSpendState::FallbackForfeited,
+		Some(FallbackOutcome::Spent) => protos::VtxoSpendState::Spent,
+		Some(FallbackOutcome::Pending) => protos::VtxoSpendState::FallbackPending,
+		None => state,
 	}
 }
 
@@ -114,8 +127,8 @@ impl rpc::server::ArkService for Server {
 		};
 
 		let ret = protos::HandshakeResponse {
-			min_protocol_version: MIN_PROTOCOL_VERSION,
-			max_protocol_version: MAX_PROTOCOL_VERSION,
+			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MIN_PROTOCOL_VERSION },
+			max_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MAX_PROTOCOL_VERSION },
 			psa,
 		};
 		Ok(tonic::Response::new(ret))
@@ -135,6 +148,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::OffboardFeeRateResponse>, tonic::Status> {
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		let feerate = self.offboard_feerate();
 		Ok(tonic::Response::new(protos::OffboardFeeRateResponse {
 			sat_vkb: feerate.to_sat_per_kwu() * 4,
@@ -146,12 +160,13 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 
-		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await).await
-			.to_status()?;
+		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await)
+			.await.to_status()?;
 
 		let response = protos::GetVtxoResponse {
 			vtxo: vtxo_state.vtxo.serialize(),
@@ -165,13 +180,19 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoStatusRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoStatusResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
 
-		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await).await
-			.to_status()?;
+		let (vtxo_state, fallback, owners, outcomes) = self.db.write(async |t| {
+			let state = t.get_server_vtxo_by_id(id).await?;
+			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
+			let fallback = t.fallback_customer_vtxos(&keys).await?;
+			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?,
+				t.fallback_outcomes(&[id], &self.bitcoind).await?))
+		}).await.to_status()?;
 
 		let spend_state = vtxo_state.spend_state;
 		let user_vtxo = match vtxo_state.vtxo.try_into_user_vtxo() {
@@ -184,12 +205,14 @@ impl rpc::server::ArkService for Server {
 		attestation.verify(&user_vtxo)
 			.badarg("invalid VTXO status attestation")?;
 
-		let Some(spend_state) = client_spend_state(spend_state) else {
+		let Some(spend_state) = client_spend_state(spend_state, fallback.contains(&id)) else {
 			macros::not_found!([id], "VTXO not found");
 		};
 
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
-			spend_state: spend_state as i32,
+			spend_state: fallback_spend_state(spend_state, outcomes.get(&id)) as i32,
+			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+			fallback_committed: outcomes.contains_key(&id),
 		}))
 	}
 
@@ -198,6 +221,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosByIdsResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > rpc::MAX_NB_VTXO_IDS {
@@ -209,8 +233,8 @@ impl rpc::server::ArkService for Server {
 
 		// Unknown ids are reported, not an error, so one bad id does not
 		// cost the client the whole batch.
-		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await).await
-			.to_status()?;
+		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await)
+			.await.to_status()?;
 
 		let mut missing = Vec::new();
 		for id in &ids {
@@ -232,6 +256,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosStatusByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosStatusByIdsResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > rpc::MAX_NB_VTXO_IDS {
@@ -246,8 +271,14 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let states = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await).await
-			.to_status()?;
+		let (states, fallback, owners, outcomes) = self.db.write(async |t| {
+			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
+			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
+				.collect::<Vec<_>>();
+			let fallback = t.fallback_customer_vtxos(&keys).await?;
+			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?,
+				t.fallback_outcomes(&ids, &self.bitcoind).await?))
+		}).await.to_status()?;
 
 		// An id without a client-visible user vtxo is reported as missing,
 		// not as an error, so one bad id does not cost the client the batch.
@@ -255,7 +286,8 @@ impl rpc::server::ArkService for Server {
 		let mut by_id = HashMap::with_capacity(states.len());
 		for (id, state) in states {
 			let Ok(user_vtxo) = state.vtxo.try_into_user_vtxo() else { continue };
-			let Some(spend_state) = client_spend_state(state.spend_state) else { continue };
+			let Some(spend_state) = client_spend_state(state.spend_state,
+				fallback.contains(&id)) else { continue };
 			by_id.insert(id, (user_vtxo, spend_state));
 		}
 
@@ -274,7 +306,9 @@ impl rpc::server::ArkService for Server {
 
 			vtxos.push(protos::VtxoStatus {
 				vtxo_id: id.to_bytes().to_vec(),
-				spend_state: *spend_state as i32,
+				spend_state: fallback_spend_state(*spend_state, outcomes.get(&id)) as i32,
+				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+				fallback_committed: outcomes.contains_key(&id),
 			});
 		}
 
@@ -289,6 +323,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RecoverVtxosByXpubRequest>,
 	) -> Result<tonic::Response<protos::RecoverVtxosByXpubResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if self.config.recovery_xpub_nb_keys == 0 {
@@ -334,11 +369,20 @@ impl rpc::server::ArkService for Server {
 		// from, so their status needs no attestation of its own. A VTXO in a
 		// server-internal state is left out, as GetVtxoStatus reports it as
 		// not found.
+		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
+		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		let (fallback, owners, outcomes) = self.db.write(async |t| Ok((
+			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
+			t.fallback_outcomes(&ids, &self.bitcoind).await?,
+		))).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
-				spend_state: client_spend_state(v.spend_state)? as i32,
+				spend_state: fallback_spend_state(client_spend_state(v.spend_state,
+					fallback.contains(&v.vtxo.id()))?, outcomes.get(&v.vtxo.id())) as i32,
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
+				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
+				fallback_committed: outcomes.contains_key(&v.vtxo.id()),
 			})
 		}).collect();
 
@@ -360,7 +404,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardCosignRequest>,
 	) -> Result<tonic::Response<protos::BoardCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_BOARD_FUNDING_TX
@@ -372,6 +416,8 @@ impl rpc::server::ArkService for Server {
 
 		let amount = Amount::from_sat(req.amount);
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
+		let mut owner_links = OwnerLinks::default();
+		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref(), self.config.expiry_payouts).to_status()?;
 		let expiry_height = check_block_height(req.expiry_height)
 			.map_err(|e| tonic::Status::invalid_argument(format!("expiry_height: {e}")))?;
 		let utxo = OutPoint::from_bytes(&req.utxo)?;
@@ -383,7 +429,7 @@ impl rpc::server::ArkService for Server {
 		};
 
 		let resp = self.cosign_board(
-			amount, user_pubkey, expiry_height, utxo, funding_tx.as_ref(), pub_nonce,
+			amount, user_pubkey, expiry_height, utxo, funding_tx.as_ref(), pub_nonce, &owner_links,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp.into()))
@@ -397,6 +443,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardVtxoRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let vtxo = <Vtxo<Full>>::deserialize(&req.board_vtxo[..])
@@ -414,6 +461,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -442,6 +490,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -469,10 +518,16 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let request = ArkoorPackageCosignRequest::try_from(req.into_inner())
+		super::validate_pver(&req, self.config.expiry_payouts)?;
+		let req = req.into_inner();
+		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many parts in cosign request");
+		}
+		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
+		let request = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
-		let response = self.cosign_oor(request).await.to_status()?;
+		let response = self.cosign_oor(request, &owner_links).await.to_status()?;
 		Ok(tonic::Response::new(response.into()))
 	}
 
@@ -483,7 +538,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LightningPayHtlcCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -491,10 +546,14 @@ impl rpc::server::ArkService for Server {
 				in order to be able to send Lightning payments.");
 		}
 
+		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many parts in cosign request");
+		}
+		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
 			.badarg("invalid cosign request")?;
 
-		let resp = self.request_lightning_pay_htlc_cosign(cosign_requests)
+		let resp = self.request_lightning_pay_htlc_cosign(cosign_requests, &owner_links)
 			.await.context("error making payment")?;
 
 		Ok(tonic::Response::new(resp.into()))
@@ -505,7 +564,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::InitiateLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -540,11 +599,14 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::LightningPaymentStatus>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
-		let res = self.check_lightning_payment(payment_hash, req.wait).await.to_status()?;
-		Ok(tonic::Response::new(protos::LightningPaymentStatus { payment_status: Some(res) }))
+		let source_ids = req.htlc_vtxo_ids.iter().map(VtxoId::from_bytes)
+			.collect::<Result<Vec<_>, _>>()?;
+		let res = self.check_lightning_payment(payment_hash, req.wait, &source_ids).await.to_status()?;
+		Ok(tonic::Response::new(res))
 	}
 
 	#[tracing::instrument(skip(self, req))]
@@ -552,10 +614,16 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.into_inner())
+		super::validate_pver(&req, self.config.expiry_payouts)?;
+		let req = req.into_inner();
+		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many parts in cosign request");
+		}
+		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
+		let cosign_requests = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
-		let cosign_resp = self.revoke_lightning_pay_htlcs(cosign_requests).await
+		let cosign_resp = self.revoke_lightning_pay_htlcs(cosign_requests, &owner_links).await
 			.to_status()?;
 
 		Ok(tonic::Response::new(cosign_resp.into()))
@@ -566,6 +634,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FetchBolt12InvoiceRequest>,
 	) -> Result<tonic::Response<protos::FetchBolt12InvoiceResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let offer = match Offer::try_from(req.offer.to_vec()) {
@@ -594,7 +663,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::StartLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::StartLightningReceiveResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -617,6 +686,7 @@ impl rpc::server::ArkService for Server {
 			mailbox_id,
 			req.description,
 			req.expiry_secs.map(Duration::from_secs),
+			req.claim_destination,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp))
@@ -627,12 +697,17 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::CheckLightningReceiveResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
 
 		let sub = self.check_lightning_receive(payment_hash, req.wait).await.to_status()?;
-		Ok(tonic::Response::new(sub.into()))
+		let outcome = self.db.write(async |t| t.receive_fallback_outcome(&sub, &self.bitcoind).await).await.to_status()?;
+		let mut response: protos::CheckLightningReceiveResponse = sub.into();
+		response.fallback_spend_state = outcome.as_ref()
+			.map(|outcome| fallback_spend_state(protos::VtxoSpendState::Unspecified, Some(outcome)) as i32);
+		Ok(tonic::Response::new(response))
 	}
 
 	#[tracing::instrument(skip(self, req))]
@@ -640,7 +715,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareLightningReceiveClaimRequest>
 	) -> Result<tonic::Response<protos::PrepareLightningReceiveClaimResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		// For token filters. Like the integration API, this trusts the
 		// proxy chain to set `X-Forwarded-For`, see `RemoteAddrService`.
 		let client_address = req.extensions().get::<SocketAddr>().cloned()
@@ -655,10 +730,12 @@ impl rpc::server::ArkService for Server {
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
 
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
+		let mut owner_links = OwnerLinks::default();
+		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref(), self.config.expiry_payouts).to_status()?;
 		let htlc_recv_expiry = BlockHeight::new(req.htlc_recv_expiry);
 
 		let (sub, htlcs) = self.prepare_lightning_claim(
-			payment_hash, user_pubkey, htlc_recv_expiry, req.lightning_receive_anti_dos,
+			payment_hash, user_pubkey, htlc_recv_expiry, req.lightning_receive_anti_dos, &owner_links,
 			client_address,
 		).await.to_status()?;
 
@@ -673,21 +750,23 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ClaimLightningReceiveRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
 
 		let payment_preimage = Preimage::from_bytes(req.payment_preimage)?;
-		let cosign_request = ArkoorPackageCosignRequest::try_from(
-			req.cosign_request.badarg("cosign request missing")?,
-		).badarg("invalid cosign request")?;
+		let raw_cosign = req.cosign_request.badarg("cosign request missing")?;
+		let owner_links = OwnerLinks::from_parts(&raw_cosign.parts, self.config.expiry_payouts).to_status()?;
+		let cosign_request = ArkoorPackageCosignRequest::try_from(raw_cosign)
+			.badarg("invalid cosign request")?;
 
 		let cosign_resp = self.claim_lightning_receive(
 			payment_hash,
 			payment_preimage,
 			cosign_request,
 			pver,
+			&owner_links,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(cosign_resp.into()))
@@ -698,6 +777,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CancelLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -714,6 +794,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::NextRoundTimeResponse>, tonic::Status> {
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		Ok(tonic::Response::new(protos::NextRoundTimeResponse {
 			timestamp: self.rounds.next_round_time.read()
 				.duration_since(UNIX_EPOCH).expect("we set this value beyond unix epoch")
@@ -733,6 +814,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<Self::SubscribeRoundsStream>, tonic::Status> {
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		let mgr = self.rtmgr.clone();
 		let stream = self.rounds.events()
 			.map(|e| Ok(e.as_ref().into()))
@@ -745,6 +827,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::RoundEvent>, tonic::Status> {
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		if let Some(event) = self.rounds.last_event() {
 			Ok(tonic::Response::new(event.as_ref().into()))
 		} else {
@@ -760,7 +843,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::SubmitPaymentRequest>,
 	) -> Result<tonic::Response<protos::SubmitPaymentResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -774,8 +857,12 @@ impl rpc::server::ArkService for Server {
 			Ok(SelfSignedInput { vtxo_id, attestation })
 		}).collect::<Result<_, tonic::Status>>()?;
 
+		req.unblinded_mailbox_id.as_ref()
+			.map(|b| MailboxIdentifier::deserialize(b)).transpose().badarg("invalid unblinded mailbox id")?;
+		let mut owner_links = OwnerLinks::default();
 		let mut vtxo_requests = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests.clone() {
+			owner_links.insert_request(r.vtxo.as_ref().badarg("missing vtxo request")?, self.config.expiry_payouts).to_status()?;
 			// Make sure users provided right number of nonces.
 			if r.public_nonces.len() != self.config.nb_round_nonces {
 				macros::badarg!("need exactly {} public nonces", self.config.nb_round_nonces);
@@ -795,6 +882,7 @@ impl rpc::server::ArkService for Server {
 		let inp = RoundInput::RegisterPayment {
 			inputs,
 			vtxo_requests,
+			owner_links,
 			unlock_preimage: Secret::new(unlock_preimage),
 			user_agent_name: crate::telemetry::current_user_agent_name(),
 		};
@@ -815,7 +903,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::VtxoSignaturesRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -847,7 +935,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -872,8 +960,10 @@ impl rpc::server::ArkService for Server {
 			macros::badarg!("delegated round participations need an unblinded mailbox id");
 		}
 
+		let mut owner_links = OwnerLinks::default();
 		let mut outputs = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests {
+			owner_links.insert_request(&r, self.config.expiry_payouts).to_status()?;
 			outputs.push(StoredRoundOutput {
 				vtxo_request: r.try_into().badarg("invalid vtxo request")?,
 				unblinded_mailbox_id,
@@ -881,7 +971,7 @@ impl rpc::server::ArkService for Server {
 		}
 
 		let unlock_hash = self.register_delegated_round_participation(
-			inputs, outputs, req.scheduled_height.map(BlockHeight::new),
+			inputs, outputs, req.scheduled_height.map(BlockHeight::new), &owner_links,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(protos::RoundParticipationResponse {
@@ -894,6 +984,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationStatusRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationStatusResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let unlock_hash = UnlockHash::from_bytes(&req.unlock_hash)?;
@@ -901,14 +992,20 @@ impl rpc::server::ArkService for Server {
 		let attestation = (required && !req.attestation.is_empty())
 			.then(|| RoundParticipationStatusAttestation::from_bytes(&req.attestation))
 			.transpose()?;
-		let part = self.db.read(async |t| t.get_round_participation_by_unlock_hash(unlock_hash).await).await.to_status()?
-			// unlock hashes are public, so when required only the owner
-			// learns that the participation exists
-			.filter(|p| !required || attestation.is_some_and(|a|
+		let part = self.db.read(async |t| {
+			let part = t.get_round_participation_by_unlock_hash(unlock_hash).await?;
+			// Authenticate before exposing a cancellation tombstone.
+			if required && !part.as_ref().is_some_and(|p| attestation.is_some_and(|a|
 				p.outputs.iter().filter_map(|o| o.unblinded_mailbox_id)
 					.any(|id| a.verify(unlock_hash, id).is_ok())
-			))
-			.not_found([unlock_hash], "round participation not found")?;
+			)) {
+				return Ok(None);
+			}
+			if t.query_opt("SELECT participation_id FROM expiry_cancelled_participation WHERE unlock_hash=$1", &[&unlock_hash.to_string()]).await?.is_some() {
+				return Err(crate::error::RoundCancelledBeforeForfeit(unlock_hash).into());
+			}
+			Ok(part)
+		}).await.to_status()?.not_found([unlock_hash], "round participation not found")?;
 		let input_vtxo_ids = part.inputs.iter().map(|i| i.vtxo_id.to_bytes().to_vec()).collect();
 
 		let res = if let Some(round_id) = part.round_id {
@@ -932,7 +1029,11 @@ impl rpc::server::ArkService for Server {
 				output_vtxos.push(tree.build_vtxo(idx).serialize());
 			}
 
-			if part.inputs.iter().all(|i| i.is_forfeited()) {
+			// The marker is committed atomically with every accepted forfeit.
+			// Multiple READ COMMITTED reads may see removed child rows after
+			// reading a superseded parent; an empty set is never acceptance.
+			if part.forfeited_at.is_some() && !part.inputs.is_empty()
+				&& part.inputs.iter().all(|i| i.is_forfeited()) {
 				protos::RoundParticipationStatusResponse {
 					status: protos::RoundParticipationStatus::RoundPartReleased.into(),
 					unlock_preimage: Some(part.unlock_preimage.leak_ref().to_vec()),
@@ -963,7 +1064,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LeafVtxoCosignRequest>,
 	) -> Result<tonic::Response<protos::LeafVtxoCosignResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -985,7 +1086,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitNoncesRequest>,
 	) -> Result<tonic::Response<protos::ForfeitNoncesResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1016,7 +1117,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitVtxosRequest>,
 	) -> Result<tonic::Response<protos::ForfeitVtxosResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1040,7 +1141,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareOffboardRequest>,
 	) -> Result<tonic::Response<protos::PrepareOffboardResponse>, tonic::Status> {
-		let pver = req.pver()?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let request = req.offboard.badarg("missing offboard field")?.try_into()
@@ -1080,6 +1181,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FinishOffboardRequest>,
 	) -> Result<tonic::Response<protos::FinishOffboardResponse>, tonic::Status> {
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let offboard_txid = Txid::from_bytes(req.offboard_txid)?;
@@ -1139,20 +1241,35 @@ mod test {
 	use super::*;
 
 	#[test]
+	fn fallback_status_distinguishes_pending_payment_and_no_output() {
+		let spent = protos::VtxoSpendState::Spent;
+		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Pending)), protos::VtxoSpendState::FallbackPending);
+		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Spent)), spent);
+		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Forfeited)), protos::VtxoSpendState::FallbackForfeited);
+		assert_eq!(fallback_spend_state(protos::VtxoSpendState::Spendable, None), protos::VtxoSpendState::Spendable);
+	}
+
+	#[test]
 	fn client_spend_state_collapses_server_internal_states() {
 		// Client-relevant states map to a concrete spend state.
-		assert_eq!(client_spend_state(SpendState::Spendable), Some(protos::VtxoSpendState::Spendable));
-		assert_eq!(client_spend_state(SpendState::HtlcRecvUnclaimed), Some(protos::VtxoSpendState::HtlcRecvUnclaimed));
-		assert_eq!(client_spend_state(SpendState::Spent), Some(protos::VtxoSpendState::Spent));
-		assert_eq!(client_spend_state(SpendState::LnSpent), Some(protos::VtxoSpendState::Spent));
-		assert_eq!(client_spend_state(SpendState::Unclaimed), Some(protos::VtxoSpendState::Unclaimed));
-		assert_eq!(client_spend_state(SpendState::Unregistered), Some(protos::VtxoSpendState::Unregistered));
+		assert_eq!(client_spend_state(SpendState::Spendable, false), Some(protos::VtxoSpendState::Spendable));
+		assert_eq!(client_spend_state(SpendState::HtlcRecvUnclaimed, false), Some(protos::VtxoSpendState::HtlcRecvUnclaimed));
+		assert_eq!(client_spend_state(SpendState::Spent, false), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::LnSpent, false), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::Unclaimed, false), Some(protos::VtxoSpendState::Unclaimed));
+		assert_eq!(client_spend_state(SpendState::Unregistered, false), Some(protos::VtxoSpendState::Unregistered));
+
+		// A customer allocation remains pending even though admission is fenced.
+		assert_eq!(client_spend_state(SpendState::Spent, true), Some(protos::VtxoSpendState::FallbackPending));
+		assert_eq!(client_spend_state(SpendState::LnSpent, true), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::Spendable, true), Some(protos::VtxoSpendState::Spendable));
+		assert_eq!(client_spend_state(SpendState::Pool, true), None);
 
 		// Server-internal states (pool, forfeit, connector) collapse to `None`
 		// so the endpoint reports them as not found.
-		assert_eq!(client_spend_state(SpendState::Pool), None);
-		assert_eq!(client_spend_state(SpendState::RoundForfeit), None);
-		assert_eq!(client_spend_state(SpendState::OffboardForfeit), None);
-		assert_eq!(client_spend_state(SpendState::OffboardConnector), None);
+		assert_eq!(client_spend_state(SpendState::Pool, false), None);
+		assert_eq!(client_spend_state(SpendState::RoundForfeit, false), None);
+		assert_eq!(client_spend_state(SpendState::OffboardForfeit, false), None);
+		assert_eq!(client_spend_state(SpendState::OffboardConnector, false), None);
 	}
 }

@@ -380,7 +380,8 @@ impl<T> RetryUnlessRejected<T> for Result<T, tonic::Status> {
 impl<T> RetryUnlessRejected<T> for anyhow::Result<T> {
 	fn retry_unless_rejected(self) -> Result<T, AdvanceError> {
 		self.map_err(|e| {
-			if let Some(s) = e.downcast_ref::<tonic::Status>() && s.is_rejection() {
+			if crate::FallbackRefusal::from_error(&e).is_some()
+				|| e.downcast_ref::<tonic::Status>().is_some_and(|s| s.is_rejection()) {
 				AdvanceError::Abort(e.into())
 			} else {
 				AdvanceError::Retry(e.into())
@@ -528,13 +529,17 @@ where
 	/// a step. Calling this directly is for actions that end outside of a
 	/// step, like a cancel.
 	pub async fn finish(self, wallet: &Wallet) -> anyhow::Result<()> {
-		wallet.release_action_locks(&self.id).await?;
-		self.remove(wallet).await
+		self.finish_or_remove(wallet, true).await
 	}
 
 	/// Remove the checkpoint of the action, and keep the vtxos it locked
 	/// locked.
 	pub async fn remove(self, wallet: &Wallet) -> anyhow::Result<()> {
+		self.finish_or_remove(wallet, false).await
+	}
+
+	async fn finish_or_remove(self, wallet: &Wallet, release_locks: bool) -> anyhow::Result<()> {
+		if release_locks { wallet.release_action_locks(&self.id).await?; }
 		wallet.inner.db.remove_wallet_action_checkpoint(&self.id).await?;
 		Ok(())
 	}

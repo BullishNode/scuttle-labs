@@ -3,13 +3,15 @@ use std::{fmt, io};
 use std::borrow::Cow;
 use std::str::FromStr;
 
+use bitcoin::Network;
 use bitcoin::bech32::{self, ByteIterExt, Fe32IterExt};
 use bitcoin::hashes::{sha256, Hash};
-use bitcoin::secp256k1::{Keypair, PublicKey};
+use bitcoin::secp256k1::{schnorr, Keypair, PublicKey};
 
 use crate::{ProtocolDecodingError, ProtocolEncoding, VtxoPolicy};
 use crate::encode::{MAX_VEC_SIZE, ReadExt, WriteExt};
 use crate::mailbox::{BlindedMailboxIdentifier, MailboxIdentifier};
+use crate::fallback::OwnerLink;
 
 
 /// The human-readable part for mainnet addresses
@@ -59,6 +61,12 @@ pub enum VtxoDelivery {
 	ServerMailbox {
 		blinded_id: BlindedMailboxIdentifier,
 	},
+	/// Matching coin and mailbox authorization for new issuance.
+	ServerMailboxJoint {
+		blinded_id: BlindedMailboxIdentifier,
+		signature: schnorr::Signature,
+		mailbox_signature: schnorr::Signature,
+	},
 	Unknown {
 		delivery_type: u8,
 		data: Vec<u8>,
@@ -75,8 +83,16 @@ const DELIVERY_BUILTIN: u8 = 0x00;
 
 /// The type byte for the "server mailbox" delivery mechanism
 const DELIVERY_MAILBOX: u8 = 0x01;
+const DELIVERY_MAILBOX_JOINT: u8 = 0x03;
 
 impl VtxoDelivery {
+	/// The blinded id to post unchanged through the server's mailbox RPC.
+	pub fn mailbox_id(&self) -> Option<BlindedMailboxIdentifier> {
+		match self {
+			Self::ServerMailbox { blinded_id } | Self::ServerMailboxJoint { blinded_id, .. } => Some(*blinded_id),
+			Self::Unknown { .. } => None,
+		}
+	}
 
 	/// Returns whether the VTXO delivery type is unknown
 	pub fn is_unknown(&self) -> bool {
@@ -90,6 +106,7 @@ impl VtxoDelivery {
 	fn encoded_length(&self) -> usize {
 		match self {
 			Self::ServerMailbox { .. } => 1 + 33,
+			Self::ServerMailboxJoint { .. } => 1 + 33 + 64 + 64,
 			Self::Unknown { data, .. } => 1usize.saturating_add(data.len()),
 		}
 	}
@@ -100,6 +117,11 @@ impl VtxoDelivery {
 			Self::ServerMailbox { blinded_id } => {
 				w.emit_u8(DELIVERY_MAILBOX)?;
 				w.emit_slice(blinded_id.as_ref())?;
+			},
+			Self::ServerMailboxJoint { blinded_id, signature, mailbox_signature } => {
+				w.emit_u8(DELIVERY_MAILBOX_JOINT)?;
+				OwnerLink { blinded_id: *blinded_id, signature: *signature,
+					mailbox_signature: *mailbox_signature }.encode(w)?;
 			},
 			Self::Unknown { delivery_type, data } => {
 				w.emit_u8(*delivery_type)?;
@@ -121,6 +143,12 @@ impl VtxoDelivery {
 					|_| ParseAddressError::Invalid("invalid blinded mailbox identifier"),
 				)?,
 			}),
+			DELIVERY_MAILBOX_JOINT => {
+				let link = OwnerLink::deserialize(&payload[1..])
+					.map_err(|_| ParseAddressError::Invalid("invalid joint mailbox link"))?;
+				let mailbox_signature = link.mailbox_signature;
+				Ok(Self::ServerMailboxJoint { blinded_id: link.blinded_id, signature: link.signature, mailbox_signature })
+			},
 			delivery_type => Ok(Self::Unknown {
 				delivery_type: delivery_type,
 				data: payload[1..].to_vec(),
@@ -206,6 +234,20 @@ impl Address {
 	/// The different VTXO delivery options provided by the user
 	pub fn delivery(&self) -> &[VtxoDelivery] {
 		&self.delivery
+	}
+
+	/// Check the selected coin signature against the actual policy key.
+	/// The intended server derives the mailbox verifier; a payer cannot do so.
+	pub fn owner_link(&self, network: Network, server_mailbox_pubkey: PublicKey) -> Result<Option<OwnerLink>, ParseAddressError> {
+		self.delivery.iter().find_map(|delivery| match delivery {
+			VtxoDelivery::ServerMailboxJoint { blinded_id, signature, mailbox_signature } =>
+				Some(OwnerLink { blinded_id: *blinded_id, signature: *signature, mailbox_signature: *mailbox_signature }),
+			_ => None,
+		}).map(|link| {
+			link.verify_coin(network, server_mailbox_pubkey, self.policy.user_pubkey())
+				.map_err(|_| ParseAddressError::Invalid("invalid signed mailbox link"))?;
+			Ok(link)
+		}).transpose()
 	}
 
 	/// Write the address payload to the writer
@@ -507,6 +549,26 @@ impl Builder {
 		Ok(self)
 	}
 
+	/// Authorize the address with both its output key and mailbox key.
+	pub fn mailbox_joint(
+		mut self, network: Network, server: PublicKey, mailbox_key: &Keypair, coin_key: &Keypair,
+	) -> Result<Self, AddressBuilderError> {
+		let policy = self.policy.as_ref().ok_or("set policy first")?;
+		if policy.user_pubkey() != coin_key.public_key() {
+			return Err("VTXO key does not match policy".into());
+		}
+		if self.testnet != (network != Network::Bitcoin) {
+			return Err("address network does not match mailbox authorization".into());
+		}
+		let link = OwnerLink::new_joint(network, server, mailbox_key, coin_key)
+			.map_err(|_| "invalid joint mailbox authorization")?;
+		let mailbox_signature = link.mailbox_signature;
+		self.delivery.push(VtxoDelivery::ServerMailboxJoint {
+			blinded_id: link.blinded_id, signature: link.signature, mailbox_signature,
+		});
+		Ok(self)
+	}
+
 	/// Finish by building an [Address]
 	pub fn into_address(self) -> Result<Address, AddressBuilderError> {
 		Ok(Address {
@@ -554,6 +616,66 @@ mod test {
 	use bitcoin::secp256k1::rand;
 	use crate::SECP;
 	use super::*;
+
+	fn signed_key(number: u8) -> Keypair {
+		let mut secret = [0; 32]; secret[31] = number;
+		Keypair::from_seckey_slice(&SECP, &secret).unwrap()
+	}
+
+	// Fixed BIP340 reference signatures, independently encoded as Bech32m.
+
+	#[test]
+	fn joint_mailbox_address_recipient_forwarding_and_legacy_separation() {
+		let server = signed_key(11); let mailbox = signed_key(17); let coin = signed_key(3);
+		let address = Address::builder().testnet(true).server_pubkey(signed_key(13).public_key())
+			.pubkey_policy(coin.public_key()).mailbox_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap()
+			.into_address().unwrap();
+		let copied = test_roundtrip(&address);
+		let proof = copied.owner_link(Network::Regtest, server.public_key()).unwrap().unwrap();
+		assert_eq!(proof.verify_joint(Network::Regtest, &server, coin.public_key()).unwrap(),
+			MailboxIdentifier::from_pubkey(mailbox.public_key()));
+		let repeated = Address::builder().testnet(true).server_pubkey(signed_key(13).public_key())
+			.pubkey_policy(coin.public_key()).mailbox_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap()
+			.into_address().unwrap();
+		assert_eq!(address, repeated);
+		assert!(copied.owner_link(Network::Signet, server.public_key()).is_err());
+		let mut payload = vec![DELIVERY_MAILBOX_JOINT];
+		payload.extend_from_slice(&proof.serialize()[..99]);
+		assert!(VtxoDelivery::decode(&payload).is_err());
+	}
+
+	#[test]
+	fn joint_mailbox_builder_uses_actual_policy_key_and_is_deterministic() {
+		let server = signed_key(11); let mailbox = signed_key(17);
+		for coin in [signed_key(3), signed_key(6)] {
+			let build = || Address::builder().testnet(true).server_pubkey(signed_key(13).public_key())
+				.pubkey_policy(coin.public_key()).mailbox_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap()
+				.into_address().unwrap();
+			assert_eq!(build().to_string(), build().to_string());
+			let link = test_roundtrip(&build()).owner_link(Network::Regtest, server.public_key()).unwrap().unwrap();
+			assert_eq!(link.verify_joint(Network::Regtest, &server, coin.public_key()).unwrap(),
+				MailboxIdentifier::from_pubkey(mailbox.public_key()));
+		}
+		assert!(Address::builder().testnet(true).server_pubkey(signed_key(13).public_key())
+			.pubkey_policy(signed_key(6).public_key()).mailbox_joint(Network::Regtest, server.public_key(), &mailbox, &signed_key(3)).is_err());
+	}
+
+	#[test]
+	fn joint_mailbox_rejects_bad_shapes_and_retains_unknown_delivery_types() {
+		let server = signed_key(11); let mailbox = signed_key(17); let coin = signed_key(3);
+		let address = Address::builder().testnet(true).server_pubkey(signed_key(13).public_key())
+			.pubkey_policy(coin.public_key()).mailbox_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap()
+			.into_address().unwrap();
+		let mut payload = Vec::new(); address.encode_payload(&mut payload).unwrap();
+		for length in 41..payload.len() {
+			assert!(Address::decode_payload(true, payload[..length].iter().copied()).is_err());
+		}
+		for bytes in [vec![0x7f], vec![0x7f, 1, 2, 3]] {
+			let unknown = VtxoDelivery::decode(&bytes).unwrap();
+			let mut encoded = Vec::new(); unknown.encode(&mut encoded).unwrap();
+			assert_eq!(encoded, bytes);
+		}
+	}
 
 	#[test]
 	fn test_versions() {

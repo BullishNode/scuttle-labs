@@ -22,7 +22,7 @@ use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 use tracing::{error, info, trace, warn};
 
-use ark::{Vtxo, VtxoId, VtxoPolicy, VtxoRequest, ServerVtxo};
+use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy, VtxoRequest, ServerVtxo};
 use ark::arkoor::ArkoorDestination;
 use ark::vtxo::Full;
 use ark::arkoor::package::{ArkoorPackageCosignRequest, ArkoorPackageCosignResponse};
@@ -38,15 +38,15 @@ use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
 
 use crate::arkoor::ArkoorCosignRequestValidationParams;
 use crate::database::block::BlockTable;
+use crate::database::expiry_lightning::LightningSourceState;
 use crate::database::htlc_vtxo::{self, HtlcDirection, HtlcResolution, HtlcVtxo};
 use crate::database::tree::VtxoTreeUpdate;
 use crate::database::ln::{
-	LightningHtlcSubscription, LightningHtlcSubscriptionStatus, LightningPaymentStatus,
+	LightningHtlcSubscription, LightningHtlcSubscriptionStatus,
 };
 use crate::error::ContextExt;
+use crate::owner_proof::OwnerLinks;
 use crate::{check_max_amount, telemetry, Server, CAPTAIND_API_KEY};
-
-
 
 /// Validate the client-requested HTLC-recv VTXO expiry leaves at
 /// least `htlc_expiry_delta` blocks of settlement margin below the
@@ -105,9 +105,15 @@ pub(crate) fn htlc_recvs_expired(
 		.filter(|h| h.direction() == HtlcDirection::Outgoing)
 		.collect::<Vec<_>>();
 	!htlc_recvs.is_empty() && htlc_recvs.iter().all(|h| {
-		height > h.htlc_expiry() && (
-			!h.vtxo.is_exited() || h.htlc.chain_resolution == Some(HtlcResolution::Revoked)
-		)
+		if h.htlc.resolution() == Some(HtlcResolution::Fulfilled) || height <= h.htlc_expiry() {
+			return false;
+		}
+		match h.htlc.chain_resolution {
+			Some(HtlcResolution::Revoked) => h.htlc.chain_resolution_height.is_some_and(|block|
+				htlc_vtxo::grant_reclamation_confirmed(block, tip, Some(watchman_tip))),
+			None => !h.vtxo.is_exited(),
+			Some(HtlcResolution::Fulfilled) => false,
+		}
 	})
 }
 
@@ -144,7 +150,6 @@ pub(crate) fn validate_intra_ark_payment(
 
 	Ok(())
 }
-
 
 /// The margin (in blocks) the server requires between the current chain tip
 /// and the lowest incoming HTLC expiry when cosigning a lightning receive
@@ -196,10 +201,11 @@ fn validate_receive_claim(
 }
 
 impl Server {
-	#[tracing::instrument(skip(self, request))]
+	#[tracing::instrument(skip(self, request, owner_links))]
 	pub async fn request_lightning_pay_htlc_cosign(
 		&self,
 		request: ArkoorPackageCosignRequest<VtxoId>,
+		owner_links: &crate::owner_proof::OwnerLinks,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		let input_vtxo_ids = request.inputs().cloned().collect::<Vec<VtxoId>>();
 		let input_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxo_ids).await).await?;
@@ -280,7 +286,7 @@ impl Server {
 
 		slog!(LightningPayHtlcsRequested, payment_hash, expiry);
 
-		let (builder, _) = self.cosign_oor_with_builder(builder).await?;
+		let (builder, _) = self.cosign_oor_with_builder(builder, owner_links).await?;
 		Ok(builder.cosign_response())
 	}
 
@@ -309,14 +315,18 @@ impl Server {
 		// while the payment is validated and handed to the lightning node.
 		let _guard = self.payment_guards.lock(payment_hash).await;
 
+		invoice.check_signature().context("invalid invoice signature")?;
 		let htlc_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&htlc_vtxo_ids).await).await?;
+		let recorded = self.db.read(async |t|
+			t.is_recorded_lightning_payment(&invoice, payment_amount, &htlc_vtxo_ids).await
+		).await?;
 
 		slog!(LightningPaymentInitRequested, payment_hash, htlc_vtxo_ids: htlc_vtxo_ids.clone());
 
 		let chain_tip = self.sync_manager.chain_tip().height;
 		let mut vtxos = vec![];
 		for htlc_vtxo in htlc_vtxos {
-			htlc_vtxo.check_htlc_send_spendable(chain_tip)?;
+			if !recorded { htlc_vtxo.check_htlc_send_spendable(chain_tip)?; }
 
 			let vtxo = htlc_vtxo.vtxo.clone();
 
@@ -336,6 +346,9 @@ impl Server {
 
 			vtxos.push(vtxo);
 		}
+		// An exact retry acknowledges existing work even if its node or a new
+		// admission view is now unavailable. It never resubmits the recorded call.
+		if recorded { return Ok(()); }
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
@@ -362,6 +375,11 @@ impl Server {
 		if let Some(sub) = self.db.read(async |t|
 			t.get_htlc_subscription_by_payment_hash(payment_hash).await
 		).await? {
+			if let Invoice::Bolt11(invoice) = &invoice {
+				if invoice.is_expired() {
+					return badarg!("invoice has expired");
+				}
+			}
 			validate_intra_ark_payment(&sub, &invoice, payment_amount)?;
 		}
 
@@ -416,14 +434,15 @@ impl Server {
 		&self,
 		payment_hash: PaymentHash,
 		wait: bool,
-	) -> anyhow::Result<lightning_payment_status::PaymentStatus> {
-		let status = if wait {
-			self.lightning_manager.wait_payment_status(payment_hash).await?
+		source_ids: &[VtxoId],
+	) -> anyhow::Result<protos::LightningPaymentStatus> {
+		let (status, scope) = if wait {
+			self.lightning_manager.wait_payment_status(payment_hash, source_ids).await?
 		} else {
-			self.lightning_manager.get_payment_status(payment_hash).await?
+			self.lightning_manager.get_payment_status(payment_hash, source_ids).await?
 		};
 
-		Ok(match status {
+		let payment_status = match status {
 			PaymentStatus::Success(preimage) => {
 				lightning_payment_status::PaymentStatus::Success(protos::PaymentSuccessStatus {
 					preimage: preimage.to_vec(),
@@ -448,6 +467,10 @@ impl Server {
 			PaymentStatus::Pending => {
 				lightning_payment_status::PaymentStatus::Pending(protos::Empty {})
 			},
+		};
+		Ok(protos::LightningPaymentStatus {
+			payment_status: Some(payment_status),
+			htlc_vtxo_ids: scope.iter().map(|id| id.to_bytes().to_vec()).collect(),
 		})
 	}
 
@@ -460,9 +483,9 @@ impl Server {
 	pub async fn revoke_lightning_pay_htlcs(
 		&self,
 		cosign_request: ArkoorPackageCosignRequest<VtxoId>,
+		owner_links: &crate::owner_proof::OwnerLinks,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		let tip = self.chain_tip().height as BlockHeight;
-		let db = self.db.clone();
 
 		let requested_policy = cosign_request.all_outputs()
 			.all_same(|v| v.policy.clone())
@@ -493,10 +516,6 @@ impl Server {
 			htlc_vtxo_ids: htlc_vtxo_ids.clone(),
 		);
 
-		if self.htlc_settler.is_settled(payment_hash).await?.is_some() {
-			return badarg!("invoice has already been paid");
-		}
-
 		let cosign_request = cosign_request.set_vtxos(htlc_vtxos)?;
 
 		let validation = ArkoorCosignRequestValidationParams {
@@ -507,31 +526,6 @@ impl Server {
 		let builder = self.validate_cosign_request(validation, cosign_request)
 			.badarg("invalid cosign request")?;
 
-		// The payment these HTLCs were committed to, not another sender's
-		// payment to the same hash.
-		let attempt = db.read(async |t|
-			t.get_latest_payment_attempt_by_htlc_vtxos(&htlc_vtxo_ids).await
-		).await?;
-		let subscription_id = attempt.as_ref().and_then(|a| a.lightning_htlc_subscription_id);
-
-		// If payment not found but input vtxos are found, we can allow revoke
-		if let Some(attempt) = attempt {
-			match attempt.status {
-				LightningPaymentStatus::Failed => {},
-				LightningPaymentStatus::Succeeded => {
-					error!("This lightning payment has completed, but no preimage found. Accepting revocation");
-				},
-				_ if tip > input_policy.htlc_expiry => {
-					// Check one last time to see if it completed
-					let res = self.lightning_manager.get_payment_status(payment_hash).await;
-					if let Ok(PaymentStatus::Success(_)) = res {
-						return badarg!("This lightning payment has completed");
-					}
-				},
-				_ => return badarg!("This lightning payment is not eligible for revocation yet")
-			}
-		}
-
 		// Output user vtxos from the revoke cosign go in as `unregistered`,
 		// matching the arkoor cosign path. They flip to spendable once the
 		// caller uploads the signed chain via register_vtxo_transactions.
@@ -540,51 +534,62 @@ impl Server {
 			.insert_oor_spent_vtxos(builder.build_unsigned_internal_vtxos())
 			.insert_unregistered_vtxos(builder.build_unsigned_vtxos().map(ServerVtxo::from))
 			.mark_vtxos_oor_spent(builder.input_spend_info());
-		self.db.write(async |t| {
-			// Re-check the settlement inside the write tx: the early gate and
-			// the eligibility read above both run in their own (read)
-			// transactions, so a payment can settle between them and this write.
-			// `ensure_not_settled` commits the check atomically with the
-			// vtxo-tree update below, so a settled payment can no longer be
-			// refunded (which would double-pay the sender).
+		let settlement_refusal = self.db.write(async |t| {
+			t.lock_settlement_sources(payment_hash).await?;
+			t.lock_htlc_settlements().await?;
+			let mut unknown = false;
+			for source in &htlc_vtxo_ids {
+				match t.source_settlement(payment_hash, *source).await? {
+					crate::database::ln::SourceSettlement::Funded => return badarg!("invoice has already been paid"),
+					crate::database::ln::SourceSettlement::Unknown => {
+						t.warn_unknown_settlement(*source);
+						unknown = true;
+					},
+					crate::database::ln::SourceSettlement::NotSettled => {},
+				}
+			}
+			// Release no funds when settlement is unknown; return the
+			// refusal outside this transaction.
+			if unknown { return Ok(true); }
+			// Also refuse when the hash settled through any other source. That
+			// keeps such a source held instead of refunding it cooperatively.
 			t.ensure_not_settled(payment_hash).await?;
-
-			// For an intra-Ark payment the payee shares this payment hash via a
-			// receive subscription. The settlement check above only catches a
-			// preimage that has already been recorded; it does NOT catch the
-			// window where the payee has been granted HTLC-recv vtxos but is
-			// withholding the claim (and thus the preimage). Atomically cancel
-			// the receive here so a later claim is refused, and bail if the
-			// receive is still committed - otherwise the server would refund
-			// the sender AND pay the payee for one payment.
-			// A canceled receive only refuses the cooperative claim, so granted
-			// HTLC-recv vtxos commit it until [htlc_recvs_expired].
-			// Only the receive these HTLCs paid for is canceled, never another
-			// user's receive on the same hash.
-			let htlc_vtxos = htlc_vtxo::get_htlc_vtxo_states_by_payment_hash(&t, payment_hash).await?;
-			let watchman_tip = t.get_highest_block(BlockTable::Watchmand).await?.map(|b| b.height);
-			let htlc_recvs_expired = htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip);
-			let canceled = match subscription_id {
-				Some(id) => t.cancel_revocable_htlc_subscription(id, htlc_recvs_expired).await?,
-				None => None,
-			};
-			if let Some((status, htlc_recvs_granted)) = canceled {
-				// Stays committed even once the grants expired: the sender then
-				// refunds on-chain, where our preimage clause stays an alternative
-				// only until the sender spends the timeout branch.
-				let committed = match status {
-					LightningHtlcSubscriptionStatus::Settled => true,
-					LightningHtlcSubscriptionStatus::HtlcsReady => !htlc_recvs_expired,
-					LightningHtlcSubscriptionStatus::Canceled =>
-						htlc_recvs_granted && !htlc_recvs_expired,
-					LightningHtlcSubscriptionStatus::Created
-						| LightningHtlcSubscriptionStatus::Accepted => false,
-				};
-				if committed {
-					return badarg!(
-						"invoice receive is already committed (status: {status}), \
-						cannot revoke: the payment can still be claimed",
-					);
+			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
+			crate::database::expiry_guard::guard_obligation_changes(t, &htlc_vtxo_ids).await?;
+			for source in &htlc_vtxo_ids {
+				match t.lightning_source_state(*source, payment_hash).await? {
+					LightningSourceState::Discharged => return badarg!("invoice has already been paid"),
+					LightningSourceState::Pending => return badarg!("source payment outcome is not yet terminal"),
+					LightningSourceState::Failed | LightningSourceState::Unattempted => {},
+				}
+			}
+			// Reuse upstream's source-bound attempt lookup. A hash shared with
+			// another sender must not select the receive to cancel.
+			let attempt = t.get_latest_payment_attempt_by_htlc_vtxos(&htlc_vtxo_ids).await?;
+			if let Some(subscription_id) = attempt.and_then(|a| a.lightning_htlc_subscription_id) {
+				let htlc_vtxos = htlc_vtxo::get_htlc_vtxo_states_by_payment_hash(&t, payment_hash).await?;
+				let watchman_tip = t.get_highest_block(BlockTable::Watchmand).await?.map(|b| b.height);
+				let htlc_recvs_expired = htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip);
+				if let Some((status, htlc_recvs_granted)) =
+					t.cancel_revocable_htlc_subscription(subscription_id, htlc_recvs_expired).await?
+				{
+					// Stays committed even once the grants expired: the sender then
+					// refunds on-chain, where our preimage clause stays an alternative
+					// only until the sender spends the timeout branch.
+					let committed = match status {
+						LightningHtlcSubscriptionStatus::Settled => true,
+						LightningHtlcSubscriptionStatus::HtlcsReady => !htlc_recvs_expired,
+						LightningHtlcSubscriptionStatus::Canceled =>
+							htlc_recvs_granted && !htlc_recvs_expired,
+						LightningHtlcSubscriptionStatus::Created
+							| LightningHtlcSubscriptionStatus::Accepted => false,
+					};
+					if committed {
+						return badarg!(
+							"invoice receive is already committed (status: {status}), \
+							cannot revoke: the payment can still be claimed",
+						);
+					}
 				}
 			}
 
@@ -595,8 +600,9 @@ impl Server {
 			htlc_vtxo::set_htlc_vtxo_resolutions(
 				&t, &htlc_vtxo_ids, HtlcResolution::Revoked,
 			).await?;
-			Ok(())
+			Ok(false)
 		}).await?;
+		if settlement_refusal { return badarg!("source settlement provenance is unknown"); }
 
 		let new_vtxo_ids = builder.build_unsigned_vtxos().map(|v| v.id()).collect::<Vec<_>>();
 
@@ -618,6 +624,7 @@ impl Server {
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
 		description: Option<String>,
 		expiry: Option<Duration>,
+		claim_destination: Option<protos::VtxoRequest>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
 
@@ -672,12 +679,25 @@ impl Server {
 		// Calculate lightning receive fees and validate fees don't exceed the received amount
 		let fee = self.config.fees.lightning_receive.calculate(amount)
 			.context("fee overflowed")?;
-		validate_and_subtract_fee(amount, fee)?;
+		let net_amount = validate_and_subtract_fee(amount, fee)?;
 
 		if let Some(max) = self.config.max_vtxo_amount {
 			if amount > max {
 				return badarg!("Requested amount exceeds limit of {}", max);
 			}
+		}
+		if let Some(destination) = claim_destination {
+			let policy = VtxoPolicy::deserialize(&destination.policy).badarg("invalid claim destination policy")?;
+			if !matches!(policy, VtxoPolicy::Pubkey(_)) {
+				return badarg!("claim destination must use a pubkey policy");
+			}
+			if destination.amount != net_amount.to_sat() {
+				return badarg!("claim destination amount differs from receive amount after fees");
+			}
+			let mut links = OwnerLinks::default();
+			links.insert_request(&destination, self.config.expiry_payouts)?;
+			self.db.write(async |t| links.verify(t, [policy.user_pubkey()],
+				self.mailbox_key.leak_ref(), self.config.network).await).await?;
 		}
 
 		// A payment hash carries at most one subscription.
@@ -820,8 +840,12 @@ impl Server {
 		user_pubkey: PublicKey,
 		htlc_recv_expiry: BlockHeight,
 		anti_dos: Option<protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos>,
+		owner_links: &crate::owner_proof::OwnerLinks,
 		client_address: Option<SocketAddr>,
 	) -> anyhow::Result<(LightningHtlcSubscription, Vec<Vtxo<Full>>)> {
+		if self.config.expiry_payouts {
+			owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		}
 		// Held for the whole call. The status only becomes `htlcs-ready` after
 		// the arkoor is persisted, so without this lock concurrent calls each
 		// allocate a full HTLC set for one invoice and can each return a
@@ -867,6 +891,9 @@ impl Server {
 		if self.htlc_settler.is_settled(payment_hash).await?.is_some() {
 			return badarg!("invoice has already been paid");
 		}
+
+		self.db.write(async |t| owner_links.verify(t, [user_pubkey],
+			self.mailbox_key.leak_ref(), self.config.network).await).await?;
 
 		self.verify_ln_receive_anti_dos(anti_dos, payment_hash, client_address).await?;
 
@@ -985,13 +1012,14 @@ impl Server {
 		badarg!("this feature has been disabled by the server")
 	}
 
-	#[tracing::instrument(skip(self, payment_preimage, cosign_request))]
+	#[tracing::instrument(skip(self, payment_preimage, cosign_request, owner_links))]
 	pub async fn claim_lightning_receive(
 		&self,
 		payment_hash: PaymentHash,
 		payment_preimage: Preimage,
 		cosign_request: ArkoorPackageCosignRequest<VtxoId>,
 		pver: u64,
+		owner_links: &crate::owner_proof::OwnerLinks,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		// Held for the whole call, so no other call decides on this payment
 		// while the claim is validated, settled and cosigned.
@@ -1010,7 +1038,7 @@ impl Server {
 			.not_found([payment_hash], "no pending payment with this payment hash")?;
 
 		let is_self_payment = self.db.read(async |t|
-			t.get_open_lightning_payment_attempt_by_subscription_id(sub.id).await
+			t.get_lightning_payment_attempt_by_subscription_id(sub.id).await
 		).await?.is_some();
 
 		match sub.status {
@@ -1050,6 +1078,14 @@ impl Server {
 
 		let mut htlc_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&sub.htlc_vtxos).await).await?;
 		htlc_vtxos.sort_by_key(|v| v.vtxo_id);
+		if first_claim {
+			let lowest_grant_expiry = htlc_vtxos.iter().map(|grant| grant.vtxo.policy()
+				.as_server_htlc_recv().map(|policy| policy.htlc_expiry)
+				.context("receive grant has another policy")).collect::<anyhow::Result<Vec<_>>>()?
+				.into_iter().min().context("receive has no granted HTLC expiry")?;
+			validate_receive_claim(lowest_grant_expiry, self.sync_manager.chain_tip().height,
+				RECEIVE_CLAIM_EXPIRY_MARGIN).badarg("HTLC receive grant is too close to expiry")?;
+		}
 
 		// check that cosign request input vtxos and htlc vtxos match
 		let mut htlc_amount = Amount::ZERO;
@@ -1082,12 +1118,21 @@ impl Server {
 		let builder = self.validate_cosign_request(validation, cosign_request)
 			.badarg("invalid cosign request")?;
 
+		let receive_claims = crate::database::expiry_receive::ReceiveClaimBinding::from_package(&builder)
+			.badarg("invalid receive destination")?;
+		ensure!(receive_claims.len() == htlc_ids.len(), "receive claim contains a non-receive source");
+		let checkpoint = self.db.write(async |t| {
+			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
+			let checkpoint = t.store_htlc_settlement(payment_preimage).await?;
+			t.prepare_receive_claims(&receive_claims).await?;
+			Ok(checkpoint)
+		}).await?;
+
 		// Record the preimage in the settler so the watchman signer/policy
 		// can find it if this VTXO ends up being claimed on-chain.
 		// The settler is the single source of truth for preimages; all
 		// settlement paths (cooperative and on-chain) converge here.
-		self.htlc_settler.settle(payment_preimage).await
-			.context("could not record htlc settlement")?;
+		self.htlc_settler.notify_stored(checkpoint, payment_hash);
 
 		// Settle the hold invoice before releasing the grant, so the inbound
 		// HTLC is collected while it is still live.
@@ -1096,7 +1141,7 @@ impl Server {
 				.context("could not settle hold invoice, refusing to release the claim")?;
 		}
 
-		let (builder, _) = self.cosign_oor_with_builder(builder).await?;
+		let (builder, _) = self.cosign_oor_with_builder(builder, owner_links).await?;
 		let vtxo_request = VtxoRequest {
 			amount: sub.amount(),
 			policy: vtxo_policy,
@@ -1113,7 +1158,6 @@ impl Server {
 		Ok(builder.cosign_response())
 	}
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1228,6 +1272,35 @@ mod tests {
 		// and certainly once it expired
 		assert!(validate_receive_claim(BlockHeight::new(100), BlockHeight::new(100), margin).is_err());
 		assert!(validate_receive_claim(BlockHeight::new(99), BlockHeight::new(100), margin).is_err());
+	}
+
+	#[test]
+	fn fulfilled_grants_never_expire_and_revoked_grants_wait_for_six_blocks() {
+		let coin = ark::test_util::VTXO_VECTORS.board_vtxo.clone();
+		let now = chrono::Local::now();
+		let mut grant = HtlcVtxo {
+			htlc: htlc_vtxo::Htlc { payment_hash: PaymentHash::from([1; 32]),
+				htlc_expiry: BlockHeight::new(100), direction: HtlcDirection::Outgoing,
+				offchain_resolution: Some(HtlcResolution::Fulfilled),
+				chain_resolution: None, chain_resolution_height: None },
+			vtxo: crate::database::VtxoState { id: 1, vtxo_id: coin.id(), vtxo: coin,
+				oor_spent_txid: None, spent_in_round: None, offboarded_in: None,
+				banned_until_height: None, spend_state: crate::database::SpendState::Spendable,
+				decided_for_fallback: false, confirmed_height: None, created_at: now, updated_at: now },
+		};
+		assert!(!htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
+		grant.htlc.offchain_resolution = None;
+		assert!(htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
+		grant.vtxo.confirmed_height = Some(BlockHeight::new(110));
+		grant.htlc.chain_resolution = Some(HtlcResolution::Revoked);
+		grant.htlc.chain_resolution_height = Some(BlockHeight::new(120));
+		for (server, watchman, expected) in [(124, Some(124), false), (125, Some(125), true),
+			(150, Some(124), false), (124, Some(150), false), (150, None, false)] {
+			assert_eq!(htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(server),
+				watchman.map(BlockHeight::new)), expected);
+		}
+		grant.htlc.chain_resolution = Some(HtlcResolution::Fulfilled);
+		assert!(!htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
 	}
 
 	#[test]

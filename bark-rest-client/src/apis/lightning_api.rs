@@ -29,6 +29,7 @@ pub enum CancelReceiveError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GenerateInvoiceError {
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -38,6 +39,7 @@ pub enum GenerateInvoiceError {
 #[serde(untagged)]
 pub enum GenerateInvoiceForAddressError {
     Status400(models::BadRequestError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -74,6 +76,7 @@ pub enum ListReceiveStatusesError {
 #[serde(untagged)]
 pub enum PayError {
     Status400(models::BadRequestError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -149,7 +152,7 @@ pub async fn generate_invoice(configuration: &configuration::Configuration, ligh
     }
 }
 
-/// Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.
+/// Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. With expiry payouts enabled, the address must carry a joint owner link. The server verifies the link and preserves the recipient's immutable coin-to-mailbox binding. Missing or invalid ownership at expiry leaves that customer's bitcoin held instead of assigning it to the provider or operator. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.
 pub async fn generate_invoice_for_address(configuration: &configuration::Configuration, lightning_invoice_for_address_request: models::LightningInvoiceForAddressRequest) -> Result<models::InvoiceInfo, Error<GenerateInvoiceForAddressError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_body_lightning_invoice_for_address_request = lightning_invoice_for_address_request;

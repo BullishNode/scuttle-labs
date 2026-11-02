@@ -3,7 +3,6 @@
 //! Protocol versions identify the protocol clients use to speak to the server.
 //!
 
-
 /// Version of the initial mainnet release
 pub const PROTOCOL_VERSION_BASE: u64 = 1;
 
@@ -37,3 +36,7 @@ pub const PROTOCOL_VERSION_BOARD_FUNDING_TX: u64 = 4;
 /// scripts, so the server rejects Lightning sends and receives and round
 /// participations from clients below this version with an upgrade error.
 pub const PROTOCOL_VERSION_HASHLOCK_CLAUSES: u64 = 5;
+
+/// Joint ownership and automatic expired-backing payouts. Payout-on servers
+/// require this version; payout-off servers retain the ordinary range.
+pub const PROTOCOL_VERSION_EXPIRY_PAYOUTS: u64 = 6;

@@ -8,6 +8,16 @@ mod embedded {
 	}
 }
 
+pub mod expiry_attribution;
+pub(crate) mod expiry_guard;
+pub mod expiry_inventory;
+pub mod expiry_chain;
+pub mod expiry_decision;
+pub mod expiry_ownership;
+pub mod expiry_payout;
+pub(crate) mod expiry_lightning;
+pub(crate) mod expiry_receive;
+
 mod ban;
 pub mod block;
 pub mod data_migrations;
@@ -27,7 +37,6 @@ mod query;
 
 pub use self::block::BlockTable;
 pub use self::model::*;
-
 
 use std::borrow::Borrow;
 use std::str::FromStr;
@@ -69,7 +78,7 @@ const NOARG: &[&bool] = &[];
 
 const DEFAULT_DATABASE: &str = "postgres";
 
-/// Advisory lock keys for `pg_advisory_xact_lock`.
+/// Advisory lock keys for PostgreSQL transaction and session locks.
 ///
 /// Each variant maps to a unique lock id. Using an enum avoids
 /// computing `hashtext(...)` at runtime and makes every lock site
@@ -147,13 +156,16 @@ pub enum MailboxPayload {
 
 #[derive(Clone)]
 pub struct Db {
-	pool: Pool<ConnectionManager>
+	pool: Pool<ConnectionManager>,
+	expiry_payouts: bool,
 }
 
 impl Db {
 	async fn run_migrations(&self) -> anyhow::Result<()> {
 		let mut conn = self.get_conn().await?;
-		embedded::migrations::runner().run_async::<Client>(&mut conn).await?;
+		conn.query_one("SELECT set_config('ark.expiry_payouts', $1, false)",
+			&[&self.expiry_payouts.to_string()]).await?;
+		embedded::migrations::runner().run_async::<Client>(&mut *conn).await?;
 		info!("All migrations got successfully run");
 		Ok(())
 	}
@@ -226,13 +238,17 @@ impl Db {
 	pub async fn connect(config: &PostgresConfig) -> anyhow::Result<Self> {
 		let pool = Self::pool_connect(&config.name, config).await?;
 
-		let db = Db { pool };
+		let mut db = Db { pool, expiry_payouts: false };
 		db.run_migrations().await?;
+		let expiry_payouts = db.get_conn().await?.query_one(
+			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
+		).await?.get(0);
+		db.expiry_payouts = expiry_payouts;
 
 		Ok(db)
 	}
 
-	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
+	pub async fn create_with_payouts(config: &PostgresConfig, expiry_payouts: bool) -> anyhow::Result<Self> {
 		info!("Checking if a database exists...");
 		let connect = Self::raw_connect(config).await;
 
@@ -250,8 +266,22 @@ impl Db {
 			conn.execute(&statement, &[]).await?;
 		}
 
-		Self::connect(config).await
+		let pool = Self::pool_connect(&config.name, config).await?;
+		let db = Db { pool, expiry_payouts };
+		// V78 stores the selected mode in the same transaction as its schema.
+		db.run_migrations().await?;
+		let stored: bool = db.get_conn().await?.query_one(
+			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
+		).await?.get(0);
+		ensure!(stored == expiry_payouts, "database was created in a different payout mode");
+		Ok(db)
 	}
+
+	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
+		Self::create_with_payouts(config, false).await
+	}
+
+	pub fn expiry_payouts(&self) -> bool { self.expiry_payouts }
 
 	/// Check out a raw pooled connection, below the [Db::read]/[Db::write]
 	/// transaction API. Only for tests that must manipulate session state.
@@ -315,7 +345,7 @@ impl Db {
 			.read_only(read_only)
 			.start().await
 			.context("unable to start db tx")?;
-		let tx = Tx { inner: &pgtx };
+		let tx = Tx { inner: &pgtx, expiry_payouts: self.expiry_payouts };
 		let ret = f(&tx).await;
 		if read_only {
 			// We want to commit read queries regardless of error because it's the
@@ -351,6 +381,7 @@ impl Db {
 /// A managed postgres DB transaction
 pub struct Tx<'t> {
 	inner: &'t tokio_postgres::Transaction<'t>,
+	expiry_payouts: bool,
 }
 
 impl<'t> std::ops::Deref for Tx<'t> {
@@ -362,6 +393,8 @@ impl<'t> std::ops::Deref for Tx<'t> {
 }
 
 impl<'t> Tx<'t> {
+	pub fn expiry_payouts(&self) -> bool { self.expiry_payouts }
+
 	/**
 	 * VTXOs
 	*/
@@ -455,7 +488,7 @@ impl<'t> Tx<'t> {
 		&self,
 		update: tree::VtxoTreeUpdate,
 	) -> anyhow::Result<u64> {
-		tree::execute_vtxo_tree_update(&self, update).await
+		tree::execute_vtxo_tree_update(self, update).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -480,6 +513,16 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<Checkpoint>> {
 		if vtxos.is_empty() {
 			return Ok(None);
+		}
+
+		if self.expiry_payouts() {
+			let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
+			let owners = self.coin_owner_mailboxes(&ids).await?;
+			for id in ids {
+				if owners.get(&id) != Some(&mailbox_id.as_pubkey()) {
+					return crate::error::badarg!("vtxo {} does not belong to the provided mailbox", id);
+				}
+			}
 		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
@@ -703,6 +746,7 @@ impl<'t> Tx<'t> {
 			res.push(entry);
 		}
 
+
 		Ok(res)
 	}
 
@@ -824,6 +868,8 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Store recovery hints only. A mailbox holder may name foreign or unknown
+	/// IDs; this path must never create VTXOs or coin-to-mailbox bindings.
 	pub async fn store_vtxo_ids_in_mailbox(
 		&self,
 		mailbox_type: MailboxType,
@@ -973,7 +1019,7 @@ impl<'t> Tx<'t> {
 				&forfeit_result.connector_vtxos, SpendState::OffboardConnector
 			)
 			.mark_vtxos_offboard_spent(offboard_triples);
-		tree::execute_vtxo_tree_update(&self, update).await?;
+		tree::execute_vtxo_tree_update(self, update).await?;
 
 		// register the connector output vtxo directly into the frontier, so
 		// the watchman can sweep it once the input vtxos have expired

@@ -505,6 +505,8 @@ async fn try_create_wallet(
 			lock_manager: Some(lock_manager),
 			create_if_not_exists: true,
 			create_without_server: opts.force,
+
+			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
 			run_daemon: false,
 			..Default::default()
 		},
@@ -577,6 +579,7 @@ pub async fn open_wallet(datadir: &Path, user_agent: &str) -> anyhow::Result<Opt
 			persister: Some(db),
 			lock_manager: Some(lock_manager),
 			onchain: Some(onchain.clone()),
+
 			run_daemon: false,
 			..Default::default()
 		},

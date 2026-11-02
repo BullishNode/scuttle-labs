@@ -24,7 +24,6 @@ pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod test_suite;
 
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -37,7 +36,7 @@ use lightning_invoice::Bolt11Invoice;
 #[cfg(feature = "onchain-bdk")]
 use bdk_wallet::ChangeSet;
 
-use ark::{Vtxo, VtxoId};
+use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 
@@ -154,6 +153,16 @@ pub trait BarkPersister: Send + Sync + 'static {
 	///
 	/// Errors:
 	/// - Returns an error if the update fails.
+	/// Bind a migrated wallet's previously absent mailbox property once.
+	async fn set_mailbox_identity(&self, _identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		bail!("this persister cannot bind a migrated mailbox identity")
+	}
+
+	/// Retain the negotiated mode alongside the server's stored public keys.
+	async fn set_server_payouts(&self, _payouts: bool) -> anyhow::Result<()> {
+		bail!("this persister cannot store the negotiated payout mode")
+	}
+
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()>;
 
 	/// Set the server's mailbox public key in wallet properties.
@@ -671,6 +680,14 @@ pub trait BarkPersister: Send + Sync + 'static {
 		new_state: VtxoState,
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<WalletVtxo>;
+
+	/// Retire an authenticated commitment to ordinary Spent and retain its
+	/// last observed status for display. The status does not release funds.
+	async fn set_vtxo_fallback_status(&self, _id: VtxoId, _status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		bail!("this persister does not support durable fallback outcomes")
+	}
 
 	/// Release `holder`'s lock on the given vtxo, transitioning it to
 	/// [VtxoState::Spendable]. `holder` must match the value passed at

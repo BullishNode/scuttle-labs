@@ -17,6 +17,7 @@ use bitcoin::bip32;
 use bitcoin::secp256k1::Keypair;
 use tracing::{error, info};
 use bitcoind_async_client::traits::Reader;
+use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 
 use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::EPHEMERAL_KEY_PATH;
@@ -132,6 +133,7 @@ impl Daemon {
 				network, cfg.network,
 			);
 		}
+		bitcoind.require_txindex().await?;
 
 		let deep_tip = bcd::deep_tip(&bitcoind).await
 			.context("failed to query node for deep tip")?;
@@ -239,6 +241,10 @@ impl Daemon {
 			rtmgr, sync_manager, watchman_wallet, frontier, watchman_handle,
 			bitcoin_address_blocklist,
 		})
+	}
+
+	pub(crate) fn watchman_wallet(&self) -> &InstrumentedLock<PersistedWallet> {
+		&self.watchman_wallet
 	}
 
 	pub fn watchman_handle(&self) -> &WatchmanHandle {

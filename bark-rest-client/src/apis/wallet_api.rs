@@ -45,6 +45,7 @@ pub enum BalanceError {
 #[serde(untagged)]
 pub enum Bip321UriError {
     Status400(models::BadRequestError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -61,6 +62,7 @@ pub enum ConnectedError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CreateWalletError {
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -141,6 +143,7 @@ pub enum NextRoundError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum OffboardAllError {
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -151,6 +154,7 @@ pub enum OffboardAllError {
 pub enum OffboardVtxosError {
     Status400(models::BadRequestError),
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(),
     UnknownValue(serde_json::Value),
 }
@@ -175,6 +179,7 @@ pub enum PendingRoundsError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RefreshAllError {
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -184,6 +189,7 @@ pub enum RefreshAllError {
 #[serde(untagged)]
 pub enum RefreshCounterpartyError {
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -194,6 +200,7 @@ pub enum RefreshCounterpartyError {
 pub enum RefreshDelegatedError {
     Status400(models::BadRequestError),
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -204,6 +211,7 @@ pub enum RefreshDelegatedError {
 pub enum RefreshVtxosError {
     Status400(models::BadRequestError),
     Status404(models::NotFoundError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -213,6 +221,7 @@ pub enum RefreshVtxosError {
 #[serde(untagged)]
 pub enum SendError {
     Status400(models::BadRequestError),
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -221,6 +230,7 @@ pub enum SendError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SendOnchainError {
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
@@ -236,6 +246,7 @@ pub enum SyncError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SyncMailboxError {
+    Status409(models::FallbackRefusalError),
     Status500(models::InternalServerError),
     UnknownValue(serde_json::Value),
 }
