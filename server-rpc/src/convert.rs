@@ -50,7 +50,6 @@ impl From<OwnerLink> for protos::OwnerProof {
 		Self {
 			blinded_mailbox_id: link.blinded_id.as_ref().to_vec(),
 			signature: link.signature.serialize().to_vec(),
-			version: 2,
 			mailbox_signature: link.mailbox_signature.serialize().to_vec(),
 		}
 	}
@@ -63,7 +62,6 @@ impl TryFrom<protos::OwnerProof> for OwnerLink {
 			.map_err(|_| "invalid blinded mailbox identifier")?;
 		let signature = schnorr::Signature::from_slice(&proof.signature)
 			.map_err(|_| "invalid mailbox link signature")?;
-		if proof.version != 2 { return Err("joint owner proof version required".into()); }
 		let mailbox_signature = schnorr::Signature::from_slice(&proof.mailbox_signature)
 			.map_err(|_| "invalid mailbox authorization signature")?;
 		OwnerLink::from_joint_parts(blinded_id, signature, mailbox_signature)
@@ -854,23 +852,18 @@ mod test {
 	}
 
 	#[test]
-	fn joint_owner_link_proto_requires_exact_versioned_fields() {
+	fn joint_owner_link_proto_requires_both_signatures() {
 		let key = |n| { let mut bytes = [0; 32]; bytes[31] = n;
 			bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &bytes).unwrap() };
 		let server = key(11); let mailbox = key(17); let coin = key(3);
 		let link = OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
 		let proto = protos::OwnerProof::from(link);
-		assert_eq!(proto.version, 2);
 		assert_eq!(OwnerLink::try_from(proto.clone()).unwrap(), link);
 		for length in [0, 63, 65] {
 			let mut changed = proto.clone(); changed.mailbox_signature.resize(length, 0);
 			assert!(OwnerLink::try_from(changed).is_err());
 		}
-		for version in [0, 1, 3, u32::MAX] {
-			let mut changed = proto.clone(); changed.version = version;
-			assert!(OwnerLink::try_from(changed).is_err());
-		}
-		let mut legacy_proto = proto; legacy_proto.version = 0; legacy_proto.mailbox_signature.clear();
+		let mut legacy_proto = proto; legacy_proto.mailbox_signature.clear();
 		assert!(OwnerLink::try_from(legacy_proto).is_err());
 	}
 

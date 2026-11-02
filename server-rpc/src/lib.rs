@@ -67,16 +67,12 @@ pub mod protos {
 	pub mod mailbox_server {
 		tonic::include_proto!("mailbox_server");
 	}
-	pub mod scuttle {
-		tonic::include_proto!("scuttle");
-	}
 }
 
 pub use client::ServerConnection;
 pub use crate::protos::bark_server::ark_service_client::ArkServiceClient;
 
 pub mod admin {
-	pub use crate::protos::scuttle::scuttle_service_client::ScuttleServiceClient;
 	pub use crate::protos::bark_server::wallet_admin_service_client::WalletAdminServiceClient;
 	pub use crate::protos::bark_server::round_admin_service_client::RoundAdminServiceClient;
 	pub use crate::protos::bark_server::lightning_admin_service_client::LightningAdminServiceClient;
@@ -93,7 +89,6 @@ pub mod intman {
 
 #[cfg(feature = "server")]
 pub mod server {
-	pub use crate::protos::scuttle::scuttle_service_server::{ScuttleService, ScuttleServiceServer};
 	pub use crate::protos::bark_server::ark_service_server::{ArkService, ArkServiceServer};
 	pub use crate::protos::bark_server::wallet_admin_service_server::{WalletAdminService, WalletAdminServiceServer};
 	pub use crate::protos::bark_server::round_admin_service_server::{RoundAdminService, RoundAdminServiceServer};

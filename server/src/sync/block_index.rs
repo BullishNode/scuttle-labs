@@ -130,8 +130,9 @@ impl BlockIndex {
 			return Ok(false);
 		}
 
-		// Height is not monotonic: a shorter branch can have more chainwork.
-		// Find the common ancestor instead of panicking on its height.
+		if bitcoind_tip.height < self.sync_tip().height {
+			panic!("bitcoind chain went backward. We probably restarted. Wait for bitcoind to sync and start again");
+		}
 
 		debug!("Discovered new tip with height={} and hash={}", bitcoind_tip.height, bitcoind_tip.hash);
 

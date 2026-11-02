@@ -9,15 +9,15 @@ async fn fail_attempt_requires_admin_auth() {
 	let ctx = TestContext::new("server/fail_attempt_requires_admin_auth").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let request = || {
-		let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: i64::MAX, native_cold_restart_confirmed: false });
+		let mut request = tonic::Request::new(protos::ReconcileLightningAttemptRequest { attempt_id: i64::MAX, native_cold_restart_confirmed: false });
 		request.set_pver(server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
 		request
 	};
-	let mut public = server_rpc::admin::ScuttleServiceClient::connect(srv.ark_url()).await.unwrap();
+	let mut public = server_rpc::admin::LightningAdminServiceClient::connect(srv.ark_url()).await.unwrap();
 	assert_eq!(public.reconcile_lightning_attempt(request()).await.unwrap_err().code(), tonic::Code::Unimplemented);
 	let address = srv.config().rpc.admin_address.unwrap().to_string();
-	let mut admin = server_rpc::admin::ScuttleServiceClient::connect(format!("http://{address}")).await.unwrap();
-	let missing = protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: i64::MAX, native_cold_restart_confirmed: false };
+	let mut admin = server_rpc::admin::LightningAdminServiceClient::connect(format!("http://{address}")).await.unwrap();
+	let missing = protos::ReconcileLightningAttemptRequest { attempt_id: i64::MAX, native_cold_restart_confirmed: false };
 	assert_eq!(admin.reconcile_lightning_attempt(missing).await.unwrap_err().code(), tonic::Code::InvalidArgument);
 	let mut old = request();
 	old.set_pver(server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS - 1);
@@ -75,19 +75,19 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(error.message().contains("unsupported protocol"));
 
-	let mut public_operator = server_rpc::admin::ScuttleServiceClient::connect(srv.ark_url()).await.unwrap();
-	let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
+	let mut public_operator = server_rpc::admin::LightningAdminServiceClient::connect(srv.ark_url()).await.unwrap();
+	let mut request = tonic::Request::new(protos::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
 	request.set_pver(version);
 	assert_eq!(public_operator.reconcile_lightning_attempt(request).await.unwrap_err().code(), tonic::Code::Unimplemented);
 	let address = format!("http://{}", srv.config().rpc.admin_address.unwrap());
-	let mut operator = server_rpc::admin::ScuttleServiceClient::connect(address).await.unwrap();
-	let error = operator.reconcile_lightning_attempt(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false }).await.unwrap_err();
+	let mut operator = server_rpc::admin::LightningAdminServiceClient::connect(address).await.unwrap();
+	let error = operator.reconcile_lightning_attempt(protos::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false }).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(error.message().contains("pver"));
-	let mut old = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
+	let mut old = tonic::Request::new(protos::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
 	old.set_pver(version - 1);
 	assert_eq!(operator.reconcile_lightning_attempt(old).await.unwrap_err().code(), tonic::Code::InvalidArgument);
-	let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
+	let mut request = tonic::Request::new(protos::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
 	request.set_pver(version);
 	let error = operator.reconcile_lightning_attempt(request).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);

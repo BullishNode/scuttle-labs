@@ -7,13 +7,12 @@ use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::secp256k1::{self, ecdh, schnorr, Keypair, Message, PublicKey, Scalar, SecretKey};
 use bitcoin::{Network, ScriptBuf};
 
-use crate::{ProtocolDecodingError, ProtocolEncoding, ReadExt, WriteExt, SECP};
+use crate::{ProtocolDecodingError, ProtocolEncoding, SECP};
 use crate::mailbox::{BlindedMailboxIdentifier, MailboxBlindingError, MailboxIdentifier};
 
 const COIN_TAG: &str = "Ark/ExpiryOwnerLink/Coin/v2";
 const MAILBOX_TAG: &str = "Ark/ExpiryOwnerLink/Mailbox/v2";
 const TWEAK_TAG: &str = "Ark/ExpiryOwnerMailboxTweak/v2";
-const JOINT_MARKER: u8 = 0;
 const JOINT_VERSION: u8 = 2;
 
 fn tagged_message(tag: &str, fields: &[&[u8]]) -> Message {
@@ -126,17 +125,12 @@ impl OwnerLink {
 
 impl ProtocolEncoding for OwnerLink {
 	fn encode<W: io::Write + ?Sized>(&self, writer: &mut W) -> Result<(), io::Error> {
-		writer.emit_u8(JOINT_MARKER)?;
-		writer.emit_u8(JOINT_VERSION)?;
 		self.blinded_id.encode(writer)?;
 		self.signature.encode(writer)?;
 		self.mailbox_signature.encode(writer)
 	}
 
 	fn decode<R: io::Read + ?Sized>(reader: &mut R) -> Result<Self, ProtocolDecodingError> {
-		if reader.read_u8()? != JOINT_MARKER || reader.read_u8()? != JOINT_VERSION {
-			return Err(ProtocolDecodingError::invalid("joint owner link required"));
-		}
 		let blinded_id = BlindedMailboxIdentifier::decode(reader)?;
 		let signature = schnorr::Signature::decode(reader)?;
 		let mailbox_signature = schnorr::Signature::decode(reader)?;
@@ -303,8 +297,7 @@ mod tests {
 		let server = key(11); let mailbox = key(17); let coin = key(3);
 		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
 		let wire = link.serialize();
-		assert_eq!(wire.len(), 163);
-		assert_eq!(&wire[..2], &[0, 2]);
+		assert_eq!(wire.len(), 161);
 		assert_eq!(OwnerLink::deserialize(&wire).unwrap(), link);
 		for len in 0..wire.len() { assert!(OwnerLink::deserialize(&wire[..len]).is_err()); }
 		let mut trailing = wire.clone(); trailing.push(0); assert!(OwnerLink::deserialize(&trailing).is_err());
@@ -314,9 +307,7 @@ mod tests {
 				assert!(changed.verify_joint(Network::Regtest, &server, coin.public_key()).is_err(), "byte {index}");
 			}
 		}
-		let mut wrong_version = wire.clone(); wrong_version[1] = 1;
-		assert!(OwnerLink::deserialize(&wrong_version).is_err());
-		let stripped = wire[2..99].to_vec();
+		let stripped = wire[..97].to_vec();
 		assert_eq!(stripped.len(), 97);
 		assert!(OwnerLink::deserialize(&stripped).is_err());
 		let mut legacy = stripped;

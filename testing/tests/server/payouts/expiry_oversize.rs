@@ -367,7 +367,7 @@ async fn bounded_round_inventory() {
 		}
 		Ok(())
 	}).await.unwrap();
-	assert_eq!(max_evidence_bytes, batch_limit * 163);
+	assert_eq!(max_evidence_bytes, batch_limit * 161);
 	let sponsor_funding = fund_sponsors(&ctx, &srv, 96).await;
 	ctx.generate_blocks(2).await;
 	let mut jobs = VecDeque::new();

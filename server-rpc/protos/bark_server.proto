@@ -305,11 +305,10 @@ message RecoverVtxosByXpubResponse {
 
 // boarding
 
-// Versioned coin and mailbox authorization of a server-specific link.
+// Coin and mailbox authorization of a server-specific link.
 message OwnerProof {
 	bytes blinded_mailbox_id = 1;
 	bytes signature = 3;
-	uint32 version = 4;
 	bytes mailbox_signature = 5;
 }
 
@@ -715,7 +714,21 @@ service RoundAdminService {
 	rpc TriggerRound(core.Empty) returns (core.Empty) {}
 }
 
+message ReconcileLightningAttemptRequest {
+	int64 attempt_id = 1000;
+	// Privileged operator confirms complete same-backend CLN/plugin cessation,
+	// restart of its original persistent store and exclusion of new dispatch.
+	bool native_cold_restart_confirmed = 1001;
+}
+
+message ReconcileLightningAttemptResponse {
+	int64 attempt_id = 1000;
+	bytes payment_hash = 1001;
+	string status = 1002;
+}
+
 service LightningAdminService {
+	rpc ReconcileLightningAttempt(ReconcileLightningAttemptRequest) returns (ReconcileLightningAttemptResponse) {}
 	rpc StartLightningNode(LightningNodeUri) returns (core.Empty) {}
 	rpc StopLightningNode(LightningNodeUri) returns (core.Empty) {}
 }
