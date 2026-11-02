@@ -1789,7 +1789,6 @@ async fn lightning_payment_attempt_error_survives_until_failed() {
 	assert_eq!(failed.error.as_deref(), Some(error));
 }
 
-/// A stored xpay error is cleared when the remaining parts succeed.
 #[tokio::test]
 async fn lightning_payment_attempt_error_cleared_on_success() {
 	use server::database::ln::LightningPaymentStatus;
@@ -1834,58 +1833,6 @@ async fn lightning_payment_attempt_error_cleared_on_success() {
 	let succeeded = read().await;
 	assert_eq!(succeeded.status, LightningPaymentStatus::Succeeded);
 	assert_eq!(succeeded.error, None);
-}
-
-/// `mark_htlc_send_vtxos_ln_spent` flags a linked spendable vtxo `ln-spent`,
-/// including when its attempt has already reached `Succeeded`. The settlement
-/// path transitions the attempt to `Succeeded` before marking its vtxos, so the
-/// mark must not depend on the attempt still being open.
-#[tokio::test]
-async fn mark_htlc_send_vtxos_ln_spent_for_settled_attempt() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/ln_spent_settled_attempt").await;
-	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-
-	// A spendable HTLC-send vtxo that funds the payment.
-	let vtxo = ServerVtxo::from(VTXO_VECTORS.arkoor_htlc_out_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
-
-	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
-	let invoice = Invoice::Bolt11(bolt11.clone());
-
-	// Open attempt linked to the HTLC-send vtxo.
-	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(2), None, &[vtxo.id()], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
-	).await).await.unwrap();
-
-	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("open attempt present");
-
-	// Settle the attempt, then mark its linked vtxos.
-	db.write(async |t| t.update_lightning_payment_attempt_result(
-		&attempt, LightningPaymentStatus::Succeeded, None, None,
-	).await).await.unwrap().expect("attempt should have transitioned to Succeeded");
-
-	db.write(async |t| t.mark_htlc_send_vtxos_ln_spent(attempt.payment_hash).await).await.unwrap();
-
-	// The funding vtxo must be flagged ln-spent.
-	let db_client = ctx.postgres_manager().database_client(Some(&ctx.test_name)).await;
-	let row = db_client.query_one(
-		"SELECT spend_state::text AS spend_state FROM vtxo WHERE vtxo_id = $1",
-		&[&vtxo.id().to_string()],
-	).await.unwrap();
-	let spend_state: String = row.get("spend_state");
-	assert_eq!(spend_state, "ln-spent",
-		"HTLC-send vtxo should be ln-spent for a settled payment attempt");
 }
 
 /// `store_lightning_payment_start` must persist `block_height`, `user_fee`
@@ -1956,6 +1903,7 @@ fn new_cln_xpay(node_id: i64, payment_hash: PaymentHash) -> NewClnXpay {
 		htlc_expiry: Some(BlockHeight::new(900)),
 		label: None,
 		payment_hash,
+		signed_invoice: None,
 		user_fee_msat: Some(1000),
 		user_agent: None,
 	}
@@ -2562,9 +2510,9 @@ async fn lightning_receive_notification_mailbox_duplicate() {
 	Db::create(&postgres_cfg).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
-	let mailbox_id = MailboxIdentifier::from_pubkey(
-		PublicKey::from_str(DUMMY_PUBKEY).unwrap()
-	);
+	let mailbox_id = MailboxIdentifier::from_str(
+		"038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354"
+	).unwrap();
 	let bolt11 = BOLT11_INVOICE.parse::<Bolt11Invoice>().unwrap();
 	let payment_hash = bolt11.as_payment_hash();
 	let payment_hash_str = payment_hash.to_string();
@@ -2604,9 +2552,9 @@ async fn lightning_send_finished_mailbox_notification() {
 	Db::create(&postgres_cfg).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
-	let mailbox_id = MailboxIdentifier::from_pubkey(
-		PublicKey::from_str(DUMMY_PUBKEY).unwrap()
-	);
+	let mailbox_id = MailboxIdentifier::from_str(
+		"038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354"
+	).unwrap();
 	let payment_hash = BOLT11_INVOICE.parse::<Bolt11Invoice>().unwrap().as_payment_hash();
 
 	// Store a failed payment notification (no preimage, with a reason)

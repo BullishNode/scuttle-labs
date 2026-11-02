@@ -1,6 +1,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use anyhow::bail;
 use bitcoin::{Address, address::NetworkUnchecked};
@@ -11,7 +12,7 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, BitcoinRpcClient, RpcApi};
 
 use server::sync::{ChainEventListener, RawMempool, BlockData};
 use server::sync::block_index::{BlockIndex};
-use server::database::{BlockTable, Db};
+use server::database::{BlockTable, Db, Tx};
 
 use ark_testing::TestContext;
 
@@ -70,7 +71,7 @@ impl ChainEventListener for BlockIndexListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, block: BlockRef) -> anyhow::Result<()> {
 		if let Some(tip) = *self.tip.lock() {
 			if block.height > tip.height {
 				panic!(
@@ -178,11 +179,14 @@ async fn test_block_index_basic_sync() {
 /// A listener that fails the first `on_reorg` call and succeeds afterwards.
 pub struct FailOnceReorgListener {
 	calls: Arc<AtomicUsize>,
+	cache_calls: Arc<AtomicUsize>,
+	db: Db,
 }
 
 impl FailOnceReorgListener {
-	pub fn new() -> Self {
-		Self { calls: Arc::new(AtomicUsize::new(0)) }
+	pub fn new(db: Db) -> Self {
+		Self { calls: Arc::new(AtomicUsize::new(0)),
+			cache_calls: Arc::new(AtomicUsize::new(0)), db }
 	}
 }
 
@@ -196,10 +200,19 @@ impl ChainEventListener for FailOnceReorgListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, _block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, tx: &Tx<'_>, _block: BlockRef) -> anyhow::Result<()> {
 		let calls = self.calls.fetch_add(1, Ordering::SeqCst);
 		if calls == 0 {
 			bail!("simulated reorg failure");
+		}
+		Ok(())
+	}
+
+	async fn on_reorg_committed(&self, block: BlockRef) -> anyhow::Result<()> {
+		let tip = self.db.read(async |t| t.get_highest_block(BlockTable::Captaind).await).await?;
+		assert_eq!(tip, Some(block), "cache refresh must observe the committed rollback with one pooled connection");
+		if self.cache_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+			bail!("simulated postcommit cache failure");
 		}
 		Ok(())
 	}
@@ -216,7 +229,8 @@ async fn test_block_index_reorg_retry() {
 	let mut ctx = TestContext::new_minimal("block_index/reorg_retry").await;
 
 	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+	let mut postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+	postgres_cfg.max_connections = 1;
 	Db::create(&postgres_cfg).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 
@@ -224,8 +238,9 @@ async fn test_block_index_reorg_retry() {
 	let bitcoind = ctx.bitcoind().sync_client();
 	let bitcoind_async = ctx.bitcoind().async_client();
 
-	let listener = FailOnceReorgListener::new();
+	let listener = FailOnceReorgListener::new(db.clone());
 	let call_count = listener.calls.clone();
+	let cache_calls = listener.cache_calls.clone();
 	let listeners = vec![Box::new(listener) as Box<dyn ChainEventListener>];
 	let birthday = bitcoind.deep_tip().expect("deep tip");
 	let mut block_index = BlockIndex::new(bitcoind_async, db.clone(), listeners, birthday, BlockTable::Captaind).await.expect("blockindex created");
@@ -245,12 +260,15 @@ async fn test_block_index_reorg_retry() {
 	let result = block_index.sync().await;
 	assert!(result.is_err(), "First sync should fail due to listener failure");
 
-	// Second sync should re-detect the same reorg, retry, and converge.
-	block_index.sync().await.expect("Second sync should succeed after retry");
+	// The retry commits SQL, but a failed cache refresh must not make the
+	// following ancestor lookup use deleted blocks.
+	assert!(block_index.sync().await.is_err());
+	block_index.sync().await.expect("Third sync should retry caches and converge");
 
 	check_block_index_is_consistent(&db, BlockTable::Captaind, &bitcoind).await;
 
 	// The listener must have been called twice: one failure, then one success.
 	assert_eq!(call_count.load(Ordering::SeqCst), 2);
+	assert_eq!(cache_calls.load(Ordering::SeqCst), 2, "cache retry must not repeat the committed rollback");
+	assert!(!block_index.sync().await.unwrap());
 }
-
