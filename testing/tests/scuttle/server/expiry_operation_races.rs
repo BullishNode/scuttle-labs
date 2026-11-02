@@ -69,6 +69,44 @@ async fn wait_for_query_lock(tx: &Tx<'_>, prefix: &str) -> anyhow::Result<()> {
 	}).await.expect("real competing operation never reached its PostgreSQL row lock")
 }
 
+async fn published_payout(db: &Db, id: ark::VtxoId, message: &str) -> Transaction {
+	tokio::time::timeout(Duration::from_secs(20), async {
+		loop {
+			let row = db.read(async |tx| Ok(tx.query_opt("
+				SELECT a.sweep_tx
+				FROM expiry_allocation a
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+				JOIN expiry_entitlement e ON e.id=c.entitlement_id
+				WHERE e.vtxo_id=$1
+				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
+				AND a.broadcast_at IS NOT NULL
+			", &[&id.to_string()]).await?)).await.unwrap();
+			if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
+			tokio::time::sleep(Duration::from_millis(25)).await;
+		}
+	}).await.expect(message)
+}
+
+async fn offboard_allocations(
+	db: &Db, id: ark::VtxoId,
+) -> Vec<(i64, Vec<u8>, i64, i64, i64, i64)> {
+	db.read(async |tx| Ok(tx.query("
+		SELECT a.id,a.sweep_tx,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat
+		FROM expiry_allocation a
+		JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+		JOIN expiry_entitlement e ON e.id=c.entitlement_id
+		WHERE e.vtxo_id=$1 ORDER BY a.id
+	", &[&id.to_string()]).await?.into_iter().map(|row|
+		(row.get::<_, i64>(0),row.get::<_, Vec<u8>>(1),row.get::<_, i64>(2),
+		 row.get::<_, i64>(3),row.get::<_, i64>(4),row.get::<_, i64>(5))).collect::<Vec<_>>())).await.unwrap()
+}
+
+fn assert_canceled_movement(cancelled: &bark::movement::Movement) {
+	assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
+	assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
+	assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+}
+
 async fn offboard_race(offboard_wins: bool, finality: bool) {
 	let name = if finality { "server/expiry_native_offboard_fallback_finality" }
 		else if offboard_wins { "server/expiry_native_offboard_wins" }
@@ -160,21 +198,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 		assert_eq!(customer, 0, "the binding offboard must not also receive a fallback payment");
 	} else {
 		srv.watchmand().start().await.unwrap();
-		let parent: Transaction = tokio::time::timeout(Duration::from_secs(20), async {
-			loop {
-				let row = db.read(async |tx| Ok(tx.query_opt("
-					SELECT a.sweep_tx
-					FROM expiry_allocation a
-					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id
-					WHERE e.vtxo_id=$1
-					AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
-					AND a.broadcast_at IS NOT NULL
-				", &[&id.to_string()]).await?)).await.unwrap();
-				if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
-				tokio::time::sleep(Duration::from_millis(25)).await;
-			}
-		}).await.expect("actual payout decision did not publish");
+		let parent = published_payout(&db, id, "actual payout decision did not publish").await;
 		gate.release.notify_one();
 		let error = tokio::time::timeout(Duration::from_secs(20), operation).await.unwrap().unwrap().unwrap_err();
 		assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback));
@@ -202,10 +226,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			_ => unreachable!(),
 		};
 		if finality {
-			let cancelled = wallet_db.get_movement_by_id(movement).await.unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(&wallet_db.get_movement_by_id(movement).await.unwrap());
 			wallet.sync_fallback_payouts().await.unwrap();
 			assert_eq!(wallet.offboard_checkpoint(&prepared.id).await.unwrap(), Some(prepared.clone()));
 			let history = wallet.history().await.unwrap();
@@ -228,10 +249,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			assert_eq!(wallet.get_full_vtxo(id).await.unwrap(), signed, "payment must retain signed recovery material");
 			let history = wallet.history().await.unwrap();
 			assert_eq!(history.iter().map(|entry| entry.effective_balance.to_sat()).sum::<i64>(), native_balance);
-			let cancelled = history.iter().find(|entry| entry.id == movement).unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(history.iter().find(|entry| entry.id == movement).unwrap());
 			let rpc = ctx.bitcoind().sync_client();
 			let confirmed = rpc.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().unwrap();
 			rpc.invalidate_block(&confirmed.blockhash.unwrap()).unwrap();
@@ -248,23 +266,12 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			assert!(wallet.lock_vtxos([id], None).await.is_err());
 			assert_eq!(signed.amount(), coin.amount());
 			let history = wallet.history().await.unwrap();
-			let cancelled = history.iter().find(|entry| entry.id == movement).unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(history.iter().find(|entry| entry.id == movement).unwrap());
 			assert_eq!(history.iter().map(|entry| entry.effective_balance.to_sat()).sum::<i64>(), native_balance);
 
 			// Keep the offline cut above unchanged. Bring back the SAME server
 			// and wallet stores; listener ports are intentionally reassigned.
-			let allocations = db.read(async |tx| Ok(tx.query("
-				SELECT a.id,a.sweep_tx,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat
-				FROM expiry_allocation a
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id
-				WHERE e.vtxo_id=$1 ORDER BY a.id
-			", &[&id.to_string()]).await?.into_iter().map(|row|
-				(row.get::<_, i64>(0),row.get::<_, Vec<u8>>(1),row.get::<_, i64>(2),
-				 row.get::<_, i64>(3),row.get::<_, i64>(4),row.get::<_, i64>(5))).collect::<Vec<_>>())).await.unwrap();
+			let allocations = offboard_allocations(&db, id).await;
 			assert_eq!(allocations.len(), 1);
 			assert_eq!((allocations[0].2,allocations[0].3,allocations[0].4,allocations[0].5), (100_000,1_000,99_000,0));
 			wallet.stop_daemon_wait().await.unwrap();
@@ -318,10 +325,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			wallet.sync_pending_offboards().await.unwrap();
 			assert!(wallet.offboard_checkpoint(&prepared.id).await.unwrap().is_none(),
 				"authenticated terminal fallback must finish the superseded offboard after its session was lost");
-			let cancelled = wallet_db.get_movement_by_id(movement).await.unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(&wallet_db.get_movement_by_id(movement).await.unwrap());
 			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 			assert!(wallet.lock_vtxos([id], None).await.is_err());
 			assert_eq!(wallet_db.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spent);
@@ -336,15 +340,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			let paid = rpc.get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
 			assert!(paid.confirmations >= 6);
 			assert_eq!(paid.value, sat(99_000));
-			let after = db.read(async |tx| Ok(tx.query("
-				SELECT a.id,a.sweep_tx,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat
-				FROM expiry_allocation a
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id
-				WHERE e.vtxo_id=$1 ORDER BY a.id
-			", &[&id.to_string()]).await?.into_iter().map(|row|
-				(row.get::<_, i64>(0),row.get::<_, Vec<u8>>(1),row.get::<_, i64>(2),
-				 row.get::<_, i64>(3),row.get::<_, i64>(4),row.get::<_, i64>(5))).collect::<Vec<_>>())).await.unwrap();
+			let after = offboard_allocations(&db, id).await;
 			assert_eq!(after, allocations, "recovery must retain one original allocation, immutable parent and fee");
 		}
 
@@ -413,21 +409,8 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 	let funding = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(funding, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
-	let parent: Transaction = tokio::time::timeout(Duration::from_secs(20), async {
-		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("
-				SELECT a.sweep_tx
-				FROM expiry_allocation a
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id
-				WHERE e.vtxo_id=$1
-				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
-				AND a.broadcast_at IS NOT NULL
-			", &[&refunds[0].id().to_string()]).await?)).await.unwrap();
-			if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
-			tokio::time::sleep(Duration::from_millis(25)).await;
-		}
-	}).await.expect("genuine post-expiry revocation did not permit its actual fallback payout");
+	let parent = published_payout(&db, refunds[0].id(),
+		"genuine post-expiry revocation did not permit its actual fallback payout").await;
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, input.amount() - sat(1_000));
