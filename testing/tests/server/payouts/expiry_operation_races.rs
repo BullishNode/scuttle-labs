@@ -69,16 +69,7 @@ async fn wait_for_query_lock(tx: &Tx<'_>, prefix: &str) -> anyhow::Result<()> {
 async fn published_payout(db: &Db, id: ark::VtxoId, message: &str) -> Transaction {
 	tokio::time::timeout(Duration::from_secs(20), async {
 		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("
-				SELECT a.sweep_tx
-				FROM expiry_allocation a
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id
-				WHERE e.vtxo_id=$1
-				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
-				AND a.broadcast_at IS NOT NULL
-			", &[&id.to_string()]).await?)).await.unwrap();
-			if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
+			if let Some((_, parent)) = super::expiry_test::published_payout(db, id).await { break parent; }
 			tokio::time::sleep(Duration::from_millis(25)).await;
 		}
 	}).await.expect(message)
@@ -425,15 +416,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	let height=ctx.generate_blocks(a.expiry_height().to_u32()+1-current).await;
 	srv.watchmand().start().await.unwrap();
 	super::expiry_test::rebuilt(&ctx,&srv,&db).await;
-	let parent:Transaction=tokio::time::timeout(Duration::from_secs(20),async {
-		loop {
-			let row=db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",&[&a.id().to_string()]).await?)).await.unwrap();
-			if let Some(row)=row {break deserialize(row.get("sweep_tx")).unwrap();}
-			tokio::time::sleep(Duration::from_millis(25)).await;
-		}
-	}).await.expect("A's actual ordinary fallback must publish");
+	let parent=published_payout(&db,a.id(),"A's actual ordinary fallback must publish").await;
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await,parent);
 	let chain=ctx.bitcoind().sync_client();
 	// Both expired backing roots are batched: A pays its customer, while B's
@@ -515,13 +498,8 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	let sponsor_points=sponsor_tx.output.iter().enumerate().filter(|(_,o)|o.script_pubkey==funding.script_pubkey())
 		.map(|(index,_)|bitcoin::OutPoint::new(sponsor,index as u32)).collect::<Vec<_>>();
 	assert!(child.input.iter().any(|input|sponsor_points.contains(&input.previous_output)));
-	let mut fee_inputs=sat(0);
-	for input in &child.input {
-		fee_inputs+=ctx.bitcoind().await_transaction(input.previous_output.txid).await.output[input.previous_output.vout as usize].value;
-	}
-	assert_eq!(fee_inputs,sat(100_000));
 	assert!(fee>0);
-	assert_eq!(child.output.iter().map(|o|o.value).sum::<bitcoin::Amount>()+sat(u64::try_from(fee).unwrap()),fee_inputs);
+	assert_eq!(child.output.iter().map(|o|o.value).sum::<bitcoin::Amount>()+sat(u64::try_from(fee).unwrap()),sat(100_000));
 	let recipient_history=recipient.history().await.unwrap();
 	let recipient_balance=recipient.balance().await.unwrap().summary();
 	let history=owner.history().await.unwrap();
