@@ -1,7 +1,7 @@
 //! Real-size native splitting. Run explicitly with the fallback-scale profile.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
 use ark::fallback::OwnerLink;
@@ -21,6 +21,8 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
 use server::owner_proof::OwnerLinks;
 use server_rpc::protos;
+
+use super::expiry_test::actual_fee;
 
 const PAYEES: usize = 327;
 const LEAF_SAT: u64 = 5_000;
@@ -111,15 +113,6 @@ async fn native_node(
 	(outputs, Node { input: input_point, checkpoint_tx, branches, payees })
 }
 
-async fn actual_fee(ctx: &TestContext, tx: &Transaction) -> u64 {
-	let mut inputs = 0;
-	for input in &tx.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		inputs += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	inputs - tx.output.iter().map(|out| out.value.to_sat()).sum::<u64>()
-}
-
 /// Observe publication, then mine its package. A package already mined
 /// alongside another observed level is checked through its canonical block.
 async fn confirm_package(
@@ -142,7 +135,7 @@ async fn confirm_package(
 	assert_eq!(ctx.bitcoind().await_transaction(txid).await, *parent);
 	assert_eq!(parent.version.0, 3);
 	assert!(parent.vsize() <= 10_000);
-	assert_eq!(actual_fee(ctx, parent).await, 0);
+	assert_eq!(actual_fee(ctx, parent).await, sat(0));
 	let info = rpc.custom_get_raw_transaction_info(txid, None).unwrap().unwrap();
 	let hash = info.blockhash.unwrap();
 	let height = rpc.get_block_header_info(&hash).unwrap().height;
@@ -158,7 +151,7 @@ async fn confirm_package(
 	assert_eq!(sponsor.version.0, 3);
 	assert!(sponsor.vsize() <= 1_000, "actual TRUC child size must satisfy Core's production bound");
 	let fee = actual_fee(ctx, sponsor).await;
-	assert!(fee > 0);
+	assert!(fee > sat(0));
 	let child_info = rpc.custom_get_raw_transaction_info(sponsor.compute_txid(), None).unwrap().unwrap();
 	assert_eq!(child_info.blockhash, Some(hash));
 	assert!(child_info.confirmations.unwrap_or(0) > 0);
@@ -183,6 +176,75 @@ async fn expiry_automatic_real_limit_multilevel_split_pays_every_owner() {
 async fn expiry_bounded_round_inventory_splits_and_pays_every_owner() {
 	tokio::time::timeout(Duration::from_secs(3000), bounded_round_inventory()).await
 		.expect("bounded round inventory exceeded 3000 seconds");
+}
+
+async fn fund_sponsors(ctx: &TestContext, srv: &Captaind, count: usize) -> BTreeSet<OutPoint> {
+	let address = srv.watchmand().wait_wallet_address().await;
+	let mut sponsors = BTreeSet::new();
+	for _ in 0..count {
+		let txid = ctx.bitcoind().fund_addr(address.clone(), sat(200_000)).await;
+		let tx = ctx.bitcoind().await_transaction(txid).await;
+		let outputs = tx.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == address.script_pubkey())
+			.collect::<Vec<_>>();
+		assert_eq!(outputs.len(), 1);
+		assert_eq!(outputs[0].1.value, sat(200_000));
+		sponsors.insert(OutPoint::new(txid, outputs[0].0 as u32));
+	}
+	assert_eq!(sponsors.len(), count);
+	sponsors
+}
+
+async fn post_leaves(srv: &Captaind, owners: &[Owner], terminals: &[(usize, Vtxo<Full>)]) {
+	let mut mailbox = srv.get_mailbox_public_rpc().await;
+	let mailbox_pubkey = srv.ark_info().await.mailbox_pubkey;
+	for (index, leaf) in terminals {
+		let owner = &owners[*index];
+		let blinded = owner.mailbox.to_blinded(mailbox_pubkey, &owner.key).unwrap();
+		mailbox.post_arkoor_message(protos::mailbox_server::PostArkoorMessageRequest {
+			blinded_id: blinded.as_ref().to_vec(), vtxos: vec![leaf.serialize()],
+		}).await.unwrap();
+	}
+}
+
+async fn split_leaves(
+	srv: &Captaind, client: &bark::Wallet, rpc: &mut ArkClient, owners: &[Owner],
+	mut jobs: VecDeque<(Vtxo<Full>, Keypair, Vec<usize>)>, bounded: bool,
+) -> (Vec<Node>, Vec<(usize, Vtxo<Full>)>) {
+	let mut nodes = Vec::new();
+	let mut terminals = Vec::new();
+	while let Some((input, key, group)) = jobs.pop_front() {
+		if bounded {
+			assert!(input.exit_depth() < 10);
+			assert_eq!(group.len() % 4, 0);
+		}
+		let parts = group.len().min(4);
+		let base = group.len() / parts;
+		let extra = group.len() % parts;
+		let mut offset = 0;
+		let mut destinations = Vec::new();
+		let mut children = Vec::new();
+		for part in 0..parts {
+			let count = base + usize::from(part < extra);
+			let indices = group[offset..offset + count].to_vec();
+			offset += count;
+			let child_key = if count == 1 { owners[indices[0]].key }
+				else { client.derive_store_next_keypair().await.unwrap().0 };
+			destinations.push(ArkoorDestination {
+				total_amount: sat(count as u64 * LEAF_SAT), policy: ark::VtxoPolicy::new_pubkey(child_key.public_key()),
+			});
+			children.push((indices, child_key));
+		}
+		let (outputs, node) = native_node(srv, client, rpc, input, key, destinations, group.len()).await;
+		nodes.push(node);
+		for (output, (indices, child_key)) in outputs.into_iter().zip(children) {
+			if bounded { assert!(output.exit_depth() <= 11); }
+			if indices.len() == 1 {
+				if bounded { assert_eq!(output.exit_depth(), 11); }
+				terminals.push((indices[0], output));
+			} else { jobs.push_back((output, child_key, indices)); }
+		}
+	}
+	(nodes, terminals)
 }
 
 async fn bounded_round_inventory() {
@@ -259,22 +321,14 @@ async fn bounded_round_inventory() {
 	let mut rpc = srv.get_public_rpc().await;
 	let proof_db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mailbox_key = srv.mailbox_keypair();
-	let mut first_link_elapsed = Duration::ZERO;
 	for owner in &owners {
 		let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &owner.mailbox_key, &owner.key).unwrap();
-		let started = Instant::now();
 		proof_db.write(async |tx| tx.verify_owner_link(&mailbox_key, owner.key.public_key(), &proof, Network::Regtest).await)
 			.await.unwrap();
-		first_link_elapsed += started.elapsed();
 	}
-	// Measure the existing configured round bound, not the larger default.
-	// Signing/setup stays outside each verification timer; no release limit or
-	// financial oracle is changed to fit this measurement.
+	// Verify distinct, repeated and invalid proofs at the configured round bound.
 	let batch_limit = 4_usize.saturating_pow(srv.config().nb_round_nonces as u32);
 	assert_eq!(batch_limit, 64);
-	let mut distinct_elapsed = Duration::ZERO;
-	let mut repeated_elapsed = Duration::ZERO;
-	let mut invalid_elapsed = Duration::ZERO;
 	let mut max_evidence_bytes = 0;
 	for group in owners.chunks(batch_limit) {
 		let keys = group.iter().map(|owner| owner.key.public_key()).collect::<Vec<_>>();
@@ -285,9 +339,7 @@ async fn bounded_round_inventory() {
 			evidence_bytes += proof.serialize().len(); distinct.insert(owner.key.public_key(), proof);
 		}
 		max_evidence_bytes = max_evidence_bytes.max(evidence_bytes);
-		let started = Instant::now();
 		proof_db.write(async |tx| distinct.verify(tx, keys.iter().copied(), &mailbox_key, Network::Regtest).await).await.unwrap();
-		distinct_elapsed += started.elapsed();
 		let one = &group[0];
 		let before = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,joint_proof FROM owner_key WHERE user_pubkey=$1",
 			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
@@ -301,18 +353,13 @@ async fn bounded_round_inventory() {
 			if index + 1 == batch_limit { bad.signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&[0; 64]).unwrap(); }
 			invalid.insert(one.key.public_key(), bad);
 		}
-		let started = Instant::now();
 		proof_db.write(async |tx| repeated.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap();
-		repeated_elapsed += started.elapsed();
-		let started = Instant::now();
 		let error = proof_db.write(async |tx| invalid.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap_err();
-		invalid_elapsed += started.elapsed();
 		assert!(error.is::<server::OwnershipRefusal>(), "{error:#}");
 		let after = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id,joint_proof FROM owner_key WHERE user_pubkey=$1",
 			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
 		assert_eq!((after.get::<_, String>(0), after.get::<_, String>(1)), canonical);
 	}
-	let started = Instant::now();
 	proof_db.read(async |tx| {
 		for owner in &owners {
 			assert_eq!(tx.expiry_owner(owner.key.public_key()).await?,
@@ -320,55 +367,15 @@ async fn bounded_round_inventory() {
 		}
 		Ok(())
 	}).await.unwrap();
-	let payout_lookup_elapsed = started.elapsed();
 	assert_eq!(max_evidence_bytes, batch_limit * 163);
-	eprintln!("signed-link cost: owners={} configured_batch={} max_encoded_evidence_bytes={} first_link_us={} distinct_replay_us={} repeated_us={} invalid_last_us={} payout_lookup_us={}",
-		owners.len(), batch_limit, max_evidence_bytes, first_link_elapsed.as_micros(), distinct_elapsed.as_micros(),
-		repeated_elapsed.as_micros(), invalid_elapsed.as_micros(), payout_lookup_elapsed.as_micros());
-	let mut sponsor_funding = BTreeSet::new();
-	let fee_address = srv.watchmand().wait_wallet_address().await;
-	for _ in 0..96 {
-		let txid = ctx.bitcoind().fund_addr(fee_address.clone(), sat(200_000)).await;
-		let tx = ctx.bitcoind().await_transaction(txid).await;
-		let outputs = tx.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == fee_address.script_pubkey())
-			.collect::<Vec<_>>();
-		assert_eq!(outputs.len(), 1);
-		assert_eq!(outputs[0].1.value, sat(200_000));
-		sponsor_funding.insert(OutPoint::new(txid, outputs[0].0 as u32));
-	}
-	assert_eq!(sponsor_funding.len(), 96);
+	let sponsor_funding = fund_sponsors(&ctx, &srv, 96).await;
 	ctx.generate_blocks(2).await;
 	let mut jobs = VecDeque::new();
 	for (index, source) in sources.into_iter().enumerate() {
 		let key = client.get_vtxo_key(&source).await.unwrap();
 		jobs.push_back((source, key, Vec::from_iter(index * 256..(index + 1) * 256)));
 	}
-	let mut nodes = Vec::new();
-	let mut terminals = Vec::new();
-	while let Some((input, key, group)) = jobs.pop_front() {
-		assert!(input.exit_depth() < 10);
-		let mut destinations = Vec::new();
-		let mut children = Vec::new();
-		assert_eq!(group.len() % 4, 0);
-		for indices in group.chunks(group.len() / 4) {
-			let child_key = if indices.len() == 1 { owners[indices[0]].key }
-				else { client.derive_store_next_keypair().await.unwrap().0 };
-			destinations.push(ArkoorDestination {
-				total_amount: sat(indices.len() as u64 * LEAF_SAT),
-				policy: ark::VtxoPolicy::new_pubkey(child_key.public_key()),
-			});
-			children.push((indices.to_vec(), child_key));
-		}
-		let (outputs, node) = native_node(&srv, &client, &mut rpc, input, key, destinations, group.len()).await;
-		nodes.push(node);
-		for (output, (indices, child_key)) in outputs.into_iter().zip(children) {
-			assert!(output.exit_depth() <= 11);
-			if indices.len() == 1 {
-				assert_eq!(output.exit_depth(), 11);
-				terminals.push((indices[0], output));
-			} else { jobs.push_back((output, child_key, indices)); }
-		}
-	}
+	let (nodes, terminals) = split_leaves(&srv, &client, &mut rpc, &owners, jobs, true).await;
 	assert_eq!(nodes.len(), 1360);
 	assert_eq!(terminals.len(), COUNT);
 	assert_eq!(terminals.iter().map(|(index, _)| *index).collect::<BTreeSet<_>>().len(), COUNT);
@@ -377,16 +384,7 @@ async fn bounded_round_inventory() {
 		leaf.validate(&funding).unwrap();
 		for step in leaf.transactions() { signed_paths.insert(step.tx.compute_txid(), step.tx); }
 	}
-	let mut mailbox = srv.get_mailbox_public_rpc().await;
-	let mailbox_pubkey = srv.ark_info().await.mailbox_pubkey;
-	for (index, leaf) in &terminals {
-		let owner = &owners[*index];
-		let blinded = owner.mailbox.to_blinded(mailbox_pubkey, &owner.key).unwrap();
-		mailbox.post_arkoor_message(protos::mailbox_server::PostArkoorMessageRequest {
-			blinded_id: blinded.as_ref().to_vec(), vtxos: vec![leaf.serialize()],
-		}).await.unwrap();
-	}
-	drop(mailbox);
+	post_leaves(&srv, &owners, &terminals).await;
 	drop(rpc);
 	drop(client);
 	drop(wallet);
@@ -466,17 +464,7 @@ async fn automatic_multilevel_split() {
 	let board_exit = source.transactions().find(|step| step.tx.input[0].previous_output == source.chain_anchor())
 		.expect("the genuine board supplies its signed first exit step").tx;
 	client.register_vtxo_transactions_with_server([&source]).await.unwrap();
-	let mut sponsor_funding = BTreeSet::new();
-	let fee_address = srv.watchmand().wait_wallet_address().await;
-	for _ in 0..16 {
-		let txid = ctx.bitcoind().fund_addr(fee_address.clone(), sat(200_000)).await;
-		let tx = ctx.bitcoind().await_transaction(txid).await;
-		let outputs = tx.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == fee_address.script_pubkey())
-			.collect::<Vec<_>>();
-		assert_eq!(outputs.len(), 1);
-		assert_eq!(outputs[0].1.value, sat(200_000));
-		sponsor_funding.insert(OutPoint::new(txid, outputs[0].0 as u32));
-	}
+	let sponsor_funding = fund_sponsors(&ctx, &srv, 16).await;
 	ctx.generate_blocks(2).await;
 
 	let mut destinations = Vec::new();
@@ -497,40 +485,9 @@ async fn automatic_multilevel_split() {
 		if let Some(key) = key { jobs.push_back((output, key, group)); }
 		else { terminals.push((group[0], output)); }
 	}
-	let mut nodes = vec![root_node];
-	while let Some((input, key, group)) = jobs.pop_front() {
-		let mut destinations = Vec::new();
-		let mut children = Vec::new();
-		if group.len() <= 4 {
-			for &index in &group {
-				destinations.push(ArkoorDestination {
-					total_amount: sat(LEAF_SAT), policy: ark::VtxoPolicy::new_pubkey(owners[index].key.public_key()),
-				});
-				children.push((vec![index], None));
-			}
-		} else {
-			let base = group.len() / 4;
-			let extra = group.len() % 4;
-			let mut offset = 0;
-			for part in 0..4 {
-				let count = base + usize::from(part < extra);
-				let indices = group[offset..offset + count].to_vec();
-				offset += count;
-				let child_key = if count == 1 { owners[indices[0]].key }
-					else { client.derive_store_next_keypair().await.unwrap().0 };
-				destinations.push(ArkoorDestination {
-					total_amount: sat(count as u64 * LEAF_SAT), policy: ark::VtxoPolicy::new_pubkey(child_key.public_key()),
-				});
-				children.push((indices, (count > 1).then_some(child_key)));
-			}
-		}
-		let (outputs, node) = native_node(&srv, &client, &mut rpc, input, key, destinations, group.len()).await;
-		nodes.push(node);
-		for (output, (indices, child_key)) in outputs.into_iter().zip(children) {
-			if let Some(key) = child_key { jobs.push_back((output, key, indices)); }
-			else { terminals.push((indices[0], output)); }
-		}
-	}
+	let (mut nodes, mut leaves) = split_leaves(&srv, &client, &mut rpc, &owners, jobs, false).await;
+	nodes.insert(0, root_node);
+	terminals.append(&mut leaves);
 	assert_eq!(nodes.len(), 154);
 	assert_eq!(terminals.len(), PAYEES);
 	assert_eq!(terminals.iter().map(|(i, _)| *i).collect::<BTreeSet<_>>().len(), PAYEES);
@@ -540,19 +497,10 @@ async fn automatic_multilevel_split() {
 		for branch in &node.branches { signed_paths.insert(branch.exit_tx.compute_txid(), branch.exit_tx.clone()); }
 	}
 	assert_eq!(signed_paths.len(), 635, "154 native operations sign 634 path transactions, plus the board exit");
-	let mut mailbox = srv.get_mailbox_public_rpc().await;
-	let mailbox_pubkey = srv.ark_info().await.mailbox_pubkey;
-	for (index, leaf) in &terminals {
-		let owner = &owners[*index];
-		let blinded = owner.mailbox.to_blinded(mailbox_pubkey, &owner.key).unwrap();
-		mailbox.post_arkoor_message(protos::mailbox_server::PostArkoorMessageRequest {
-			blinded_id: blinded.as_ref().to_vec(), vtxos: vec![leaf.serialize()],
-		}).await.unwrap();
-	}
+	post_leaves(&srv, &owners, &terminals).await;
 	drop(client);
 	drop(wallet);
 	drop(rpc);
-	drop(mailbox);
 	let current = ctx.bitcoind().get_block_count().await as u32;
 	assert!(current < source.expiry_height().to_u32());
 	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - current).await;
@@ -740,7 +688,7 @@ async fn finish_payouts(
 	for tx in graph.values() {
 		let info = core.custom_get_raw_transaction_info(tx.compute_txid(), None).unwrap().unwrap();
 		assert!(info.confirmations.unwrap_or(0) >= 6);
-		fees += actual_fee(ctx, tx).await;
+		fees += actual_fee(ctx, tx).await.to_sat();
 		for input in &tx.input {
 			assert!(spent.insert(input.previous_output), "no backing or fee outpoint may be spent twice");
 			if !graph.contains_key(&input.previous_output.txid) {
