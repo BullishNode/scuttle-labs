@@ -126,7 +126,6 @@ impl BlockIndex {
 		}
 
 		if self.sync_tip() == bitcoind_tip {
-			self.notify_sync_complete().await?;
 			return Ok(false);
 		}
 
@@ -178,13 +177,7 @@ impl BlockIndex {
 			self.add_block(block_data).await?;
 		}
 
-		self.notify_sync_complete().await?;
 		Ok(true)
-	}
-
-	async fn notify_sync_complete(&self) -> anyhow::Result<()> {
-		for listener in &self.listeners { listener.on_sync_complete(self.sync_tip()).await?; }
-		Ok(())
 	}
 
 	/// Handles a chain reorganization by rolling back to the given block.

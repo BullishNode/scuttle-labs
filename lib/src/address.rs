@@ -309,8 +309,7 @@ impl Address {
 			delivery.push(VtxoDelivery::decode(&buf[..])?);
 		}
 
-		let address = Address::new(testnet, ark_id, policy, delivery);
-		Ok(address)
+		Ok(Address::new(testnet, ark_id, policy, delivery))
 	}
 }
 
@@ -572,7 +571,7 @@ impl Builder {
 
 	/// Finish by building an [Address]
 	pub fn into_address(self) -> Result<Address, AddressBuilderError> {
-		let address = Address {
+		Ok(Address {
 			testnet: self.testnet,
 			ark_id: self.server_pubkey.ok_or("missing server pubkey")?.into(),
 			policy: self.policy.ok_or("missing policy")?,
@@ -590,8 +589,7 @@ impl Builder {
 
 				ret
 			}
-		};
-		Ok(address)
+		})
 	}
 }
 
