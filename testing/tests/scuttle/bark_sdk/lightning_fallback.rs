@@ -287,7 +287,8 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	}
 	srv.wait_for_vtxopool(&ctx).await;
 	let gate = HoldSuccessfulReceiveClaim { hold: Arc::new(AtomicBool::new(true)),
-		arrived: Arc::new(tokio::sync::Notify::new()), requests: Arc::new(AtomicUsize::new(0)) };
+		arrived: Arc::new(tokio::sync::Notify::new()), requests: Arc::new(AtomicUsize::new(0)),
+		hold_before: false, release_before: Arc::new(tokio::sync::Notify::new()) };
 	let proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
 	let mut wallet_builder = ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true);
 	if fallback { wallet_builder = wallet_builder.app_bip86(); }
