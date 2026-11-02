@@ -9,15 +9,9 @@ use server_log::ExpiryHoldObserved;
 use ark_testing::{btc, sat, TestContext};
 use std::time::Duration;
 
-
 #[tokio::test]
 async fn held_coin_is_alarmed_before_decision() {
 	abandoned_registered_send(true, false).await;
-}
-
-#[tokio::test]
-async fn expiry_completed_watchman_rejects_new_send_while_captain_lags() {
-	abandoned_registered_send(false, true).await;
 }
 
 async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {

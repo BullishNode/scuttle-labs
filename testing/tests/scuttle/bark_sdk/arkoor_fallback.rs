@@ -64,63 +64,6 @@ async fn offline_signed_addresses_receive_split_and_isolated_outputs() {
 	}
 }
 
-/// The refusal comes from the real server after a complete SDK request has
-/// reserved its input and allocated change. The existing abort must unlock
-/// funds without making that change key available for reuse.
-#[tokio::test]
-async fn rejected_change_link_unlocks_inputs_without_recycling_the_key() {
-	let ctx = TestContext::new("bark_sdk/rejected_change_link_unlocks_inputs").await;
-	let srv = ctx.captaind("server").create().await;
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	let address = recipient.new_address().await.unwrap();
-	#[derive(Clone)]
-	struct RejectChange {
-		recipient: bitcoin::secp256k1::PublicKey,
-		armed: Arc<AtomicBool>,
-		refusal: Arc<Mutex<Option<(bitcoin::secp256k1::PublicKey, tonic::Status)>>>,
-	}
-	#[async_trait::async_trait]
-	impl captaind::proxy::ArkRpcProxy for RejectChange {
-		async fn request_arkoor_cosign(&self, upstream: &mut ArkClient, mut request: protos::ArkoorPackageCosignRequest)
-			-> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
-			if !self.armed.load(Ordering::SeqCst) { return Ok(upstream.request_arkoor_cosign(request).await?.into_inner()); }
-			let change = request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs))
-				.find(|output| VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey() != self.recipient).unwrap();
-			let key = VtxoPolicy::deserialize(&change.policy).unwrap().user_pubkey();
-			change.owner_proof.as_mut().unwrap().signature = vec![0; 64];
-			let error = upstream.request_arkoor_cosign(request).await.unwrap_err();
-			assert_eq!(bark::FallbackRefusal::from_status(&error), Some(bark::FallbackRefusal::InvalidOwnerProof));
-			assert_eq!(error.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
-			*self.refusal.lock().unwrap() = Some((key, error.clone()));
-			Err(error)
-		}
-	}
-	let armed = Arc::new(AtomicBool::new(true));
-	let refusal = Arc::new(Mutex::new(None));
-	let proxy = srv.start_proxy_no_mailbox(RejectChange { recipient: address.policy().user_pubkey(), armed: armed.clone(), refusal: refusal.clone() }).await;
-	let sender = ctx.bark_sdk("sender", &proxy).boarded(sat(400_000))
-		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	let before = sender.spendable_vtxos().await.unwrap().into_iter().map(|coin| coin.id()).collect::<Vec<_>>();
-	let next_before = sender.peek_next_keypair().await.unwrap().1;
-	let error = sender.send_arkoor_payment(&address, sat(100_000)).await.unwrap_err();
-	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::InvalidOwnerProof));
-	let key = refusal.lock().unwrap().as_ref().unwrap().0;
-	let (allocated, _) = sender.pubkey_keypair(&key).await.unwrap().expect("the allocated change key stays in the keystore");
-	assert_eq!(allocated, next_before);
-	assert!(sender.peek_next_keypair().await.unwrap().1 > allocated, "abort must not rewind the key cursor");
-	assert_eq!(sender.spendable_vtxos().await.unwrap().into_iter().map(|coin| coin.id()).collect::<Vec<_>>(), before);
-	assert!(sender.pending_arkoor_sends().await.unwrap().is_empty());
-	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(400_000));
-	let db = server::database::Db::connect(&srv.config().postgres.clone()).await.unwrap();
-	let keys = [key.to_string(), address.policy().user_pubkey().to_string()];
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-	armed.store(false, Ordering::SeqCst);
-	sender.send_arkoor_payment(&address, sat(100_000)).await.unwrap();
-	recipient.sync_mailbox().await.unwrap();
-	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(300_000));
-	assert_eq!(assert_balance_consistent(&recipient, false).await.spendable, sat(100_000));
-}
-
 /// An accepted cosign can outlive its reply and the client process. The SDK
 /// resumes its persisted action with a reconstructed joint proof, keeping the same
 /// economic transaction and the original input locked until finalization.

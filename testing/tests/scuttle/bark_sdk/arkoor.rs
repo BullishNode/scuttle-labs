@@ -13,7 +13,4 @@ use bark::movement::MovementStatus;
 use ark_testing::{TestContext, sat};
 use ark_testing::balance::assert_balance_consistent;
 
-/// An address that lists no delivery mechanism this bark can use is refused
-/// before the arkoor is built, so the sender keeps its funds.
-
 include!("arkoor_fallback.rs");

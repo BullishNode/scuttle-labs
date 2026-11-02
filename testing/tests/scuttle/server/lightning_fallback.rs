@@ -303,7 +303,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	assert_eq!(anchors.len(), 1);
 	let child = async {
 		loop {
-			if let Some((child, _)) = super::watchman::observed_payout_fee_child(&ctx, &parent) { break child; }
+			if let Some((child, _)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) { break child; }
 			tokio::time::sleep(poll_interval()).await;
 		}
 	}.wait_millis(10_000).await;
@@ -334,7 +334,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let change = child.output.iter().map(|out| out.value).sum::<Amount>();
 	let actual_fee = sat(100_000).checked_sub(change).unwrap();
 	assert!(actual_fee > Amount::ZERO);
-	let (observed, observed_fee) = super::watchman::observed_payout_fee_child(&ctx, &parent).unwrap();
+	let (observed, observed_fee) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent).unwrap();
 	assert_eq!(observed, *child);
 	assert_eq!(observed_fee, i64::try_from(actual_fee.to_sat()).unwrap());
 	let expected_change = child.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO)

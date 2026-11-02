@@ -116,7 +116,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 			).await?)).await.unwrap();
 			if let Some(row) = row {
 				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				if let Some((child, fee)) = super::watchman::observed_payout_fee_child(&ctx, &parent) {
+				if let Some((child, fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) {
 					break (row.get::<_, i64>("id"), parent, child, fee);
 				}
 			}
@@ -158,7 +158,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	// the unique confirmed sponsor and verify its block and fee against Core.
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			if let Some((sponsor, measured_fee)) = super::watchman::observed_payout_fee_child(&ctx, &parent) {
+			if let Some((sponsor, measured_fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) {
 				assert!(sponsor.input.iter().any(|input| input.previous_output.txid == parent.compute_txid()));
 				let info = ctx.bitcoind().sync_client()
 					.custom_get_raw_transaction_info(sponsor.compute_txid(), None).unwrap()

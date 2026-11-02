@@ -6,11 +6,7 @@ use std::time::Duration;
 
 use bitcoin::{Amount, Network, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
-use bitcoin::hashes::{sha256, Hash};
-use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::Keypair;
-use futures::future::join_all;
-use log::{info, trace};
 
 use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark::lightning::PaymentHash;
@@ -18,30 +14,19 @@ use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
 use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
-use ark::arkoor::ArkoorDestination;
-use ark::attestations::ArkoorCosignAttestation;
 use ark::vtxo::Full;
-use ark::vtxo::TapScriptClause;
-use ark::vtxo::policy::VtxoPolicyKind;
 use bark::Wallet;
-use bark::lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
-use bark_json::primitives::{VtxoStateInfo, WalletVtxoInfo};
-use server_log::{LightningReceiveCanceled, LightningReceiveKeptCommitted};
+use bark::lightning_invoice::Bolt11Invoice;
 use server_rpc::protos;
 use server::database::Db;
-use server::database::htlc_vtxo::HtlcDirection;
 use server::vtxopool::VtxoTarget;
 
-use ark_testing::{Bark, Captaind, TestContext, btc, lightning_test, require_bark_version, sat};
-use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
-use ark_testing::context::LightningPaymentSetup;
-use ark_testing::daemon::captaind::{self, ArkClient, WalletAdminClient};
-use ark_testing::util::{poll_interval, wait_timeout, FutureExt, ToAltString};
-use ark_testing::exit::complete_exit;
-use bitcoin_ext::AmountExt;
+use ark_testing::{Captaind, TestContext, btc, sat};
+use ark_testing::constants::BOARD_CONFIRMATIONS;
+use ark_testing::daemon::captaind::{self, ArkClient};
+use ark_testing::util::{poll_interval, FutureExt};
 
 use cln_rpc::plugins::hold;
-
 
 /// Asserts that every unspent entry in `vtxo_pool` (`spent_at IS NULL`)
 /// references a `vtxo` row with `spend_state = 'pool'`.
@@ -112,7 +97,6 @@ async fn revoke_htlc_vtxos(
 	let mut srv_rpc = srv.get_public_rpc().await;
 	srv_rpc.request_lightning_pay_htlc_revocation(cosign_request).await.map(|_| ())
 }
-
 
 /// Verify that the server extracts preimages from on-chain HTLC spends
 /// and uses them to settle invoices.

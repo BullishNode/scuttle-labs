@@ -6,7 +6,6 @@ use bitcoin::bip32::{Xpriv, Xpub};
 use bitcoin::secp256k1::{Keypair, PublicKey};
 
 use ark::{ProtocolEncoding, ServerVtxo, Vtxo, VtxoId, SECP};
-use ark::attestations::VtxoStatusAttestation;
 use ark::recovery::XpubRecoveryAuthorization;
 use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::Full;

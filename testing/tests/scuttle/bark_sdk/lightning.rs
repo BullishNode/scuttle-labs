@@ -17,7 +17,7 @@ use bark::actions::lightning::pay::LightningSendState;
 use bark::actions::lightning::receive::LightningReceiveState;
 use bark::movement::MovementStatus;
 use bark::subsystem::Subsystem;
-use bark::{LightningSendOptions, OpenWalletArgs, Wallet, WalletSeed};
+use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::{OnchainWallet, OnchainWalletTrait};
 use bark::persist::sqlite::SqliteClient;
 use bitcoin::Network;

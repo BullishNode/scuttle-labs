@@ -10,7 +10,7 @@ use bitcoin_ext::rpc::RpcApi;
 use serde_json::json;
 use server::database::Db;
 
-use super::watchman::observed_payout_fee_child;
+use ark_testing::onchain::observed_payout_fee_child;
 
 /// No allocation, spend fence or chain acknowledgment is inserted by the test.
 /// The running captaind and watchmand must discover, decide, sign and publish

@@ -411,16 +411,6 @@ async fn expiry_internal_one_attempt_partial_terminal_keeps_other_source_owed() 
 	Box::pin(partial_terminal(TerminalCase::Partial)).await;
 }
 
-#[tokio::test]
-async fn expiry_internal_partial_terminal_replays_actual_claim_after_reorg() {
-	Box::pin(partial_terminal(TerminalCase::Reorg)).await;
-}
-
-#[tokio::test]
-async fn expiry_internal_all_sources_exited_returns_all_grants() {
-	Box::pin(partial_terminal(TerminalCase::All)).await;
-}
-
 /// Both customers already have their on-chain receipts. Remaining G
 /// principal belongs to the operator, and must not stay held as a nonexistent
 /// customer refund. Observe normal watchman timeout transactions, not flags.

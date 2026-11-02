@@ -4,26 +4,24 @@ mod tree;
 use std::str::FromStr;
 use std::time::Duration;
 
-use bitcoin::secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey};
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::Transaction;
 use chrono::{Local, TimeDelta};
 
-use ark::{ServerVtxo, VtxoId, VtxoPolicy, VtxoRequest};
+use ark::{ServerVtxo, VtxoPolicy, VtxoRequest};
 use ark::offboard::OffboardForfeitResult;
 use ark::integration::{TokenStatus, TokenType};
 use ark::lightning::{AsPaymentHash, Invoice, PaymentHash, Preimage};
 use ark::mailbox::{MailboxIdentifier, MailboxType};
 use ark::rounds::RoundId;
 use ark::test_util::VTXO_VECTORS;
-use ark::vtxo::ServerHtlcRecv_v0_VtxoPolicy;
 use ark::tree::signed::{UnlockHash, UnlockPreimage};
 
 use bitcoin::hashes::{sha256, Hash};
-use bark::lightning_invoice::{Bolt11Invoice, Currency, InvoiceBuilder, PaymentSecret};
+use bark::lightning_invoice::Bolt11Invoice;
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
 use cln_rpc::listsendpays_request::ListsendpaysIndex;
 
-use server::OwnershipRefusal;
 use server::database::{BlockTable, Db, MailboxPayload};
 use server::database::data_migrations::backfill_cln_hold;
 use server::database::hold::{self, ClnHoldStatus, NewClnHold};

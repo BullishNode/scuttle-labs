@@ -123,6 +123,12 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 	assert_eq!((counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2)), (0, 0, 0));
 }
 
+/// Register only the authenticated mailbox. The output binding must still be
+/// absent when a request exercises the admission verifier.
+
+/// Valid replays intentionally touch VTXO updated_at. Keep every other field,
+/// including created_at, exact; refused requests use the full source_rows.
+
 /// Exact invoice, source, settlement and immutable-output records. All queries
 /// are scoped to this payment or its proposed keys, not background pool work.
 

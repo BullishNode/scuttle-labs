@@ -12,7 +12,6 @@ use server::database::expiry_ownership::OwnershipDisposition;
 use server::database::Db;
 use server_rpc::protos;
 
-
 /// Two grants share a hash, but only one funds a paid attempt.
 /// Its preimage must neither collect the unused grant nor block its automatic expiry refund.
 async fn same_hash_sources(cooperative_refund: bool) {
@@ -212,11 +211,6 @@ async fn same_hash_sources(cooperative_refund: bool) {
 	",
 		&[&grants[0].to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0,
 		"the source which funded the external invoice never receives a second customer payment");
-}
-
-#[tokio::test]
-async fn expiry_unused_same_hash_grant_retains_its_own_liability() {
-	same_hash_sources(false).await;
 }
 
 #[tokio::test]

@@ -16,7 +16,7 @@ use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark::lightning::PaymentHash;
 use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
-use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
+use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use ark::arkoor::ArkoorDestination;
 use ark::attestations::ArkoorCosignAttestation;

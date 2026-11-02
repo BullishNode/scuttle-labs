@@ -1,11 +1,9 @@
-use ark::ProtocolEncoding;
 use ark::fallback::OwnerLink;
 use ark::lightning::PaymentHash;
 use bitcoin::Network;
 use bitcoin::secp256k1::{Keypair, PublicKey};
 use ark_testing::daemon::captaind::Captaind;
 use server::database::Db;
-use server_rpc::protos;
 
 pub(super) async fn unmapped_owner_link(srv: &Captaind, coin: &Keypair, mailbox: &Keypair) -> OwnerLink {
 	OwnerLink::new_joint(Network::Regtest, srv.mailbox_keypair().public_key(), mailbox, coin).unwrap()

@@ -48,10 +48,6 @@ impl Owner {
 
 }
 
-async fn server(ctx: &TestContext) -> Arc<Captaind> {
-	server_with_lifetime(ctx, BlockDelta::new(24)).await
-}
-
 async fn server_with_lifetime(ctx: &TestContext, lifetime: BlockDelta) -> Arc<Captaind> {
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(move |cfg| cfg.vtxo_lifetime = lifetime).watchmand().create().await;

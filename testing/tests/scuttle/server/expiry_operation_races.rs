@@ -704,7 +704,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	assert!(chain.custom_get_raw_transaction_info(offboard_txid,None).unwrap().is_none());
 	assert_eq!(recipient.balance().await.unwrap().spendable,live.amount());
 	assert_eq!(live.amount()+quote+actual.value+sat(1_000),sat(200_000));
-	let (child,fee)=super::watchman::observed_payout_fee_child(&ctx,&parent).unwrap();
+	let (child,fee)=ark_testing::onchain::observed_payout_fee_child(&ctx,&parent).unwrap();
 	let sponsor_tx=ctx.bitcoind().await_transaction(sponsor).await;
 	let sponsor_points=sponsor_tx.output.iter().enumerate().filter(|(_,o)|o.script_pubkey==funding.script_pubkey())
 		.map(|(index,_)|bitcoin::OutPoint::new(sponsor,index as u32)).collect::<Vec<_>>();

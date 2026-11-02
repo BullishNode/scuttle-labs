@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::time::Duration;
 
 use bitcoin::{Amount, NetworkKind};
@@ -11,7 +10,6 @@ use ark::recovery::XpubRecoveryAuthorization;
 use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::Full;
 use server::database::Db;
-use server::recovery::{MAX_RECOVERY_RESPONSE_VTXO_BYTES, RECOVERY_VTXO_PAGE_SIZE};
 use server_rpc::{protos, RequestExt};
 
 use ark_testing::TestContext;
@@ -37,8 +35,5 @@ fn xpub_request(
 		cursor_vtxo_id: None,
 	}
 }
-
-/// The server scans exactly the configured number of keys from the requested
-/// start index, cut short at the last non-hardened index.
 
 include!("recovery_fallback.rs");
