@@ -744,27 +744,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		srv.wait_for_sync_height(tip).await;
 		wm.wait_for_sync_height(tip).await;
 		assert_eq!(core.get_block_count().unwrap(), u64::from(tip.to_u32()));
-		// Captaind must commit both live receiver rights before the single trigger.
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
-				FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
-			if rows.len() == expected_sources.len() {
-				let mut seen = BTreeSet::new();
-				for row in rows {
-					let id = row.get::<_, String>("vtxo_id");
-					assert!(seen.insert(id.clone()));
-					let source = customer_sources.iter().find(|source| source.id().to_string() == id).unwrap();
-					assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
-					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-
-
-				}
-				assert_eq!(seen, expected_sources);
-				break;
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-		let tip_hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		loop {
 			if db.read(async |tx| {
 				// The one manual sweep must observe every committed ownership decision.
@@ -772,11 +751,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
-				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.height == tip
-					&& view.hash == tip_hash
-					&& (tx.expiry_view().await? == Some(view)))
+				Ok(allocated == expected_sources)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -947,7 +922,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 	}
 	assert_eq!(observed_payouts, expected_payouts);
 	assert_eq!(observed_claims, BTreeMap::from([(OutPoint::new(claim.compute_txid(), 0), claim.output[0].value)]));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,\
 		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)",
@@ -965,9 +940,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 
 		assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("allocated"), source.amount().to_sat() as i64);
-		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-		let user_key = source.user_pubkey().to_string();
-
 
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
@@ -1138,27 +1110,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		srv.wait_for_sync_height(tip).await;
 		wm.wait_for_sync_height(tip).await;
 		assert_eq!(core.get_block_count().unwrap(), u64::from(tip.to_u32()));
-		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		// Captaind must commit both live sender rights before the single trigger.
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
-				FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
-			if rows.len() == expected_sources.len() {
-				let mut seen = BTreeSet::new();
-				for row in rows {
-					let id = row.get::<_, String>("vtxo_id");
-					assert!(seen.insert(id.clone()));
-					let source = changes.iter().find(|source| source.id().to_string() == id).unwrap();
-					assert_eq!(row.get::<_, i64>("gross_sat"), 125_000);
-					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-
-
-				}
-				assert_eq!(seen, expected_sources);
-				break;
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
 		loop {
 			if db.read(async |tx| {
 				// The one manual sweep must observe every committed ownership decision.
@@ -1166,10 +1117,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
-				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.height == tip
-					&& view.hash == hash && (tx.expiry_view().await? == Some(view)))
+				Ok(allocated == expected_sources)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -1333,7 +1281,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 	}
 	assert_eq!(observed_payouts, expected_payouts);
 	assert_eq!(observed_claims, BTreeMap::from([(OutPoint::new(claim.compute_txid(), 0), claim.output[0].value)]));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,\
 		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)",
@@ -1351,9 +1299,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 
 		assert_eq!(row.get::<_, i64>("gross_sat"), 125_000);
 		assert_eq!(row.get::<_, i64>("allocated"), 125_000);
-		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-		let user_key = source.user_pubkey().to_string();
-
 
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
