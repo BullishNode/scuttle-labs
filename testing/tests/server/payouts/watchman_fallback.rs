@@ -1627,6 +1627,7 @@ pub(super) async fn watchman_sweeps_round_leftovers_after_exits() {
 	assert_eq!(terminal_count, 18);
 	assert_eq!(consumed_roots, roots.iter().map(|root| root.point()).collect());
 	assert_eq!(operator, sat(10 * 200_000 + 8 * 2_000));
+	let mut claims = BTreeMap::new();
 	let mut observed = BTreeMap::new();
 	let exit_txs = replacements.iter().take(2).flat_map(|coin| coin.transactions()).map(|step| step.tx).collect::<Vec<_>>();
 	let exit_ids = exit_txs.iter().map(|tx| tx.compute_txid()).collect::<BTreeSet<_>>();
