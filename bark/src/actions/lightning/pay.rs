@@ -22,10 +22,10 @@ use log::{debug, error, info, trace, warn};
 
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
-use ark::lightning::{CheckAmountError, Invoice, PaymentHash, PaymentStatus, Preimage};
+use ark::lightning::{Invoice, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
-use bitcoin_ext::{AmountExt, BlockHeight};
+use bitcoin_ext::BlockHeight;
 use server_rpc::protos::{self, lightning_payment_status};
 
 use crate::Wallet;
@@ -193,11 +193,6 @@ impl WalletAction for LightningSend {
 						Err(error) => Advance::Park { state: self,
 							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: Some(error) },
 					});
-				}
-				if let PaymentStatus::Success(preimage) =
-					check_lightning_send_payment_status(wallet, &self, htlcs).await.retry()? {
-					settle_lightning_send_payment(wallet, &self, htlcs, preimage).await?;
-					return Ok(Advance::Done);
 				}
 				revoke_lightning_send_htlcs(wallet, &self, htlcs, revocation).await?;
 				return Ok(Advance::Done);
@@ -377,23 +372,9 @@ pub(crate) async fn start_lightning_send(
 	}
 
 	invoice.check_signature().context("invoice has bad signature")?;
-	if let Invoice::Bolt11(invoice) = &invoice {
-		if invoice.would_expire(bark_runtime::now().duration_since(bark_runtime::UNIX_EPOCH)?) {
-			bail!("invoice has expired");
-		}
-	}
 
 	let payment_amount = invoice.get_payment_amount(user_amount)
 		.context("invoice has bad payment amount")?;
-	// A fixed invoice cannot deliver a caller-specified larger amount.
-	if let Some(invoice_msat) = invoice.amount_msat() {
-		let invoice_amount = Amount::from_msat_ceil(invoice_msat);
-		if payment_amount != invoice_amount {
-			return Err(CheckAmountError::InvalidUserAmount {
-				invoice: invoice_amount, user: payment_amount,
-			}.into());
-		}
-	}
 	if payment_amount == Amount::ZERO {
 		bail!("Cannot pay invoice for 0 sats (0 sat invoices are not any-amount invoices)");
 	}

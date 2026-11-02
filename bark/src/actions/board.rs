@@ -293,7 +293,9 @@ async fn run_broadcast(
 /// sufficiently confirmed, and kick off an exit near expiry (keeping the board
 /// around so registration can still win while the exit is abortable).
 async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, AdvanceError> {
+	let (_, ark_info) = wallet.require_server().await.retry()?;
 	let current_height = wallet.inner.chain.tip().await.retry()?;
+	let required = BlockDelta::new(ark_info.required_board_confirmations as u16);
 
 	let vtxo = wallet.get_vtxo_by_id(board.vtxo_id).await.retry()?;
 
@@ -302,6 +304,17 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	if vtxo.state.kind() == VtxoStateKind::Exited {
 		wallet.inner.movements.finish_movement(board.movement_id, MovementStatus::Failed).await
 			.context("failed to finalize exited board movement").retry()?;
+		return Ok(Advance::Done);
+	}
+
+	// A previous drive already observed a confirmed double-spend of a funding
+	// tx input and marked the vtxo spent (see the `Fatal` arm below), but was
+	// interrupted before tearing the board down: finish the teardown.
+	if vtxo.state.kind() == VtxoStateKind::Spent {
+		wallet.inner.movements.finish_movement_with_update(
+			board.movement_id, MovementStatus::Failed,
+			MovementUpdate::new().effective_balance(SignedAmount::ZERO),
+		).await.context("failed to finalize double-spent board movement").retry()?;
 		return Ok(Advance::Done);
 	}
 
@@ -341,27 +354,7 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 		Err(_) => None,
 	};
 
-	// Only registration needs a live server. Its absence must not stop
-	// chain-only cleanup or the retained board's near-expiry exit.
-	let can_register = if let Some(confs) = confs {
-		match wallet.require_server().await {
-			Ok((_, ark_info)) => confs >= BlockDelta::new(ark_info.required_board_confirmations as u16).to_u32(),
-			Err(e) => {
-				let reason = format!("{:#}", e);
-				warn!("Failed to register board {}: {}", board.id, reason);
-				last_park_error = Some(reason);
-				false
-			},
-		}
-	} else { false };
-
-	if can_register {
-		// Completion can outlive checkpoint removal and the coin can then be
-		// spent normally. Require current funding confirmation too: an old
-		// successful movement must not hide a funding conflict after a reorg.
-		if wallet.inner.db.get_movement_by_id(board.movement_id).await.retry()?.status == MovementStatus::Successful {
-			return Ok(Advance::Done);
-		}
+	if confs.is_some_and(|c| c >= required.to_u32()) {
 		// Attempt registration inline. A failure here (the server can't see
 		// enough confirmations yet, or refuses) is not terminal: leave the vtxo
 		// Locked and retry next drive, exactly like the old loop. The funding tx
@@ -383,12 +376,7 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 	//
 	// I know this if is collapsible, but it reads better like this...
 	let exit_margin = wallet.config().vtxo_exit_margin;
-	// A completed board checkpoint may remain after its coin was unlocked
-	// or spent. Keep that replay parked rather than start another exit.
-	if vtxo.state.kind() != VtxoStateKind::Spent
-		&& vtxo.expiry_height() <= current_height + exit_margin
-		&& wallet.inner.db.get_movement_by_id(board.movement_id).await.retry()?.status != MovementStatus::Successful
-	{
+	if vtxo.expiry_height() <= current_height + exit_margin {
 		if !wallet.exit_mgr().is_exiting(vtxo.id()).await {
 			warn!("Board {} expired before confirmation, marking VTXO for exit", board.id);
 			wallet.inner.exit.start_exit_for_vtxos(&[vtxo.vtxo.clone()]).await.retry()?;

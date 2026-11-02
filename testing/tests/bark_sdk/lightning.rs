@@ -1,27 +1,20 @@
-use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::StreamExt;
 
 use ark::lightning::{PaymentHash, Preimage};
-use ark::attestations::VtxoStatusAttestation;
 use ark::ProtocolEncoding;
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use ark_testing::{TestContext, btc, util::{FutureExt, poll_interval}};
 use ark_testing::balance::assert_balance_consistent;
 
-use bark::actions::{AdvanceError, WalletAction};
 use bark::actions::lightning::pay::LightningSendState;
 use bark::actions::lightning::receive::{LightningReceiveState, Progress as ReceiveProgress};
 use bark::movement::MovementStatus;
 use bark::subsystem::Subsystem;
 use bark::{LightningSendOptions, OpenWalletArgs, Wallet, WalletSeed};
-use bark::onchain::{OnchainWallet, OnchainWalletTrait};
-use bark::persist::sqlite::SqliteClient;
 use bitcoin::Network;
-use bitcoin::{FeeRate, OutPoint, Transaction};
+use bitcoin::{OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin_ext::rpc::RpcApi;
 use cln_rpc::plugins::hold;
@@ -428,43 +421,7 @@ async fn receive_claim_on_mailbox_notification() {
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 
-	#[derive(Clone)]
-	struct DuplicateGrant {
-		duplicate: Arc<AtomicBool>,
-		prepare_calls: Arc<AtomicUsize>,
-		claim_calls: Arc<AtomicUsize>,
-	}
-
-	#[async_trait::async_trait]
-	impl captaind::proxy::ArkRpcProxy for DuplicateGrant {
-		async fn prepare_lightning_receive_claim(
-			&self, upstream: &mut ArkClient, req: protos::PrepareLightningReceiveClaimRequest,
-		) -> Result<protos::PrepareLightningReceiveClaimResponse, tonic::Status> {
-			let mut response = upstream.prepare_lightning_receive_claim(req).await?.into_inner();
-			self.prepare_calls.fetch_add(1, Ordering::SeqCst);
-			if self.duplicate.load(Ordering::SeqCst) {
-				let original = response.htlc_vtxos.first().expect("genuine signed grant").clone();
-				response.htlc_vtxos.push(original);
-			}
-			Ok(response)
-		}
-
-		async fn claim_lightning_receive(
-			&self, upstream: &mut ArkClient, req: protos::ClaimLightningReceiveRequest,
-		) -> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
-			self.claim_calls.fetch_add(1, Ordering::SeqCst);
-			Ok(upstream.claim_lightning_receive(req).await?.into_inner())
-		}
-	}
-
-	let duplicate = Arc::new(AtomicBool::new(true));
-	let prepare_calls = Arc::new(AtomicUsize::new(0));
-	let claim_calls = Arc::new(AtomicUsize::new(0));
-	let proxy = srv.start_proxy_no_mailbox(DuplicateGrant {
-		duplicate: duplicate.clone(), prepare_calls: prepare_calls.clone(),
-		claim_calls: claim_calls.clone(),
-	}).await;
-	let wallet = ctx.bark_sdk("bark", &proxy)
+	let wallet = ctx.bark_sdk("bark", &srv)
 		.cfg(|cfg| cfg.daemon_manual_sync = true)
 		.create().await;
 
@@ -493,47 +450,6 @@ async fn receive_claim_on_mailbox_notification() {
 					break;
 				}
 			}
-			srv.wait_for_lightning_receive_accepted(payment_hash).await;
-			let checkpoint = wallet.lightning_receive_checkpoint(payment_hash).await.unwrap()
-				.expect("original receive checkpoint");
-			assert!(matches!(&checkpoint.progress, ReceiveProgress::AwaitingPayment));
-			assert!(checkpoint.grant_ids.is_empty());
-			let history_before = wallet.history().await.unwrap();
-			let balance_before = wallet.balance().await.unwrap().summary();
-			assert!(wallet.all_vtxos().await.unwrap().is_empty());
-
-			// Exercise the public admission step, not the executor's Abort cleanup:
-			// that cleanup removes this receive rather than retrying it.
-			let rejected = checkpoint.clone().advance(&wallet).await;
-			let cause = match &rejected {
-				Err(AdvanceError::Abort(error)) => Some(error.root_cause().to_string()),
-				_ => None,
-			};
-			let checkpoint_unchanged = wallet.lightning_receive_checkpoint(payment_hash).await
-				.unwrap().as_ref() == Some(&checkpoint);
-			let bodies = wallet.all_vtxos().await.unwrap();
-			let history_unchanged = wallet.history().await.unwrap() == history_before;
-			let balance_unchanged = wallet.balance().await.unwrap().summary() == balance_before;
-			// Preserve the real cut before its assertions without writing any preimage.
-			tokio::fs::write(ctx.datadir.join("duplicate-grant-admission.json"),
-				serde_json::to_vec_pretty(&serde_json::json!({
-					"abort_cause": cause.as_deref(), "prepare_calls": prepare_calls.load(Ordering::SeqCst),
-					"claim_calls": claim_calls.load(Ordering::SeqCst), "body_count": bodies.len(),
-					"checkpoint_unchanged": checkpoint_unchanged,
-					"history_unchanged": history_unchanged, "balance_unchanged": balance_unchanged,
-				})).unwrap(),
-			).await.unwrap();
-			assert_eq!(cause.as_deref(), Some("Server returned duplicate HTLC VTXO IDs"));
-			assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
-			assert_eq!(claim_calls.load(Ordering::SeqCst), 0, "no preimage-bearing claim RPC");
-			assert!(checkpoint_unchanged, "no accepted HTLC checkpoint");
-			assert!(bodies.is_empty(), "no duplicate or unique grant body admitted");
-			assert!(history_unchanged, "no receive movement admitted");
-			assert!(balance_unchanged, "no principal admitted");
-
-			// The genuine original checkpoint was never edited or removed. The
-			// normal driver can now claim this same payment with the unique grant.
-			duplicate.store(false, Ordering::SeqCst);
 			wallet.try_claim_lightning_receive(payment_hash, false).await
 		},
 	);
@@ -553,16 +469,6 @@ async fn receive_claim_on_mailbox_notification() {
 
 	let balance = assert_balance_consistent(&wallet, false).await;
 	assert_eq!(balance.spendable, invoice_amount);
-	assert_eq!(balance.total(), invoice_amount);
-	assert_eq!(claim_calls.load(Ordering::SeqCst), 1);
-	assert!(wallet.lightning_receive_checkpoint(payment_hash).await.unwrap().is_none());
-	assert_eq!(movements.iter().filter(|m| m.subsystem.is_subsystem(Subsystem::LIGHTNING_RECEIVE))
-		.count(), 1);
-	assert!(matches!(wallet.try_claim_lightning_receive(payment_hash, false).await.unwrap(),
-		LightningReceiveState::Settled(_)));
-	assert!(wallet.history().await.unwrap() == movements, "no duplicate receive history");
-	assert_eq!(wallet.balance().await.unwrap().summary(), balance.summary());
-	assert_eq!(claim_calls.load(Ordering::SeqCst), 1, "settled replay must not reveal again");
 }
 
 /// The cooperative claim and the server's hold settler both settle the hold

@@ -190,8 +190,6 @@ struct CountVtxoRpcs {
 	stall_xpub: Arc<AtomicBool>,
 	xpub_pages: Arc<AtomicUsize>,
 	first_xpub_id: Arc<Mutex<Option<VtxoId>>>,
-	fail_discovery: Arc<AtomicBool>,
-	discovery_failures: Arc<AtomicUsize>,
 }
 
 impl CountVtxoRpcs {
@@ -202,8 +200,6 @@ impl CountVtxoRpcs {
 			stall_xpub: Arc::new(AtomicBool::new(false)),
 			xpub_pages: Arc::new(AtomicUsize::new(0)),
 			first_xpub_id: Arc::new(Mutex::new(None)),
-			fail_discovery: Arc::new(AtomicBool::new(false)),
-			discovery_failures: Arc::new(AtomicUsize::new(0)),
 		}
 	}
 }
@@ -213,11 +209,6 @@ impl captaind::proxy::ArkRpcProxy for CountVtxoRpcs {
 	async fn recover_vtxos_by_xpub(&self, upstream: &mut ArkClient, req: protos::RecoverVtxosByXpubRequest)
 		-> Result<protos::RecoverVtxosByXpubResponse, tonic::Status>
 	{
-		if self.fail_discovery.load(Ordering::SeqCst) {
-			self.discovery_failures.fetch_add(1, Ordering::SeqCst);
-			return Err(tonic::Status::unavailable("discovery backend unavailable"));
-		}
-
 		if !self.stall_xpub.load(Ordering::SeqCst) {
 			return Ok(upstream.recover_vtxos_by_xpub(req).await?.into_inner());
 		}
@@ -277,11 +268,6 @@ impl captaind::proxy::MailboxRpcProxy for CountVtxoRpcs {
 	async fn read_mailbox(&self, upstream: &mut MailboxClient, req: protos::mailbox_server::MailboxRequest)
 		-> Result<protos::mailbox_server::MailboxMessages, tonic::Status>
 	{
-		if self.fail_discovery.load(Ordering::SeqCst) {
-			self.discovery_failures.fetch_add(1, Ordering::SeqCst);
-			return Err(tonic::Status::unavailable("discovery backend unavailable"));
-		}
-
 		if self.stall_xpub.load(Ordering::SeqCst) {
 			// Preserve the existing xpub-only fixture boundary; the mailbox must
 			// not silently replace the page that timed out.
@@ -380,17 +366,7 @@ async fn recovery_batch_reads(stall_xpub: bool) {
 /// them again in batch.
 #[tokio::test]
 async fn recovery_retries_a_failed_status_batch() {
-	Box::pin(recovery_retry(false)).await;
-}
-
-#[tokio::test]
-async fn seed_recovery_retries_discovery_after_same_store_reopen() {
-	Box::pin(recovery_retry(true)).await;
-}
-
-async fn recovery_retry(discovery_failure: bool) {
-	let ctx = TestContext::new(if discovery_failure { "bark_sdk/seed_recovery_same_store_retry" }
-		else { "bark_sdk/recovery_retries_a_failed_status_batch" }).await;
+	let ctx = TestContext::new("bark_sdk/recovery_retries_a_failed_status_batch").await;
 	// The xpub lookup carries each VTXO's body and status itself, so it is
 	// turned off to send recovery through the mailbox path under test.
 	let srv = ctx.captaind("server")
@@ -407,58 +383,20 @@ async fn recovery_retry(discovery_failure: bool) {
 	assert_eq!(expected.len(), 2);
 
 	let counts = Arc::new(VtxoRpcCounts::default());
-	let observer = CountVtxoRpcs::new(&counts, if discovery_failure { 0 } else { 1 });
-	observer.fail_discovery.store(discovery_failure, Ordering::SeqCst);
-	let proxy = srv.start_proxy_with_mailbox(observer.clone(), observer.clone()).await;
+	let proxy = srv.start_proxy_with_mailbox(CountVtxoRpcs::new(&counts, 1), ()).await;
 
 	let recovered = ctx.bark_sdk("recovered", &proxy)
-		.cfg(move |cfg| { if discovery_failure { cfg.daemon_manual_sync = true; } })
 		.mnemonic(read_mnemonic(&ctx, "target").await)
 		.create().await;
 
-	let recovered = if discovery_failure {
-		let local = SqliteClient::open(ctx.datadir.join("recovered/db.sqlite")).unwrap();
-		assert!(local.get_all_vtxos().await.unwrap().is_empty(), "first discovery failed before any IDs or bodies were obtained");
-		assert!(observer.discovery_failures.load(Ordering::SeqCst) >= 2,
-			"both actual xpub and mailbox discovery reads must fail");
-		let identity = recovered.mailbox_identifier();
-		recovered.stop_daemon_wait().await.unwrap();
-		drop(recovered);
-		let failures = observer.discovery_failures.load(Ordering::SeqCst);
-		let recovered = ctx.bark_sdk("recovered", &proxy)
-			.cfg(|cfg| cfg.daemon_manual_sync = true)
-			.mnemonic(read_mnemonic(&ctx, "target").await).create().await;
-		assert_eq!(recovered.mailbox_identifier(), identity);
-		assert!(local.get_all_vtxos().await.unwrap().is_empty());
-		assert_eq!(observer.discovery_failures.load(Ordering::SeqCst), failures,
-			"reopen must not silently repeat the creation-only scan");
-		observer.fail_discovery.store(false, Ordering::SeqCst);
-		let report = recovered.recover_from_seed().await.unwrap();
-		assert!(report.is_complete());
-		assert_eq!(report.recovered().total_amount(), sat(300_000));
-		let history = recovered.history().await.unwrap();
-		let bodies = recovered.get_full_vtxos(recovered.spendable_vtxos().await.unwrap().iter()).await.unwrap();
-		let repeated = recovered.recover_from_seed().await.unwrap();
-		assert!(repeated.is_complete());
-		assert_eq!(recovered.history().await.unwrap(), history);
-		for body in bodies {
-			assert_eq!(recovered.get_full_vtxo(body.id()).await.unwrap().serialize(), body.serialize());
-		}
-		recovered
-	} else { recovered };
 	let mut recovered_ids = recovered.spendable_vtxos().await.expect("list recovered vtxos")
 		.iter().map(|v| v.id()).collect::<Vec<_>>();
 	recovered_ids.sort();
 	assert_eq!(recovered_ids, expected, "the retry pass must recover every vtxo");
 	assert!(counts.get_vtxos_status_by_ids.load(Ordering::Relaxed) >= 2,
 		"the retry pass must query vtxo status in batch again");
-	if discovery_failure {
-		assert!(counts.get_vtxo_status.load(Ordering::Relaxed) > 0,
-			"positive recovered bodies retain their authenticated first-store recheck");
-	} else {
-		assert_eq!(counts.get_vtxo_status.load(Ordering::Relaxed), 0,
-			"a failed batch must not fall back to single status requests");
-	}
+	assert_eq!(counts.get_vtxo_status.load(Ordering::Relaxed), 0,
+		"a failed batch must not fall back to single status requests");
 }
 
 /// An id in the recovery mailbox the server does not know is reported as

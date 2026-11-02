@@ -518,13 +518,14 @@ impl Wallet {
 				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
-				// Keep bodies held by an existing flow so it can finish. Only an
-				// ordinary Spendable row is locked; the checked write cannot steal
-				// a concurrent holder. Fresh in-flight candidates remain absent.
+				// Finishing the flow the VTXO is stuck in is what decides where it
+				// belongs, so nothing is stored. Arkoor mailbox messages only carry
+				// final Pubkey-policy VTXOs, so the replay cannot bring an in-flight
+				// one back.
 				Ok(ServerStatusAdoption::InFlight(state)) => {
 					debug!("Recovery vtxo {id} not spendable ({state:?}), skipping");
-					self.lock_available_vtxos(std::slice::from_ref(&vtxo), None).await
-						.context("Failed to lock in-flight recovery vtxo")?;
+					self.inner.db.remove_vtxo(id).await
+						.context("Failed to drop in-flight recovery vtxo")?;
 					report.push_skipped(&vtxo);
 				},
 				Err(e) => {
@@ -767,18 +768,9 @@ impl Wallet {
 	/// mailboxes are then read from checkpoint 0, and every VTXO they reference
 	/// that the lookup didn't settle is resolved against the server, and against the chain when the server
 	/// reports it spendable, one mailbox page at a time and stored accordingly.
-	/// This can be called explicitly on an existing wallet after a failed
-	/// discovery at creation or a later interrupted scan. It starts from the
-	/// beginning using the same store and seed; no known VTXO IDs are needed.
-	/// Previously stored results are handled idempotently. Normal open and
-	/// sync do not automatically repeat this scan. This is an explicit Rust SDK
-	/// operation; no CLI, REST or NWC entry point is supplied.
-	///
-	/// Returns the existing [`RecoveryReport`]; inspect [`RecoveryReport::is_complete`]
-	/// and its categories rather than assuming every discovered coin is spendable.
-	/// An error can follow partial durable recovery. Retry after the underlying
-	/// service recovers; existing held coins and uncertain outcomes remain fenced.
-	pub async fn recover_from_seed(&self) -> anyhow::Result<RecoveryReport> {
+	/// Returns a [`RecoveryReport`] (see it for why recovered/skipped/failed
+	/// matters).
+	pub(crate) async fn recover_from_seed(&self) -> anyhow::Result<RecoveryReport> {
 		let mut report = RecoveryReport::default();
 		let gap_limit = self.inner.config.vtxo_key_gap_limit;
 

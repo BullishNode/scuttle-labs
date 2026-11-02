@@ -299,18 +299,15 @@ impl DaemonProcess {
 		loop {
 			// using if let to scope the wallet variable
 			if let Some(wallet) = self.wallet() {
-				let connected = self.connected.load(Ordering::Relaxed);
-				if connected {
+				if self.connected.load(Ordering::Relaxed) {
 					if let Err(e) = wallet.chain().update_fee_rates(wallet.config().fallback_fee_rate).await {
 						warn!("An error occured while updating fee rates: {e:#}");
 					}
-				}
 
-				if let Err(e) = wallet.sync_pending_boards().await {
-					warn!("An error occured while syncing pending board: {e:#}");
-				}
+					if let Err(e) = wallet.sync_pending_boards().await {
+						warn!("An error occured while syncing pending board: {e:#}");
+					}
 
-				if connected {
 					if let Err(e) = wallet.sync_pending_offboards().await {
 						warn!("An error occured while syncing pending offboards: {e:#}");
 					}

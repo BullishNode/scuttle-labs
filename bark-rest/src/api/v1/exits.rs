@@ -277,11 +277,6 @@ pub async fn exit_start_vtxos(
 	let vtxos = spendable.into_iter().chain(inround)
 		.map(|v| v.vtxo).collect::<Vec<_>>();
 
-	let selected = vtxos.iter().map(|v| v.id()).collect::<HashSet<_>>();
-	if let Some(id) = filter.include.difference(&selected).next() {
-		badarg!("VTXO {} is not eligible for a targeted exit", id);
-	}
-
 	wallet.exit_mgr().start_exit_for_vtxos(&vtxos).await
 		.context("Failed to start exit for VTXOs")?;
 

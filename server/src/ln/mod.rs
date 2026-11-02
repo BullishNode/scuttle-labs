@@ -18,7 +18,6 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use tokio::sync::broadcast;
 use bitcoin::Amount;
-use bitcoin::amount::CheckedSum;
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 use tracing::{error, info, trace, warn};
@@ -230,8 +229,7 @@ impl Server {
 
 		let payment_hash = requested_policy.payment_hash;
 
-		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount)
-			.checked_sum().badarg("HTLC amount overflow")?;
+		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount).sum::<Amount>();
 		check_max_amount("lightning send", htlc_amount, self.config.max_ln_send_amount)?;
 
 		// Held for the whole call, so no other call decides on this payment
@@ -372,11 +370,13 @@ impl Server {
 			htlc_vtxo_sum += htlc_vtxo.amount();
 		}
 
-		// New admissions must match the fixed invoice's rounded satoshi quote.
-		// Recorded retries above retain their original payment parameters.
+		// Verify against the invoice amount if applicable, disallowing underpayments.
 		if let Some(invoice_msat) = invoice.amount_msat() {
-			if payment_amount != Amount::from_msat_ceil(invoice_msat) {
-				return badarg!("requested payment amount must equal the fixed invoice amount");
+			if invoice_msat > payment_amount.to_msat() {
+				return badarg!("requested payment amount too low for invoice");
+			}
+			if invoice_msat < payment_amount.to_msat() / 2 {
+				return badarg!("requested payment amount more than double invoice amount");
 			}
 		}
 

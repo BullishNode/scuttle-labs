@@ -135,12 +135,8 @@ impl ClnNodeInfo {
 		settler: &Arc<HtlcSettler>,
 		payment_guards: &PaymentGuards,
 	) -> anyhow::Result<LightningNodeId> {
-		let mut rpc = tokio::time::timeout(Duration::from_secs(10), self.config.build_grpc_client())
-			.await.context("timed out connecting rpc")?
-			.context("failed to connect rpc")?;
-		let hold_rpc = tokio::time::timeout(Duration::from_secs(10), self.config.build_hold_client())
-			.await.context("timed out connecting hold rpc")?
-			.context("failed to connect hold rpc")?;
+		let mut rpc = self.config.build_grpc_client().await.context("failed to connect rpc")?;
+		let hold_rpc = self.config.build_hold_client().await.context("failed to connect hold rpc")?;
 
 		let info = unary_rpc(rpc.getinfo(cln_rpc::GetinfoRequest {})).await
 			.context("failed to get info from rpc")?
