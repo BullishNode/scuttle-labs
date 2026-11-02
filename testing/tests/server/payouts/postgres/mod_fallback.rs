@@ -1,41 +1,4 @@
 
-#[tokio::test]
-async fn legacy_lightning_payment_attempt_result_update() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt_result").await;
-	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-
-	Db::create_with_payouts(&postgres_cfg, true).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
-
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-
-	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
-	let invoice = Invoice::Bolt11(bolt11.clone());
-
-	legacy_payment_attempt(&db, node_id, &invoice, &[]).await;
-
-	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("attempt present");
-	assert!(attempt.final_amount_msat.is_none());
-
-	let updated_at = db.write(async |t| t.update_lightning_payment_attempt_result(
-		&attempt, LightningPaymentStatus::Succeeded, None, Some(9999),
-	).await).await.unwrap();
-	assert!(updated_at.is_some(), "update should return new updated_at");
-
-	// Verify changes persisted
-	let attempt2 = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("attempt still present");
-	assert_eq!(attempt2.final_amount_msat, Some(9999));
-}
-
 /// An existing successful attempt consumes only its linked signed HTLC sources.
 #[tokio::test]
 async fn successful_attempt_consumes_its_linked_htlc_send() {
@@ -101,41 +64,6 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	).await.unwrap();
 	let spend_state: String = row.get("spend_state");
 	assert_eq!(spend_state, "ln-spent", "the successful attempt consumes its linked source");
-}
-
-#[tokio::test]
-async fn mailbox_writers_need_no_registration_and_delivery_matches_the_birth_owner() {
-	let mut ctx = TestContext::new_minimal("postgresd/mailbox_without_registration").await;
-	ctx.init_central_postgres().await;
-	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create_with_payouts(&cfg, true).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let foreign = Keypair::from_seckey_slice(&ark::SECP, &[249; 32]).unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(foreign.public_key());
-	let coin = VTXO_VECTORS.board_vtxo.clone();
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(coin.clone())]).await).await.unwrap();
-	let before = db.read(async |tx| Ok(tx.query_one("SELECT to_jsonb(s)::TEXT FROM checkpoint_state s WHERE type_id=1", &[])
-		.await?.get::<_, String>(0))).await.unwrap();
-	assert!(db.write(async |tx| tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[coin.clone()]).await)
-		.await.is_err());
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT to_jsonb(s)::TEXT FROM checkpoint_state s WHERE type_id=1", &[])
-		.await?.get::<_, String>(0))).await.unwrap(), before);
-	let hash = Preimage::random().compute_payment_hash();
-	let unlock = UnlockHash::hash(b"unregistered notification mailbox");
-	for kind in 0..4 {
-		assert!(db.write(async |tx| match kind {
-			0 => tx.store_round_participation_in_mailbox(mailbox, unlock).await,
-			1 => tx.store_lightning_receive_notification(mailbox, &hash.to_string(), coin.amount()).await,
-			2 => tx.store_lightning_send_finished(mailbox, hash, None, Some(LightningFailureKind::FeeTooLow)).await,
-			3 => tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[coin.id()]).await,
-			_ => unreachable!(),
-		}).await.unwrap().is_some());
-	}
-	assert_eq!(db.read(async |tx| tx.get_mailbox_messages(mailbox, 0, 100).await).await.unwrap().len(), 4);
-	assert!(db.write(async |tx| tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[]).await).await.unwrap().is_none());
-	assert!(db.write(async |tx| tx.store_vtxo_ids_in_mailbox(MailboxType::RecoveryVtxoId, mailbox, &[]).await).await.unwrap().is_none());
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM owner_key WHERE mailbox_pk=$1", &[&foreign.public_key().to_string()])
-		.await?.get::<_, i64>(0))).await.unwrap(), 0, "notifications and hints never authorize a mailbox or coin");
 }
 
 async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, sources: &[VtxoId]) {

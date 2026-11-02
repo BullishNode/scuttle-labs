@@ -6,12 +6,9 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use ark::lightning::{PaymentHash, Preimage};
-use ark::attestations::VtxoStatusAttestation;
-use ark::ProtocolEncoding;
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use ark_testing::{TestContext, btc, util::{FutureExt, poll_interval}};
 use ark_testing::balance::assert_balance_consistent;
-use ark_testing::onchain::AppBip86Wallet;
 
 use bark::actions::lightning::pay::LightningSendState;
 use bark::actions::lightning::receive::LightningReceiveState;
@@ -21,8 +18,7 @@ use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::{OnchainWallet, OnchainWalletTrait};
 use bark::persist::sqlite::SqliteClient;
 use bitcoin::Network;
-use bitcoin::{FeeRate, OutPoint, Transaction};
-use bitcoin::consensus::deserialize;
+use bitcoin::{OutPoint, Transaction};
 use bitcoin_ext::rpc::RpcApi;
 use cln_rpc::plugins::hold;
 use server::database::Db;

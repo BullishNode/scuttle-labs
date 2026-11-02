@@ -1689,6 +1689,44 @@ async fn lightning_payment_attempt_with_error() {
 	assert!(open.is_empty());
 }
 
+#[tokio::test]
+async fn lightning_payment_attempt_result_update() {
+	use server::database::ln::LightningPaymentStatus;
+
+	let mut ctx = TestContext::new_minimal("postgresd/lightning_payment_attempt_result").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	let invoice = Invoice::Bolt11(bolt11.clone());
+
+	db.write(async |t| t.store_lightning_payment_start(
+		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+	).await).await.unwrap();
+
+	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
+		(&bolt11).into()
+	).await).await.unwrap().expect("attempt present");
+	assert!(attempt.final_amount_msat.is_none());
+
+	let updated_at = db.write(async |t| t.update_lightning_payment_attempt_result(
+		&attempt, LightningPaymentStatus::Succeeded, None, Some(9999),
+	).await).await.unwrap();
+	assert!(updated_at.is_some(), "update should return new updated_at");
+
+	// Verify changes persisted
+	let attempt2 = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
+		(&bolt11).into()
+	).await).await.unwrap().expect("attempt still present");
+	assert_eq!(attempt2.final_amount_msat, Some(9999));
+}
+
 /// xpay can give up while parts are still pending. Its error is stored then,
 /// without changing the status, and must survive the later update that marks
 /// the attempt failed.
@@ -1743,6 +1781,52 @@ async fn lightning_payment_attempt_error_survives_until_failed() {
 	let failed = read().await;
 	assert_eq!(failed.status, LightningPaymentStatus::Failed);
 	assert_eq!(failed.error.as_deref(), Some(error));
+}
+
+#[tokio::test]
+async fn lightning_payment_attempt_error_cleared_on_success() {
+	use server::database::ln::LightningPaymentStatus;
+
+	let mut ctx = TestContext::new_minimal("postgresd/lightning_payment_attempt_error_cleared").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+
+	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
+	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
+
+	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
+	let invoice = Invoice::Bolt11(bolt11.clone());
+
+	db.write(async |t| t.store_lightning_payment_start(
+		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+	).await).await.unwrap();
+
+	let read = async || db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
+		(&bolt11).into()
+	).await).await.unwrap().expect("attempt present");
+
+	let attempt = read().await;
+	db.write(async |t| t.update_lightning_payment_attempt_status(
+		&attempt, LightningPaymentStatus::Submitted, None,
+	).await).await.unwrap();
+
+	let submitted = read().await;
+	db.write(async |t| t.set_lightning_payment_attempt_error(&submitted, "routing failed").await)
+		.await.unwrap().expect("error update applies");
+
+	let pending = read().await;
+	assert_eq!(pending.error.as_deref(), Some("routing failed"));
+
+	db.write(async |t| t.update_lightning_payment_attempt_result(
+		&pending, LightningPaymentStatus::Succeeded, None, Some(1_000_000),
+	).await).await.unwrap().expect("update applies");
+
+	let succeeded = read().await;
+	assert_eq!(succeeded.status, LightningPaymentStatus::Succeeded);
+	assert_eq!(succeeded.error, None);
 }
 
 /// `store_lightning_payment_start` must persist `block_height`, `user_fee`

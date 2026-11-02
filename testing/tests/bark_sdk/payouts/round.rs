@@ -15,7 +15,7 @@ use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::movement::{MovementId, MovementStatus};
 use bark::onchain::OnchainWallet;
 use bark::persist::BarkPersister;
-use bark::persist::adaptor::{partition, Query, QueryRange, Record, StorageAdaptor, StorageAdaptorWrapper};
+use bark::persist::adaptor::StorageAdaptorWrapper;
 use bark::persist::adaptor::filestore::FileStorageAdaptor;
 use bark::persist::models::{RoundStateId, SerdeRoundState};
 use bark::round::{RoundFlowKind, RoundStatus};
@@ -128,45 +128,7 @@ impl captaind::proxy::ArkRpcProxy for RefreshTransport {
 	}
 }
 
-#[derive(Clone, Default)]
-struct RoundWriteFault {
-	armed: Arc<AtomicBool>,
-	hits: Arc<AtomicUsize>,
-	unlock_armed: Arc<AtomicBool>,
-	unlock_hits: Arc<AtomicUsize>,
-	snapshot_armed: Arc<AtomicBool>,
-	snapshot_hits: Arc<AtomicUsize>,
-}
-
-struct RoundWriteGate {
-	inner: FileStorageAdaptor,
-	fault: RoundWriteFault,
-}
-
-#[async_trait::async_trait]
-impl StorageAdaptor for RoundWriteGate {
-	async fn put(&mut self, record: Record) -> anyhow::Result<()> {
-		if record.partition == partition::ROUND_STATE && self.fault.armed.load(Ordering::SeqCst) {
-			self.fault.hits.fetch_add(1, Ordering::SeqCst);
-			return Err(std::io::Error::other("round checkpoint write unavailable").into());
-		}
-		if record.partition == partition::VTXO && self.fault.snapshot_armed.load(Ordering::SeqCst) {
-			self.fault.snapshot_hits.fetch_add(1, Ordering::SeqCst);
-			return Err(std::io::Error::other("known fallback status write unavailable").into());
-		}
-		if record.partition == partition::VTXO && self.fault.unlock_armed.load(Ordering::SeqCst) {
-			self.fault.unlock_hits.fetch_add(1, Ordering::SeqCst);
-			return Err(std::io::Error::other("round input release write unavailable").into());
-		}
-		self.inner.put(record).await
-	}
-	async fn get(&self, partition: u8, pk: &[u8]) -> anyhow::Result<Option<Record>> { self.inner.get(partition, pk).await }
-	async fn delete(&mut self, partition: u8, pk: &[u8]) -> anyhow::Result<Option<Record>> { self.inner.delete(partition, pk).await }
-	async fn query_sorted<R: QueryRange>(&self, query: Query<R>) -> anyhow::Result<Vec<Record>> { self.inner.query_sorted(query).await }
-	async fn get_all(&self, partition: u8) -> anyhow::Result<Vec<Record>> { self.inner.get_all(partition).await }
-}
-
-type RefreshDatabase = StorageAdaptorWrapper<RoundWriteGate>;
+type RefreshDatabase = StorageAdaptorWrapper<FileStorageAdaptor>;
 
 struct IssuedRefresh {
 	wallet: Wallet,

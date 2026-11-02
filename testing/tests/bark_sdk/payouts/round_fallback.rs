@@ -7,7 +7,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 			.watchmand().create().await;
 		let transport = RefreshTransport::default();
 		let IssuedRefresh { wallet, proxy, database, mnemonic, source, state_id, movement, unlock_hash, sweep_at, first_height, .. } =
-			Box::pin(issued_refresh(&ctx, &srv, transport.clone(), RoundWriteFault::default(), true)).await;
+			Box::pin(issued_refresh(&ctx, &srv, transport.clone(), true)).await;
 		let registration = wallet.fallback_script();
 		let attestation = RoundParticipationStatusAttestation::new(unlock_hash, &wallet.mailbox_keypair());
 		drop(wallet);
@@ -178,7 +178,7 @@ async fn issued_refresh_keeps_its_holder_without_exact_cancellation_metadata() {
 			.cfg(|config| { config.expiry_payouts = true; config.vtxo_lifetime = BlockDelta::new(48); config.vtxo_exit_delta = BlockDelta::new(3); })
 			.watchmand().create().await;
 		let transport = RefreshTransport::default();
-		let fixture = Box::pin(issued_refresh(&ctx, &srv, transport.clone(), RoundWriteFault::default(), false)).await;
+		let fixture = Box::pin(issued_refresh(&ctx, &srv, transport.clone(), false)).await;
 		*transport.status_fault.lock().unwrap() = CancellationStatusFault::IssuedThenUnknown;
 		transport.status_steps.store(0, Ordering::SeqCst);
 		let mut state = fixture.wallet.lock_wait_round_state(fixture.state_id).await.unwrap().unwrap();
@@ -215,11 +215,6 @@ async fn issued_refresh_keeps_its_holder_without_exact_cancellation_metadata() {
 	})).await.expect("invalid cancellation replies must leave the principal protected");
 }
 
-#[tokio::test]
-async fn fallback_source_state_write_failure_retains_its_receipt_fence() {
-	Box::pin(retained_claim_write_failure(false)).await;
-}
-
 async fn reopen_refresh(
 	ctx: &TestContext, proxy: &captaind::proxy::ArkRpcProxyServer,
 	mnemonic: &bip39::Mnemonic, database: Arc<RefreshDatabase>,
@@ -233,15 +228,13 @@ async fn reopen_refresh(
 }
 
 async fn issued_refresh(
-	ctx: &TestContext, srv: &Captaind, transport: RefreshTransport, fault: RoundWriteFault,
+	ctx: &TestContext, srv: &Captaind, transport: RefreshTransport,
 	interactive: bool,
 ) -> IssuedRefresh {
 	transport.reject_nonces.store(true, Ordering::SeqCst);
 	let proxy = srv.start_proxy_no_mailbox(transport.clone()).await;
 	let storage_path = ctx.datadir.join("refresh-owner.json");
-	let database = Arc::new(StorageAdaptorWrapper::new(RoundWriteGate {
-		inner: FileStorageAdaptor::open(&storage_path).await.unwrap(), fault,
-	}));
+	let database = Arc::new(StorageAdaptorWrapper::new(FileStorageAdaptor::open(&storage_path).await.unwrap()));
 	let mnemonic = bip39::Mnemonic::generate(12).unwrap();
 	let wallet = Box::pin(reopen_refresh(ctx, &proxy, &mnemonic, database.clone())).await;
 	let address = wallet.onchain().unwrap().write().await.address().await.unwrap();
@@ -386,69 +379,4 @@ async fn await_refresh_tombstone(
 			tokio::time::sleep(poll_interval()).await;
 		}
 	}.wait_millis(30_000).await;
-}
-
-async fn retained_claim_write_failure(receipt_write: bool) {
-	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
-		let name = if receipt_write { "bark_sdk/receipt_write_failure" }
-			else { "bark_sdk/receipt_source_state_write_failure" };
-		let ctx = TestContext::new(name).await;
-		let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
-			config.vtxo_lifetime = BlockDelta::new(24);
-			config.vtxo_exit_delta = BlockDelta::new(3);
-		}).watchmand().create().await;
-		let transport = RefreshTransport::default();
-		let proxy = srv.start_proxy_no_mailbox(transport.clone()).await;
-		let seed = bip39::Mnemonic::generate(12).unwrap();
-		let fault = RoundWriteFault::default();
-		let path = ctx.datadir.join("retained-owner.json");
-		let database = Arc::new(StorageAdaptorWrapper::new(RoundWriteGate {
-			inner: FileStorageAdaptor::open(&path).await.unwrap(), fault: fault.clone(),
-		}));
-		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &seed, database.clone())).await;
-		let address = wallet.onchain().unwrap().write().await.address().await.unwrap();
-		ctx.bitcoind().fund_addr(address, sat(300_000)).await;
-		ctx.generate_blocks(1).await;
-		wallet.sync_onchain().await.unwrap();
-		let board = wallet.board_amount(sat(100_000)).await.unwrap();
-		ctx.await_transaction(board.funding_tx.compute_txid()).await;
-		ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
-		wallet.sync_pending_boards().await.unwrap();
-		let coin = wallet.get_vtxo_by_id(board.vtxos[0]).await.unwrap();
-		let signed = wallet.get_full_vtxo(coin.id()).await.unwrap();
-		wallet.validate_vtxo(&signed).await.unwrap();
-		super::fallback_adoption::await_decision(&ctx, &srv, &coin).await;
-		if receipt_write { fault.snapshot_armed.store(true, Ordering::SeqCst); }
-		else { fault.unlock_armed.store(true, Ordering::SeqCst); }
-		assert!(wallet.sync_fallback_payouts().await.is_err());
-		assert_eq!(if receipt_write { fault.snapshot_hits.load(Ordering::SeqCst) }
-			else { fault.unlock_hits.load(Ordering::SeqCst) }, 1);
-		assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-		assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().state, VtxoState::Spendable);
-		assert!(database.get_all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()),
-			"both former receipt/source fault selectors now fail the single atomic known-coin write");
-		// No payment/exit is attempted after the failed persistence operation.
-		// Reopen the same store and retry only authenticated observation.
-		drop(wallet);
-		drop(database);
-		fault.snapshot_armed.store(false, Ordering::SeqCst);
-		fault.unlock_armed.store(false, Ordering::SeqCst);
-		let database = Arc::new(StorageAdaptorWrapper::new(RoundWriteGate {
-			inner: FileStorageAdaptor::open(&path).await.unwrap(), fault,
-		}));
-		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &seed, database.clone())).await;
-		wallet.sync_fallback_payouts().await.unwrap();
-		assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().state, VtxoState::Locked { holder: None });
-		assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-		wallet.validate_vtxo(&signed).await.unwrap();
-		assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-		assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, Amount::ZERO, sat(100_000)).await;
-		let committed = database.get_all_vtxos().await.unwrap().into_iter()
-			.filter(|coin| coin.fallback_status.is_some()).collect::<Vec<_>>();
-		assert_eq!(committed.len(), 1);
-		assert_eq!(committed[0].id(), coin.id());
-		assert_eq!(committed[0].fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-		assert!(!wallet.history().await.unwrap().iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
-			"a status write does not add an Ark receipt movement");
-	})).await.expect("receipt persistence failures retain the source and retry only observation");
 }

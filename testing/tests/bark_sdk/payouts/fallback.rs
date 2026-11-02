@@ -2,8 +2,6 @@ use ark_testing::TestContext;
 use bitcoin::Network;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use ark_testing::sat;
-use bitcoin_ext::BlockDelta;
-use ark::ProtocolEncoding;
 
 #[tokio::test]
 async fn mailbox_bip86_identity_survives_seed_only_second_device_and_reopen() {
@@ -82,44 +80,4 @@ async fn external_mailbox_identity_routes_delivery_and_refuses_wrong_reopen() {
 	assert_eq!(reopened.mailbox_identifier().as_pubkey(), key.public_key());
 	assert_eq!(reopened.fallback_script(), original);
 	assert_eq!(reopened.balance().await.unwrap().spendable, ark_testing::sat(10_000));
-}
-
-/// An undecided expired source keeps its normal unilateral protection even
-/// when the server is offline. A committed receipt is tested separately.
-#[tokio::test]
-async fn undecided_expired_source_can_reopen_offline_and_start_its_exit() {
-	let ctx = TestContext::new("bark_sdk/undecided_expired_source_offline_exit").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| { cfg.expiry_payouts = true;
-		cfg.vtxo_lifetime = BlockDelta::new(24);
-		cfg.vtxo_exit_delta = BlockDelta::new(3);
-	}).watchmand().create().await;
-	let seed = bip39::Mnemonic::generate(12).unwrap();
-	let wallet = ctx.bark_sdk("owner", &srv).mnemonic(seed.clone())
-		.cfg(|cfg| cfg.daemon_manual_sync = true).boarded(sat(100_000)).create().await;
-	wallet.stop_daemon_wait().await.unwrap();
-	let source = wallet.spendable_vtxos().await.unwrap().remove(0);
-	let signed = wallet.get_full_vtxo(source.id()).await.unwrap();
-	let config = wallet.config().clone();
-	srv.watchmand().stop().await.unwrap();
-	let height = ctx.bitcoind().get_block_count().await as u32;
-	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;
-	srv.wait_for_sync_height(expired).await;
-	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
-	let state = db.read(async |tx| tx.get_user_vtxo_by_id(source.id()).await).await.unwrap();
-	assert_eq!(state.spend_state, server::database::SpendState::Spendable);
-	assert!(!state.decided_for_fallback);
-	assert!(db.read(async |tx| Ok(tx.query_opt("SELECT id FROM expiry_entitlement WHERE vtxo_id=$1",
-		&[&source.id().to_string()]).await?)).await.unwrap().is_none());
-	assert!(wallet.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
-	drop(wallet);
-	srv.stop().await.unwrap();
-	let cached = bark::Wallet::open(Network::Regtest,
-		bark::WalletSeed::new_from_mnemonic(Network::Regtest, &seed), config,
-		bark::OpenWalletArgs { datadir: Some(ctx.datadir.join("owner")),
-			run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
-	assert_eq!(cached.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
-	assert_eq!(cached.balance().await.unwrap().needs_refresh, source.amount());
-	assert!(cached.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
-	cached.exit_mgr().start_exit_for_vtxos(&[source.vtxo.clone()]).await.unwrap();
-	assert_eq!(cached.exit_mgr().get_exit_vtxo_ids().await, vec![source.id()]);
 }

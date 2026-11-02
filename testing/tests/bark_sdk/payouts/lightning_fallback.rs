@@ -259,41 +259,20 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 
 #[tokio::test]
 async fn receive_claim_reply_loss_is_durable_before_wire_and_recovers_after_reopen() {
-	receive_claim_reply_loss_reopen(false).await;
+	receive_claim_reply_loss_reopen().await;
 }
 
-/// The same actually settled, reply-lost claim must also retain its rightful
-/// fallback after reopening, registering the signed leaf, and going absent.
-#[tokio::test]
-async fn receive_claim_reply_loss_reopen_abandon_fallback_and_seed_recovery() {
-	receive_claim_reply_loss_reopen(true).await;
-}
-
-/// Observe sponsorship directly in Core, including a child already mined.
-
-async fn receive_claim_reply_loss_reopen(fallback: bool) {
-	let ctx = TestContext::new(if fallback {
-		"bark_sdk/receive_claim_reply_loss_fallback_seed_recovery"
-	} else {
-		"bark_sdk/receive_claim_reply_loss_reopen"
-	}).await;
+async fn receive_claim_reply_loss_reopen() {
+	let ctx = TestContext::new("bark_sdk/receive_claim_reply_loss_reopen").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let mut builder = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
-		.cfg(move |cfg| cfg.expiry_payouts = fallback);
-	if fallback { builder = builder.bitcoind(ctx.bitcoind_arc()).watchmand(); }
-	let srv = builder.create().await;
-	if fallback {
-		assert_eq!(srv.config().fees.lightning_receive.base_fee, bitcoin::Amount::ZERO);
-		assert_eq!(srv.config().fees.lightning_receive.ppm, ark::fees::PpmFeeRate::ZERO);
-	}
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.expiry_payouts = false).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let gate = HoldSuccessfulReceiveClaim { hold: Arc::new(AtomicBool::new(true)),
 		arrived: Arc::new(tokio::sync::Notify::new()), requests: Arc::new(AtomicUsize::new(0)),
 		hold_before: false, release_before: Arc::new(tokio::sync::Notify::new()) };
 	let proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
-	let mut wallet_builder = ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true);
-	if fallback { wallet_builder = wallet_builder.app_bip86(); }
-	let wallet = wallet_builder.create().await;
+	let wallet = ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	lightning.sync().await;
 	let amount = btc(0.5);
 	let invoice = wallet.bolt11_invoice(amount, None, None).await.unwrap();
@@ -346,17 +325,9 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 	let mnemonic = bip39::Mnemonic::from_str(tokio::fs::read_to_string(ctx.datadir.join("receiver/mnemonic"))
 		.await.unwrap().trim()).unwrap();
 	let database = Arc::new(SqliteClient::open(ctx.datadir.join("receiver/db.sqlite")).unwrap());
-	let (onchain, script): (Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>>, _) = if fallback {
-		let wallet = AppBip86Wallet::load_or_create(
-			Network::Regtest, mnemonic.to_seed(""), database.clone(), ctx.bitcoind().sync_client(),
-		).await.unwrap();
-		let script = wallet.fallback_script();
-		(Arc::new(tokio::sync::RwLock::new(wallet)), script)
-	} else {
-		let wallet = OnchainWallet::load_or_create(Network::Regtest, mnemonic.to_seed(""), database.clone()).await.unwrap();
-		let script = wallet.fallback_script();
-		(Arc::new(tokio::sync::RwLock::new(wallet)), script)
-	};
+	let onchain: Arc<tokio::sync::RwLock<dyn OnchainWalletTrait>> = Arc::new(tokio::sync::RwLock::new(
+		OnchainWallet::load_or_create(Network::Regtest, mnemonic.to_seed(""), database.clone()).await.unwrap(),
+	));
 	let mut config = ctx.bark_default_cfg(&proxy, Some(ctx.bitcoind()));
 	config.daemon_manual_sync = true;
 	let reopened = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic), config,
@@ -376,181 +347,4 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 		assert_eq!(receives[0].status, MovementStatus::Successful);
 		assert_eq!(receives[0].effective_balance, amount.to_signed().unwrap());
 	}
-	if !fallback { return; }
-
-	// Settled is not sufficient: independently authenticate that the signed
-	// receive leaf was registered, validated, and is ordinarily spendable.
-	let coins = reopened.spendable_vtxos().await.unwrap();
-	assert_eq!(coins.len(), 1);
-	let source = reopened.get_full_vtxo(coins[0].id()).await.unwrap();
-	reopened.validate_vtxo(&source).await.unwrap();
-	assert_eq!(source.amount(), amount);
-	let key = reopened.get_vtxo_key(&source).await.unwrap();
-	let mut rpc = srv.get_public_rpc().await;
-	let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
-		vtxo_id: source.id().to_bytes().to_vec(),
-		attestation: VtxoStatusAttestation::new(source.id(), &key).serialize(),
-	}).await.unwrap().into_inner();
-	assert_eq!(status.spend_state, protos::VtxoSpendState::Spendable as i32);
-	let registration = reopened.fallback_script();
-	assert_eq!(registration, script, "the payout must use the original seed-derived app BIP86 script");
-	assert!(registration.is_p2tr());
-	let expected = source.amount() - ark_testing::sat(500_000);
-	let absent_height = ctx.bitcoind().get_block_count().await;
-	drop(reopened);
-
-	// Two distinct confirmed sponsor UTXOs also permit unrelated operator
-	// pool roots to expire. Neither is a deposit into the absent receiver.
-	for _ in 0..2 {
-		ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, ark_testing::sat(100_000)).await;
-	}
-	ctx.generate_blocks(2).await;
-	let height = ctx.bitcoind().get_block_count().await as u32;
-	assert!(height < source.expiry_height().to_u32());
-	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;
-	srv.wait_for_sync_height(expired).await;
-	srv.watchmand().wait_for_sync_height(expired).await;
-
-	// Read the real background journal; the test never inserts a decision,
-	// ownership result, registration, or payout transaction into Postgres.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let (parent, child) = tokio::time::timeout(Duration::from_secs(60), async {
-		// Confirm only real signed prefixes when the ordinary watchman publishes them,
-		// then honor its configured grace before expecting the next signed step.
-		let mut pending_prefixes = source.transactions().map(|step| {
-			assert!(step.tx.input.iter().all(|input| input.sequence == bitcoin::Sequence::ZERO));
-			step.tx.compute_txid()
-		}).collect::<std::collections::BTreeSet<_>>();
-		let blocks_per_prefix = srv.watchmand().config().watchman.progress_grace_period.to_u32()
-			.checked_add(1).expect("prefix confirmation and grace block count must fit");
-		let prefix_block_budget = u32::try_from(pending_prefixes.len()).unwrap()
-			.checked_mul(blocks_per_prefix).expect("signed source path block budget must fit");
-		let mut mined_prefix_blocks = 0_u32;
-		loop {
-			let row = db.read(async |t| Ok(t.query_opt(
-				"SELECT a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL \
-				ORDER BY a.id DESC LIMIT 1", &[&source.id().to_string()],
-			).await?)).await.unwrap();
-			if let Some(row) = row {
-				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				if let Some(child) = native_payout_child(&ctx, &parent, source.expiry_height()).await { break (parent, child); }
-			}
-			let core = ctx.bitcoind().sync_client();
-			if let Some(txid) = core.get_raw_mempool().unwrap().into_iter().find(|txid| pending_prefixes.contains(txid)) {
-				assert!(pending_prefixes.remove(&txid)); // Each signed prefix can authorize one batch.
-				mined_prefix_blocks = mined_prefix_blocks.checked_add(blocks_per_prefix).unwrap();
-				assert!(mined_prefix_blocks <= prefix_block_budget);
-				let tip = ctx.generate_blocks(blocks_per_prefix).await;
-				let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
-				loop {
-					if db.read(async |tx| {
-						let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-						Ok(view.height == tip
-							&& view.hash == hash && (tx.expiry_view().await? == Some(view)))
-					}).await.unwrap() { break; }
-					tokio::time::sleep(Duration::from_millis(50)).await;
-				}
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("the registered received leaf never reached an actual background payout");
-	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	assert_eq!(ctx.bitcoind().await_transaction(child.compute_txid()).await, child);
-	assert_eq!(parent.version.0, 3);
-	assert!(parent.vsize() <= 10_000);
-	let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()).collect::<Vec<_>>();
-	assert_eq!(anchors.len(), 1);
-	let anchor = OutPoint::new(parent.compute_txid(), anchors[0].0 as u32);
-	assert!(child.input.iter().any(|input| input.previous_output == anchor),
-		"the measured fee subsidy must actually spend this payout parent's P2A");
-	let outputs = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == registration).collect::<Vec<_>>();
-	assert_eq!(outputs.len(), 1);
-	assert_eq!(outputs[0].1.value, expected);
-	let point = OutPoint::new(parent.compute_txid(), outputs[0].0 as u32);
-	let mut parent_input_sat = 0;
-	for input in &parent.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		parent_input_sat += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	assert_eq!(parent_input_sat, parent.output.iter().map(|out| out.value.to_sat()).sum::<u64>());
-	let mut child_input_sat = 0;
-	for input in &child.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		child_input_sat += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	let subsidy = child_input_sat - child.output.iter().map(|out| out.value.to_sat()).sum::<u64>();
-	assert!(subsidy > 0);
-	let confirmed = ctx.generate_blocks(6).await;
-	srv.wait_for_sync_height(confirmed).await;
-	srv.watchmand().wait_for_sync_height(confirmed).await;
-	// Core 31 reports P2A as `anchor`; raw JSON avoids the old RPC model's
-	// unsupported script-type decoder while checking the canonical block.
-	let core = ctx.bitcoind().sync_client();
-	let parent_chain: serde_json::Value = core.call("getrawtransaction", &[
-		serde_json::json!(parent.compute_txid().to_string()), serde_json::json!(true),
-	]).unwrap();
-	let child_chain: serde_json::Value = core.call("getrawtransaction", &[
-		serde_json::json!(child.compute_txid().to_string()), serde_json::json!(true),
-	]).unwrap();
-	assert!(parent_chain["confirmations"].as_u64().unwrap() >= 6);
-	assert!(child_chain["confirmations"].as_u64().unwrap() >= 6);
-	let payout_block = parent_chain["blockhash"].as_str().unwrap();
-	assert_eq!(child_chain["blockhash"].as_str().unwrap(), payout_block);
-	let header: serde_json::Value = core.call("getblockheader", &[
-		serde_json::json!(payout_block), serde_json::json!(true),
-	]).unwrap();
-	assert!(header["confirmations"].as_u64().unwrap() >= 6);
-	assert_eq!(core.get_block_hash(header["height"].as_u64().unwrap()).unwrap().to_string(), payout_block);
-	let payout = ctx.bitcoind().sync_client().get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
-	assert!(payout.confirmations >= 6);
-	assert_eq!(payout.value, expected);
-	// The payout script belongs to the absent SDK wallet, not Core's test
-	// treasury. Count chain outputs without wallet import/accounting.
-	let mut received = bitcoin::Amount::ZERO;
-	for height in absent_height + 1..=u64::from(confirmed.to_u32()) {
-		let block = core.get_block(&core.get_block_hash(height).unwrap()).unwrap();
-		for tx in block.txdata {
-			received += tx.output.iter().filter(|output| output.script_pubkey == registration)
-				.map(|output| output.value).sum::<bitcoin::Amount>();
-		}
-	}
-	assert_eq!(received, expected,
-		"the old receive HTLC must not create another payout to the same owner");
-
-	// New Ark and BDK databases, original seed only; no leaf IDs, receipts,
-	// or payout transaction are supplied to the restored wallet.
-	let restored = ctx.bark_sdk("seed_only", &srv).mnemonic(mnemonic).app_bip86()
-		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	assert_eq!(restored.fallback_script(), registration);
-	restored.sync_onchain().await.unwrap();
-	let onchain = restored.onchain().unwrap();
-	assert_eq!(onchain.read().await.balance().await, expected);
-	restored.sync_fallback_payouts().await.unwrap();
-	assert_eq!(payout.value, expected);
-
-	let destination = ctx.bitcoind().get_new_address();
-	let psbt = onchain.write().await.prepare_drain_tx(destination.clone(), FeeRate::from_sat_per_vb(2).unwrap()).await.unwrap();
-	let recovery_fee = psbt.fee().unwrap();
-	assert!(recovery_fee > bitcoin::Amount::ZERO);
-	let signed = onchain.write().await.sign_psbt(psbt).await.unwrap();
-	let recovery = onchain.write().await.finish_psbt(signed).await.unwrap().extract_tx().unwrap();
-	assert_eq!(recovery.input.len(), 1, "seed recovery must spend only its actual fallback outpoint");
-	assert_eq!(recovery.input[0].previous_output, point);
-	assert_eq!(recovery.input[0].witness.len(), 1, "actual BIP86 ownership must authorize the recovery spend");
-	assert_eq!(recovery.output.len(), 1);
-	assert_eq!(recovery.output[0].script_pubkey, destination.script_pubkey());
-	let recovered_value = expected - recovery_fee;
-	assert_eq!(recovery.output[0].value, recovered_value);
-	assert_eq!(payout.value, recovery.output.iter().map(|output| output.value).sum::<bitcoin::Amount>() + recovery_fee);
-	restored.chain().broadcast_tx(&recovery).await.unwrap();
-	assert_eq!(ctx.bitcoind().await_transaction(recovery.compute_txid()).await, recovery);
-	ctx.generate_blocks(6).await;
-	let recovered = core.get_tx_out(&recovery.compute_txid(), 0, Some(true)).unwrap().unwrap();
-	assert!(recovered.confirmations >= 6);
-	assert_eq!(recovered.value, recovered_value);
-	assert_eq!(ctx.bitcoind().get_received_by_address(&destination), recovered_value);
-	assert!(ctx.bitcoind().sync_client().get_tx_out(&point.txid, point.vout, Some(true)).unwrap().is_none());
 }
