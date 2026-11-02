@@ -1,4 +1,3 @@
-mod payouts;
 //! Integration tests that exercise the bark Rust SDK (the `bark-wallet`
 //! crate's public API) directly, rather than driving the `bark` CLI binary
 //! as a subprocess.
@@ -9,6 +8,7 @@ mod payouts;
 //! that link against the current `bark-wallet` crate, so running them in
 //! that mode would silently test the current code under a "compat" label.
 
+mod payouts;
 mod arkoor;
 mod balance;
 mod board;
