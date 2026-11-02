@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::{PaymentHash, Preimage};
+use ark::vtxo::TapScriptClause;
 use ark::{ProtocolEncoding, VtxoPolicy};
 use ark_testing::{btc, sat, TestContext};
 use bark::vtxo::VtxoState;
@@ -248,7 +249,7 @@ async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
 	let final_output = core.get_tx_out(&recovered.point().txid, recovered.point().vout, Some(true)).unwrap().unwrap();
 	assert_eq!(final_output.value, sat(100_000));
 	assert_eq!(final_output.script_pub_key.script().unwrap(), recovered.output_script_pubkey());
-	assert!(final_output.confirmations >= u64::from((recovered.exit_delta() * 2).to_u32()));
+	assert!(final_output.confirmations >= (recovered.exit_delta() * 2).to_u32());
 	assert!(core.get_block_count().unwrap() >= u64::from(deadline.to_u32()));
 	let address = wallet.get_onchain_address().await;
 	assert_ne!(address.script_pubkey(), fallback);
