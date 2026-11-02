@@ -19,7 +19,7 @@ use bitcoin_ext::{BlockDelta, BlockHeight};
 use server::database::Db;
 use server::database::htlc_vtxo::{self, HtlcDirection};
 use server::database::tree::VtxoTreeUpdate;
-use server::database::ln::{HtlcSettlementOrigin, LightningHtlcSubscriptionStatus, SourceSettlement};
+use server::database::ln::{LightningHtlcSubscriptionStatus, SourceSettlement};
 use server::database::xpay::{self, ClnXpayStatus, NewClnXpay};
 use server::ln::LightningFailureKind;
 

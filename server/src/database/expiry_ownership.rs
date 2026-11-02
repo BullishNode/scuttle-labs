@@ -250,7 +250,7 @@ impl Tx<'_> {
 					SourceSettlement::Unknown => Some("Lightning settlement provenance unknown"),
 					SourceSettlement::Funded if source != LightningSourceState::Discharged
 						&& htlc.htlc.resolution() != Some(HtlcResolution::Fulfilled) => Some("Lightning settlement and source status disagree"),
-					SourceSettlement::NotSettled | SourceSettlement::Disjoint if source == LightningSourceState::Discharged
+					SourceSettlement::NotSettled if source == LightningSourceState::Discharged
 						=> Some("Lightning settlement does not support source success"),
 					_ => None,
 				};

@@ -5,18 +5,15 @@ use ark::lightning::{PaymentHash, Preimage};
 use ark::VtxoPolicy;
 use ark_testing::{btc, sat, TestContext};
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use bitcoin_ext::rpc::RpcApi;
-use bitcoin::Transaction;
-use bitcoin::consensus::deserialize;
 use server::database::expiry_ownership::OwnershipDisposition;
 use server::database::Db;
 use server_rpc::protos;
 
 /// Two grants share a hash, but only one funds a paid attempt.
-/// Its preimage must neither collect the unused grant nor block its automatic expiry refund.
-async fn same_hash_sources(cooperative_refund: bool) {
-	let name = if cooperative_refund { "server/expiry_unused_same_hash_cooperative_refund" }
-		else { "server/expiry_unused_same_hash_source" };
+/// Its preimage must not collect the unused grant; ambiguous custody stays held.
+#[tokio::test]
+async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
+	let name = "server/expiry_unused_same_hash_grant_held";
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).no_vtxo_pool().funded(btc(10))
@@ -117,12 +114,12 @@ async fn same_hash_sources(cooperative_refund: bool) {
 			}).await.unwrap();
 		} else {
 			assert_eq!(db.read(async |t| t.source_settlement(hash, grants[1]).await).await.unwrap(),
-				server::database::ln::SourceSettlement::Disjoint);
+				server::database::ln::SourceSettlement::Unknown);
 			assert!(matches!(proposal.disposition, OwnershipDisposition::Unresolved(_)),
 				"the unused, unexpired source is not discharged by another source's preimage: {:?}", proposal.disposition);
 		}
 	}
-	if cooperative_refund {
+	{
 		assert_eq!(signed_grants[1].amount(), sat(100_000));
 		let unused = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, grants[1]).await).await.unwrap().unwrap();
 		assert_eq!(unused.htlc.offchain_resolution, None);
@@ -145,7 +142,6 @@ async fn same_hash_sources(cooperative_refund: bool) {
 				'attempts',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM lightning_payment_attempt a WHERE a.payment_hash=$2),
 				'links',(SELECT jsonb_agg(to_jsonb(l) ORDER BY l.vtxo_id) FROM lightning_payment_attempt_htlc_vtxo l JOIN lightning_payment_attempt a ON a.id=l.lightning_payment_attempt_id WHERE a.payment_hash=$2),
 				'wal',(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM htlc_settlement s WHERE s.payment_hash=$2),
-				'origins',(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.kind,o.attempt_id,o.subscription_id,o.vtxo_id) FROM htlc_settlement_source o JOIN htlc_settlement s ON s.id=o.settlement_id WHERE s.payment_hash=$2),
 				'owners',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.vtxo_id) FROM coin_owner c WHERE c.vtxo_id=ANY($1)),
 				'virtual',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.txid) FROM virtual_transaction v WHERE v.txid=ANY($3)),
 				'entitlements',(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)),
@@ -157,63 +153,30 @@ async fn same_hash_sources(cooperative_refund: bool) {
 			).await;
 			let error = response.expect_err("a settled hash must not be cooperatively refunded through either source");
 			assert_eq!(error.code(), tonic::Code::InvalidArgument);
-			assert!(error.message().ends_with("invoice has already been paid"), "{error}");
+			assert!(error.message().ends_with(if index == 0 { "invoice has already been paid" }
+				else { "source settlement provenance is unknown" }), "{error}");
 			assert_eq!(committed().await, before);
 			assert_eq!(super::expiry_admission::source_rows(&db, &ids).await, source_before);
 			assert_eq!(super::expiry_admission::owner_rows(&db, &keys).await, owners_before);
 		}
 	}
 
-	let destination = client.fallback_script();
-	drop(client);
-	let fee_address = srv.watchmand().wait_wallet_address().await;
-	// The paid source and its unused sibling are separate physical trees.
-	// Each parent needs its own confirmed fee sponsor while both remain unmined.
-	for _ in 0..2 {
-		ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
-	}
-	ctx.generate_blocks(2).await;
+	// Decision13 intentionally withdraws the former 99k automatic disjoint
+	// refund. Exercise the real completed maturity view, not a fabricated row.
 	let current = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(deadline.to_u32() + 1 - current).await;
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let parent: Transaction = tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let row = db.read(async |t| Ok(t.query_opt("
-				SELECT a.sweep_tx
-				FROM expiry_allocation a
-				JOIN expiry_allocation_coin c ON c.allocation_id = a.id
-				JOIN expiry_entitlement e ON e.id = c.entitlement_id
-				WHERE e.vtxo_id = $1
-				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
-				AND c.disposition = 'customer'
-				AND a.broadcast_at IS NOT NULL
-			",
-				&[&grants[1].to_string()]).await?)).await.unwrap();
-			if let Some(row) = row {
-				break deserialize(row.get("sweep_tx")).unwrap();
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("unused same-hash grant was not automatically refunded to its offline owner");
-	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
-	assert_eq!(output.value, sat(99_000));
-	if cooperative_refund { assert_eq!(output.value + sat(1_000), signed_grants[1].amount()); }
-	ctx.generate_blocks(6).await;
-	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
-	assert_eq!(db.read(async |t| Ok(t.query_one("
-		SELECT COUNT(*)
-		FROM expiry_allocation_coin c
-		JOIN expiry_entitlement e ON e.id = c.entitlement_id
-		WHERE e.vtxo_id = $1
-		AND c.disposition = 'customer'
-	",
-		&[&grants[0].to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0,
-		"the source which funded the external invoice never receives a second customer payment");
-}
-
-#[tokio::test]
-async fn expiry_unused_same_hash_grant_can_be_refunded_after_other_source_paid() {
-	same_hash_sources(true).await;
+	let snapshot = db.read(async |t| t.backing_snapshot(&[ark::ServerVtxo::from(sources[1].0.clone()).to_bare()]).await).await.unwrap();
+	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[1]).unwrap();
+	let held = db.read(async |t| t.propose_expiry_ownership(fact, expired, Some(expired)).await).await.unwrap();
+	assert!(matches!(held.disposition, OwnershipDisposition::Unresolved(_)));
+	assert!(held.settlement_integrity_hold);
+	let htlc = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, grants[1]).await).await.unwrap().unwrap();
+	assert_eq!(htlc.htlc.resolution(), None);
+	assert!(htlc.vtxo.oor_spent_txid.is_none());
+	assert_eq!(htlc.amount(), sat(100_000));
+	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c
+		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
+		&[&grants[1].to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 }

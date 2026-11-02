@@ -545,7 +545,7 @@ impl Server {
 						t.warn_unknown_settlement(*source);
 						unknown = true;
 					},
-					crate::database::ln::SourceSettlement::NotSettled | crate::database::ln::SourceSettlement::Disjoint => {},
+					crate::database::ln::SourceSettlement::NotSettled => {},
 				}
 			}
 			// Release no funds when settlement is unknown; return the
@@ -1123,8 +1123,7 @@ impl Server {
 		ensure!(receive_claims.len() == htlc_ids.len(), "receive claim contains a non-receive source");
 		let checkpoint = self.db.write(async |t| {
 			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
-			let checkpoint = t.store_htlc_settlement_from(payment_preimage,
-				crate::database::ln::HtlcSettlementOrigin::Receive(sub.id)).await?;
+			let checkpoint = t.store_htlc_settlement(payment_preimage).await?;
 			t.prepare_receive_claims(&receive_claims).await?;
 			Ok(checkpoint)
 		}).await?;

@@ -163,8 +163,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 
 		let (updated, checkpoint) = self.db.write(async |t| {
 			let checkpoint = if let Some(preimage) = preimage {
-				t.store_htlc_settlement_from(preimage,
-					crate::database::ln::HtlcSettlementOrigin::Attempt(attempt.id)).await?
+				t.store_htlc_settlement(preimage).await?
 			} else {
 				t.lock_settlement_sources(attempt.payment_hash).await?;
 				None

@@ -296,15 +296,6 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 				assert_eq!(owner.get::<_, String>(0), receiver_mailbox.to_string());
 				prepared.push((source,row.get::<_, String>("output_vtxo_id"),output.amount().to_sat()));
 			}
-			let origins = tx.query("SELECT s.kind,s.attempt_id,s.subscription_id FROM htlc_settlement_source s
-				JOIN htlc_settlement w ON w.id=s.settlement_id WHERE w.payment_hash=$1
-				ORDER BY s.kind,s.attempt_id NULLS FIRST", &[&hash.to_string()]).await?
-				.into_iter().map(|row|(row.get::<_, String>(0),row.get::<_, Option<i64>>(1),row.get::<_, Option<i64>>(2)))
-				.collect::<Vec<_>>();
-			assert_eq!(origins.len(),3);
-			assert!(origins.contains(&("receive".into(),None,Some(sub.id))));
-			assert!(origins.contains(&("receive".into(),Some(attempt.id),Some(sub.id))));
-			assert!(origins.contains(&("attempt".into(),Some(attempt.id),None)));
 			let ids = tx.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo
 				WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&attempt.id]).await?;
 			for row in ids {
@@ -312,7 +303,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 				assert_eq!(tx.source_settlement(hash,id).await?,SourceSettlement::Funded);
 			}
 			Ok(serde_json::json!({"subscription":sub.id,"status":current.status.to_string(),
-				"prepared":prepared,"origins":origins}))
+				"prepared":prepared}))
 		}).await.unwrap();
 		let sender = sender_snapshot(&db,hash,attempt.id).await;
 		serde_json::json!({"receive":state,"sender":sender})

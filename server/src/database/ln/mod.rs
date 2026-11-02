@@ -2,7 +2,7 @@
 mod model;
 pub use model::*;
 mod settlement;
-pub use settlement::{HtlcSettlementOrigin, SourceSettlement};
+pub use settlement::SourceSettlement;
 
 
 use std::str::FromStr;
@@ -983,14 +983,8 @@ impl<'t> Tx<'t> {
 		&self,
 		preimage: Preimage,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Unknown).await
-	}
-
-	async fn store_htlc_settlement_wal(
-		&self,
-		preimage: Preimage,
-	) -> anyhow::Result<Option<Checkpoint>> {
 		let payment_hash = preimage.compute_payment_hash();
+		self.lock_settlement_sources(payment_hash).await?;
 
 		// ON CONFLICT DO NOTHING makes this idempotent: if an HTLC tx
 		// gets unconfirmed and re-confirmed in a reorg, the duplicate

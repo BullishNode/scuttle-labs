@@ -279,8 +279,7 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 				let mut notifications = Vec::new();
 				for &(id, preimage, resolution) in &spent {
 					if let Some(preimage) = preimage {
-						let checkpoint = t.store_htlc_settlement_from(preimage,
-							crate::database::ln::HtlcSettlementOrigin::Onchain(id)).await?;
+						let checkpoint = t.store_htlc_settlement(preimage).await?;
 						notifications.push((checkpoint, preimage.compute_payment_hash()));
 					}
 					t.register_vtxo_spend(id, height, txid).await?;

@@ -1,6 +1,5 @@
 //! Reconcile a real payment after its caller has stopped, using its own native label.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,17 +7,13 @@ use ark::lightning::{PaymentHash, Preimage};
 use ark::ProtocolEncoding;
 use bark::{LightningSendOptions, OpenWalletArgs, Wallet, WalletSeed};
 use bark::actions::lightning::pay::{LightningSendState, Progress};
-use bark::movement::MovementStatus;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
-use bark::subsystem::Subsystem;
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::daemon::lightningd::Lightningd;
 use ark_testing::daemon::captaind::Captaind;
 use ark_testing::onchain::AppBip86Wallet;
-use bitcoin::{Amount, Network, OutPoint, Transaction, TxOut};
-use bitcoin::consensus::deserialize;
+use bitcoin::{Amount, Network};
 use bitcoin_ext::BlockDelta;
-use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use cln_rpc::plugins::hold;
 use server::database::Db;
@@ -64,7 +59,6 @@ async fn reopen_sender(ctx: &TestContext, srv: &Captaind, name: &str, seed: &bip
 	let db: Arc<dyn BarkPersister> = Arc::new(SqliteClient::open(ctx.datadir.join(name).join("db.sqlite")).unwrap());
 	let onchain = AppBip86Wallet::load_or_create(Network::Regtest, seed.to_seed(""), db.clone(),
 		ctx.bitcoind().sync_client()).await.unwrap();
-	let script = onchain.fallback_script();
 	let mut config = ctx.bark_default_cfg(srv, Some(ctx.bitcoind()));
 	config.daemon_manual_sync = true;
 	config.vtxo_refresh_expiry_threshold = BlockDelta::new(4);
@@ -92,10 +86,6 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 				config.invoice_check_interval = Duration::from_secs(1);
 			}).watchmand().create().await;
 		let start_height = ctx.bitcoind().get_block_count().await;
-		let operator_script = {
-			let config = srv.watchmand().config();
-			config.sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey()
-		};
 		let mnemonic = bip39::Mnemonic::generate(12).unwrap();
 		let old = Box::pin(ctx.bark_sdk("failed-sender", &srv).mnemonic(mnemonic.clone()).app_bip86()
 			.cfg(|config| { config.daemon_manual_sync = true; config.vtxo_refresh_expiry_threshold=BlockDelta::new(4); config.vtxo_exit_margin=BlockDelta::new(2); }).boarded(sat(100_000)).create()).await;
@@ -191,7 +181,6 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		assert_eq!(later_htlcs.vtxo_ids.len(), 2, "the later native send must have a incomplete-scope boundary");
 		assert_ne!(later_htlcs.vtxo_ids, old_htlcs.vtxo_ids);
 		let mut later_sources = Vec::new();
-		let mut later_fundings = Vec::new();
 		for id in &later_htlcs.vtxo_ids {
 			let source = later.get_full_vtxo(*id).await.unwrap();
 			let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
@@ -199,7 +188,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			assert_eq!(later.get_vtxo_key(&source).await.unwrap().public_key(), source.policy().user_pubkey());
 			assert_ne!(source.chain_anchor(), old_source.chain_anchor());
 			assert_eq!(source.amount(), sat(50_000));
-			later_sources.push(source); later_fundings.push(funding);
+			later_sources.push(source);
 		}
 		assert_ne!(later_sources[0].chain_anchor(),later_sources[1].chain_anchor());
 		for (ids,failed) in [(&old_htlcs.vtxo_ids,true),(&later_htlcs.vtxo_ids,false)] {
@@ -229,7 +218,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			assert_eq!(status.htlc_vtxo_ids, scope);
 			if success {
 				assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Success(value)) if value.preimage == preimage.to_vec()));
-			} else { assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Failed(_)))); }
+			} else { assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Pending(_)))); }
 		}
 		for scope in [Vec::new(), vec![old_htlcs.vtxo_ids[0],later_htlcs.vtxo_ids[0]], vec![old_htlcs.vtxo_ids[0],old_htlcs.vtxo_ids[0]], vec![old_send.input_vtxo_ids[0]], vec![later_htlcs.vtxo_ids[0]]] {
 			let status = rpc.check_lightning_payment(protos::CheckLightningPaymentRequest {
@@ -241,147 +230,22 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		drop(later);
 
-		// The paid later sources and failed source form two expiry
-		// heights. Preserve the same 100,000 sat fee capital, usable independently by
-		// both packages before any intervening block confirms their change.
-		assert_eq!(later_sources[0].expiry_height(), later_sources[1].expiry_height());
-		assert_ne!(old_source.expiry_height(), later_sources[0].expiry_height());
-		let fee_address = srv.watchmand().wait_wallet_address().await;
-		let mut sponsor_ids = Vec::new();
-		for _ in 0..2 {
-			sponsor_ids.push(ctx.bitcoind().fund_addr(fee_address.clone(), sat(50_000)).await);
-		}
-		ctx.generate_blocks(2).await;
-		let mut sponsor_roots = BTreeMap::new();
-		for sponsor in sponsor_ids {
-			let tx = ctx.bitcoind().await_transaction(sponsor).await;
-			let outputs = tx.output.iter().enumerate().filter(|(_,out)|out.script_pubkey == fee_address.script_pubkey()).collect::<Vec<_>>();
-			assert_eq!(outputs.len(), 1); assert_eq!(outputs[0].1.value,sat(50_000));
-			let point = OutPoint::new(sponsor, outputs[0].0 as u32);
-			let utxo = ctx.bitcoind().sync_client().get_tx_out(&point.txid,point.vout,Some(true)).unwrap().unwrap();
-			assert!(utxo.confirmations >= 2); assert_eq!(utxo.value,sat(50_000));
-			assert_eq!(utxo.script_pub_key.script().unwrap(),fee_address.script_pubkey());
-			assert!(sponsor_roots.insert(point, outputs[0].1.clone()).is_none());
-		}
-		assert_eq!(sponsor_roots.len(),2);
-		assert_eq!(sponsor_roots.values().map(|out|out.value).sum::<Amount>(),sat(100_000));
-		let height = ctx.bitcoind().get_block_count().await as u32;
-		assert!(height < old_send.htlc_expiry.to_u32());
-		let expired = ctx.generate_blocks(old_send.htlc_expiry.to_u32()+1-height).await;
-		srv.wait_for_sync_height(expired).await;
-		srv.watchmand().wait_for_sync_height(expired).await;
-		let parent = tokio::time::timeout(Duration::from_secs(30), async {
-			loop {
-				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&old_source.id().to_string()]).await?)).await.unwrap();
-				if let Some(row) = row { break deserialize::<Transaction>(row.get(0)).unwrap(); }
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-		}).await.expect("the absent previous failed sender must receive its fallback despite the later payment");
-		ctx.bitcoind().await_transaction(parent.compute_txid()).await;
-		let outputs = parent.output.iter().enumerate().filter(|(_,out)|out.script_pubkey==destination).collect::<Vec<_>>();
-		assert_eq!(outputs.len(),1); assert_eq!(outputs[0].1.value,sat(99_000));
-		let payout = OutPoint::new(parent.compute_txid(),outputs[0].0 as u32);
-		let confirmed = ctx.generate_blocks(6).await;
-		srv.wait_for_sync_height(confirmed).await;
-		srv.watchmand().wait_for_sync_height(confirmed).await;
-		let core = ctx.bitcoind().sync_client();
-		let utxo = core.get_tx_out(&payout.txid,payout.vout,Some(true)).unwrap().unwrap();
-		assert!(utxo.confirmations>=6); assert_eq!(utxo.value,sat(99_000));
-		assert_eq!(utxo.script_pub_key.script().unwrap(),destination);
+		// Decision13 holds the old source when a different source paid this
+		// hash. Return to its real store: no false Paid record or history.
+		let returned = Box::pin(reopen_sender(&ctx,&srv,"failed-sender",&mnemonic)).await;
+		let checkpoint = returned.lightning_send_checkpoint(hash).await.unwrap().unwrap();
+		let history = returned.history().await.unwrap();
+		let coins = returned.all_vtxos().await.unwrap();
+		returned.sync_mailbox().await.unwrap();
+		Box::pin(returned.check_lightning_payment(hash, false)).await.unwrap();
+		assert!(!returned.is_invoice_paid(hash).await.unwrap());
+		assert_eq!(returned.lightning_send_checkpoint(hash).await.unwrap(), Some(checkpoint));
+		assert_eq!(returned.history().await.unwrap(), history);
+		assert_eq!(returned.all_vtxos().await.unwrap(), coins);
+		assert!(old_htlcs.vtxo_ids.iter().all(|id| coins.iter().any(|coin| coin.vtxo.id()==*id
+			&& matches!(coin.state,bark::vtxo::VtxoState::Locked { holder: Some(_) }))));
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
-		tokio::time::timeout(Duration::from_secs(30),async {
-			loop {
-				let confirmed=db.read(async |tx| Ok(tx.query_opt("SELECT a.id FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.status='confirmed' AND a.sweep_txid=$2",&[&old_source.id().to_string(),&parent.compute_txid().to_string()]).await?.is_some())).await.unwrap();
-				if confirmed { break; }
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-		}).await.expect("the canonical refund must enter confirmed server history before client adoption");
-		for _ in 0..2 {
-			let returned = Box::pin(reopen_sender(&ctx,&srv,"failed-sender",&mnemonic)).await;
-			for _ in 0..2 {
-				returned.chain().invalidate_caches().await;
-				returned.sync_mailbox().await.unwrap();
-				returned.sync().await;
-				returned.sync_onchain().await.unwrap();
-			}
-			assert!(!returned.is_invoice_paid(hash).await.unwrap());
-			let onchain = returned.onchain().unwrap();
-			assert!(onchain.read().await.is_mine(&destination).await.unwrap());
-			assert!(onchain.read().await.balance().await >= sat(99_000), "the onchain wallet must discover its payout");
-			let received = core.get_tx_out(&payout.txid,payout.vout,Some(true)).unwrap().unwrap();
-			assert_eq!(received.value, sat(99_000));
-			assert_eq!(received.script_pub_key.script().unwrap(), destination);
-			let history = returned.history().await.unwrap();
-			let sends = history.iter().filter(|row|row.subsystem.is_subsystem(Subsystem::LIGHTNING_SEND)).collect::<Vec<_>>();
-			assert_eq!(sends.len(),1); assert_eq!(sends[0].id,old_htlcs.movement_id);
-			assert_eq!(sends[0].status,MovementStatus::Failed);
-			assert_eq!(sends[0].effective_balance.to_sat(),0);
-			assert_eq!(sends[0].offchain_fee,Amount::ZERO);
-		}
 
-		let mut roots = sponsor_roots.clone();
-		assert!(roots.insert(old_source.chain_anchor(),old_funding.output[old_source.chain_anchor().vout as usize].clone()).is_none());
-		for (source,funding) in later_sources.iter().zip(&later_fundings) {
-			assert!(roots.insert(source.chain_anchor(),funding.output[source.chain_anchor().vout as usize].clone()).is_none());
-		}
-		assert_eq!(roots.len(),5); assert_eq!(roots.values().map(|out|out.value).sum::<Amount>(),sat(300_000));
-		let mut known = roots.clone(); let mut terminal = roots.clone(); let mut graph = BTreeMap::new();
-		let mut spent = BTreeSet::new(); let mut miner = Amount::ZERO;
-		let mut customer = BTreeSet::new();
-		for height in start_height+1..=core.get_block_count().unwrap() {
-			for tx in core.get_block(&core.get_block_hash(height).unwrap()).unwrap().txdata {
-				if !tx.input.iter().any(|input|known.contains_key(&input.previous_output)) { continue; }
-				let mut value = Amount::ZERO;
-				for input in &tx.input {
-					assert!(spent.insert(input.previous_output));
-					value+=known.get(&input.previous_output).expect("no undeclared money may enter the complete backing/sponsor cut").value;
-					assert!(terminal.remove(&input.previous_output).is_some());
-				}
-				miner+=value.checked_sub(tx.output.iter().map(|out|out.value).sum()).unwrap();
-				let txid=tx.compute_txid();
-				for (vout,out) in tx.output.iter().enumerate() {
-					let point=OutPoint::new(txid,vout as u32); known.insert(point,out.clone()); terminal.insert(point,out.clone());
-					if out.script_pubkey==destination { customer.insert(point); assert_eq!(out.value,sat(99_000)); }
-					assert_ne!(out.script_pubkey,later_destination,"the paid later source must not get a fallback");
-				}
-				assert!(graph.insert(txid,tx).is_none()); assert!(graph.len()<=64);
-			}
-		}
-		// Every canonical fee child must spend a declared sponsor,
-		// never customer principal or an undeclared funding input.
-		for tx in graph.values() {
-			let anchors = tx.input.iter().filter(|input|known[&input.previous_output].script_pubkey==*bitcoin_ext::fee::P2A_SCRIPT).count();
-			if anchors == 0 { continue; }
-			assert_eq!(anchors,1);
-			let fee_inputs = tx.input.iter().filter(|input|known[&input.previous_output].script_pubkey!=*bitcoin_ext::fee::P2A_SCRIPT).collect::<Vec<_>>();
-			assert!(!fee_inputs.is_empty());
-			assert!(fee_inputs.iter().all(|input|sponsor_roots.contains_key(&input.previous_output)));
-		}
-		assert_eq!(customer,BTreeSet::from([payout]));
-		assert_eq!(sat(300_000),terminal.values().map(|out|out.value).sum::<Amount>()+miner);
-		assert_eq!(graph.get(&parent.compute_txid()),Some(&parent));
-		assert_eq!(parent.version.0,3); assert!(parent.vsize()<=10_000);
-		let parent_inputs=parent.input.iter().map(|input|known[&input.previous_output].value).sum::<Amount>();
-		assert_eq!(parent_inputs,parent.output.iter().map(|out|out.value).sum());
-		let anchors=parent.output.iter().enumerate().filter(|(_,out)|out.script_pubkey==*bitcoin_ext::fee::P2A_SCRIPT).collect::<Vec<_>>();
-		assert_eq!(anchors.len(),1); assert_eq!(anchors[0].1.value,Amount::ZERO);
-		let anchor=OutPoint::new(parent.compute_txid(),anchors[0].0 as u32);
-		let children=graph.values().filter(|tx|tx.input.iter().any(|input|input.previous_output==anchor)).collect::<Vec<_>>();
-		assert_eq!(children.len(),1); assert_eq!(children[0].version.0,3); assert!(children[0].vsize()<=1_000);
-		let parent_info:serde_json::Value=core.call("getrawtransaction",&[serde_json::json!(parent.compute_txid().to_string()),serde_json::json!(true)]).unwrap();
-		let child_info:serde_json::Value=core.call("getrawtransaction",&[serde_json::json!(children[0].compute_txid().to_string()),serde_json::json!(true)]).unwrap();
-		assert_eq!(parent_info["blockhash"],child_info["blockhash"]); assert!(child_info["confirmations"].as_u64().unwrap()>=6);
-		let child_fee=children[0].input.iter().map(|input|known[&input.previous_output].value).sum::<Amount>()-children[0].output.iter().map(|out|out.value).sum::<Amount>();
-		assert!(child_fee>Amount::ZERO);
-		let admin = srv.watchmand().config().admin_address.unwrap();
-		let mut watch = ark_testing::daemon::captaind::WalletAdminClient::connect(format!("http://{admin}")).await.unwrap();
-		let watch_points=watch.wallet_status(protos::Empty{}).await.unwrap().into_inner().watchman.unwrap().confirmed_utxos.into_iter().map(|point|point.parse::<OutPoint>().unwrap()).collect::<BTreeSet<_>>();
-		for (point,out) in terminal {
-			if out.value==Amount::ZERO { continue; }
-			let utxo=core.get_tx_out(&point.txid,point.vout,Some(true)).unwrap().unwrap();
-			assert!(utxo.confirmations>=6); assert_eq!(utxo.value,out.value); assert_eq!(utxo.script_pub_key.script().unwrap(),out.script_pubkey);
-			assert!(point==payout||out.script_pubkey==operator_script||watch_points.contains(&point));
-		}
 		let final_pays=remote_pays(&lightning.internal,hash).await;
 		assert_eq!(final_pays.len(),2);
 		let failed=final_pays.iter().find(|pay|pay.label.as_deref()==Some(old_label.as_str())).unwrap();

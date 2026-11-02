@@ -157,11 +157,11 @@ async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, source
 	}).await.unwrap();
 }
 
-/// Real PostgreSQL transaction/provenance contracts with explicit metadata
-/// fixtures. These do not claim a native payment or witness was observed.
+/// Existing source facts and a consistent WAL are both required. These
+/// explicit PostgreSQL metadata fixtures do not claim a native payment.
 #[tokio::test]
-async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
-	let mut ctx = TestContext::new_minimal("postgresd/settlement_provenance_origins").await;
+async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
+	let mut ctx = TestContext::new_minimal("postgresd/settlement_source_facts").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
 	Db::create_with_payouts(&config, true).await.unwrap();
@@ -215,138 +215,29 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 		&[&hash.to_string()]).await?.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>())).await.unwrap();
 	assert_eq!(attempts.len(), 2);
 	let predicate = async |source| db.read(async |t| t.source_settlement(hash, source).await).await.unwrap();
-	let failure_allowed = async |id| db.write(async |t| {
-		t.lock_settlement_sources(hash).await?;
-		t.lock_htlc_settlements().await?;
-		let attempt = t.get_lightning_payment_attempt_by_id(id).await?.unwrap();
-		t.ensure_attempt_sources_allow_failure(&attempt).await
-	}).await;
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
-	failure_allowed(attempts[0]).await.unwrap();
-	failure_allowed(attempts[1]).await.unwrap();
-	// Supported retry shape: failed A={S,T}, later B={S}. An incoming S
-	// witness proves only S, not A's unspent co-input T. Roll this controlled
-	// metadata shape and its WAL back before the remaining receive controls.
-	let overlap: anyhow::Result<()> = db.write(async |t| {
-		t.execute("INSERT INTO lightning_payment_attempt_htlc_vtxo(lightning_payment_attempt_id,vtxo_id) VALUES($1,$2)",
-			&[&attempts[0], &ids[1].to_string()]).await?;
-		t.execute("UPDATE lightning_payment_attempt SET status='failed',updated_at=NOW() WHERE id=$1", &[&attempts[0]]).await?;
-		t.execute("UPDATE lightning_payment_attempt_htlc_vtxo SET vtxo_id=$2 WHERE lightning_payment_attempt_id=$1",
-			&[&attempts[1], &ids[0].to_string()]).await?;
-		assert!(t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Onchain(ids[0])).await?.is_some());
-		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Funded);
-		assert_eq!(t.source_settlement(hash, ids[1]).await?, SourceSettlement::Disjoint);
-		assert_eq!(t.query_one("SELECT count(*) FROM htlc_settlement_source WHERE kind='onchain' AND attempt_id IS NOT NULL",
-			&[]).await?.get::<_, i64>(0), 0);
-		anyhow::bail!("roll back the overlapping-attempt witness control")
-	}).await;
-	assert!(format!("{:#}", overlap.unwrap_err()).contains("roll back the overlapping-attempt witness control"));
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
-	let outgoing: anyhow::Result<()> = db.write(async |t| {
-		t.execute("UPDATE lightning_payment_attempt SET lightning_htlc_subscription_id=$2,updated_at=NOW() WHERE id=$1",
-			&[&attempts[0], &subscription]).await?;
-		assert!(t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Onchain(ids[2])).await?.is_some());
-		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Funded,
-			"the outgoing grant witness retains its actual subscription funding scope");
-		assert_eq!(t.source_settlement(hash, ids[1]).await?, SourceSettlement::Disjoint);
-		anyhow::bail!("roll back the outgoing-grant funding control")
-	}).await;
-	assert!(format!("{:#}", outgoing.unwrap_err()).contains("roll back the outgoing-grant funding control"));
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
-	let rolled_back: anyhow::Result<()> = db.write(async |t| {
-		t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Receive(subscription)).await?;
-		anyhow::bail!("roll back the original WAL and its origin together")
-	}).await;
-	assert!(rolled_back.is_err());
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
-	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement_source", &[])
-		.await?.get::<_, i64>(0))).await.unwrap(), 0);
-	// No attempt funded this subscription: the genuine DB relation is external.
-	assert!(db.write(async |t| t.store_htlc_settlement_from(preimage,
-		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap().is_some());
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::Disjoint);
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::Disjoint);
-	failure_allowed(attempts[0]).await.unwrap();
-	failure_allowed(attempts[1]).await.unwrap();
-	// Add an actual subscription funding association in this controlled fixture.
-	// Until its complete origin is recorded, the old observation fails closed.
-	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET lightning_htlc_subscription_id=$2,updated_at=NOW() WHERE id=$1",
-		&[&attempts[0], &subscription]).await?)).await.unwrap();
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::Unknown);
-	assert!(format!("{:#}", failure_allowed(attempts[0]).await.unwrap_err())
-		.contains("source settlement does not permit failure"));
-	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
-		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap(), None);
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::Disjoint);
-	assert!(format!("{:#}", failure_allowed(attempts[0]).await.unwrap_err())
-		.contains("source settlement does not permit failure"));
-	failure_allowed(attempts[1]).await.unwrap();
-	// A truncated receive observation is not evidence of disjointness.
-	db.write(async |t| Ok(t.execute("DELETE FROM htlc_settlement_source WHERE kind='receive' AND attempt_id=$1",
+	assert!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap().is_some());
+	for id in &ids { assert_eq!(predicate(*id).await, SourceSettlement::Unknown); }
+	// A same-hash preimage cannot discharge the failed or unattempted source.
+	// An exact positive source fact can, but never without the matching WAL.
+	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET status='succeeded',updated_at=NOW() WHERE id=$1",
 		&[&attempts[0]]).await?)).await.unwrap();
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
-	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
-		HtlcSettlementOrigin::Receive(subscription)).await).await.unwrap(), None);
-	// A later native-attempt observation must survive an already-present WAL.
-	// Hold its transaction while the exact refund-side lock/predicate waits.
-	let (stored_tx, stored_rx) = tokio::sync::oneshot::channel();
-	let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-	let writer_db = db.clone();
-	let second_attempt = attempts[1];
-	let writer = tokio::spawn(async move {
-		writer_db.write(async move |t| {
-			assert_eq!(t.store_htlc_settlement_from(preimage,
-				HtlcSettlementOrigin::Attempt(second_attempt)).await?, None);
-			stored_tx.send(()).unwrap();
-			release_rx.await.unwrap();
-			Ok(())
-		}).await
-	});
-	stored_rx.await.unwrap();
-	let reader_db = db.clone();
-	let second_source = ids[1];
-	let mut decision = tokio::spawn(async move {
-		reader_db.write(async |t| {
-			t.lock_settlement_sources(hash).await?;
-			t.lock_htlc_settlements().await?;
-			t.source_settlement(hash, second_source).await
-		}).await
-	});
-	assert!(tokio::time::timeout(Duration::from_millis(250), &mut decision).await.is_err(),
-		"a refund decision must wait for the source's in-flight settlement observation");
-	release_tx.send(()).unwrap();
-	writer.await.unwrap().unwrap();
-	assert_eq!(decision.await.unwrap().unwrap(), SourceSettlement::Funded);
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::Funded);
-	let count = async || db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement_source", &[])
-		.await?.get::<_, i64>(0))).await.unwrap();
-	let before = count().await;
-	let rolled_back: anyhow::Result<()> = db.write(async |t| {
-		t.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Onchain(ids[2])).await?;
-		anyhow::bail!("roll back witness observation and its source records together")
-	}).await;
-	assert!(rolled_back.is_err());
-	assert_eq!(count().await, before);
-	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
-		HtlcSettlementOrigin::Onchain(ids[2])).await).await.unwrap(), None);
-	assert!(count().await > before);
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
-	// A second same-hash origin never creates another WAL entry or rewrites it.
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
+	let without_wal: anyhow::Result<()> = db.write(async |t| {
+		t.execute("DELETE FROM htlc_settlement WHERE payment_hash=$1", &[&hash.to_string()]).await?;
+		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Unknown);
+		let attempt = t.get_lightning_payment_attempt_by_id(attempts[0]).await?.unwrap();
+		assert!(t.ensure_attempt_sources_allow_failure(&attempt).await.is_err());
+		anyhow::bail!("roll back missing-WAL metadata control")
+	}).await;
+	assert!(without_wal.is_err());
+	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
+	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
+		LightningHtlcSubscriptionStatus::Settled, None, None).await).await.unwrap();
+	assert_eq!(predicate(ids[2]).await, SourceSettlement::Funded);
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
+	assert_eq!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap(), None);
 	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement WHERE payment_hash=$1",
 		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
-	assert_eq!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
-	assert_eq!(db.write(async |t| t.store_htlc_settlement_from(preimage,
-		HtlcSettlementOrigin::Attempt(i64::MAX)).await).await.unwrap(), None);
-	for source in &ids {
-		assert_eq!(predicate(*source).await, SourceSettlement::Unknown);
-	}
-	for id in &attempts {
-		let before = db.read(async |t| t.get_lightning_payment_attempt_by_id(*id).await).await.unwrap().unwrap();
-		assert!(format!("{:#}", failure_allowed(*id).await.unwrap_err())
-			.contains("source settlement does not permit failure"));
-		let after = db.read(async |t| t.get_lightning_payment_attempt_by_id(*id).await).await.unwrap().unwrap();
-		assert_eq!(after.status, before.status);
-		assert_eq!(after.updated_at, before.updated_at, "a refused failure guard does not rewrite the attempt");
-	}
 }

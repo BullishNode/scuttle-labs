@@ -147,13 +147,3 @@ END;
 $$;
 CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo
 DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION require_customer_coin_owner();
-
-CREATE TABLE htlc_settlement_source (
-	settlement_id BIGINT NOT NULL REFERENCES public.htlc_settlement(id),
-	kind TEXT NOT NULL CHECK (kind IN ('attempt', 'receive', 'onchain', 'unknown')),
-	attempt_id BIGINT REFERENCES public.lightning_payment_attempt(id),
-	subscription_id BIGINT REFERENCES public.lightning_htlc_subscription(id),
-	vtxo_id TEXT REFERENCES public.vtxo(vtxo_id),
-	recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	UNIQUE NULLS NOT DISTINCT (settlement_id, kind, attempt_id, subscription_id, vtxo_id)
-);

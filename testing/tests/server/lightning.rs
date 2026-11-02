@@ -336,14 +336,7 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 			let leaf = input.witness.taproot_leaf_script().unwrap();
 			assert_eq!(leaf.version, bitcoin::taproot::LeafVersion::TapScript);
 			assert_eq!(leaf.script, clause.tapscript().as_script());
-			let origins = db.read(async |tx| Ok(tx.query("SELECT p.attempt_id,p.subscription_id,s.preimage \
-				FROM htlc_settlement_source p JOIN htlc_settlement s ON s.id=p.settlement_id \
-				WHERE s.payment_hash=$1 AND p.kind='onchain' AND p.vtxo_id=$2",
-				&[&hash.to_string(), &id.to_string()]).await?)).await.unwrap();
-			assert_eq!(origins.len(), 1);
-			assert_eq!(origins[0].get::<_, Option<i64>>("attempt_id"), None);
-			assert_eq!(origins[0].get::<_, Option<i64>>("subscription_id"), Some(subscription.id));
-			assert_eq!(origins[0].get::<_, &str>("preimage"), preimage.to_string());
+			assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 		}
 		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1",
 			&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
@@ -393,17 +386,7 @@ async fn server_settles_invoice_from_on_chain_htlc_preimage(
 			let leaf = input.witness.taproot_leaf_script().unwrap();
 			assert_eq!(leaf.version, bitcoin::taproot::LeafVersion::TapScript);
 			assert_eq!(leaf.script, clause.tapscript().as_script());
-			let origins = db.read(async |tx| Ok(tx.query("SELECT p.attempt_id,p.subscription_id,s.preimage \
-				FROM htlc_settlement_source p JOIN htlc_settlement s ON s.id=p.settlement_id \
-				WHERE s.payment_hash=$1 AND p.kind='onchain' AND p.vtxo_id=$2",
-				&[&hash.to_string(), &grant_id.to_string()]).await?)).await.unwrap();
-			assert_eq!(origins.len(), 2, "the witness retains its own origin and its authentic funding-attempt link");
-			assert_eq!(origins.iter().map(|row| row.get::<_, Option<i64>>("attempt_id")).collect::<HashSet<_>>(),
-				HashSet::from([None, Some(attempt.id)]));
-			for origin in origins {
-				assert_eq!(origin.get::<_, Option<i64>>("subscription_id"), Some(subscription.id));
-				assert_eq!(origin.get::<_, &str>("preimage"), preimage.to_string());
-			}
+			assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 		}
 		for source in sources {
 			assert_eq!(source.get::<_, &str>("payment_hash"), hash.to_string());

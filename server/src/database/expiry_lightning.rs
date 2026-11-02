@@ -143,7 +143,7 @@ impl Tx<'_> {
 		for source in &requested {
 			match self.source_settlement(hash, *source).await? {
 				SourceSettlement::Funded => any_funded = true,
-				SourceSettlement::NotSettled | SourceSettlement::Disjoint => all_funded = false,
+				SourceSettlement::NotSettled => all_funded = false,
 				SourceSettlement::Unknown => {
 					self.warn_unknown_settlement(*source);
 					unknown = true;

@@ -105,9 +105,6 @@ async fn revoke_htlc_vtxos(
 /// HTLC VTXOs. The exit publishes the HTLC preimage on-chain, which the
 /// server's HtlcSettler extracts to settle the hold invoice.
 
-#[path = "lightning_settlement.rs"]
-mod settlement;
-
 include!("lightning_fallback.rs");
 
 include!("lightning_helpers.rs");
