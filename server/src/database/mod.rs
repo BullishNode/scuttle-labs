@@ -250,9 +250,10 @@ impl Db {
 
 		let mut db = Db { pool, expiry_payouts: false };
 		db.run_migrations().await?;
-		db.expiry_payouts = db.get_conn().await?.query_one(
+		let expiry_payouts = db.get_conn().await?.query_one(
 			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
 		).await?.get(0);
+		db.expiry_payouts = expiry_payouts;
 
 		Ok(db)
 	}
