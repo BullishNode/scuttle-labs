@@ -97,19 +97,19 @@ impl Watchman {
 					spend.fee_rate, self.config.incremental_relay_fee
 				));
 			}
-			if let Err(error) = self.db.write(async |t| {
+			let committed_wallet = self.db.write(async |t| {
 				t.lock_watchman_tip(view).await?;
 				// Wallet sync may hold the wallet while waiting for this connection.
-				let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(()); };
+				let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(None); };
 				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
 					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
-					return Ok(());
+					return Ok(None);
 				}
 				// A request may outlive a later refresh, offboard or key drop.
 				// Reprove preservation and retain its sorted path locks through
 				// publication, rather than trusting the old request's txid alone.
 				if !t.request_expiry_split(view, &root).await
-					.context("expiry split request revalidation")? { return Ok(()); }
+					.context("expiry split request revalidation")? { return Ok(None); }
 				let current = t.query_one("
 					SELECT progress_txid FROM expiry_split_request
 					WHERE vtxo_id=$1
@@ -119,11 +119,19 @@ impl Watchman {
 					"expiry split instruction changed"
 				);
 				t.lock_unallocated_watchman_inputs(&ids).await.context("expiry split input locks")?;
-				self.process_progress_tx(t, &mut wallet, txid, &root, fee_rate).await
-					.context("expiry split progress publication")
-			}).await {
-				warn!(vtxo_id = %ids[0], progress_txid = %txid, error = %format!("{error:#}"),
-					"Expiry split remains pending");
+				if self.process_progress_tx(t, &mut wallet, txid, &root, fee_rate).await
+					.context("expiry split progress publication")? {
+					Ok(Some(wallet))
+				} else { Ok(None) }
+			}).await;
+			match committed_wallet {
+				Ok(Some(mut wallet)) => {
+					let _ = wallet.take_staged();
+					crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
+				},
+				Ok(None) => {},
+				Err(error) => warn!(vtxo_id = %ids[0], progress_txid = %txid, error = %format!("{error:#}"),
+					"Expiry split remains pending"),
 			}
 		}
 		Ok(())

@@ -753,15 +753,20 @@ impl Watchman {
 				break;
 			}
 
-			if let Err(e) = self.db.write(async |t| {
+			match self.db.write(async |t| {
 				// Normal exit progression competes with payouts for the same
 				// physical backing too. Hold its coin locks through publication.
 				t.lock_unallocated_watchman_inputs(&[vtxo.id()]).await?;
 				self.process_progress_tx(t, &mut wallet, progress_txid, &vtxo, fee_rate).await
 			}).await {
-				slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
+				Ok(true) => {
+					let _ = wallet.take_staged();
+					crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
+				},
+				Ok(false) => {},
+				Err(e) => slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
 					error: e.to_string(),
-				);
+				),
 			}
 		}
 
@@ -779,7 +784,7 @@ impl Watchman {
 		txid: Txid,
 		vtxo: &ServerVtxo,
 		fee_rate: FeeRate,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<bool> {
 		// Reuse the publication transaction, retaining its source locks without
 		// borrowing another connection from the same pool.
 		let vtx = tx.get_virtual_transaction_by_txid(txid).await?
@@ -795,7 +800,7 @@ impl Watchman {
 			let (current_package_fee, weight) = payout::mempool_child_fee(&self.bitcoind, child).await?
 				.context("progress fee child left the mempool")?;
 			if current_package_fee >= (progress_tx.weight() + weight) * fee_rate {
-				return Ok(());
+				return Ok(false);
 			}
 			MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
 		} else {
@@ -808,10 +813,14 @@ impl Watchman {
 		let cpfp_txid = cpfp_tx.compute_txid();
 		let result = bcd::submit_package(&self.bitcoind, &[&progress_tx, &cpfp_tx]).await?;
 		bcd::require_package_acceptance(&result, &[&progress_tx, &cpfp_tx])?;
+		wallet.commit_tx(&cpfp_tx);
+		if let Some(change) = wallet.staged() {
+			tx.store_changeset(wallet.kind(), change).await?;
+		}
 
 		slog!(ProgressBroadcast, vtxo_id: vtxo.id(), txid, cpfp_txid);
 
-		Ok(())
+		Ok(true)
 	}
 }
 
