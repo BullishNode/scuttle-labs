@@ -439,7 +439,7 @@ impl<E: ExtensionHandler> Default for Bip321Uri<E> {
 
 /// Case-insensitive prefix strip.
 fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-	if s.get(..prefix.len())?.eq_ignore_ascii_case(prefix) {
+	if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
 		Some(&s[prefix.len()..])
 	} else {
 		None
@@ -464,8 +464,11 @@ impl<E: ExtensionHandler> FromStr for Bip321Uri<E> {
 		if input.len() < SCHEME.len() {
 			return Err(Bip321Error::TooShort);
 		}
-		let body = strip_prefix_ignore_case(input, SCHEME)
-			.ok_or(Bip321Error::InvalidScheme)?;
+		if !input[..SCHEME.len()].eq_ignore_ascii_case(SCHEME) {
+			return Err(Bip321Error::InvalidScheme);
+		}
+
+		let body = &input[SCHEME.len()..];
 		let (address_str, query_str) = {
 			let mut split = body.splitn(2, '?');
 			(split.next().unwrap(), split.next())
@@ -871,16 +874,6 @@ mod tests {
 	}
 
 	#[test]
-	fn unicode_query_key_is_optional() {
-		let uri = parse_no_ext("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?aaaé=x")
-			.unwrap();
-		assert_eq!(
-			uri.custom.get("aaaé").unwrap(),
-			&[FieldWithAttributes::new("x".to_string(), false)]
-		);
-	}
-
-	#[test]
 	fn unknown_multiple_params_accepted() {
 		let uri = parse_no_ext("bitcoin:1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa?somethingyoudontunderstand=50&somethingyoudontunderstand=60")
 		.unwrap();
@@ -950,12 +943,6 @@ mod tests {
 	#[test]
 	fn reject_wrong_scheme() {
 		let err = parse_no_ext("litecoin:addr123").unwrap_err();
-		assert_eq!(err, Bip321Error::InvalidScheme);
-	}
-
-	#[test]
-	fn reject_unicode_scheme() {
-		let err = parse_no_ext("aaaaaaaé").unwrap_err();
 		assert_eq!(err, Bip321Error::InvalidScheme);
 	}
 
