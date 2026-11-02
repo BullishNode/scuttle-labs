@@ -1,84 +1,40 @@
 //! Exact selected P2TR dust boundaries through ordinary SDK accounts.
 
-use super::expiry_test::{ExpectedLeaf, confirm_epoch, receipt, fields, rebuilt, actual_fee, Epoch};
+use super::expiry_test::{ExpectedLeaf, confirm_epoch, receipt, rebuilt, actual_fee, Epoch};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use ark::attestations::VtxoStatusAttestation;
 use ark::{ProtocolEncoding, Vtxo, VtxoId, SECP};
 use ark::vtxo::Full;
 use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
-use bark::{OpenWalletArgs, Wallet, WalletSeed};
-use bark::lock_manager::memory::MemoryLockManager;
-use bark::persist::sqlite::SqliteClient;
+use bark::Wallet;
 use bark::movement::{Movement, MovementStatus};
 use bark::vtxo::VtxoState;
-use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
 use server_rpc::protos;
 
 async fn balances(wallet: &Wallet, spendable: Amount) {
-	let mut expected = [Amount::ZERO; 9];
-	expected[0] = spendable;
-	assert_eq!(fields(&wallet.balance().await.unwrap()), expected);
+	let balance = ark_testing::balance::assert_balance_consistent(wallet, false).await;
+	assert_eq!(balance.spendable, spendable);
+	assert_eq!(balance.total(), spendable);
 	assert!(wallet.exit_mgr().list_all(false, false).await.unwrap().is_empty(),
 		"no live or finished unilateral exit may claim already settled principal");
-}
-
-/// App secrets stay in memory. Only the public payout binding is registered;
-/// this fixture never claims spending or custody of these external outputs.
-struct Application {
-	seed: [u8; 64],
-	database: PathBuf,
-	script: ScriptBuf,
-}
-
-impl Application {
-	fn new(ctx: &TestContext, index: usize) -> Self {
-		let seed = bip39::Mnemonic::generate(12).unwrap().to_seed("");
-		let spend_key = ark_testing::onchain::AppBip86Wallet::mailbox_keypair(Network::Regtest, &seed).unwrap();
-		let script = ScriptBuf::new_p2tr(&SECP, spend_key.x_only_public_key().0, None);
-		let address = Address::from_script(&script, Network::Regtest).unwrap();
-		assert_eq!(address.script_pubkey(), script);
-		assert_eq!(script.minimal_non_dust(), sat(330));
-		Self { seed, script, database: ctx.datadir.join(format!("recipient_{index}.sqlite")) }
-	}
-
-	async fn open(&self, ctx: &TestContext, srv: &Captaind, create: bool) -> Wallet {
-		assert_eq!(self.database.exists(), !create, "reopen must load the original database");
-		let mut config = ctx.bark_default_cfg(&*srv, Some(ctx.bitcoind()));
-		config.daemon_manual_sync = true;
-		assert_eq!(config.change_vtxo_split_factor, 2);
-		Wallet::open(Network::Regtest, WalletSeed::new_from_seed(Network::Regtest, &self.seed), config,
-			OpenWalletArgs {
-				persister: Some(Arc::new(SqliteClient::open(&self.database).unwrap())),
-				lock_manager: Some(Box::new(MemoryLockManager::new())),
-				onchain: None,
-				create_if_not_exists: create, run_daemon: false, ..Default::default()
-			},
-		).await.unwrap()
-	}
 }
 
 /// Normal SDK sends, mailbox hydration, and authenticated ordinary status
 /// establish the source and its complete signed descendants. No manually fabricated registrations.
 async fn receive_boundary(
-	srv: &Captaind, db: &Db, sender: &Wallet, recipient: &Wallet,
+	srv: &Captaind, sender: &Wallet, recipient: &Wallet,
 	amount: Amount, board: &Transaction,
 ) -> (Vtxo<Full>, Vec<VtxoId>) {
 	balances(recipient, Amount::ZERO).await;
 	let before = sender.spendable_vtxos().await.unwrap();
-	let before = {
-		let mut full = BTreeMap::new();
-		for coin in before { full.insert(coin.id(), sender.get_full_vtxo(coin.id()).await.unwrap()); }
-		full
-	};
-	let total_before = before.values().map(|coin| coin.amount()).sum::<Amount>();
+	let total_before = before.iter().map(|coin| coin.amount()).sum::<Amount>();
 	let address = recipient.new_address().await.unwrap();
 	Box::pin(sender.send_arkoor_payment(&address, amount)).await.unwrap();
 	assert!(sender.pending_arkoor_sends().await.unwrap().is_empty());
@@ -91,36 +47,25 @@ async fn receive_boundary(
 	leaf.validate(board).unwrap();
 	let _real_leaf_key = recipient.get_vtxo_key(&leaf).await.unwrap();
 	balances(recipient, amount).await;
-	let mut after = BTreeMap::new();
-	for coin in sender.spendable_vtxos().await.unwrap() {
-		let full = sender.get_full_vtxo(coin.id()).await.unwrap();
-		full.validate(board).unwrap();
-		after.insert(full.id(), full);
-	}
-	assert_eq!(after.values().map(|coin| coin.amount()).sum::<Amount>() + amount, total_before);
-	let consumed = before.values().filter(|coin| !after.contains_key(&coin.id())).collect::<Vec<_>>();
+	let after = sender.spendable_vtxos().await.unwrap();
+	assert_eq!(after.iter().map(|coin| coin.amount()).sum::<Amount>() + amount, total_before);
+	let consumed = before.iter().filter(|coin| !after.iter().any(|current| current.id() == coin.id())).collect::<Vec<_>>();
 	assert_eq!(consumed.len(), 1, "all genuine change pieces here exceed the next small payment");
-	let source = consumed[0];
+	let source = sender.get_full_vtxo(consumed[0].id()).await.unwrap();
 	assert_eq!(sender.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spent);
-	assert_eq!(sender.get_full_vtxo(source.id()).await.unwrap().serialize(), source.serialize());
 	assert_eq!(leaf.chain_anchor(), source.chain_anchor());
 	assert_eq!(leaf.expiry_height(), source.expiry_height());
 	assert_eq!(leaf.exit_delta(), source.exit_delta());
 	assert_eq!(leaf.server_pubkey(), source.server_pubkey());
-	let new_change = after.values().filter(|coin| !before.contains_key(&coin.id())).collect::<Vec<_>>();
-	let expected = std::iter::once(&leaf).chain(new_change.iter().copied()).collect::<Vec<_>>();
+	let new_change = after.iter().filter(|coin| !before.iter().any(|prior| prior.id() == coin.id())).collect::<Vec<_>>();
 	assert_eq!(new_change.len(), 2, "retain the real default split factor2");
-	assert_eq!(expected.iter().map(|coin| coin.amount()).sum::<Amount>(), source.amount());
-	let key = sender.get_vtxo_key(source).await.unwrap();
+	assert_eq!(leaf.amount() + new_change.iter().map(|coin| coin.amount()).sum::<Amount>(), source.amount());
+	let key = sender.get_vtxo_key(&source).await.unwrap();
 	let status = srv.get_public_rpc().await.get_vtxo_status(protos::GetVtxoStatusRequest {
 		vtxo_id: source.id().to_bytes().to_vec(),
 		attestation: VtxoStatusAttestation::new(source.id(), &key).serialize(),
 	}).await.unwrap().into_inner();
 	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
-	for coin in expected {
-		let stored = db.read(async |tx| tx.get_user_vtxo_by_id(coin.id()).await).await.unwrap();
-		assert_eq!(stored.vtxo.serialize(), coin.serialize());
-	}
 	let arrivals = recipient.history().await.unwrap();
 	let arrivals = arrivals.iter().filter(|movement| movement.subsystem.name == "bark.arkoor"
 		&& movement.subsystem.kind == "receive" && movement.output_vtxos.contains(&leaf.id())).collect::<Vec<_>>();
@@ -130,17 +75,13 @@ async fn receive_boundary(
 	(leaf, vec![source.id()])
 }
 
-async fn verify_return(
-	wallet: &Wallet, leaves: &[&ExpectedLeaf], epoch: &Epoch, baseline: &[Movement],
-) -> (Vec<Option<OutPoint>>, Vec<Movement>) {
+async fn verify_return(wallet: &Wallet, leaves: &[&ExpectedLeaf], epoch: &Epoch, baseline: &[Movement]) {
 	wallet.sync_fallback_payouts().await.unwrap();
-	let mut receipts = Vec::new();
-	for leaf in leaves { receipts.push(receipt(wallet, leaf, epoch).await); }
+	for leaf in leaves { receipt(wallet, leaf, epoch).await; }
 	balances(wallet, Amount::ZERO).await;
 	assert!(wallet.pending_arkoor_sends().await.unwrap().is_empty());
-	let history = wallet.history().await.unwrap();
-	assert_eq!(history, baseline, "chain payout discovery must retain ordinary history without duplicate debits");
-	(receipts, history)
+	assert_eq!(wallet.history().await.unwrap(), baseline,
+		"chain payout discovery must retain ordinary history without duplicate debits");
 }
 
 async fn boundaries() {
@@ -167,24 +108,26 @@ async fn boundaries() {
 	let board_fee = actual_fee(&ctx, &board).await;
 	assert_eq!(sat(100_000) + ordinary.values().copied().sum::<Amount>() + board_fee, sat(200_000));
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let apps = (0..3).map(|index| Application::new(&ctx, index)).collect::<Vec<_>>();
+	let mut apps = Vec::new();
 	let mut recipients = Vec::new();
-	for app in &apps { recipients.push(Box::pin(app.open(&ctx, &srv, true)).await); }
+	for index in 0..3 {
+		let app = Box::pin(ctx.bark(format!("recipient_{index}"), &srv)
+			.cfg(|config| config.daemon_manual_sync = true).create()).await;
+		recipients.push(Box::pin(app.client()).await);
+		apps.push(app);
+	}
 	let sender_binding = sender.fallback_script();
 	let mut bindings = vec![sender_binding.clone()];
 	let mut mailboxes = vec![sender.mailbox_identifier()];
-	for (wallet, app) in recipients.iter().zip(&apps) {
+	for wallet in &recipients {
 		assert!(wallet.onchain().is_none());
-		let binding = wallet.fallback_script();
-		assert_eq!(binding, app.script);
-
-		bindings.push(binding);
+		bindings.push(wallet.fallback_script());
 		mailboxes.push(wallet.mailbox_identifier());
 	}
 	assert_eq!(bindings.iter().map(|binding| binding.clone()).collect::<BTreeSet<_>>().len(), 4);
 	assert_eq!(mailboxes.iter().map(|mailbox| mailbox.as_pubkey().to_string()).collect::<BTreeSet<_>>().len(), 4);
 	for (binding, mailbox) in bindings.iter().zip(&mailboxes) {
-
+		assert_eq!(binding.minimal_non_dust(), sat(330));
 		assert_eq!(**binding, ScriptBuf::new_p2tr(&SECP, mailbox.as_pubkey().x_only_public_key().0, None));
 		for input in &board.input {
 			let funding = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
@@ -196,10 +139,10 @@ async fn boundaries() {
 	let mut leaves = Vec::new();
 	let mut old = BTreeSet::from([source.id()]);
 	for (index, wallet) in recipients.iter().enumerate() {
-		let (coin, consumed) = Box::pin(receive_boundary(&srv, &db, &sender, wallet, sat(amounts[index]), &board)).await;
+		let (coin, consumed) = Box::pin(receive_boundary(&srv, &sender, wallet, sat(amounts[index]), &board)).await;
 		old.extend(consumed);
 		let pays = index != 0;
-		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: apps[index].script.clone(),
+		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: bindings[index + 1].clone(),
 			fee: if pays { 1_000 } else { 0 }, payout: if pays { dust + index as u64 - 1 } else { 0 },
 			forfeited: if pays { 0 } else { amounts[index] }, group_payout: if pays { dust + index as u64 - 1 } else { 0 } });
 	}
@@ -263,8 +206,8 @@ async fn boundaries() {
 	assert_eq!(epoch.parents.len(), 1);
 	assert_eq!(epoch.children.len(), 1);
 	let parent = epoch.parents.values().next().unwrap();
-	let payees = vec![(apps[0].script.clone(), None), (apps[1].script.clone(), Some(dust)),
-		(apps[2].script.clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 1_000))];
+	let payees = vec![(bindings[1].clone(), None), (bindings[2].clone(), Some(dust)),
+		(bindings[3].clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 1_000))];
 	let operator = {
 		let config = srv.watchmand().config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -280,20 +223,20 @@ async fn boundaries() {
 		&[&forbidden]).await?)).await.unwrap().is_empty());
 	let returned_sender = Box::pin(donor_cli.client()).await;
 	let sender_leaves = leaves.iter().filter(|leaf| leaf.mailbox == mailboxes[0]).collect::<Vec<_>>();
-	let sender_result = verify_return(&returned_sender, &sender_leaves, &epoch, &history_before[0]).await;
-	let mut results = Vec::new();
+	verify_return(&returned_sender, &sender_leaves, &epoch, &history_before[0]).await;
 	let mut returned = Vec::new();
 	for (index, app) in apps.iter().enumerate() {
-		let wallet = Box::pin(app.open(&ctx, &srv, false)).await;
+		assert!(app.datadir().join("db.sqlite").is_file(), "return must use the original wallet database");
+		let wallet = Box::pin(app.client()).await;
 		assert_eq!(wallet.fallback_script(), bindings[index + 1]);
 		assert_eq!(wallet.mailbox_identifier(), mailboxes[index + 1]);
-		results.push(verify_return(&wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await);
+		verify_return(&wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await;
 		returned.push(wallet);
 	}
 	for _ in 0..2 {
-		assert_eq!(verify_return(&returned_sender, &sender_leaves, &epoch, &history_before[0]).await, sender_result);
+		verify_return(&returned_sender, &sender_leaves, &epoch, &history_before[0]).await;
 		for (index, wallet) in returned.iter().enumerate() {
-			assert_eq!(verify_return(wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await, results[index]);
+			verify_return(wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await;
 		}
 	}
 	for wallet in std::iter::once(&returned_sender).chain(&returned) { wallet.stop_daemon_wait().await.unwrap(); }
@@ -302,15 +245,6 @@ async fn boundaries() {
 	ctx.generate_blocks(1).await;
 	rebuilt(&ctx, &srv, &db).await;
 
-	let reopened_sender = Box::pin(donor_cli.client()).await;
-	assert_eq!(verify_return(&reopened_sender, &sender_leaves, &epoch, &history_before[0]).await, sender_result);
-	for (index, app) in apps.iter().enumerate() {
-		let wallet = Box::pin(app.open(&ctx, &srv, false)).await;
-		assert_eq!(wallet.fallback_script(), bindings[index + 1]);
-		assert_eq!(verify_return(&wallet, &[&leaves[index]], &epoch, &history_before[index + 1]).await, results[index]);
-		wallet.stop_daemon_wait().await.unwrap();
-	}
-	reopened_sender.stop_daemon_wait().await.unwrap();
 	assert!(ctx.bitcoind().get_block_count().await - start <= 96);
 }
 

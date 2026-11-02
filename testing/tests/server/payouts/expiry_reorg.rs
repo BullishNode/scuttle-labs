@@ -1,4 +1,4 @@
-use super::expiry_test::wait_payout as wait_for_payout;
+use super::expiry_test::{actual_fee, canonical, wait_payout as wait_for_payout};
 
 use std::time::Duration;
 
@@ -29,7 +29,8 @@ async fn wait_for_confirmation(db: &Db, allocation: i64, point: BlockRef, hash: 
 
 /// No fixture inserts entitlements, allocations, chain acknowledgments or
 /// invalidation flags. Real Core forks and daemon restart drive the rebuild.
-async fn payout_reorg() {
+#[tokio::test]
+async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 	let ctx = TestContext::new("server/expiry_payout_reorg_6").await;
 	// Both daemons observe the same real Core fork.
 	let core_url = ctx.bitcoind().rpc_url();
@@ -136,11 +137,6 @@ async fn payout_reorg() {
 		"reorg recovery cannot rewrite the immutable payout parent");
 }
 
-#[tokio::test]
-async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
-	payout_reorg().await;
-}
-
 /// A configured regtest fee rise drives the real watchman replacement path.
 /// This is a fee-policy/restart test, not a congested public-network claim.
 #[tokio::test]
@@ -198,12 +194,7 @@ async fn expiry_payout_fee_replacement_keeps_parent_and_counts_only_confirmed_ch
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	assert!(sat(recorded_fee) >= target * (parent.weight() + replacement.weight()));
 	assert!(recorded_fee > first_fee && recorded_fee > 1_000);
-	let mut input_value = 0;
-	for input in &replacement.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		input_value += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	assert_eq!(recorded_fee, input_value - replacement.output.iter().map(|out| out.value.to_sat()).sum::<u64>());
+	assert_eq!(recorded_fee, actual_fee(&ctx, &replacement).await.to_sat());
 	ctx.generate_blocks(6).await;
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
@@ -395,19 +386,9 @@ async fn positive_untrusted_parent_recovery() {
 	assert!(child.output.iter().all(|out| out.script_pubkey != destination));
 
 	ctx.generate_blocks(6).await;
-	let parent_receipt: serde_json::Value = rpc.call("getrawtransaction", &[
-		serde_json::json!(parent.compute_txid()), serde_json::json!(true),
-	]).unwrap();
-	let child_receipt: serde_json::Value = rpc.call("getrawtransaction", &[
-		serde_json::json!(child.compute_txid()), serde_json::json!(true),
-	]).unwrap();
-	assert!(parent_receipt["confirmations"].as_u64().unwrap() >= 6);
-	assert!(child_receipt["confirmations"].as_u64().unwrap() >= 6);
-	assert_eq!(parent_receipt["blockhash"], child_receipt["blockhash"]);
-	let block: BlockHash = parent_receipt["blockhash"].as_str().unwrap().parse().unwrap();
-	let header = rpc.get_block_header_info(&block).unwrap();
-	assert!(header.confirmations >= 6);
-	assert_eq!(rpc.get_block_hash(header.height as u64).unwrap(), block);
+	let confirmed = canonical(&ctx, &parent);
+	assert_eq!(canonical(&ctx, &child), confirmed, "the real sponsor child confirms with its immutable parent");
+	let block = confirmed.hash;
 	let payout = rpc.get_tx_out(&parent.compute_txid(), payout_index, Some(true)).unwrap().unwrap();
 	assert_eq!(payout.value, sat(99_000));
 	assert!(payout.confirmations >= 6);
