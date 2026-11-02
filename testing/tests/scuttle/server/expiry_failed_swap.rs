@@ -339,7 +339,7 @@ async fn failed_swap_during_restart() {
 		graph.insert(sponsor.compute_txid(), sponsor);
 	}
 	assert_eq!(active, 1);
-	let payee = db.read(async |tx| Ok(tx.query_one("SELECT output_index,spk,amount_sat \
+	let payee = db.read(async |tx| Ok(tx.query_one("SELECT (ROW_NUMBER() OVER (ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat \
 		FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts", &[&allocation],
 	).await?)).await.unwrap();
 	assert_eq!(payee.get::<_, i32>("output_index"), i32::try_from(payout.vout).unwrap());

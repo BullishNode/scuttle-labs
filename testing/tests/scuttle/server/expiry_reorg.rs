@@ -385,7 +385,7 @@ async fn positive_untrusted_parent_recovery(crash: bool) {
 		srv.watchmand().start().await.unwrap();
 		assert_ne!(srv.watchmand().native_child().await.unwrap(), before);
 		let row = db.read(async |t| Ok(t.query_one("SELECT a.sweep_tx,a.status,a.broadcast_at IS NULL AS unpublished, \
-			(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_allocation a,expiry_entitlement e WHERE a.id=$1 AND e.id=$2",
+			(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_allocation_state a,expiry_entitlement e WHERE a.id=$1 AND e.id=$2",
 			&[&allocation, &entitlement]).await?)).await.unwrap();
 		assert_eq!(deserialize::<Transaction>(row.get("sweep_tx")).unwrap(), parent);
 		assert_eq!(row.get::<_, String>("status"), "pending");
@@ -441,7 +441,7 @@ async fn positive_untrusted_parent_recovery(crash: bool) {
 		.expect("configured sweeper must warn for this positive-but-untrusted allocation")
 		.expect("watchman warning handler closed");
 	let held = db.read(async |t| Ok(t.query_one("SELECT a.status,a.sweep_tx,a.broadcast_at IS NULL AS unpublished, \
-		(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_allocation a,expiry_entitlement e \
+		(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_allocation_state a,expiry_entitlement e \
 		WHERE a.id=$1 AND e.id=$2", &[&allocation,&entitlement]).await?)).await.unwrap();
 	assert_eq!(held.get::<_, String>("status"), "pending");
 	assert!(held.get::<_, bool>("unpublished"));
