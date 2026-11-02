@@ -281,7 +281,7 @@ async fn assert_final_outcome(
 		).await?.get::<_, String>(0))).await.unwrap();
 		assert_eq!(active, expected_payers[&coin].to_string(), "the active receipt must identify the actual canonical payer");
 	}
-	let allocations = db.read(async |tx| Ok(tx.query("SELECT id,status,sweep_tx FROM expiry_allocation \
+	let allocations = db.read(async |tx| Ok(tx.query("SELECT id,status,sweep_tx FROM expiry_allocation_state \
 		WHERE id=ANY($1)", &[&stored_parents.keys().copied().collect::<Vec<_>>()],
 	).await?)).await.unwrap();
 	assert_eq!(allocations.len(), stored_parents.len());

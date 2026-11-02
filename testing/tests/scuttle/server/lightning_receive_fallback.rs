@@ -576,7 +576,7 @@ async fn registered_receive_fallback() {
 	assert_eq!(actual.script_pub_key.script().unwrap(), destination);
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let paid = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_allocation \
+			let paid = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_allocation_state \
 				WHERE sweep_txid=$1 AND status='confirmed'", &[&payout.txid.to_string()],
 			).await?.get::<_, i64>(0))).await.unwrap();
 			if paid == 1 { break; }
