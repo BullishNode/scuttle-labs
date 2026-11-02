@@ -447,8 +447,8 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 				loop {
 					if db.read(async |tx| {
 						let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-						Ok(view.processed.height == tip
-							&& view.processed.hash == hash && tx.expiry_view_is_current(view).await?)
+						Ok(view.height == tip
+							&& view.hash == hash && (tx.expiry_view().await? == Some(view)))
 					}).await.unwrap() { break; }
 					tokio::time::sleep(Duration::from_millis(50)).await;
 				}

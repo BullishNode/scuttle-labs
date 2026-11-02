@@ -25,7 +25,7 @@ use bitcoin::taproot::{LeafVersion, TapLeafHash};
 use bitcoin_ext::{AmountExt, BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi, json::SignRawTransactionInput};
 use server::database::{Db, SpendState};
-use server::database::expiry_inventory::{BackingPartitionResidual, BackingSnapshot, BackingSnapshotLimits};
+use server::database::expiry_inventory::BackingSnapshot;
 use server::vtxopool::VtxoTarget;
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use cln_rpc::plugins::hold::{self, InvoiceState};
@@ -313,8 +313,7 @@ async fn registered_receive_fallback() {
 		coin.validate(&shared_funding).unwrap();
 		terminals.push(ServerVtxo::from(coin.clone()));
 	}
-	let limits = BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 };
-	let snapshot = db.read(async |tx| tx.backing_snapshot(&[terminals[0].to_bare()], limits).await).await.unwrap();
+	let snapshot = db.read(async |tx| tx.backing_snapshot(&[terminals[0].to_bare()]).await).await.unwrap();
 	let physical_root = snapshot.regular.iter().find(|fact| fact.state.vtxo.point() == shared_anchor)
 		.expect("shared pool root must exist in its actual source inventory").state.vtxo.clone();
 	assert_eq!(physical_root.amount(), root_value);
@@ -330,11 +329,10 @@ async fn registered_receive_fallback() {
 			}
 		}
 	}
-	let residuals = residuals.into_iter().map(|(outpoint, txout)| BackingPartitionResidual { outpoint, txout }).collect::<Vec<_>>();
-	BackingSnapshot { roots: vec![physical_root], regular: Vec::new() }
-		.check_partition(&terminals, &[shared_funding.clone()], &residuals, limits).unwrap();
+	let residuals = residuals.into_iter().map(|(_, txout)| txout).collect::<Vec<_>>();
+
 	assert_eq!(terminals.iter().map(|coin| coin.amount()).sum::<Amount>()
-		+ residuals.iter().map(|residual| residual.txout.value).sum::<Amount>(), root_value);
+		+ residuals.iter().map(|residual| residual.value).sum::<Amount>(), root_value);
 	let depth = source.exit_depth().max(unknown_source.exit_depth());
 	assert!(depth <= 8, "the declared fixed confirmation schedule only covers this bounded signed geometry");
 	let mut unknown_path = BTreeMap::from([(shared_anchor, shared_funding.output[shared_anchor.vout as usize].clone())]);
@@ -602,7 +600,7 @@ async fn registered_receive_fallback() {
 			loop {
 				let rebuilt = db.read(async |tx| {
 					let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-					Ok(view.processed == point && tx.expiry_view_is_current(view).await?)
+					Ok(view == point && (tx.expiry_view().await? == Some(view)))
 				}).await.unwrap();
 				if rebuilt { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;

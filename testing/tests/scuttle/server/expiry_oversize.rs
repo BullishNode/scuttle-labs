@@ -21,7 +21,6 @@ use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
 use server::owner_proof::OwnerLinks;
-use server::database::expiry_inventory::{BackingPartitionResidual, BackingSnapshotLimits};
 use server_rpc::protos;
 
 const PAYEES: usize = 327;
@@ -379,32 +378,6 @@ async fn bounded_round_inventory() {
 		leaf.validate(&funding).unwrap();
 		for step in leaf.transactions() { signed_paths.insert(step.tx.compute_txid(), step.tx); }
 	}
-	let limits = BackingSnapshotLimits { max_rows: 250_000, max_serialized_bytes: 256 * 1024 * 1024 };
-	let root = db.read(async |tx| Ok(tx.get_bare_vtxo_by_id(ark::VtxoId::from(anchor)).await?.vtxo))
-		.await.unwrap();
-	let snapshot = db.read(async |tx| tx.backing_snapshot(std::slice::from_ref(&root), limits).await)
-		.await.unwrap();
-	let residuals = signed_paths.values().flat_map(|tx| tx.output.iter().enumerate().filter_map(|(vout, output)| {
-		output.is_p2a_fee_anchor().then_some(BackingPartitionResidual {
-			outpoint: OutPoint::new(tx.compute_txid(), vout as u32), txout: output.clone(),
-		})
-	})).collect::<Vec<_>>();
-	let sources = terminals.iter().map(|(_, leaf)| ark::ServerVtxo::from(leaf.clone())).collect::<Vec<_>>();
-	snapshot.check_partition(&sources, std::slice::from_ref(&funding), &residuals, limits).unwrap();
-	let proof_rows = snapshot.roots.len() + sources.len() + 1 + residuals.len()
-		+ sources.iter().map(|source| usize::from(source.exit_depth())).sum::<usize>();
-	let proof_bytes = sources.iter().map(|source| source.serialize().len()).sum::<usize>()
-		+ serialize(&funding).len() + residuals.iter().map(|residual| serialize(&residual.txout).len()).sum::<usize>();
-	assert!(proof_rows <= limits.max_rows && proof_bytes <= limits.max_serialized_bytes);
-	let inventory = db.read(async |tx| Ok(tx.query_one(
-		"SELECT COUNT(*) AS rows, SUM(octet_length(vtxo))::BIGINT AS bytes FROM vtxo WHERE anchor_point=$1",
-		&[&anchor.to_string()],
-	).await?)).await.unwrap();
-	let rows = inventory.get::<_, i64>("rows");
-	let bytes = inventory.get::<_, i64>("bytes");
-	assert!(rows >= COUNT as i64 && rows <= 25_893);
-	assert!(bytes > 0 && bytes < 256 * 1024 * 1024);
-	assert_eq!(snapshot.regular.len(), rows as usize);
 	let mut mailbox = srv.get_mailbox_public_rpc().await;
 	let mailbox_pubkey = srv.ark_info().await.mailbox_pubkey;
 	for (index, leaf) in &terminals {

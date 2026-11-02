@@ -19,7 +19,6 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
 use cln_rpc::plugins::hold;
 use server::database::{Db, SpendState};
-use server::database::expiry_inventory::BackingSnapshotLimits;
 use server::database::expiry_ownership::OwnershipDisposition;
 use server::database::ln::LightningPaymentStatus;
 use server_rpc::protos;
@@ -240,11 +239,9 @@ async fn failed_swap_during_restart() {
 	let before_deadline = ctx.generate_blocks(input.expiry_height().to_u32() + 1 - height).await;
 	assert!(before_deadline < deadline);
 	wait_rebuilt(&db, server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap()).await;
-	let snapshot = db.read(async |tx| tx.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()],
-		BackingSnapshotLimits { max_rows: 1_000, max_serialized_bytes: 1_000_000 }).await).await.unwrap();
+	let snapshot = db.read(async |tx| tx.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == source).unwrap();
-	let proposal = db.read(async |tx| tx.propose_expiry_ownership(fact, &funding,
-		before_deadline, Some(before_deadline)).await).await.unwrap();
+	let proposal = db.read(async |tx| tx.propose_expiry_ownership(fact, before_deadline, Some(before_deadline)).await).await.unwrap();
 	assert!(matches!(proposal.disposition, OwnershipDisposition::Unresolved(_)));
 	assert!(!proposal.needs_chain_progress);
 	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \

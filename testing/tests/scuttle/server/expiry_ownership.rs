@@ -98,16 +98,16 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 			loop {
 				if let Some(view) = db.read(async |tx| {
 					let Some(view) = tx.expiry_view().await? else { return Ok(None); };
-					Ok(if tx.expiry_view_is_current(view).await? { Some(view) } else { None })
+					Ok(if (tx.expiry_view().await? == Some(view)) { Some(view) } else { None })
 				}).await.unwrap() {
-					if view.processed.height==expired && view.processed.hash==canonical { break view; }
+					if view.height==expired && view.hash==canonical { break view; }
 				}
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
 		}).await.expect("the advancing watchmand must publish its real valid completed primary view");
 		let c = db.read(async |tx| tx.get_highest_block(server::database::BlockTable::Captaind).await)
 			.await.unwrap().unwrap();
-		assert!(c.height < input.expiry_height() && input.expiry_height() <= view.processed.height && view.processed.height < deadline);
+		assert!(c.height < input.expiry_height() && input.expiry_height() <= view.height && view.height < deadline);
 		assert_eq!(srv.bitcoind().get_block_count().await, u64::from(c.height.to_u32()), "captain Core RPC must remain genuinely lagged/alive");
 		lightning.internal.wait_for_block(expired).await;
 		assert!(cut().await.values().all(|count| *count==0));
@@ -116,14 +116,14 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 		assert_eq!(stored.spend_state, server::database::SpendState::Spendable);
 		assert!(stored.confirmed_height.is_none());
 		assert!(!stored.decided_for_fallback);
-		Some((c.height,view.processed,view.generation))
+		Some((c.height,view))
 	} else { None };
 	let response = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000,
 		htlc_vtxo_ids: htlcs.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: None,
 	}).await;
-	if let Some((captain,watchman,generation)) = completed {
+	if let Some((captain,watchman)) = completed {
 		let counts = cut().await;
 		let pays = lightning.internal.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
 			bolt11:None,payment_hash:Some(hash.to_vec()),status:None,index:None,limit:None,start:None,
@@ -135,7 +135,7 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 		// refusal assertion; never continue its unattempted-refund tail if admitted.
 		tokio::fs::write(ctx.datadir.join("lagged-admission-observation.json"), serde_json::to_vec_pretty(&serde_json::json!({
 			"captain_height":captain.to_u32(),"watchman_height":watchman.height.to_u32(),
-			"watchman_hash":watchman.hash.to_string(),"generation":generation,
+			"watchman_hash":watchman.hash.to_string(),
 			"source_expiry":input.expiry_height().to_u32(),"htlc_expiry":deadline.to_u32(),
 			"source":htlc.id().to_string(),"rpc_ok":response.is_ok(),
 			"rpc_error":response.as_ref().err().map(|error| serde_json::json!({"code":error.code() as i32,
@@ -164,12 +164,9 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 	let root = ark::ServerVtxo::from(input.clone()).to_bare();
 	let funding = db.read(async |t| t.get_virtual_transaction_by_txid(input.chain_anchor().txid).await).await.unwrap().unwrap()
 		.signed_tx.unwrap().into_owned();
-	let limits = server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 };
-	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()], limits).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
-	let pending = db.read(async |t| t.propose_expiry_ownership(
-		fact, &funding, expired, Some(expired),
-	).await).await.unwrap();
+	let pending = db.read(async |t| t.propose_expiry_ownership(fact, expired, Some(expired)).await).await.unwrap();
 	assert!(matches!(pending.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
 	if check_alarms {
 		tokio::time::timeout(Duration::from_secs(30), async {
@@ -184,11 +181,9 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 	}
 	let tip = ctx.generate_blocks(deadline.to_u32() + 1 - expired.to_u32()).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
-	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()], limits).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
-	let ready = db.read(async |t| t.propose_expiry_ownership(
-		fact, &funding, tip, Some(tip),
-	).await).await.unwrap();
+	let ready = db.read(async |t| t.propose_expiry_ownership(fact, tip, Some(tip)).await).await.unwrap();
 	assert!(matches!(ready.disposition,
 		server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey, .. }
 			if user_pubkey == key.public_key()
@@ -259,14 +254,11 @@ async fn expiry_cancelled_unclaimed_output_keeps_owner_after_participation_remov
 	", &[&participation]).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(remaining, 0);
 	let funding = ctx.bitcoind().await_transaction(leaf.chain_anchor().txid).await;
-	let limits = server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 };
 	let root = leaf.to_bare();
-	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()], limits).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == root.id()).unwrap();
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-	let proposal = db.read(async |t| t.propose_expiry_ownership(
-		fact, &funding, tip, Some(tip),
-	).await).await.unwrap();
+	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, tip, Some(tip)).await).await.unwrap();
 	assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Operator));
 	assert!(matches!(proposal.evidence,
 		Some(server::database::expiry_ownership::OwnershipEvidence::Exchange {

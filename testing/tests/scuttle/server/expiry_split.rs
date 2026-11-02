@@ -106,8 +106,7 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 	if !pin { srv.watchmand().wait_for_sync_height(expired).await; }
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let root = db.read(async |t| {
-		let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()],
-			server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 }).await?;
+		let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await?;
 		Ok(snapshot.regular.into_iter().find(|f| f.state.vtxo.point() == input.chain_anchor()).unwrap().state.vtxo)
 	}).await.unwrap();
 	if let Some(mut sponsor) = pin_sponsor {
@@ -182,7 +181,7 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 		loop {
 			let result = db.write(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
-				if !t.expiry_view_is_current(view).await? { return Ok(false); }
+				if !(t.expiry_view().await? == Some(view)) { return Ok(false); }
 				let requested = t.request_expiry_split(view, &root).await?;
 				Ok(requested)
 			}).await.unwrap();

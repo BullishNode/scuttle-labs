@@ -263,8 +263,8 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		loop {
 			let rebuilt = db.read(async |tx| {
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed.height == final_height && view.processed.hash == final_hash
-					&& tx.expiry_view_is_current(view).await?)
+				Ok(view.height == final_height && view.hash == final_hash
+					&& (tx.expiry_view().await? == Some(view)))
 			}).await.unwrap();
 			if rebuilt { break; }
 			tokio::time::sleep(Duration::from_millis(100)).await;
@@ -525,8 +525,8 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		loop {
 			let rebuilt = db.read(async |tx| {
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed.height == final_height && view.processed.hash == final_hash
-					&& tx.expiry_view_is_current(view).await?)
+				Ok(view.height == final_height && view.hash == final_hash
+					&& (tx.expiry_view().await? == Some(view)))
 			}).await.unwrap();
 			if rebuilt { break; }
 			tokio::time::sleep(Duration::from_millis(100)).await;

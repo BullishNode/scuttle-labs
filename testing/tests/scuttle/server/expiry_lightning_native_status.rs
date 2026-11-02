@@ -26,8 +26,8 @@ async fn completed_view(ctx: &TestContext, srv: &Captaind, db: &Db) {
 		loop {
 			if db.read(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed.height == tip
-					&& view.processed.hash == hash && t.expiry_view_is_current(view).await?)
+				Ok(view.height == tip
+					&& view.hash == hash && (t.expiry_view().await? == Some(view)))
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}

@@ -351,8 +351,8 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	log::info!("ISSUE62 watchmand intentionally stopped at actual expired tip {}",expiry_tip);
 	db.read(async |tx| {
 		let view=tx.expiry_view().await?.unwrap();
-		assert_eq!(view.processed.height,expiry_tip);
-		assert!(tx.expiry_view_is_current(view).await?);
+		assert_eq!(view.height,expiry_tip);
+		assert!((tx.expiry_view().await? == Some(view)));
 		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=ANY($1)",
 			&[&grant_ids]).await?.get::<_, i64>(0),0,"no fallback decision may replace this controlled cooperative tail");
 		let same_hash=tx.query("SELECT v.vtxo_id FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1",

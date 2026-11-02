@@ -46,15 +46,9 @@ pub(crate) async fn guard_new_lightning_inputs(
 	tx: &super::Tx<'_>,
 	ids: &[VtxoId],
 ) -> anyhow::Result<()> {
-	let row = tx.query_one("SELECT processed_height,processed_hash FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
 	let view = tx.expiry_view().await?;
-	// A fresh store without a completed watchmand view keeps the captain-only
-	// admission floor. Once published, an invalidated/mismatched view is not
-	// permission to admit new work against a possibly older captain tip.
-	ensure!(view.is_some() || (row.get::<_, Option<i64>>("processed_height").is_none()
-		&& row.get::<_, Option<&str>>("processed_hash").is_none()),
-		"completed expiry view is not usable for new Lightning work");
-	let watchman_height = view.map_or(0_i64, |view| i64::from(view.processed.height));
+	if let Some(point) = view { tx.lock_watchman_tip(point).await?; }
+	let watchman_height = view.map_or(0_i64, |point| i64::from(point.height));
 	guard_obligation_changes(tx, ids).await?;
 	let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 	if let Some(row) = tx.query_opt(

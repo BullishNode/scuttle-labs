@@ -90,12 +90,9 @@ async fn same_hash_sources(cooperative_refund: bool) {
 		let funding = db.read(async |t|
 			t.get_virtual_transaction_by_txid(input.chain_anchor().txid).await
 		).await.unwrap().unwrap().signed_tx.unwrap().into_owned();
-		let snapshot = db.read(async |t| t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()],
-			server::database::expiry_inventory::BackingSnapshotLimits { max_rows: 10_000, max_serialized_bytes: 10_000_000 }).await).await.unwrap();
+		let snapshot = db.read(async |t| t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
 		let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[index]).unwrap();
-		let proposal = db.read(async |t| t.propose_expiry_ownership(
-			fact, &funding, height, Some(height),
-		).await).await.unwrap();
+		let proposal = db.read(async |t| t.propose_expiry_ownership(fact, height, Some(height)).await).await.unwrap();
 		if index == 0 {
 			assert_eq!(proposal.disposition, OwnershipDisposition::Operator, "the source that actually funded the paid invoice is discharged");
 			assert_eq!(db.read(async |t| t.source_settlement(hash, grants[0]).await).await.unwrap(),
@@ -109,9 +106,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 					&[&grants[0].to_string()]).await?;
 				Ok(())
 			}).await.unwrap();
-			let held = db.read(async |t| t.propose_expiry_ownership(
-				fact, &funding, height, Some(height),
-			).await).await.unwrap();
+			let held = db.read(async |t| t.propose_expiry_ownership(fact, height, Some(height)).await).await.unwrap();
 			assert!(matches!(held.disposition, OwnershipDisposition::Unresolved(_)));
 			assert!(held.settlement_integrity_hold, "cached Failed cannot authorize a paid-source refund or operator allocation");
 			db.write(async |t| {

@@ -17,7 +17,6 @@ pub mod expiry_ownership;
 pub mod expiry_payout;
 pub(crate) mod expiry_lightning;
 pub(crate) mod expiry_receive;
-pub(crate) mod expiry_geometry;
 
 mod ban;
 pub mod block;
@@ -212,10 +211,7 @@ impl Db {
 					AND table_name='cln_xpay' AND column_name='signed_invoice' AND data_type='text') \
 				 AND NOT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='public' \
 					AND table_name='cln_xpay' AND column_name='dispatch_count') \
-				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='scuttle' \
-					AND table_name='expiry_chain_view' AND column_name='processed_height' AND data_type='bigint') \
-				 AND EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema='scuttle' \
-					AND table_name='expiry_chain_view' AND column_name='processed_hash' AND data_type='text') \
+				 AND to_regclass('scuttle.expiry_chain_view') IS NULL \
 				 AND to_regclass('public.expiry_sync_ack') IS NULL \
 				 AND to_regclass('scuttle.expiry_sync_ack') IS NULL \
 				 AND to_regclass('scuttle.expiry_hold') IS NULL \
@@ -224,10 +220,10 @@ impl Db {
 			).await?.get(0);
 			ensure!(bound, "incomplete Scuttle schema; use a fresh store");
 			let complete: bool = conn.query_one(
-				"SELECT COUNT(*)=13 FROM information_schema.tables WHERE table_schema='scuttle' \
+				"SELECT COUNT(*)=12 FROM information_schema.tables WHERE table_schema='scuttle' \
 				 AND table_type='BASE TABLE' AND table_name IN ( \
 				 'owner_key','coin_owner','expiry_entitlement','expiry_cancelled_participation', \
-				 'expiry_chain_view','expiry_allocation','expiry_allocation_input','expiry_allocation_coin', \
+				 'expiry_allocation','expiry_allocation_input','expiry_allocation_coin', \
 				 'expiry_allocation_payout','expiry_split_request','expiry_terminal_claim', \
 				 'expiry_lightning_receive_claim','htlc_settlement_source')", &[],
 			).await?.get(0);

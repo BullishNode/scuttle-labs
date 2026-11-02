@@ -161,8 +161,6 @@ pub struct Watchman {
 	///
 	/// Includes claims, progress txs, and foreign spends (e.g. user exits).
 	mempool_spends: parking_lot::RwLock<HashMap<VtxoId, MempoolSpend>>,
-	/// Finite expiry inventory cursor, owned by this single engine.
-	expiry_cursor: tokio::sync::Mutex<i64>,
 }
 
 impl Watchman {
@@ -190,7 +188,6 @@ impl Watchman {
 			frontier,
 			sync_height,
 			mempool_spends: parking_lot::RwLock::new(HashMap::new()),
-			expiry_cursor: tokio::sync::Mutex::new(0),
 		}
 	}
 
@@ -409,7 +406,7 @@ impl Watchman {
 			&[&ids]).await?.into_iter().map(|r| (r.get::<_, String>(0),r.get::<_, String>(1))).collect::<HashMap<_, _>>()
 		)).await?;
 		let mut claims = Vec::new();
-		for vtxo in sweeps {
+		for vtxo in &sweeps {
 			let state = eligible.get(&vtxo.id().to_string()).map(String::as_str);
 			let owned = match (vtxo.policy(), state) {
 				(ServerVtxoPolicy::ServerOwned, Some("offboard-forfeit")) => true,
@@ -422,22 +419,19 @@ impl Watchman {
 			};
 			if owned {
 				self.update_mempool_spend(vtxo.id()).await;
-				claims.push(vtxo);
+				claims.push(vtxo.clone());
 			}
 		}
 		if !claims.is_empty() { self.process_claims(claims).await?; }
 		// Operator-only claims above do not depend on customer view readiness.
 		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
-		view.verify(&self.bitcoind).await?;
-		{
-			let mut cursor = self.expiry_cursor.lock().await;
-			*cursor = self.expiry_readiness_pass(view, *cursor).await?;
-		}
+		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+		self.expiry_readiness_pass(view, sweeps).await?;
 		// Expired customer backing never reaches upstream's drain-only builder.
 		self.process_expiry_payouts(view).await?;
 		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
 		for (txid, root) in splits {
-			view.verify(&self.bitcoind).await?;
+			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 			let ids = [root.id()];
 			let mut fee_rate = self.fee_estimator.regular();
 			self.update_mempool_spend(root.id()).await;
@@ -455,7 +449,7 @@ impl Watchman {
 			if let Err(error) = self.db.write(async |t| {
 				// Reorg callbacks also acquire the wallet. Take validity first,
 				// so no wallet holder can wait behind exclusive invalidation.
-				t.lock_valid_expiry_view(view).await?;
+				t.lock_watchman_tip(view).await?;
 				let mut wallet = self.watchman_wallet.lock().await;
 				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
 					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");

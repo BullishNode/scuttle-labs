@@ -377,11 +377,11 @@ pub(super) async fn wait_partial_confirmation(
 		loop {
 			let coherent = db.write(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
-				if view.processed.height != height
-					|| view.processed.hash != expected_hash
-					|| !t.expiry_view_is_current(view).await?
+				if view.height != height
+					|| view.hash != expected_hash
+					|| !(t.expiry_view().await? == Some(view))
 				{ return Ok(false); }
-				t.lock_valid_expiry_view(view).await?;
+				t.lock_watchman_tip(view).await?;
 				let recorded = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation a ON a.id=c.allocation_id \
 					WHERE e.vtxo_id=$1 AND c.active AND a.status='confirmed' AND a.sweep_tx=$2",
@@ -576,8 +576,8 @@ async fn all_terminal_returns(
 		loop {
 			let rebuilt=db.read(async |t| {
 				let Some(view)=t.expiry_view().await? else {return Ok(false);};
-				Ok(view.processed.height==height
-					&& view.processed.hash==expected_hash && t.expiry_view_is_current(view).await?)
+				Ok(view.height==height
+					&& view.hash==expected_hash && (t.expiry_view().await? == Some(view)))
 			}).await.unwrap();
 			if rebuilt {break;}
 			tokio::time::sleep(Duration::from_millis(50)).await;

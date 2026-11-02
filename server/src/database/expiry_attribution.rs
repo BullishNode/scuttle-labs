@@ -11,7 +11,7 @@ use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, VtxoId};
 
 use crate::error::OwnershipRefusal;
-use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
+use super::expiry_ownership::{OwnershipDisposition, OwnershipProposal};
 use super::Tx;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,18 +43,10 @@ impl Tx<'_> {
 	pub async fn derived_expiry_owner(&self, ownership: &OwnershipProposal) -> anyhow::Result<Attribution> {
 		let OwnershipDisposition::Customer { user_pubkey } = &ownership.disposition
 			else { return Ok(Attribution::Unresolved); };
-		let Some(evidence) = &ownership.evidence else { return Ok(Attribution::Unresolved); };
-		let Some(row) = self.query_opt("SELECT k.mailbox_pk,c.mailbox_pk AS birth_mailbox
-			FROM owner_key k LEFT JOIN coin_owner c ON c.vtxo_id=$2
-			WHERE k.user_pubkey=$1", &[&user_pubkey.to_string(), &ownership.id.to_string()]).await?
-			else { return Ok(Attribution::Unresolved); };
-		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk"))
-			else { return Ok(Attribution::Unresolved); };
-		if matches!(evidence, OwnershipEvidence::Pubkey)
-			&& row.get::<_, Option<&str>>("birth_mailbox") != Some(mailbox.to_string().as_str())
-		{
-			return Ok(Attribution::Unresolved);
-		}
+		if ownership.evidence.is_none() { return Ok(Attribution::Unresolved); }
+		let Some(row) = self.query_opt("SELECT mailbox_pk FROM owner_key WHERE user_pubkey=$1",
+			&[&user_pubkey.to_string()]).await? else { return Ok(Attribution::Unresolved); };
+		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk")) else { return Ok(Attribution::Unresolved); };
 		Ok(Attribution::Owned { mailbox_pk: mailbox,
 			spk: ark::fallback::payout_script(mailbox) })
 	}

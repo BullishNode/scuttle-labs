@@ -663,7 +663,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 			loop {
 				if db.read(async |t| {
 					let Some(view) = t.expiry_view().await? else { return Ok(false); };
-					Ok(view.processed == point && t.expiry_view_is_current(view).await?)
+					Ok(view == point && (t.expiry_view().await? == Some(view)))
 				}).await.unwrap() { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
@@ -675,14 +675,11 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 			 WHERE e.vtxo_id = $1 AND c.disposition = 'customer'",
 			&[&source.to_string()]).await?)).await.unwrap().is_none(), "sender refund must wait for six grant confirmations");
 		let fact = db.read(async |t| {
-			let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()],
-				server::database::expiry_inventory::BackingSnapshotLimits {
-					max_rows: 250_000, max_serialized_bytes: 256 * 1024 * 1024,
-				}).await?;
+			let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()]).await?;
 			Ok(snapshot.regular.into_iter().find(|fact| fact.state.vtxo_id == source).unwrap())
 		}).await.unwrap();
 		let funding = ctx.bitcoind().await_transaction(incoming[0].chain_anchor().txid).await;
-		let proposal = db.read(async |t| t.propose_expiry_ownership(&fact, &funding, height, Some(height)).await).await.unwrap();
+		let proposal = db.read(async |t| t.propose_expiry_ownership(&fact, height, Some(height)).await).await.unwrap();
 		assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
 		let height = ctx.generate_blocks(1).await;
 		srv.wait_for_sync_height(height).await;
@@ -701,9 +698,8 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 			loop {
 				let proposal = db.read(async |t| {
 					let Some(view) = t.expiry_view().await? else { return Ok(None); };
-					if view.processed != point { return Ok(None); }
-					Ok(Some(t.propose_expiry_ownership(&fact, &funding,
-						view.processed.height, Some(view.processed.height)).await?))
+					if view != point { return Ok(None); }
+					Ok(Some(t.propose_expiry_ownership(&fact, view.height, Some(view.height)).await?))
 				}).await.unwrap();
 				if let Some(proposal) = proposal {
 					if matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey } if user_pubkey == key.public_key()) {
@@ -950,7 +946,7 @@ async fn expiry_internal_shared_incoming_root_refunds_both_absent_attempts() {
 			if let Some(target) = maturity {
 				let mature_view = db.read(async |t| {
 					let Some(view) = t.expiry_view().await? else { return Ok(false); };
-					Ok(view.processed.height>=target && t.expiry_view_is_current(view).await?)
+					Ok(view.height>=target && (t.expiry_view().await? == Some(view)))
 				}).await.unwrap();
 				if !mature_view { continue; }
 			}

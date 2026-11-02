@@ -9,18 +9,14 @@ async fn fallback_fresh_schema_reopens_concurrently_without_resetting_state() {
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
 	let db = server::database::Db::create(&config).await.unwrap();
-	db.write(async |tx| tx.invalidate_expiry_chain().await).await.unwrap();
 	let client = ctx.postgres_manager().database_client(Some(&config.name)).await;
 	let history = client.query("SELECT version, checksum FROM refinery_schema_history ORDER BY version", &[]).await.unwrap()
 		.into_iter().map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
 	assert_eq!(history.iter().filter(|(version, _)| *version == 73).count(), 1);
 	assert_eq!(history.last().unwrap().0, 77);
-	let generation = client.query_one("SELECT generation FROM expiry_chain_view WHERE id=1", &[]).await.unwrap().get::<_, i64>(0);
-	assert!(generation > 0);
 	let (first, second) = tokio::join!(server::database::Db::connect(&config), server::database::Db::connect(&config));
 	drop(first.unwrap());
 	drop(second.unwrap());
-	assert_eq!(client.query_one("SELECT generation FROM expiry_chain_view WHERE id=1", &[]).await.unwrap().get::<_, i64>(0), generation);
 	let after = client.query("SELECT version, checksum FROM refinery_schema_history ORDER BY version", &[]).await.unwrap()
 		.into_iter().map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
 	assert_eq!(after, history);

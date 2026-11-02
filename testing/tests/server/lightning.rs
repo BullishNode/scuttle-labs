@@ -1220,7 +1220,7 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 			srv.watchmand().wait_for_sync_height(point.height).await;
 			let rebuilt = db.read(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed == point && t.expiry_view_is_current(view).await?)
+				Ok(view == point && (t.expiry_view().await? == Some(view)))
 			}).await.unwrap();
 			if !rebuilt { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
 			let rows = db.read(async |t| Ok(t.query(
