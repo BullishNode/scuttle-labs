@@ -21,10 +21,19 @@ the public Ark or Mailbox routes. Its network trust boundary is unchanged.
 
 `captaind rpc --addr <private-admin-address> reconcile-lightning-attempt <attempt-id>`
 observes an existing external payment on its recorded online node. It returns
-the current attempt state; it cannot choose an outcome, switch nodes or dispatch
-another payment. Pending, missing and unknown outcomes remain protected. Restore
-the same original node and store before reconciling an orphaned attempt. A manual
-check, an elapsed deadline or an empty node response never authorizes a refund.
+the current attempt state without switching nodes or dispatching another payment.
+Pending, missing and unknown outcomes remain protected by default.
+
+For a genuinely empty orphan, first exclude new dispatch, stop and reap the entire
+recorded CLN/plugin process group, then restart that same persistent backend and
+verify its network/key/store continuity. After completing those operator steps,
+`--native-cold-restart-confirmed` allows reconciliation to retire an empty own
+attempt only when complete same-hash native lookups contain no pending, successful
+or unknown work and the original source/settlement guards permit failure. This
+flag trusts the privileged operator's external lifecycle assertion; the RPC does
+not itself stop CLN or prove that assertion. A stored error, elapsed deadline,
+manager-disable operation or empty lookup alone does not establish cessation.
+Actual native success follows the normal preimage/settlement path.
 
 New functional fork fields use tags `1000` and above. Upstream invoice
 `expiry_secs` retains tag `6`. The four retired owner-proof slots (board `7`,
@@ -181,26 +190,29 @@ matched fresh-store requirements, not a database repair or conversion service.
 ## Lightning dispatch continuity
 
 An empty lookup for the attempt's own native label is not a failure receipt.
-The monitor may re-drive the original signed request on its recorded node while
-retaining custody. It uses the original amount, fee cap and retry duration; every
-call freshly bounds `maxdelay` by the original absolute HTLC deadline. The original
-wall timestamp is not reset and does not prove that native routing ended. Intra-Ark
-payments never use this path. A successful payment under another label cannot
-charge the current attempt.
+Only the original initiating task calls xpay. The monitor, exact client retries
+and operator reconciliation observe existing work; none resubmits it. A task lost
+before its first RPC leaves the recorded attempt unknown and held. An empty native
+lookup or elapsed time cannot release it. A native command already running when
+Bark restarts can still finish, and its own labelled outcome resolves normally.
 
-Each native call first commits a monotonic admission count on its existing
-`cln_xpay` row. A count records admission, not proof that the RPC reached CLN.
-Only a qualified first-dispatch NoRoute reply can complete the zero-part failure
-path, with count one rechecked in the terminal transaction. After multiple
-admissions, NoRoute remains unresolved; the attempt follows its actual own native
-records. Missing signed requests, caps or count history remain held and alarmed;
-they are not reconstructed from defaults or copied outcomes.
+The original call freshly bounds `maxdelay` by its original absolute HTLC deadline,
+using the higher native and processed server height. A live original zero-part reply
+(205, 206 or 207) may retire only that exact original call, with empty own native history and
+no same-hash Pending or Complete group. The exact node, source, settlement and
+hash guards remain. Stored errors and copied outcome rows cannot recreate this
+live authority. Intra-Ark payments never invoke xpay.
 
-Automatic recovery assumes continuity of the recorded node's configured endpoint,
-authentication and persistent store, using the pinned CLN build. The node public
-key and `getinfo` response do not prove a store generation. Only one captaind
-dispatcher may use the store at a time; dispatch guards are process-local. A stale or ambiguous
-PostgreSQL/CLN restore is not replay-safe: keep that node disabled until the pair's
-continuity is established. Do not reset the admission count or switch an unresolved
-attempt to a different node. Old Scuttle stores without these fresh request fields
-are refused rather than upgraded or backfilled with invented history.
+Keep the recorded node's endpoint, authentication and persistent store continuous.
+A public node key does not prove a store generation, and process-local dispatch
+guards do not coordinate multiple server processes. Run one captaind dispatcher
+per store. A stale or ambiguous PostgreSQL/CLN restore stays disabled until its
+continuity is established; do not switch an unresolved attempt to another node.
+Existing Scuttle stores with a resend counter are preserved and refused rather
+than upgraded in place.
+
+Stock CLN 26.06.6 does not require xpay slow mode. At a controlled cutover,
+unset any persistent `xpay-slow-mode=true` setting written by an older Scuttle
+version before starting the matched application. Removing the application setter
+does not clear an existing native configuration. Native identity, network and
+persistent-store continuity remain required.

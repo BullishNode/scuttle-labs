@@ -237,8 +237,9 @@ impl LightningManager {
 
 	/// Reconcile only this existing external attempt on its recorded online
 	/// node. Missing/offline nodes require re-adding the same node; an operator
-	/// supplies no outcome and cannot cause a new dispatch here.
-	pub async fn reconcile_lightning_attempt(&self, attempt_id: i64)
+	/// supplies no native outcome and cannot cause a new dispatch here. The
+	/// optional cold-restart assertion is a privileged external lifecycle fact.
+	pub async fn reconcile_lightning_attempt(&self, attempt_id: i64, native_cold_restart_confirmed: bool)
 		-> anyhow::Result<Option<LightningPaymentAttempt>>
 	{
 		let Some(attempt) = self.db.read(async |tx|
@@ -248,7 +249,7 @@ impl LightningManager {
 		if !attempt.status.is_final() {
 			let node = self.node_by_id(attempt.lightning_node_id)
 				.context("recorded Lightning node is not online; attempt stays held")?;
-			node.xpay.reconcile_existing_payment_attempt(attempt).await?;
+			node.xpay.reconcile_existing_payment_attempt(attempt, native_cold_restart_confirmed).await?;
 		}
 		self.db.read(async |tx| tx.get_lightning_payment_attempt_by_id(attempt_id).await).await
 	}
@@ -333,7 +334,7 @@ impl LightningManager {
 		// Refuse an unqualified external endpoint before committing an attempt.
 		// Dispatch still rechecks it: endpoint changes after commit stay unknown.
 		let info = if sub.is_none() {
-			node.xpay.qualify_before_attempt().await.map_err(PaymentPreflightRefusal)?
+			node.xpay.node_info().await.map_err(PaymentPreflightRefusal)?
 		} else {
 			unary_rpc(node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await
 				.context("failed to get info from rpc")?.into_inner()

@@ -209,7 +209,7 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		assert!(native.is_empty(), "the no-channel case must exercise a genuine zero-part reply");
 		let row = db.read(async |t| Ok(t.query_one("SELECT x.id,x.lightning_node_id,x.label,x.payment_hash, \
 			x.payment_amount_msat,x.max_routing_fee_msat,x.status::TEXT,x.error_code,a.error, \
-			x.signed_invoice,x.dispatch_count,x.htlc_expiry,a.retry_for_secs, \
+			x.signed_invoice,x.htlc_expiry,a.retry_for_secs, \
 			a.lightning_node_id AS attempt_node,n.pubkey FROM cln_xpay x \
 			JOIN lightning_payment_attempt a ON a.id=$1 JOIN lightning_node n ON n.id=x.lightning_node_id \
 			WHERE x.label=$2", &[&attempt, &attempt.to_string()]).await?)).await.unwrap();
@@ -227,7 +227,6 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 		assert_eq!(called.max_routing_fee.to_msat(),
 			u64::try_from(row.get::<_, Option<i64>>("max_routing_fee_msat").unwrap()).unwrap());
 		assert_eq!(row.get::<_, Option<&str>>("signed_invoice"), Some(dispatched_invoice.as_str()));
-		assert_eq!(row.get::<_, Option<i64>>("dispatch_count"), Some(1));
 		assert_eq!(row.get::<_, Option<i32>>("retry_for_secs"), Some(5));
 		let native_error = returned.error.as_deref().expect("NoRoute must return a native error");
 		assert_eq!(row.get::<_, &str>("error"), native_error);

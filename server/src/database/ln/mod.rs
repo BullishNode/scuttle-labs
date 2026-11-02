@@ -232,7 +232,7 @@ impl<'t> Tx<'t> {
 				&& record.lightning_node_id == attempt.lightning_node_id
 				&& record.payment_hash == attempt.payment_hash
 				&& record.payment_amount_msat == amount.to_msat()
-				&& record.original_invoice()?.to_string() == invoice.to_string(),
+				&& record.signed_invoice.as_deref() == Some(invoice.to_string().as_str()),
 				"recorded xpay request differs from initiation");
 		}
 		Ok(true)
