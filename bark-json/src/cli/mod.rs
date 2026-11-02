@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 
 use ark::VtxoId;
 use ark::lightning::{PaymentHash, Preimage};
-use bitcoin_ext::BlockDelta;
+use bitcoin_ext::{AmountExt, BlockDelta};
 
 use bark::actions::lightning::pay::{LightningSendState, Progress as SendProgress};
 use bark::movement::MovementId;
