@@ -16,9 +16,8 @@ use lightning_invoice::Bolt11Invoice;
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
 use ark::test_util::VTXO_VECTORS;
-use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::{ProtocolEncoding, Vtxo};
-use ark::vtxo::{Bare, Full};
+use ark::vtxo::Full;
 use ark::VtxoId;
 
 use super::BarkPersister;
@@ -82,10 +81,8 @@ macro_rules! bark_persister_tests {
 			test_remove_vtxo,
 			test_has_spent_vtxo,
 			test_store_vtxos_idempotent,
-			test_update_vtxo_witnesses_preserves_identity_and_state,
 			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
 			test_steal_lock_to_spent,
-			test_retire_vtxo_lock,
 			test_fallback_status_keeps_commitment_and_exit_state,
 			test_steal_lock,
 
@@ -557,35 +554,6 @@ pub async fn test_has_spent_vtxo(db: &impl BarkPersister) {
 		"an unknown vtxo is not reported as spent");
 }
 
-pub async fn test_update_vtxo_witnesses_preserves_identity_and_state(db: &impl BarkPersister) {
-	let spec = DummyTestVtxoSpec { amount: Amount::from_sat(100_000), fee: Amount::ZERO, ..Default::default() };
-	let (funding, first) = spec.build();
-	let (second_funding, second) = spec.build();
-	assert_eq!(funding, second_funding);
-	assert_eq!(first.to_bare().serialize(), second.to_bare().serialize());
-	assert_ne!(first.serialize(), second.serialize(), "fresh cosign nonces must produce different valid witness material");
-	first.validate(&funding).unwrap();
-	second.validate(&funding).unwrap();
-	assert!(!db.update_vtxo_witnesses(&second).await.unwrap());
-	let held = VtxoState::Locked { holder: Some(MovementId::new(42).into()) };
-	db.store_vtxos(&[(&first, &held)]).await.unwrap();
-	db.mark_vtxos_registered(&[first.id()]).await.unwrap();
-	assert!(db.update_vtxo_witnesses(&second).await.unwrap());
-	assert!(db.update_vtxo_witnesses(&second).await.unwrap(), "completed material replay is idempotent");
-	assert_eq!(db.get_full_vtxo(first.id()).await.unwrap().unwrap().serialize(), second.serialize());
-	let stored = db.get_wallet_vtxo(first.id()).await.unwrap().unwrap();
-	assert_eq!(stored.state, held);
-	assert!(stored.registered);
-	assert_eq!(stored.exit_depth, second.exit_depth());
-	assert_eq!(stored.exit_tx_weight.to_wu(), second.transactions().map(|step| step.tx.weight().to_wu()).sum::<u64>());
-	let wrong_bare = Vtxo::<Bare>::new(second.point(), second.policy().clone(), second.amount() + Amount::ONE_SAT,
-		second.expiry_height(), second.server_pubkey(), second.exit_delta(), second.chain_anchor());
-	let changed = Vtxo::<Full>::deserialize_with_genesis(&wrong_bare.serialize(), &second.serialize_genesis()).unwrap();
-	assert!(db.update_vtxo_witnesses(&changed).await.is_err());
-	assert_eq!(db.get_full_vtxo(first.id()).await.unwrap().unwrap().serialize(), second.serialize());
-	assert_eq!(db.get_wallet_vtxo(first.id()).await.unwrap().unwrap().state, held);
-}
-
 pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 	let vtxo = &VTXO_VECTORS.board_vtxo;
 
@@ -609,7 +577,6 @@ pub async fn test_fallback_status_keeps_commitment_and_exit_state(db: &impl Bark
 	assert_eq!(pending.state, locked, "a pending decision preserves its original holder");
 	assert_eq!(pending.fallback_status, Some(FallbackStatus::Pending));
 	db.release_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap();
-	assert!(!db.retire_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap());
 	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
 	for state in [VtxoState::Spendable, VtxoState::Spent] {
 		assert!(db.update_vtxo_state_checked(coin.id(), state, VtxoStateKind::ALL).await.is_err());
@@ -692,22 +659,6 @@ pub async fn test_steal_lock_to_spent(db: &impl BarkPersister) {
 	let unknown_id = VtxoId::from_slice(&[0u8; 36]).unwrap();
 	assert!(db.steal_lock_to_spent(&[unknown_id]).await.is_err(),
 		"steal_lock_to_spent errors on an unknown id");
-}
-
-pub async fn test_retire_vtxo_lock(db: &impl BarkPersister) {
-	let mine = &VTXO_VECTORS.round1_vtxo;
-	let foreign = &VTXO_VECTORS.round2_vtxo;
-	let holder = MovementId::new(41).into();
-	db.store_vtxos(&[
-		(mine, &VtxoState::Locked { holder: None }),
-		(foreign, &VtxoState::Locked { holder: Some(holder) }),
-	]).await.unwrap();
-	assert!(db.retire_vtxo_lock(mine.id(), None).await.unwrap());
-	assert_eq!(db.get_wallet_vtxo(mine.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(db.retire_vtxo_lock(mine.id(), None).await.unwrap());
-	assert!(!db.retire_vtxo_lock(foreign.id(), None).await.unwrap());
-	assert!(matches!(db.get_wallet_vtxo(foreign.id()).await.unwrap().unwrap().state,
-		VtxoState::Locked { holder: Some(_) }));
 }
 
 pub async fn test_steal_lock(db: &impl BarkPersister) {

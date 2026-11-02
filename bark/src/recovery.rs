@@ -493,25 +493,9 @@ impl Wallet {
 		let mut spent = Vec::new();
 		let mut unclaimed = Vec::new();
 		let mut locked = Vec::new();
-		for (mut vtxo, mut adoption) in vtxos {
+		for (vtxo, adoption) in vtxos {
 			let id = vtxo.id();
-			if matches!(&adoption, Ok(ServerStatusAdoption::Spendable | ServerStatusAdoption::FallbackPending))
-				&& vtxo.unlock_hash().is_some() {
-				match self.recover_released_round_output(&vtxo).await {
-					Ok(completed) => {
-						vtxo = completed;
-						let (_, key) = self.pubkey_keypair(&vtxo.user_pubkey()).await?
-							.context("recovered round key disappeared")?;
-						adoption = self.fetch_vtxo_status(id, &key).await
-							.and_then(|(state, committed)| ServerStatusAdoption::from_status(state, committed));
-					},
-					Err(error) => {
-						warn!("Could not complete released recovery source {id}: {error:#}");
-						report.push_failed(id, Some(vtxo.amount()));
-						continue;
-					},
-				}
-			}
+
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),

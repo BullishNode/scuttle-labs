@@ -340,16 +340,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		vtxos: &[(&Vtxo<Full>, &VtxoState)],
 	) -> anyhow::Result<()>;
 
-	/// Replace only the witness material of an existing VTXO. The caller must
-	/// first fully validate the completed body against its actual chain anchor.
-	/// Preserve the exact bare serialization, state history, holder and recovery
-	/// registration. Return false when the row does not exist; never insert it.
-	async fn update_vtxo_witnesses(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
-		let Some(stored) = self.get_full_vtxo(vtxo.id()).await? else { return Ok(false); };
-		ensure!(stored.serialize() == vtxo.serialize(), "this persister does not support VTXO witness updates");
-		Ok(true)
-	}
-
 	/// Fetch a wallet [Vtxo] with its current state by ID.
 	///
 	/// Parameters:
@@ -721,18 +711,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		vtxo_id: VtxoId,
 		holder: Option<&VtxoLockHolder>,
 	) -> anyhow::Result<()>;
-
-	/// Retire precisely `holder`'s lock directly to Spent, without making the
-	/// coin temporarily Spendable. Return false for any foreign holder/state;
-	/// already Spent is idempotent. Implementations must compare and write
-	/// atomically; an unsupported persister must leave the coin untouched.
-	async fn retire_vtxo_lock(
-		&self,
-		_vtxo_id: VtxoId,
-		_holder: Option<&VtxoLockHolder>,
-	) -> anyhow::Result<bool> {
-		bail!("this persister does not support atomic locked-coin retirement")
-	}
 
 	/// Transition multiple VTXOs to `new_state` atomically: either every
 	/// vtxo's state changes or none does. A failure must not affect any

@@ -1315,21 +1315,6 @@ async fn hark_vtxo_swap(
 ) -> Result<(), HarkForfeitError> {
 	let (mut srv, _) = wallet.require_server().await.map_err(HarkForfeitError::Err)?;
 
-	if sent_forfeit_sigs {
-		let response = srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
-			unlock_hash: unlock_hash.to_byte_array().to_vec(),
-			attestation: RoundParticipationStatusAttestation::new(
-				unlock_hash, &wallet.mailbox_keypair(),
-			).serialize(),
-		}).await.context("error checking released round material").map_err(HarkForfeitError::Err)?
-			.into_inner();
-		if response.status == protos::RoundParticipationStatus::RoundPartReleased as i32 {
-			complete_released_outputs(wallet, &mut srv, participation, output_vtxos,
-				funding_tx, unlock_hash, &response).await.map_err(HarkForfeitError::Err)?;
-			return Ok(());
-		}
-	}
-
 	// before we start make sure the server has our input vtxo signatures
 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
 		.context("couldn't send our input vtxo transactions to server")
@@ -1443,52 +1428,6 @@ async fn hark_vtxo_swap(
 		.context("couldn't register output vtxo transactions with server")
 		.map_err(HarkForfeitError::SentForfeits)?;
 
-	Ok(())
-}
-
-/// Recover signatures from an exchange whose forfeits were already accepted.
-/// This only fills witness material; normal completion decides local states.
-async fn complete_released_outputs(
-	wallet: &Wallet,
-	srv: &mut ServerConnection,
-	participation: &RoundParticipation,
-	outputs: &mut [Vtxo<Full>],
-	funding_tx: &Transaction,
-	unlock_hash: UnlockHash,
-	response: &protos::RoundParticipationStatusResponse,
-) -> anyhow::Result<()> {
-	ensure!(response.status == protos::RoundParticipationStatus::RoundPartReleased as i32,
-		"round participation has not released its preimage");
-	let preimage: [u8; 32] = response.unlock_preimage.as_deref()
-		.context("released round has no preimage")?.try_into().context("invalid released preimage length")?;
-	ensure!(UnlockHash::hash(&preimage) == unlock_hash, "released round preimage has another hash");
-	let input_ids = response.input_vtxo_ids.iter().map(|raw| VtxoId::from_bytes(raw))
-		.collect::<Result<BTreeSet<_>, _>>()?;
-	ensure!(!input_ids.is_empty() && input_ids.len() == response.input_vtxo_ids.len()
-		&& input_ids == participation.inputs.iter().map(|coin| coin.id()).collect(),
-		"released round has different inputs");
-	let server_outputs = response.output_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw))
-		.collect::<Result<Vec<_>, _>>()?;
-	ensure!(!outputs.is_empty() && outputs.len() == server_outputs.len(),
-		"released round has different outputs");
-	for (output, server_output) in outputs.iter().zip(&server_outputs) {
-		ensure!(output.to_bare().serialize() == server_output.to_bare().serialize()
-			&& output.unlock_hash() == Some(unlock_hash), "released round output changed");
-		check_vtxo_fails_hash_lock(funding_tx, output)?;
-	}
-	let actual = wallet.chain().get_tx(&funding_tx.compute_txid()).await?
-		.context("released round funding is unavailable")?;
-	let reported = deserialize::<Transaction>(response.round_funding_tx.as_deref()
-		.context("released round has no funding transaction")?)?;
-	ensure!(actual == *funding_tx && reported == actual, "released round funding differs from the chain");
-	for output in outputs.iter_mut() {
-		let bare = output.to_bare().serialize();
-		hark_cosign_leaf(wallet, srv, &actual, output).await?;
-		ensure!(output.provide_unlock_preimage(preimage), "released round preimage does not unlock output");
-		ensure!(output.to_bare().serialize() == bare && output.has_all_witnesses(),
-			"released round completion changed its output");
-		output.validate(&actual)?;
-	}
 	Ok(())
 }
 
@@ -2027,16 +1966,8 @@ async fn persist_round_success(
 	let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 	let spent_result = wallet.inner.db.steal_lock_to_spent(&input_ids).await
 		.context("failed to mark input VTXOs as spent");
-	let store_result = async {
-		// An earlier unanswered recovery can have stored this same output without
-		// its witnesses. Complete its validated material before releasing None.
-		for output in new_vtxos {
-			wallet.validate_vtxo(output).await?;
-			wallet.inner.db.update_vtxo_witnesses(output).await?;
-		}
-		wallet.store_spendable_vtxos(new_vtxos).await?;
-		wallet.unlock_vtxos(new_vtxos, None).await
-	}.await.context("failed to store new VTXOs");
+	let store_result = wallet.store_spendable_vtxos(new_vtxos).await
+		.context("failed to store new VTXOs");
 	let update_result = if let Some(mid) = movement_id {
 		wallet.inner.movements.finish_movement_with_update(
 			mid,
@@ -2422,110 +2353,6 @@ impl Wallet {
 		// from a state that is itself being synced.
 		let id = self.inner.db.store_round_state(&state).await?;
 		Ok(StoredRoundState::new(id, state))
-	}
-
-	/// Complete the existing, already released exchange without replaying forfeits
-	/// or registering transactions. The caller still checks its current status.
-	pub(crate) async fn recover_released_round_output(&self, candidate: &Vtxo<Full>) -> anyhow::Result<Vtxo<Full>> {
-		let unlock_hash = candidate.unlock_hash().context("recovery source is not a hashlocked round output")?;
-		for saved in self.pending_round_states().await? {
-			if saved.state().unlock_hash() != Some(unlock_hash) { continue; }
-			let mut state = self.lock_wait_round_state(saved.id()).await?
-				.context("round recovery state disappeared")?;
-			ensure!(matches!(state.sync(self).await?, RoundStatus::Confirmed { .. }),
-				"released round is not ready to complete");
-			self.inner.db.remove_round_state(&state).await?;
-			let output = self.get_full_vtxo(candidate.id()).await?;
-			ensure!(output.to_bare().serialize() == candidate.to_bare().serialize(), "recovered round output changed");
-			self.validate_vtxo(&output).await?;
-			return Ok(output);
-		}
-
-		let (mut srv, ark_info) = self.require_server().await?;
-		let response = srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
-			unlock_hash: unlock_hash.to_byte_array().to_vec(),
-			attestation: RoundParticipationStatusAttestation::new(
-				unlock_hash, &self.mailbox_keypair(),
-			).serialize(),
-		}).await.context("error fetching released round")?.into_inner();
-		ensure!(response.status == protos::RoundParticipationStatus::RoundPartReleased as i32,
-			"round has not released its outputs");
-		let preimage: [u8; 32] = response.unlock_preimage.as_deref()
-			.context("released round has no preimage")?.try_into().context("invalid released preimage length")?;
-		ensure!(UnlockHash::hash(&preimage) == unlock_hash, "released round preimage has another hash");
-		let input_ids = response.input_vtxo_ids.iter().map(|raw| VtxoId::from_bytes(raw))
-			.collect::<Result<BTreeSet<_>, _>>()?;
-		ensure!(!input_ids.is_empty() && input_ids.len() == response.input_vtxo_ids.len()
-			&& !input_ids.contains(&candidate.id()), "released round has empty, duplicate or overlapping inputs");
-		let funding_tx = deserialize::<Transaction>(response.round_funding_tx.as_deref()
-			.context("released round has no funding transaction")?)?;
-		ensure!(check_funding_tx_confirmations(self, funding_tx.compute_txid(), &funding_tx, false).await?,
-			"released round funding lacks confirmations");
-		let mut outputs = response.output_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw))
-			.collect::<Result<Vec<_>, _>>()?;
-		ensure!(outputs.iter().filter(|output| output.id() == candidate.id()).count() == 1,
-			"released round does not contain the requested output exactly once");
-		let expected = outputs.iter().find(|output| output.id() == candidate.id()).expect("checked above");
-		ensure!(expected.to_bare().serialize() == candidate.to_bare().serialize(), "released round output changed");
-		if candidate.has_all_witnesses() {
-			// A complete received output can have foreign participants or siblings.
-			// It needs no leaf cosigning, but the same old-input retirement applies.
-			let actual = self.chain().get_tx(&candidate.chain_anchor().txid).await?
-				.context("released round funding is unavailable")?;
-			ensure!(actual == funding_tx, "released round funding differs from the chain");
-			candidate.validate(&actual)?;
-			outputs = vec![candidate.clone()];
-		} else {
-			let output_pubkeys = outputs.iter().map(|output| output.user_pubkey()).collect::<Vec<_>>();
-			self.find_vtxo_keypairs(output_pubkeys, self.inner.config.vtxo_key_gap_limit).await?;
-			for output in &outputs {
-				ensure!(self.pubkey_keypair(&output.user_pubkey()).await?.is_some(),
-					"released round output {} is not ours", output.id());
-			}
-			let mut inputs = Vec::with_capacity(input_ids.len());
-			for id in &input_ids {
-				let input = self.fetch_vtxo(*id).await?;
-				ensure!(self.pubkey_keypair(&input.user_pubkey()).await?.is_some()
-					&& input.server_pubkey() == ark_info.server_pubkey, "released round input is not ours");
-				self.validate_vtxo(&input).await?;
-				inputs.push(input);
-			}
-			let participation = RoundParticipation {
-				inputs,
-				outputs: outputs.iter().map(|output| VtxoRequest { amount: output.amount(), policy: output.policy().clone() }).collect(),
-				owner_proofs: BTreeMap::new(),
-				unblinded_mailbox_id: Some(self.mailbox_identifier()),
-			};
-			let total = participation.total_in().context("released input value overflow")?;
-			let fee = total.checked_sub(participation.total_out().context("released output value overflow")?)
-				.context("released outputs exceed inputs")?;
-			ensure!(fee.checked_mul(100).context("released fee overflow")?
-				<= total.checked_mul(MAX_RECOVERED_PARTICIPATION_FEE_PERCENT).context("released value overflow")?,
-				"released round exceeds the recovered participation fee limit");
-			check_round_matches_participation(&participation, &outputs, &funding_tx, &ark_info,
-				None, self.chain().tip().await?, self.inner.config.vtxo_exit_margin, true)?;
-			complete_released_outputs(self, &mut srv, &participation, &mut outputs, &funding_tx,
-				unlock_hash, &response).await?;
-		}
-		// Retire only the exact authenticated participation's originals. No
-		// inferred ancestry or fallback snapshot can release another holder.
-		for id in &input_ids {
-			let Some(stored) = self.inner.db.get_wallet_vtxo(*id).await? else { continue; };
-			ensure!(stored.fallback_status.is_none(),
-				"released input has a committed fallback outcome");
-			match stored.state {
-				VtxoState::Locked { holder: None } => {
-					ensure!(self.inner.db.retire_vtxo_lock(*id, None).await?, "released input acquired another holder");
-				},
-				VtxoState::Spendable | VtxoState::Spent => {
-					self.inner.db.update_vtxo_state_checked(*id, VtxoState::Spent,
-						&[VtxoStateKind::Spendable, VtxoStateKind::Spent]).await?;
-				},
-				_ => bail!("released input still belongs to another operation"),
-			}
-		}
-		for output in &outputs { self.inner.db.update_vtxo_witnesses(output).await?; }
-		Ok(outputs.into_iter().find(|output| output.id() == candidate.id()).expect("checked above"))
 	}
 
 	/// Rebuild a delegated round participation the wallet has no local state

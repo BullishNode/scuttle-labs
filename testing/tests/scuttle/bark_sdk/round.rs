@@ -60,42 +60,16 @@ struct RefreshTransport {
 	lose_forfeit_reply: Arc<AtomicBool>,
 	accepted_forfeits: Arc<AtomicUsize>,
 	forfeit_requests: Arc<AtomicUsize>,
-	wrong_issued_outputs: Arc<Mutex<Option<(UnlockHash, Vec<Vec<u8>>)>>>,
-	wrong_issued_replies: Arc<AtomicUsize>,
 	registrations: Arc<AtomicUsize>,
-	leaf_cosigns: Arc<AtomicUsize>,
-	invalid_released_preimage: Arc<AtomicBool>,
-	reject_status_batches: Arc<AtomicBool>,
-	force_spent_history: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for RefreshTransport {
-	async fn get_vtxos_status_by_ids(&self, upstream: &mut ArkClient, request: protos::GetVtxosStatusByIdsRequest)
-		-> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status>
-	{
-		if self.reject_status_batches.load(Ordering::SeqCst) {
-			return Err(tonic::Status::unavailable("output status transport unavailable"));
-		}
-		let mut response = upstream.get_vtxos_status_by_ids(request).await?.into_inner();
-		if self.force_spent_history.load(Ordering::SeqCst) {
-			for coin in &mut response.vtxos { coin.spend_state = protos::VtxoSpendState::Spent as i32; }
-		}
-		Ok(response)
-	}
-
 	async fn register_vtxo_transactions(&self, upstream: &mut ArkClient, request: protos::RegisterVtxoTransactionsRequest)
 		-> Result<protos::Empty, tonic::Status>
 	{
 		self.registrations.fetch_add(1, Ordering::SeqCst);
 		Ok(upstream.register_vtxo_transactions(request).await?.into_inner())
-	}
-
-	async fn request_leaf_vtxo_cosign(&self, upstream: &mut ArkClient, request: protos::LeafVtxoCosignRequest)
-		-> Result<protos::LeafVtxoCosignResponse, tonic::Status>
-	{
-		self.leaf_cosigns.fetch_add(1, Ordering::SeqCst);
-		Ok(upstream.request_leaf_vtxo_cosign(request).await?.into_inner())
 	}
 
 	async fn request_forfeit_nonces(&self, upstream: &mut ArkClient, request: protos::ForfeitNoncesRequest)
@@ -127,18 +101,7 @@ impl captaind::proxy::ArkRpcProxy for RefreshTransport {
 		let result = upstream.round_participation_status(request).await;
 		let fault = *self.status_fault.lock().unwrap();
 		if matches!(fault, CancellationStatusFault::Pass) {
-			let mut response = result?.into_inner();
-			let replacement = self.wrong_issued_outputs.lock().unwrap().clone();
-			if let Some((target, outputs)) = replacement
-				&& target == hash && response.status == protos::RoundParticipationStatus::RoundPartIssued as i32 {
-				response.output_vtxos = outputs;
-				self.wrong_issued_replies.fetch_add(1, Ordering::SeqCst);
-			}
-			if response.status == protos::RoundParticipationStatus::RoundPartReleased as i32
-				&& self.invalid_released_preimage.load(Ordering::SeqCst) {
-				response.unlock_preimage.as_mut().unwrap()[0] ^= 1;
-			}
-			return Ok(response);
+			return Ok(result?.into_inner());
 		}
 		if matches!(fault, CancellationStatusFault::IssuedThenUnknown) {
 			let response = result?.into_inner();
@@ -224,7 +187,6 @@ struct IssuedRefresh {
 	proxy: captaind::proxy::ArkRpcProxyServer,
 	database: Arc<RefreshDatabase>,
 	storage_path: PathBuf,
-	pre_round_backup: PathBuf,
 	mnemonic: bip39::Mnemonic,
 	source: Vtxo<Full>,
 	state_id: RoundStateId,
@@ -233,16 +195,5 @@ struct IssuedRefresh {
 	sweep_at: BlockHeight,
 	first_height: u64,
 }
-
-
-#[derive(Clone, Copy)]
-enum ReleasedHistory {
-	None,
-	PreRoundBackup,
-	RegisteredPreRoundBackup,
-	Unanswered,
-	ForeignHolder,
-}
-
 
 include!("round_fallback.rs");

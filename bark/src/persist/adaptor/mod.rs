@@ -736,18 +736,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		Ok(())
 	}
 
-	async fn update_vtxo_witnesses(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
-		ensure!(vtxo.has_all_witnesses(), "replacement VTXO witnesses are incomplete");
-		let mut lock = self.inner.write().await;
-		let Some(mut record) = lock.get(partition::VTXO, &vtxo.id().to_bytes()).await? else { return Ok(false); };
-		let mut stored = record.to_data::<SerdeVtxo>()?;
-		ensure!(stored.vtxo.to_bare().serialize() == vtxo.to_bare().serialize(), "replacement VTXO changes its bare identity");
-		stored.vtxo = vtxo.clone();
-		record.data = serde_json::to_vec(&stored)?;
-		lock.put(record).await?;
-		Ok(true)
-	}
-
 	async fn get_wallet_vtxo(&self, id: VtxoId) -> anyhow::Result<Option<WalletVtxo>> {
 		let lock = self.inner.read().await;
 		match get_vtxo(&*lock, id).await? {
@@ -938,19 +926,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		)?;
 		lock.put(updated_record).await?;
 		Ok(())
-	}
-
-	async fn retire_vtxo_lock(
-		&self, vtxo_id: VtxoId, holder: Option<&VtxoLockHolder>,
-	) -> anyhow::Result<bool> {
-		let mut lock = self.inner.write().await;
-		let Some(coin) = get_vtxo(&*lock, vtxo_id).await? else { return Ok(false); };
-		if coin.fallback_status == Some(crate::vtxo::FallbackStatus::Pending) { return Ok(false); }
-		if coin.current_state() == Some(&VtxoState::Spent) { return Ok(true); }
-		let expected = VtxoState::Locked { holder: holder.cloned() };
-		if coin.current_state() != Some(&expected) { return Ok(false); }
-		update_vtxo_state_checked(&mut *lock, vtxo_id, VtxoState::Spent, &[VtxoStateKind::Locked]).await?;
-		Ok(true)
 	}
 
 	async fn update_vtxo_states_checked(
