@@ -10,10 +10,6 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn held_coin_is_alarmed_before_decision() {
-	abandoned_registered_send().await;
-}
-
-async fn abandoned_registered_send() {
 	let ctx = TestContext::new("server/held_coin_is_alarmed_before_decision").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal)

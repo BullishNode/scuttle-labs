@@ -1,15 +1,16 @@
+use super::{expiry_test::published_payout, owner_helpers::unmapped_owner_link};
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
-use ark::fallback::OwnerLink;
 use ark::lightning::PaymentHash;
 use ark::vtxo::Full;
 use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use bitcoin::bip32::{ChildNumber, Xpriv};
-use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::consensus::serialize;
 use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin::{Amount, Network, OutPoint, Transaction, TxOut};
 use bitcoin_ext::{BlockDelta, BlockHeight};
@@ -25,7 +26,7 @@ struct Owner {
 }
 
 impl Owner {
-	fn new(_ctx: &TestContext) -> Self {
+	fn new() -> Self {
 		let account = Xpriv::new_master(Network::Regtest, &[117; 64]).unwrap();
 		let mailbox = account.to_keypair(&SECP);
 		let script = bitcoin::ScriptBuf::new_p2tr(&ark::SECP, mailbox.x_only_public_key().0, None);
@@ -35,17 +36,6 @@ impl Owner {
 	fn key(&self, index: u32) -> Keypair {
 		self.account.derive_priv(&SECP, &[ChildNumber::from_normal_idx(index).unwrap()]).unwrap().to_keypair(&SECP)
 	}
-
-	async fn prove(&self, srv: &Captaind, key: Keypair) -> OwnerLink {
-		let server = srv.mailbox_keypair();
-		assert_eq!(server.public_key(), srv.ark_info().await.mailbox_pubkey);
-		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &self.mailbox, &key).unwrap();
-		let db = Db::connect(&srv.config().postgres).await.unwrap();
-		assert_eq!(db.write(async |tx| tx.verify_owner_link(&server, key.public_key(), &link, Network::Regtest).await)
-			.await.unwrap(), self.mailbox.public_key());
-		link
-	}
-
 }
 
 async fn server_with_lifetime(ctx: &TestContext, lifetime: BlockDelta) -> Arc<Captaind> {
@@ -58,7 +48,7 @@ async fn server_with_lifetime(ctx: &TestContext, lifetime: BlockDelta) -> Arc<Ca
 
 /// Exercise the public board protocol with evidence verified by the production link helper.
 async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair) -> Vtxo<Full> {
-	let link = owner.prove(srv, key).await;
+	let link = unmapped_owner_link(srv, &key, &owner.mailbox).await;
 	let core = ctx.bitcoind().sync_client();
 	let address = ctx.bitcoind().get_new_address();
 	let funding_id = ctx.bitcoind().fund_addr(&address, sat(200_000)).await;
@@ -119,10 +109,7 @@ async fn assert_paid_to_owner(
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let parent = tokio::time::timeout(Duration::from_secs(45), async {
 		for _ in 0..24 {
-			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&coin.id().to_string()]).await?)).await.unwrap();
-			if let Some(row) = row { return deserialize::<Transaction>(row.get("sweep_tx")).unwrap(); }
+			if let Some((_, parent)) = published_payout(&db, coin.id()).await { return parent; }
 			srv.watchmand().trigger_sweep().await;
 			tokio::time::sleep(Duration::from_millis(750)).await;
 			let tip = ctx.generate_blocks(1).await;
@@ -157,7 +144,8 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let ctx = TestContext::new("server/expiry_owner_finds_revoked_htlc_input_key").await;
 	// Backing must outlive the send deadline and its existing admission margin.
 	let srv = server_with_lifetime(&ctx, BlockDelta::new(400)).await;
-	let owner = Owner::new(&ctx);
+	let owner = Owner::new();
+	assert_eq!(srv.mailbox_keypair().public_key(), srv.ark_info().await.mailbox_pubkey);
 
 	let input_key = owner.key(1);
 	let input = board(&ctx, &srv, &owner, input_key).await;
@@ -168,7 +156,7 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 		ArkoorDestination { total_amount: sat(100_000), policy: policy.clone() },
 	]).unwrap().generate_user_nonces(&[input_key]).unwrap();
 	let mut rpc = srv.get_public_rpc().await;
-	let link = owner.prove(&srv, owner.key(500)).await;
+	let link = unmapped_owner_link(&srv, &owner.key(500), &owner.mailbox).await;
 	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for part in &mut request.parts {
 		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) { output.owner_proof = Some(link.into()); }
@@ -190,7 +178,7 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let revoke = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		vec![coin.clone()], VtxoPolicy::new_pubkey(refund_key.public_key()),
 	).unwrap().generate_user_nonces(&[owner.key(500)]).unwrap();
-	let link = owner.prove(&srv, refund_key).await;
+	let link = unmapped_owner_link(&srv, &refund_key, &owner.mailbox).await;
 	let mut request = protos::ArkoorPackageCosignRequest::from(revoke.cosign_request());
 	for part in &mut request.parts {
 		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) { output.owner_proof = Some(link.into()); }
