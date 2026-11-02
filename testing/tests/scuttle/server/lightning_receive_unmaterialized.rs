@@ -774,7 +774,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	// provider from that orphaned observation, even though the invoice paid.
 	srv.watchmand().stop().await.unwrap();
 	let old_view = db.read(async |tx| tx.expiry_view().await).await.unwrap().unwrap();
-	let core = ctx.bitcoind().sync_client();
+	let core = srv.bitcoind().sync_client();
 	let payout_block = core.custom_get_raw_transaction_info(payout.txid, None).unwrap().unwrap().blockhash.unwrap();
 	core.invalidate_block(&payout_block).unwrap();
 	assert!(core.get_block_hash(u64::from(old_view.height.to_u32())).is_err());
