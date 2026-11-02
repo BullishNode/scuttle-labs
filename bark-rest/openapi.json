@@ -2641,47 +2641,6 @@
         }
       }
     },
-    "/api/v1/wallet/fallback": {
-      "get": {
-        "tags": [
-          "wallet"
-        ],
-        "summary": "Get the mailbox-derived Bitcoin fallback address",
-        "operationId": "fallback_destination",
-        "responses": {
-          "200": {
-            "description": "Mailbox identity and BIP86 payout address",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FallbackInfo"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No wallet is loaded",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NotFoundError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Wallet identity cannot be read",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InternalServerError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/wallet/history": {
       "get": {
         "tags": [
@@ -5942,22 +5901,6 @@
           }
         }
       },
-      "FallbackInfo": {
-        "type": "object",
-        "description": "The app-selected fallback destination authenticated by this wallet.",
-        "required": [
-          "mailbox_public_key",
-          "payout_address"
-        ],
-        "properties": {
-          "mailbox_public_key": {
-            "type": "string"
-          },
-          "payout_address": {
-            "type": "string"
-          }
-        }
-      },
       "FallbackRefusalError": {
         "type": "object",
         "description": "Stable native SDK refusal. Consumers select the code, never diagnostic text.",
@@ -6307,16 +6250,6 @@
             "description": "The amount of the lightning receive, if known.",
             "minimum": 0
           },
-          "fallback_status": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/FallbackStatusInfo"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "finished_at": {
             "type": [
               "string",
@@ -6375,7 +6308,7 @@
           },
           "state": {
             "$ref": "#/components/schemas/LightningReceiveStateKind",
-            "description": "Lifecycle phase of the invoice; payout progress is `fallback_status`."
+            "description": "Lifecycle phase of the invoice."
           }
         }
       },

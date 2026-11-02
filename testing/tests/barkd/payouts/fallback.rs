@@ -1,26 +1,8 @@
-use std::str::FromStr;
-
 use ark_testing::TestContext;
-use bitcoin::{Address, Network};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin_ext::BlockDelta;
 use bark::lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
 use ark_testing::{sat, constants::BOARD_CONFIRMATIONS};
-
-#[tokio::test]
-async fn mailbox_fallback_address_is_exposed_through_the_actual_native_barkd() {
-	let ctx = TestContext::new("barkd/fallback_registration_status").await;
-	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
-	let barkd = ctx.barkd("wallet", &srv).create().await;
-	let config = barkd.client_config();
-	let get = || config.client.get(format!("{}/api/v1/wallet/fallback", config.base_path));
-	let first: bark_json::web::FallbackInfo = get().send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-
-	let address = Address::from_str(&first.payout_address).unwrap().require_network(Network::Regtest).unwrap();
-	assert_ne!(address, barkd.onchain_address().await, "native app reserves its stable fallback address");
-	let second: bark_json::web::FallbackInfo = get().send().await.unwrap().error_for_status().unwrap().json().await.unwrap();
-	assert_eq!(first.payout_address, second.payout_address, "status reads never change the immutable destination");
-}
 
 /// The invoice is ours and no payment is initiated: this checks the real
 /// expired-input refusal through the native SDK and authenticated REST route.

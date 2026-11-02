@@ -1,2 +1,0 @@
-- Expose the mailbox key and payout address at `/wallet/fallback`.
-  [#3](https://github.com/BullishNode/scuttle/pull/3)

@@ -1,6 +1,5 @@
 //! Released daemon payout history and seed restoration.
 
-use std::str::FromStr;
 use std::time::Duration;
 
 use bitcoin::{Address, Amount, Network, OutPoint};
@@ -24,13 +23,12 @@ async fn fallback_payout_history_and_seed_restore() {
 	let barkd = ctx.barkd("wallet", &srv).mnemonic(mnemonic.clone())
 		.cfg(|cfg| cfg.daemon_manual_sync = true).funded(sat(200_000)).create().await;
 	let config = barkd.client_config();
-	let registration: bark_json::web::FallbackInfo = config.client
-		.get(format!("{}/api/v1/wallet/fallback", config.base_path)).send().await.unwrap()
+	let identity: bark_json::cli::DebugInfo = config.client
+		.get(format!("{}/api/v1/wallet/debug-info", config.base_path)).send().await.unwrap()
 		.error_for_status().unwrap().json().await.unwrap();
-
-	let address = Address::from_str(&registration.payout_address).unwrap()
-		.require_network(Network::Regtest).unwrap();
-	let script = address.script_pubkey();
+	assert_eq!(identity.network, Network::Regtest);
+	let script = ark::fallback::payout_script(identity.mailbox_id);
+	let address = Address::from_script(&script, identity.network).unwrap();
 	assert!(script.is_p2tr(), "the released daemon must use its native BIP86 wallet");
 	assert_ne!(address, barkd.onchain_address().await);
 	barkd.onchain_sync().await;
@@ -145,11 +143,12 @@ async fn fallback_payout_history_and_seed_restore() {
 	restored.sync().await;
 	restored.onchain_sync().await;
 	let restored_config = restored.client_config();
-	let restored_registration: bark_json::web::FallbackInfo = restored_config.client
-		.get(format!("{}/api/v1/wallet/fallback", restored_config.base_path)).send().await.unwrap()
+	let restored_identity: bark_json::cli::DebugInfo = restored_config.client
+		.get(format!("{}/api/v1/wallet/debug-info", restored_config.base_path)).send().await.unwrap()
 		.error_for_status().unwrap().json().await.unwrap();
-
-	assert_eq!(restored_registration.payout_address, registration.payout_address);
+	assert_eq!(restored_identity.network, identity.network);
+	assert_eq!(restored_identity.mailbox_id, identity.mailbox_id);
+	assert_eq!(ark::fallback::payout_script(restored_identity.mailbox_id), script);
 	let restored_payouts = restored.onchain_utxos().await.into_iter().filter(|utxo| utxo.outpoint == point).collect::<Vec<_>>();
 	assert_eq!(restored_payouts.len(), 1);
 	assert_eq!(restored_payouts[0].amount, expected);

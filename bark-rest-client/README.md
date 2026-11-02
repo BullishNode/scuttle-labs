@@ -83,7 +83,6 @@ Class | Method | HTTP request | Description
 *WalletApi* | [**connected**](docs/WalletApi.md#connected) | **GET** /api/v1/wallet/connected | Check server connection
 *WalletApi* | [**create_wallet**](docs/WalletApi.md#create_wallet) | **POST** /api/v1/wallet/create | Create a wallet
 *WalletApi* | [**debug_info**](docs/WalletApi.md#debug_info) | **GET** /api/v1/wallet/debug-info | Get wallet debug info
-*WalletApi* | [**fallback_destination**](docs/WalletApi.md#fallback_destination) | **GET** /api/v1/wallet/fallback | Get the mailbox-derived Bitcoin fallback address
 *WalletApi* | [**get_vtxo**](docs/WalletApi.md#get_vtxo) | **GET** /api/v1/wallet/vtxos/{id} | Get VTXO detail
 *WalletApi* | [**get_vtxo_encoded**](docs/WalletApi.md#get_vtxo_encoded) | **GET** /api/v1/wallet/vtxos/{id}/encoded | Get encoded VTXO
 *WalletApi* | [**history**](docs/WalletApi.md#history) | **GET** /api/v1/wallet/history | Get wallet history (deprecated)
@@ -220,7 +219,6 @@ Class | Method | HTTP request | Description
  - [ExitTxStatusOneOf4](docs/ExitTxStatusOneOf4.md)
  - [ExitVtxoAlreadySpentState](docs/ExitVtxoAlreadySpentState.md)
  - [ExitVtxoSweptState](docs/ExitVtxoSweptState.md)
- - [FallbackInfo](docs/FallbackInfo.md)
  - [FallbackRefusalError](docs/FallbackRefusalError.md)
  - [FallbackStatusInfo](docs/FallbackStatusInfo.md)
  - [FeeEstimateQuery](docs/FeeEstimateQuery.md)
