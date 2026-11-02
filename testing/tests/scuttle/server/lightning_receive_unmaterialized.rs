@@ -769,6 +769,35 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	// the signed receive checkpoint, change the holder or publish history.
 	let grant_before = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
 	let body_before = provider.get_full_vtxo(original.source.id()).await.unwrap().serialize();
+	// The stopped watchman retains its old terminal projection while Core
+	// removes the actual payout block. A public read must not retire the
+	// provider from that orphaned observation, even though the invoice paid.
+	srv.watchmand().stop().await.unwrap();
+	let old_view = db.read(async |tx| tx.expiry_view().await).await.unwrap().unwrap();
+	let core = ctx.bitcoind().sync_client();
+	let payout_block = core.custom_get_raw_transaction_info(payout.txid, None).unwrap().unwrap().blockhash.unwrap();
+	core.invalidate_block(&payout_block).unwrap();
+	assert!(core.get_block_hash(u64::from(old_view.height.to_u32())).is_err());
+	assert_eq!(db.read(async |tx| tx.expiry_view().await).await.unwrap(), Some(old_view));
+	let error = srv.get_public_rpc().await.check_lightning_receive(protos::CheckLightningReceiveRequest {
+		hash: hash.to_vec(), wait: false,
+	}).await.unwrap_err();
+	assert_eq!(error.code(), tonic::Code::Internal);
+	assert!(provider.try_claim_lightning_receive(hash, false).await.is_err());
+	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap() == Some(checkpoint.clone()));
+	let held = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
+	assert_eq!(held.state, grant_before.state);
+	assert_eq!(held.fallback_status, grant_before.fallback_status);
+	assert_eq!(provider.get_full_vtxo(original.source.id()).await.unwrap().serialize(), body_before);
+	assert!(provider.history().await.unwrap() == before_retirement);
+	assert!(provider_db.get_settled_lightning_receive(hash).await.unwrap().is_none());
+	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
+	assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);
+	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
+	core.reconsider_block(&payout_block).unwrap();
+	assert_eq!(core.get_block_hash(u64::from(old_view.height.to_u32())).unwrap(), old_view.hash);
+	assert!(core.custom_get_raw_transaction_info(payout.txid, None).unwrap().unwrap().confirmations.unwrap() >= 6);
+	srv.watchmand().start().await.unwrap();
 	gate.stall_status.store(true, Ordering::SeqCst);
 	let error = tokio::time::timeout(Duration::from_secs(15), provider.try_claim_lightning_receive(hash, false))
 		.await.unwrap().unwrap_err();
