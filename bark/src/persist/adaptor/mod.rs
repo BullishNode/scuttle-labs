@@ -61,7 +61,7 @@ use lightning_invoice::Bolt11Invoice;
 use serde::{de::DeserializeOwned, Serialize};
 
 use ark::lightning::{PaymentHash, Preimage};
-use ark::{ProtocolEncoding, Vtxo, VtxoId};
+use ark::{Vtxo, VtxoId};
 use ark::vtxo::Full;
 
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
