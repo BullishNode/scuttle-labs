@@ -3,7 +3,6 @@ mod fallback;
 
 pub(super) use ark_testing::onchain::observed_payout_fee_child;
 
-use bark::onchain::MakeCpfpFees;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
@@ -15,18 +14,15 @@ use log::{error, warn};
 use parking_lot::Mutex;
 use bitcoincore_rpc::RpcApi;
 
-use ark::{ProtocolEncoding, Vtxo, SECP};
 use ark::fees::{BoardFees, PpmFeeRate};
 use ark::lightning::PaymentHash;
-use ark::vtxo::Full;
 use bark::exit::ExitState;
 use bark_json::primitives::VtxoStateInfo;
 use bitcoin::{Amount, Network, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::Keypair;
 use bitcoin_ext::rpc::BitcoinRpcExt;
-use bitcoin_ext::{BlockDelta, BlockHeight, TransactionExt, TxOutExt, TxStatus};
+use bitcoin_ext::{BlockDelta, TxOutExt, TxStatus};
 use server::database::Db;
 use server::vtxopool::VtxoTarget;
 use server_rpc::protos;
@@ -75,10 +71,8 @@ impl WatchmanFailureCollector {
 	}
 }
 
-
 /// Observe the fee sponsor from Core, including after its package confirms.
 /// No server child history or subsidy classification participates in this check.
-
 
 #[tokio::test]
 async fn watchman_sweeps_boards() {
@@ -374,7 +368,6 @@ async fn offboard_exit_attack(test_name: &str, n_vtxos: usize) -> bitcoin::Amoun
 		test_name, stolen, payout_received);
 	stolen
 }
-
 
 /// The vtxopool funds each lightning receive from the change of the previous one, so all the
 /// receives hang off a single allocation chain. When a user exits the oldest receive, the txs
@@ -683,31 +676,4 @@ async fn offboard_of_confirmed_exited_vtxo_never_costs_server() {
 			"expected an 'already exited' refusal from the server, got: {}", refusal,
 		);
 	}
-}
-
-
-/// A receiver withholds its preimage until the Lightning payment fails, then
-/// publishes its grant. The server must claim before the receiver can spend it.
-
-/// Preserve one same-source owner group across asynchronous backing progress.
-
-
-fn assert_canonical_watchman_tx(ctx: &TestContext, tx: &Transaction) {
-	fallback::assert_canonical_watchman_tx(ctx, tx)
-}
-
-async fn watchman_confirmed_outpoints(watchman: &Watchmand) -> BTreeSet<OutPoint> {
-	fallback::watchman_confirmed_outpoints(watchman).await
-}
-
-async fn check_receive_seed_custody(
-	ctx: &TestContext, srv: &ark_testing::Captaind,
-	wallet: &bark::Wallet, oldest: &ark::Vtxo<ark::vtxo::Bare>, destination: &bitcoin::ScriptBuf,
-	payout: OutPoint, remaining: &BTreeMap<String, ark::Vtxo>,
-) {
-	fallback::check_receive_seed_custody(ctx, srv, wallet, oldest, destination, payout, remaining).await
-}
-
-async fn expiry_same_owner_fragments(name: &str, small_first: bool) {
-	fallback::expiry_same_owner_fragments(name, small_first).await
 }

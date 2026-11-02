@@ -17,7 +17,7 @@ use server_rpc::{protos, MAX_NB_MAILBOX_ARKOOR_VTXOS};
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 use ark_testing::{TestContext, btc, require_bark_version};
-use ark_testing::daemon::captaind::{self, MailboxClient};
+use ark_testing::daemon::captaind;
 
 /// Regression test for the checkpoint visibility gap in concurrent mailbox writes.
 ///

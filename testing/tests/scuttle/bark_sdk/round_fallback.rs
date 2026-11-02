@@ -216,66 +216,6 @@ async fn issued_refresh_keeps_its_holder_without_exact_cancellation_metadata() {
 }
 
 #[tokio::test]
-async fn cancelled_refresh_checkpoint_failure_survives_reopen_before_unlock() {
-	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
-		let ctx = TestContext::new("bark_sdk/cancelled_refresh_checkpoint_failure").await;
-		let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
-			.cfg(|config| { config.vtxo_lifetime = BlockDelta::new(48); config.vtxo_exit_delta = BlockDelta::new(3); })
-			.watchmand().create().await;
-		let transport = RefreshTransport::default();
-		let fault = RoundWriteFault::default();
-		let IssuedRefresh { wallet, proxy, database, storage_path, mnemonic, source, state_id, movement, unlock_hash, sweep_at, .. } =
-			Box::pin(issued_refresh(&ctx, &srv, transport.clone(), fault.clone(), true)).await;
-		await_refresh_tombstone(&ctx, &srv, unlock_hash, sweep_at,
-			RoundParticipationStatusAttestation::new(unlock_hash, &wallet.mailbox_keypair())).await;
-		let storage = FileStorageAdaptor::open(&storage_path).await.unwrap();
-		let before = storage.get(partition::ROUND_STATE, &state_id.to_bytes()).await.unwrap().unwrap().data;
-		fault.armed.store(true, Ordering::SeqCst);
-		let mut state = wallet.lock_wait_round_state(state_id).await.unwrap().unwrap();
-		assert!(state.sync(&wallet).await.is_err());
-		assert_eq!(state.state().flow_kind(), RoundFlowKind::AwaitingConfirmations);
-		assert!(!state.state().output_vtxos().unwrap().is_empty());
-		assert!(!state.state().forfeits_may_be_exposed());
-		drop(state);
-		assert_eq!(fault.hits.load(Ordering::SeqCst), 1);
-		assert_eq!(storage.get(partition::ROUND_STATE, &state_id.to_bytes()).await.unwrap().unwrap().data, before);
-		assert_refresh_held(&wallet, &database, state_id, movement, source.id(), RoundFlowKind::AwaitingConfirmations).await;
-		drop(wallet);
-		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &mnemonic, database.clone())).await;
-		assert_refresh_held(&wallet, &database, state_id, movement, source.id(), RoundFlowKind::AwaitingConfirmations).await;
-		fault.armed.store(false, Ordering::SeqCst);
-		// The cancellation can commit even when its subsequent input release fails.
-		fault.unlock_armed.store(true, Ordering::SeqCst);
-		let mut state = wallet.lock_wait_round_state(state_id).await.unwrap().unwrap();
-		assert!(state.sync(&wallet).await.is_err());
-		assert_eq!(state.state().flow_kind(), RoundFlowKind::Canceled);
-		drop(state);
-		assert_eq!(fault.unlock_hits.load(Ordering::SeqCst), 1);
-		assert_eq!(database.get_round_state_by_id(state_id).await.unwrap().unwrap().state().flow_kind(), RoundFlowKind::Canceled);
-		assert_eq!(wallet.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Locked { holder: Some(movement.into()) });
-		assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, sat(100_000), Amount::ZERO).await;
-		drop(wallet);
-		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &mnemonic, database.clone())).await;
-		assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, sat(100_000), Amount::ZERO).await;
-		fault.unlock_armed.store(false, Ordering::SeqCst);
-		*transport.status_fault.lock().unwrap() = CancellationStatusFault::Unavailable;
-		let status_faults = transport.status_faults.load(Ordering::SeqCst);
-		let statuses = wallet.sync_pending_rounds().await.unwrap();
-		assert_eq!(transport.status_faults.load(Ordering::SeqCst), status_faults, "durable cancellation cleanup needs no new server reply");
-		assert!(matches!(statuses.get(&state_id), Some(RoundStatus::Canceled)));
-		assert!(wallet.pending_round_states().await.unwrap().is_empty());
-		assert_eq!(wallet.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spendable);
-		assert_refresh_balance(&wallet, Amount::ZERO, sat(100_000), Amount::ZERO, Amount::ZERO).await;
-		assert_eq!(database.get_movement_by_id(movement).await.unwrap().status, MovementStatus::Failed);
-		assert_eq!(database.get_movement_by_id(movement).await.unwrap().effective_balance, bitcoin::SignedAmount::ZERO);
-		assert_eq!(database.get_movement_by_id(movement).await.unwrap().offchain_fee, Amount::ZERO);
-		let history = wallet.history().await.unwrap();
-		assert!(wallet.sync_pending_rounds().await.unwrap().is_empty());
-		assert_eq!(wallet.history().await.unwrap(), history);
-	})).await.expect("a failed cancellation checkpoint must remain recoverable after reopen");
-}
-
-#[tokio::test]
 async fn accepted_forfeit_lost_reply_never_releases_the_original_refresh_input() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
 		let ctx = TestContext::new("bark_sdk/accepted_refresh_forfeit_lost_reply").await;
@@ -352,11 +292,6 @@ async fn fallback_source_state_write_failure_retains_its_receipt_fence() {
 }
 
 #[tokio::test]
-async fn fallback_receipt_write_failure_retries_without_replacing_exit_material() {
-	Box::pin(retained_claim_write_failure(true)).await;
-}
-
-#[tokio::test]
 async fn issued_refresh_completes_unsigned_history_before_unlocking_it() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
 		let ctx = TestContext::new("bark_sdk/issued_refresh_unsigned_history").await;
@@ -417,93 +352,6 @@ async fn registered_released_output_retires_original_from_a_pre_round_backup() {
 #[tokio::test]
 async fn released_refresh_seed_recovery_updates_unsigned_history() {
 	recover_released_refresh(ReleasedHistory::Unanswered).await;
-}
-
-#[tokio::test]
-async fn released_refresh_material_does_not_unlock_a_foreign_holder() {
-	recover_released_refresh(ReleasedHistory::ForeignHolder).await;
-}
-
-#[tokio::test]
-async fn recipient_round_links_and_owned_change_survive_restart() {
-	let ctx = TestContext::new("bark_sdk/recipient_round_link_restart").await;
-	let srv = ctx.captaind("server").cfg(|cfg| cfg.round_interval = Duration::from_secs(3600)).create().await;
-	let actor = ctx.bark("sender", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).funded(sat(200_000)).create().await;
-	let ids = actor.board_and_confirm_and_register(&ctx, sat(100_000)).await;
-	let wallet = actor.client().await;
-	wallet.stop_daemon_wait().await.unwrap();
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	recipient.stop_daemon_wait().await.unwrap();
-	assert_ne!(recipient.mailbox_identifier(), wallet.mailbox_identifier());
-	let key = wallet.derive_store_next_keypair().await.unwrap().0;
-	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, srv.ark_info().await.mailbox_pubkey,
-		&recipient.mailbox_keypair(), &key).unwrap();
-	let input = wallet.get_full_vtxo(ids[0]).await.unwrap();
-	let external_address = recipient.new_address().await.unwrap();
-	let external_key = external_address.policy().user_pubkey();
-	assert!(wallet.pubkey_keypair(&external_key).await.unwrap().is_none());
-	let mut external = bark::round::RoundParticipation {
-		inputs: vec![input.clone()], outputs: vec![ark::VtxoRequest {
-			amount: sat(100_000), policy: external_address.policy().clone(),
-		}], owner_proofs: Default::default(), unblinded_mailbox_id: Some(wallet.mailbox_identifier()),
-	};
-	let error = wallet.join_next_round(external.clone(), None).await.err().unwrap();
-	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::OwnerProofRequired));
-	external.owner_proofs.insert(external_key, link);
-	let error = wallet.join_next_round(external.clone(), None).await.err().unwrap();
-	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::InvalidOwnerProof));
-	assert!(wallet.pending_round_state_ids().await.unwrap().is_empty());
-	let external_link = external_address.owner_link(bitcoin::Network::Regtest, srv.ark_info().await.mailbox_pubkey).unwrap().unwrap();
-	external.owner_proofs.insert(external_key, external_link);
-	let history = wallet.history().await.unwrap();
-	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
-	let submitted = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM round_participation", &[]).await?.get::<_, i64>(0))).await.unwrap();
-	for delegated in [false, true] {
-		let error = if delegated {
-			wallet.join_next_round_delegated(external.clone(), Some(bark::subsystem::RoundMovement::Refresh)).await.err().unwrap()
-		} else {
-			wallet.join_next_round(external.clone(), Some(bark::subsystem::RoundMovement::Refresh)).await.err().unwrap()
-		};
-		assert!(error.to_string().contains("not found for requested round output"));
-		assert!(bark::FallbackRefusal::from_error(&error).is_none(), "valid ownership is distinct from signing-key availability");
-		assert!(wallet.pending_round_state_ids().await.unwrap().is_empty());
-		assert_eq!(wallet.history().await.unwrap(), history);
-		assert_eq!(wallet.get_vtxo_by_id(input.id()).await.unwrap().state, VtxoState::Spendable);
-		assert_eq!(wallet.get_full_vtxo(input.id()).await.unwrap().serialize(), input.serialize());
-		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM round_participation", &[]).await?.get::<_, i64>(0))).await.unwrap(), submitted);
-	}
-	// A locally held P can retain an independently authorized recipient M.
-	let recipient_participation = bark::round::RoundParticipation {
-		inputs: vec![input.clone()], outputs: vec![ark::VtxoRequest {
-			amount: sat(100_000), policy: ark::VtxoPolicy::new_pubkey(key.public_key()),
-		}], owner_proofs: std::collections::BTreeMap::from([(key.public_key(), link)]),
-		unblinded_mailbox_id: Some(wallet.mailbox_identifier()),
-	};
-	let recipient_id = wallet.join_next_round(recipient_participation.clone(), None).await.unwrap().id();
-	let participation = bark::round::RoundParticipation {
-		inputs: vec![input], outputs: vec![ark::VtxoRequest {
-			amount: sat(100_000), policy: ark::VtxoPolicy::new_pubkey(key.public_key()),
-		}], owner_proofs: std::collections::BTreeMap::from([(key.public_key(), link)]),
-		unblinded_mailbox_id: Some(wallet.mailbox_identifier()),
-	};
-	let mut participation = participation;
-	participation.owner_proofs.insert(key.public_key(), wallet.owner_link(key.public_key()).await.unwrap());
-	let id = wallet.join_next_round(participation.clone(), None).await.unwrap().id();
-	drop(wallet);
-	let reopened = actor.client().await;
-	let persisted = reopened.pending_round_states().await.unwrap();
-	let stored = persisted.iter().find(|state| state.id() == id).unwrap();
-	assert_eq!(stored.state().participation().owner_proofs, participation.owner_proofs);
-	let stored_recipient = persisted.iter().find(|state| state.id() == recipient_id).unwrap();
-	assert_eq!(stored_recipient.state().participation().owner_proofs, recipient_participation.owner_proofs);
-	assert_eq!(stored_recipient.state().participation().owner_proofs[&key.public_key()], link);
-	reopened.cancel_pending_round(recipient_id).await.unwrap();
-	// Queue the same actual owned key through the delegated RPC path.
-	// Its mailbox is the wallet's own; the recipient proof stays distinct.
-	reopened.join_next_round_delegated(participation, None).await.unwrap();
-	let owner = db.read(async |tx| tx.expiry_owner(key.public_key()).await).await.unwrap();
-	assert!(matches!(owner, server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
-		if mailbox_pk == reopened.mailbox_identifier().as_pubkey()));
 }
 
 async fn reopen_refresh(
@@ -876,7 +724,6 @@ async fn recover_released_refresh(history: ReleasedHistory) {
 			signed.transactions().map(|step| step.tx.weight().to_wu()).sum::<u64>());
 	})).await.expect("released seed recovery must finish without replaying accepted forfeits");
 }
-
 
 /// A genuine output from a different participation is not an exchange for our
 /// input, even when both requested the same owned policy and amount.

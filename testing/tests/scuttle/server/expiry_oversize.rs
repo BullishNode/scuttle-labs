@@ -14,7 +14,6 @@ use ark_testing::daemon::captaind::{ArkClient, WalletAdminClient};
 use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::{Keypair, rand::{thread_rng, RngCore}};
 use bitcoin_ext::{BlockDelta, TxOutExt};

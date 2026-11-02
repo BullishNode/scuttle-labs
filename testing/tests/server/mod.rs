@@ -52,7 +52,7 @@ use bark_json::primitives::WalletVtxoInfo;
 use server::database::Db;
 use server::secret::Secret;
 use server_log::{FullRound, RoundError, RoundFinished, RoundStarted, RoundUserVtxoAlreadyRegistered};
-use server_rpc::protos::{self};
+use server_rpc::protos;
 
 use ark_testing::{btc, is_bark_version, require_bark_version, sat, secs, Captaind, TestContext};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
