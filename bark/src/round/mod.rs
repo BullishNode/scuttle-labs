@@ -223,12 +223,31 @@ pub struct RoundState {
 }
 
 impl StoredRoundState {
-	/// Cancel only a self-refresh that has not exposed forfeits. Store the
-	/// cancellation before releasing inputs, so a crash cannot resubmit it.
-	pub(crate) async fn cancel_for_fallback(&mut self, wallet: &Wallet) -> anyhow::Result<bool> {
+	/// Persist an authenticated cancellation before releasing a self-refresh's inputs.
+	async fn cancel_if_server_cancelled(&mut self, wallet: &Wallet) -> anyhow::Result<bool> {
 		let state = self.state();
 		if state.done || state.sent_forfeit_sigs || state.participation.outputs.is_empty()
 			|| !state.is_self_refresh(wallet).await? { return Ok(false); }
+		let Some(unlock_hash) = state.unlock_hash() else { return Ok(false); };
+		if !state.has_cancellation_obligation(wallet).await? { return Ok(false); }
+		let (mut srv, _) = wallet.require_server().await?;
+		match srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
+			unlock_hash: unlock_hash.to_byte_array().to_vec(),
+			attestation: RoundParticipationStatusAttestation::new(
+				unlock_hash, &wallet.mailbox_keypair(),
+			).serialize(),
+		}).await {
+			Ok(_) => return Ok(false),
+			Err(status) if cancelled_before_forfeit(&status, unlock_hash) => {
+				let saved = wallet.inner.db.get_round_state_by_id(self.id()).await?
+					.context("cancelled round checkpoint is unavailable")?;
+				ensure!(!saved.state().done && !saved.state().sent_forfeit_sigs
+					&& saved.state().unlock_hash() == Some(unlock_hash)
+					&& saved.state().movement_id == self.state().movement_id,
+					"round cancellation conflicts with its durable checkpoint");
+			},
+			Err(status) => return Err(anyhow::Error::from(status).context("round cancellation status is not conclusive")),
+		}
 		// A failed write or a cancelled future must not leave an unpersisted
 		// cancellation in memory, where the next sync could release its inputs.
 		struct PendingCancellation<'a> {
@@ -251,39 +270,12 @@ impl StoredRoundState {
 		Ok(true)
 	}
 
-	async fn cancel_if_server_cancelled(&mut self, wallet: &Wallet) -> anyhow::Result<bool> {
-		let state = self.state();
-		if state.done || state.sent_forfeit_sigs || state.participation.outputs.is_empty()
-			|| !state.is_self_refresh(wallet).await? { return Ok(false); }
-		let Some(unlock_hash) = state.unlock_hash() else { return Ok(false); };
-		if !state.has_cancellation_obligation(wallet).await? { return Ok(false); }
-		let (mut srv, _) = wallet.require_server().await?;
-		match srv.client.round_participation_status(protos::RoundParticipationStatusRequest {
-			unlock_hash: unlock_hash.to_byte_array().to_vec(),
-			attestation: RoundParticipationStatusAttestation::new(
-				unlock_hash, &wallet.mailbox_keypair(),
-			).serialize(),
-		}).await {
-			Ok(_) => Ok(false),
-			Err(status) if cancelled_before_forfeit(&status, unlock_hash) => {
-				let saved = wallet.inner.db.get_round_state_by_id(self.id()).await?
-					.context("cancelled round checkpoint is unavailable")?;
-				ensure!(!saved.state().done && !saved.state().sent_forfeit_sigs
-					&& saved.state().unlock_hash() == Some(unlock_hash)
-					&& saved.state().movement_id == self.state().movement_id,
-					"round cancellation conflicts with its durable checkpoint");
-				self.cancel_for_fallback(wallet).await
-			},
-			Err(status) => Err(anyhow::Error::from(status).context("round cancellation status is not conclusive")),
-		}
-	}
-
 	/// Progress under the real round lock. The forfeit path persists its
 	/// irreversible checkpoint itself rather than relying on a successful RPC.
 	pub async fn sync(&mut self, wallet: &Wallet) -> anyhow::Result<RoundStatus> {
-		let checkpoint = self.checkpoint();
 		let result = async {
 			if self.cancel_if_server_cancelled(wallet).await? { return Ok(RoundStatus::Canceled); }
+			let checkpoint = self.checkpoint();
 			self.state_mut().sync(wallet, &checkpoint).await
 		}.await;
 		if result.is_err() {
