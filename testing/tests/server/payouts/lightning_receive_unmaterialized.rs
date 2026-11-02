@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use ark::{ProtocolEncoding, ServerVtxo, Vtxo};
 use ark::lightning::PaymentHash;
-use ark::vtxo::{Full, VtxoClause};
+use ark::vtxo::Full;
 use ark_testing::{sat, Captaind, TestContext};
-use ark_testing::daemon::captaind::{self, ArkClient, MailboxClient, WalletAdminClient};
+use ark_testing::daemon::captaind::{self, ArkClient, MailboxClient};
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
@@ -103,24 +103,14 @@ async fn original_binding(db: &Db, hash: PaymentHash) -> Binding {
 
 fn unchanged(original: &Binding, actual: &Binding) {
 	assert_eq!(actual.subscription, original.subscription);
-	assert_eq!(actual.source.id(), original.source.id());
-	assert_eq!(actual.promised.id(), original.promised.id());
-	assert_eq!(actual.promised.policy(), original.promised.policy());
-	assert_eq!(actual.promised.amount(), original.promised.amount());
+	assert_eq!(actual.source.serialize(), original.source.serialize());
+	assert_eq!(actual.promised.serialize(), original.promised.serialize());
 }
 
 async fn rebuilt(ctx: &TestContext, db: &Db) {
 	let point = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
-	tokio::time::timeout(Duration::from_secs(20), async {
-		loop {
-			let done = db.read(async |tx| {
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view == point && (tx.expiry_view().await? == Some(view)))
-			}).await.unwrap();
-			if done { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("both daemon financial views must rebuild the Core tip");
+	super::expiry_test::wait_rebuilt(db, point, Duration::from_secs(20),
+		"both daemon financial views must rebuild the Core tip").await;
 }
 
 /// Scan the entire bounded canonical chain before selecting descendants. The
@@ -231,38 +221,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 					let previous = core.get_raw_transaction(&point.txid, None).unwrap();
 					assert_eq!(previous.output[point.vout as usize], *expected);
 					assert!(*mined >= u64::from(pool.expiry_height().to_u32()));
-					let row = db.read(async |tx| Ok(tx.query_one("SELECT vtxo FROM vtxo WHERE vtxo_id=$1",
-						&[&point.to_string()]).await?)).await.unwrap();
-					let actual: ServerVtxo = ServerVtxo::deserialize(row.get("vtxo")).unwrap();
-					assert_eq!(actual.point(), point);
-					assert_eq!(actual.txout(), *expected);
-					assert_eq!(actual.server_pubkey(), pool.server_pubkey());
-					assert_eq!(actual.chain_anchor(), pool.chain_anchor());
-					let clauses = actual.policy().clauses(actual.exit_delta(), actual.expiry_height(), actual.server_pubkey());
-					let script = input.witness.taproot_leaf_script().unwrap().script;
-					let clause = clauses.iter().find(|clause| clause.tapscript().as_script() == script)
-						.expect("operator witness must match this exact signed Pool point's policy");
-					let owned_key = clause.pubkey() == pool.server_pubkey() || db.read(async |tx| Ok(tx.query_opt(
-						"SELECT pubkey FROM ephemeral_tweak WHERE pubkey=$1", &[&clause.pubkey().to_string()],
-					).await?.is_some())).await.unwrap();
-					assert!(owned_key, "operator clause needs the actual server or owned ephemeral public key");
-					match clause {
-						VtxoClause::DelayedSign(clause) => {
-							assert_eq!(input.sequence, clause.sequence());
-							let info = core.custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
-							let hash = info.blockhash.unwrap();
-							let height = core.get_block_header_info(&hash).unwrap().height as u64;
-							assert_eq!(core.get_block_hash(height).unwrap(), hash);
-							assert!(*mined >= height + u64::from(clause.block_delta.to_u32()));
-						},
-						VtxoClause::TimelockSign(clause) => {
-							assert_eq!(input.sequence, bitcoin::Sequence::ZERO);
-							assert!(matches!(transaction.lock_time, bitcoin::absolute::LockTime::Blocks(_)));
-							assert!(transaction.lock_time.to_consensus_u32() >= clause.timelock_height.to_u32());
-							assert!(*mined > u64::from(clause.timelock_height.to_u32()));
-						},
-						_ => panic!("retained Pool allocation needs its actual signature and CSV or expiry clause"),
-					}
+
 				}
 			}
 			assert_eq!(collected_inputs, usize::from(txid == payout.txid), "one collected source input belongs to the unique customer payout");
@@ -316,10 +275,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 		.copied().collect::<BTreeSet<_>>();
 	tokio::time::timeout(Duration::from_secs(10), async {
 		loop {
-			let address = srv.watchmand().config().admin_address.unwrap();
-			let mut rpc = WalletAdminClient::connect(format!("http://{address}")).await.unwrap();
-			let coins = rpc.wallet_status(protos::Empty {}).await.unwrap().into_inner().watchman.unwrap()
-				.confirmed_utxos.into_iter().map(|point| OutPoint::from_str(&point).unwrap()).collect::<BTreeSet<_>>();
+			let coins = super::expiry_test::watchman_coins(srv.watchmand()).await;
 			if watch_owned.is_subset(&coins) { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
