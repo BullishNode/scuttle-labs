@@ -1630,9 +1630,7 @@ CREATE TABLE public.owner_key (
     user_pubkey text NOT NULL,
     mailbox_pk text NOT NULL,
     blinded_id text NOT NULL,
-    joint_proof text NOT NULL,
     CONSTRAINT owner_key_blinded_id_check CHECK ((length(blinded_id) = 66)),
-    CONSTRAINT owner_key_joint_proof_check CHECK ((length(joint_proof) = 322)),
     CONSTRAINT owner_key_mailbox_pk_check CHECK ((length(mailbox_pk) = 66)),
     CONSTRAINT owner_key_user_pubkey_check CHECK ((length(user_pubkey) = 66))
 );
