@@ -1,10 +1,4 @@
-- Expose stage-entitled fallback receipts through authenticated status and mailbox reads.
-  Explicit source aliases support recipient recovery without a materialized VTXO.
+- Add protocol version 6 for expiry payouts and joint owner authorization.
+  Payout servers require this version. Servers with payouts disabled retain
+  versions 4 through 5. Authenticated status replies report payout commitments.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
-  - **BREAKING:** Retired owner-proof tags are decode-only refusal tombstones;
-    Scuttle protocol 1000 and current joint proofs are required. `SetFallback` is removed.
-- Remove the retired protocol 6 and 7 constants and the operator calls
-  that had no behaviour of their own.
-  [#3](https://github.com/BullishNode/scuttle/pull/3)
-  - **BREAKING:** `PROTOCOL_VERSION_OWNER_PROOF`, `PROTOCOL_VERSION_JOINT_OWNER_PROOF`,
-    `FailLightningAttempt` and `ScopedPaymentStatus` are removed.

@@ -1,3 +1,2 @@
-- Describe the mailbox-derived payout destination without registration state.
+- Add `FallbackInfo` with the mailbox key and its payout address.
   [#3](https://github.com/BullishNode/scuttle/pull/3)
-  - **BREAKING:** `FallbackInfo` replaces `FallbackRegistrationInfo`.
