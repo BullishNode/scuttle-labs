@@ -98,10 +98,9 @@ impl Watchman {
 				));
 			}
 			if let Err(error) = self.db.write(async |t| {
-				// Reorg callbacks also acquire the wallet. Take validity first,
-				// so no wallet holder can wait behind exclusive invalidation.
 				t.lock_watchman_tip(view).await?;
-				let mut wallet = self.watchman_wallet.lock().await;
+				// Wallet sync may hold the wallet while waiting for this connection.
+				let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(()); };
 				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
 					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
 					return Ok(());
