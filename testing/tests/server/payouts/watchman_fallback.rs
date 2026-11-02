@@ -967,8 +967,10 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 		.chain(std::iter::once(initial_pool[0].expiry_height().to_u32())).min().unwrap());
 	let tip = ctx.generate_blocks(150).await;
 	assert!(customers.values().all(|(coin, _)| coin.expiry_height() < tip));
+	srv.wait_for_sync_height(tip).await;
+	wm.wait_for_sync_height(tip).await;
 	let packages = tokio::time::timeout(Duration::from_secs(5), async {
-		// Source attribution, rebuilt views and publication share the original five seconds.
+		// After chain catch-up, attribution and publication share the original five seconds.
 		let funding_rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.lightning_htlc_subscription_id AS subscription_id FROM lightning_payment_attempt a \
 			JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id AND s.payment_hash=a.payment_hash \
 			WHERE a.payment_hash=$1", &[&hash.to_string()]).await?)).await.unwrap();
@@ -1044,8 +1046,6 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 		let source_ids = customers.keys().chain(operators.keys()).cloned().collect::<Vec<_>>();
 		let expected = source_ids.iter().cloned().collect::<BTreeSet<_>>();
 		assert_eq!(source_ids.len(), expected.len());
-		srv.wait_for_sync_height(tip).await;
-		wm.wait_for_sync_height(tip).await;
 		let blockhash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		wait_expiry_allocations(&db, &source_ids, tip, blockhash).await;
 		// The sweep rebuilds the view itself. Do not wait for the periodic rebuild before the trigger.
