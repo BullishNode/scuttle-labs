@@ -1,0 +1,22 @@
+- Add opt-in expiry payouts with `expiry_payouts`, disabled by default.
+  Fix the mode at database creation and refuse a different mode at startup.
+  Require joint spending-key and mailbox-key authorization for customer VTXOs.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Pay expired customer VTXOs to the entitled owner's mailbox-derived address.
+  Apply payout fees and the dust policy. The operator sponsors miner fees;
+  fee-child replacements preserve the stored payout parent. On-chain terminal
+  status requires six canonical confirmations. Unknown obligations stay held.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Preserve uncertain Lightning payments across errors and restarts.
+  Only the original task dispatches xpay. Live zero-part codes 205, 206 and 207
+  can establish failure after native, source and same-hash checks; empty lookups
+  and transport errors alone do not. Use unmodified Core Lightning 26.06.6.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Add guarded reconciliation through `captaind rpc reconcile-lightning-attempt`
+  on the private administrative listener. Empty-record failure requires the
+  operator to confirm a full stop and restart of the same native backend and
+  plugins with dispatch excluded. The RPC does not perform or verify that stop.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)
+- Retry failed hold settlements while other settlements continue.
+  Keep the original payment protected until its outcome is resolved.
+  [#3](https://github.com/BullishNode/scuttle/pull/3)

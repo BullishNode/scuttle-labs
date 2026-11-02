@@ -13,7 +13,7 @@ Name | Type | Description | Notes
 **payment_preimage** | Option<**String**> | The payment preimage, if known. | [optional]
 **preimage_revealed_at** | Option<**chrono::DateTime<chrono::FixedOffset>**> | The timestamp at which the preimage was revealed. | [optional]
 **settled_at** | Option<**chrono::DateTime<chrono::FixedOffset>**> | The timestamp at which the receive settled, if it has. | [optional]
-**state** | [**models::LightningReceiveStateKind**](LightningReceiveStateKind.md) | Lifecycle phase of the receive | 
+**state** | [**models::LightningReceiveStateKind**](LightningReceiveStateKind.md) | Lifecycle phase of the invoice. | 
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 
