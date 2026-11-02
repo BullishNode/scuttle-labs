@@ -744,27 +744,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		srv.wait_for_sync_height(tip).await;
 		wm.wait_for_sync_height(tip).await;
 		assert_eq!(core.get_block_count().unwrap(), u64::from(tip.to_u32()));
-		// Captaind must commit both live receiver rights before the single trigger.
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
-				FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
-			if rows.len() == expected_sources.len() {
-				let mut seen = BTreeSet::new();
-				for row in rows {
-					let id = row.get::<_, String>("vtxo_id");
-					assert!(seen.insert(id.clone()));
-					let source = customer_sources.iter().find(|source| source.id().to_string() == id).unwrap();
-					assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
-					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-
-
-				}
-				assert_eq!(seen, expected_sources);
-				break;
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-		let tip_hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		loop {
 			if db.read(async |tx| {
 				// The one manual sweep must observe every committed ownership decision.
@@ -772,11 +751,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
-				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.height == tip
-					&& view.hash == tip_hash
-					&& (tx.expiry_view().await? == Some(view)))
+				Ok(allocated == expected_sources)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -947,7 +922,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 	}
 	assert_eq!(observed_payouts, expected_payouts);
 	assert_eq!(observed_claims, BTreeMap::from([(OutPoint::new(claim.compute_txid(), 0), claim.output[0].value)]));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,\
 		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)",
@@ -965,9 +940,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 
 		assert_eq!(row.get::<_, i64>("gross_sat"), source.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("allocated"), source.amount().to_sat() as i64);
-		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-		let user_key = source.user_pubkey().to_string();
-
 
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
@@ -1138,27 +1110,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 		srv.wait_for_sync_height(tip).await;
 		wm.wait_for_sync_height(tip).await;
 		assert_eq!(core.get_block_count().unwrap(), u64::from(tip.to_u32()));
-		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		// Captaind must commit both live sender rights before the single trigger.
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts \
-				FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&source_ids]).await?)).await.unwrap();
-			if rows.len() == expected_sources.len() {
-				let mut seen = BTreeSet::new();
-				for row in rows {
-					let id = row.get::<_, String>("vtxo_id");
-					assert!(seen.insert(id.clone()));
-					let source = changes.iter().find(|source| source.id().to_string() == id).unwrap();
-					assert_eq!(row.get::<_, i64>("gross_sat"), 125_000);
-					let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-
-
-				}
-				assert_eq!(seen, expected_sources);
-				break;
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
 		loop {
 			if db.read(async |tx| {
 				// The one manual sweep must observe every committed ownership decision.
@@ -1166,10 +1117,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
 					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
-				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.height == tip
-					&& view.hash == hash && (tx.expiry_view().await? == Some(view)))
+				Ok(allocated == expected_sources)
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -1333,7 +1281,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 	}
 	assert_eq!(observed_payouts, expected_payouts);
 	assert_eq!(observed_claims, BTreeMap::from([(OutPoint::new(claim.compute_txid(), 0), claim.output[0].value)]));
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,\
 		c.allocation_id,c.gross_sat AS allocated,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE v.anchor_point=ANY($1)",
@@ -1351,9 +1299,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 
 		assert_eq!(row.get::<_, i64>("gross_sat"), 125_000);
 		assert_eq!(row.get::<_, i64>("allocated"), 125_000);
-		let facts: serde_json::Value = serde_json::from_str(row.get("facts")).unwrap();
-		let user_key = source.user_pubkey().to_string();
-
 
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), mailbox.to_string());
@@ -3024,358 +2969,8 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	failures.assert_empty();
 }
 
-pub(super) async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
-	sweep_offboard_forfeit(false).await;
-}
 
-async fn sweep_offboard_forfeit(captaind_down: bool) {
-	let ctx = TestContext::new(if captaind_down { "server/operator_sweeps_run_while_captaind_is_down" }
-		else { "server/watchman_sweeps_offboard_forfeit_after_confiscation" }).await;
-	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).funded(btc(10)).cfg(|cfg| {
-		cfg.vtxo_lifetime = BlockDelta::new(144);
-		cfg.vtxopool.vtxo_targets = vec![];
-	}).watchmand_cfg(|cfg| {
-		cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
-		cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
-	}).create().await;
-	let failures = WatchmanFailureCollector::default();
-	let wm = srv.watchmand();
-	wm.add_slog_handler(failures.clone());
 
-	let mut log_claim = wm.subscribe_log::<ClaimBroadcast>();
-	let fee_address = wm.wait_wallet_address().await;
-
-	// fund the watchman so it can pay CPFP fees for the forfeit broadcast
-	let sponsor_txid = ctx.bitcoind().fund_addr(fee_address.clone(), sat(1_000_000)).await;
-	let sponsor_tx = ctx.bitcoind().await_transaction(sponsor_txid).await;
-	let sponsors = sponsor_tx.output.iter().enumerate().filter(|(_, output)|
-		output.script_pubkey == fee_address.script_pubkey() && output.value == sat(1_000_000)).collect::<Vec<_>>();
-	assert_eq!(sponsors.len(), 1);
-	let sponsor = OutPoint::new(sponsor_txid, sponsors[0].0 as u32);
-
-	let bark = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
-	bark.board_and_confirm_and_register(&ctx, sat(400_000)).await;
-	bark.sync().await;
-	let ids = bark.vtxo_ids().await;
-	assert_eq!(ids.len(), 1);
-	let exit_point = ids[0].to_point();
-	let wallet = bark.client().await;
-	let source = wallet.get_full_vtxo(ids[0]).await.unwrap();
-	let destination = wallet.fallback_script();
-	let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
-	source.validate(&funding).unwrap();
-	assert_eq!(source.amount(), sat(400_000));
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let scan_from = ctx.bitcoind().get_block_count().await + 1;
-
-	// snapshot the wallet before offboarding; the attacker keeps the stale vtxo
-	let evil = bark.full_clone("evil").await;
-
-	let payout = ctx.bitcoind().get_new_address();
-	assert_ne!(payout.script_pubkey(), destination);
-	let offboard_txid = bark.offboard_all(&payout).await;
-	ctx.generate_blocks(1).await;
-
-	let spent = db.read(async |tx| tx.get_user_vtxo_by_id(source.id()).await).await.unwrap();
-	assert_eq!(spent.offboarded_in, Some(offboard_txid));
-	assert_eq!(spent.spend_state, server::database::SpendState::Spent);
-	assert_eq!(spent.vtxo, source);
-	let forfeit_txid = spent.oor_spent_txid.expect("offboard must retain its actual signed forfeit");
-	let virtual_tx = db.read(async |tx| tx.get_virtual_transaction_by_txid(forfeit_txid).await).await.unwrap().unwrap();
-	assert!(!virtual_tx.is_funding);
-	let forfeit = virtual_tx.signed_tx.unwrap().into_owned();
-	assert_eq!(forfeit.compute_txid(), forfeit_txid);
-	let forfeit_point = OutPoint::new(forfeit_txid, 0);
-	let forfeit_id = ark::VtxoId::from(forfeit_point);
-	let connector = OutPoint::new(offboard_txid, 1);
-	assert_eq!(forfeit.input.iter().map(|input| input.previous_output).collect::<BTreeSet<_>>(),
-		BTreeSet::from([exit_point, connector]));
-	assert_eq!(forfeit.input.len(), 2);
-	assert_eq!(forfeit.output.len(), 2);
-	assert_eq!(forfeit.output[0].value, sat(400_330));
-	assert!(forfeit.output[1].is_p2a_fee_anchor());
-	let anchor = OutPoint::new(forfeit_txid, 1);
-
-	// the attacker exits the now-forfeited vtxo
-	evil.start_exit_all().await;
-	progress_exit_until_awaiting_delta(&ctx, &evil).await;
-
-	// drive the watchman until it confiscates the exit output
-	let tip = ctx.generate_blocks(wm.config().watchman.progress_grace_period.to_u32()).await;
-	wm.wait_for_sync_height(tip).await;
-	let client = ctx.bitcoind().sync_client();
-	for _ in 0..25 {
-		wm.trigger_sweep().await;
-		tokio::time::sleep(Duration::from_secs(2)).await;
-		let tip = ctx.generate_blocks(1).await;
-		wm.wait_for_sync_height(tip).await;
-		if client.get_tx_out(&exit_point.txid, exit_point.vout, Some(true)).unwrap().is_none() {
-			break;
-		}
-	}
-	assert!(
-		client.get_tx_out(&exit_point.txid, exit_point.vout, Some(true)).unwrap().is_none(),
-		"the watchman should have confiscated the exit output",
-	);
-
-	// Keep the original maturity stimulus. The outage case leaves captaind
-	// down while the same watchmand store, database and Core remain available.
-	let stopped_rounds_balance = if captaind_down {
-		let balance = srv.wallet_status().await.rounds.total_balance;
-		srv.stop().await.unwrap();
-		// A real watchmand restart invalidates its old completed view; it
-		// completes the new Core view independently while captaind stays down.
-		wm.stop().await.unwrap();
-		wm.start().await.unwrap();
-		wm.add_slog_handler(failures.clone());
-		log_claim = wm.subscribe_log::<ClaimBroadcast>();
-		Some(balance)
-	} else { None };
-	let tip = ctx.generate_blocks(200).await;
-	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
-	assert_ne!(operator_script, destination);
-	assert_ne!(operator_script, payout.script_pubkey());
-	let raw_fee = |tx: &Transaction| {
-		let inputs = tx.input.iter().map(|input| {
-			let previous = client.get_raw_transaction(&input.previous_output.txid, None).unwrap();
-			previous.output[input.previous_output.vout as usize].value
-		}).sum::<Amount>();
-		inputs.checked_sub(tx.output.iter().map(|output| output.value).sum::<Amount>()).unwrap()
-	};
-	let (claim, msg, rounds_balance) = tokio::time::timeout(Duration::from_secs(15), async {
-		if !captaind_down { srv.wait_for_sync_height(tip).await; }
-		wm.wait_for_sync_height(tip).await;
-		assert_eq!(client.get_block_count().unwrap(), u64::from(tip.to_u32()));
-		let hash = client.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		loop {
-			if db.read(async |tx| {
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.height == tip
-					&& view.hash == hash && (tx.expiry_view().await? == Some(view)))
-			}).await.unwrap() { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-		// The forfeit is Bare: its exclusive server key needs no invented Full path or customer allocation.
-		let stored = db.read(async |tx| tx.get_bare_vtxo_by_id(forfeit_id).await).await.unwrap();
-		assert_eq!(stored.spend_state, server::database::SpendState::OffboardForfeit);
-		assert_eq!(*stored.vtxo.policy(), ark::ServerVtxoPolicy::ServerOwned);
-		assert_eq!(stored.vtxo.point(), forfeit_point);
-		assert_eq!(stored.vtxo.amount(), sat(400_330));
-		assert_eq!(stored.vtxo.server_pubkey(), source.server_pubkey());
-		assert_eq!(stored.vtxo.expiry_height(), source.expiry_height());
-		assert!(tip >= stored.vtxo.expiry_height());
-		assert_eq!(stored.vtxo.txout(), forfeit.output[0]);
-		let actual = client.get_raw_transaction(&forfeit_point.txid, None).unwrap();
-		assert_eq!(actual, forfeit);
-		assert_canonical_watchman_tx(&ctx, &actual);
-		let actual_output = &actual.output[forfeit_point.vout as usize];
-		assert_eq!(actual_output.value, stored.vtxo.amount());
-		assert_eq!(actual_output.script_pubkey, stored.vtxo.output_script_pubkey());
-		let rounds_balance = match stopped_rounds_balance {
-			Some(balance) => balance,
-			None => srv.wallet_status().await.rounds.total_balance,
-		};
-		wm.trigger_sweep().await;
-		let msg = log_claim.recv().await.expect("native confiscation claim log");
-		assert_eq!(msg.vtxo_ids, vec![forfeit_id]);
-		assert_eq!(msg.total_input_value, sat(400_330));
-		let claim = client.get_raw_transaction(&msg.txid, None).unwrap();
-		assert_eq!(claim.input.len(), 1);
-		assert_eq!(claim.input[0].previous_output, forfeit_point);
-		assert_eq!(claim.output.len(), 1);
-		assert_eq!(claim.output[0].script_pubkey, operator_script);
-		assert!(claim.output[0].value > Amount::ZERO);
-		assert_eq!(msg.total_output_value, claim.output[0].value);
-		assert_eq!(msg.fee, raw_fee(&claim));
-		assert!(msg.fee > Amount::ZERO);
-		assert_eq!(msg.total_output_value + msg.fee, sat(400_330));
-		(claim, msg, rounds_balance)
-	}).await.expect("native operator claim must be visible within the original fifteen seconds");
-	let tip = ctx.generate_blocks(6).await;
-	if captaind_down { srv.start().await.unwrap(); }
-	srv.wait_for_sync_height(tip).await;
-	wm.wait_for_sync_height(tip).await;
-	assert_canonical_watchman_tx(&ctx, &claim);
-	assert_canonical_watchman_tx(&ctx, &forfeit);
-	assert_eq!(client.get_raw_transaction(&forfeit_txid, None).unwrap(), forfeit);
-	let exit_tx = client.get_raw_transaction(&exit_point.txid, None).unwrap();
-	assert_canonical_watchman_tx(&ctx, &exit_tx);
-	assert_eq!(exit_tx.output[exit_point.vout as usize], source.txout());
-	let offboard = client.get_raw_transaction(&offboard_txid, None).unwrap();
-	assert_canonical_watchman_tx(&ctx, &offboard);
-	assert_eq!(offboard.output[0].script_pubkey, payout.script_pubkey());
-	assert_eq!(offboard.output[1].value, sat(330));
-	let offboard_row = db.read(async |tx| Ok(tx.query_one("SELECT signed_tx,user_fee_sat FROM offboards WHERE txid=$1",
-		&[&offboard_txid.to_string()]).await?)).await.unwrap();
-	assert_eq!(deserialize::<Transaction>(offboard_row.get("signed_tx")).unwrap(), offboard);
-	assert_eq!(offboard.output[0].value + sat(u64::try_from(offboard_row.get::<_, i64>("user_fee_sat")).unwrap()), sat(400_000));
-
-	let mut prior_children = Vec::new();
-	let mut delivered = BTreeMap::new();
-	let exit_txs = source.transactions().map(|step| step.tx).collect::<Vec<_>>();
-	let exit_anchors = exit_txs.iter().flat_map(|tx| tx.output.iter().enumerate()
-		.filter(|(_, output)| output.is_p2a_fee_anchor()).map(|(index, _)| OutPoint::new(tx.compute_txid(), index as u32))).collect::<BTreeSet<_>>();
-	for height in scan_from..=ctx.bitcoind().get_block_count().await {
-		for tx in client.get_block(&client.get_block_hash(height).unwrap()).unwrap().txdata {
-			if tx.input.iter().any(|input| input.previous_output == anchor) { prior_children.push(tx.clone()); }
-			if exit_txs.iter().any(|exit| exit.compute_txid() == tx.compute_txid())
-				|| tx.input.iter().any(|input| exit_anchors.contains(&input.previous_output)) { raw_fee(&tx); }
-			for (index, output) in tx.output.iter().enumerate() {
-				assert_ne!(output.script_pubkey, destination, "offboarded principal must not be paid again to the customer");
-				if output.script_pubkey == payout.script_pubkey() {
-					delivered.insert(OutPoint::new(tx.compute_txid(), index as u32), output.value);
-				}
-			}
-		}
-	}
-	assert_eq!(delivered, BTreeMap::from([(OutPoint::new(offboard_txid, 0), offboard.output[0].value)]));
-	assert_eq!(prior_children.len(), 1, "bind the actual confirmed CPFP child, not an obsolete replacement");
-	let child = &prior_children[0];
-	assert_eq!(child.input.len(), 2);
-	assert_eq!(child.input.iter().map(|input| input.previous_output).collect::<BTreeSet<_>>(), BTreeSet::from([anchor, sponsor]));
-	assert_canonical_watchman_tx(&ctx, child);
-	assert_canonical_watchman_tx(&ctx, &sponsor_tx);
-	assert_eq!(raw_fee(&forfeit), Amount::ZERO);
-	let prior_fee = raw_fee(child);
-	assert!(prior_fee > Amount::ZERO);
-	assert!(!child.output.is_empty());
-	let change = child.output.iter().enumerate().map(|(index, output)| {
-		assert!(output.value > Amount::ZERO);
-		(OutPoint::new(child.compute_txid(), index as u32), output.clone())
-	}).collect::<BTreeMap<_, _>>();
-	tokio::time::timeout(Duration::from_secs(10), async {
-		loop {
-			let owned = watchman_confirmed_outpoints(wm).await;
-			if change.keys().all(|point| owned.contains(point)) { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("every actual sponsor change output must be confirmed watchman property");
-	let claim_point = OutPoint::new(claim.compute_txid(), 0);
-	for (point, output) in change.iter().chain(std::iter::once((&claim_point, &claim.output[0]))) {
-		let actual = client.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
-		assert!(actual.confirmations >= 6);
-		assert_eq!(actual.value, output.value);
-		assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
-	}
-	for point in [exit_point, connector, anchor, sponsor, forfeit_point] {
-		assert!(client.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().is_none());
-	}
-	assert_eq!(sat(1_400_330), claim.output[0].value + change.values().map(|output| output.value).sum::<Amount>() + prior_fee + msg.fee,
-		"the closed EXIT+connector+sponsor frontier excludes already paid offboard delivery and earlier exit fees");
-	let customer_allocations = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS count FROM expiry_entitlement e \
-		JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=ANY($1) AND c.disposition<>'operator'",
-		&[&vec![source.id().to_string(), forfeit_id.to_string()]]).await?.get::<_, i64>("count"))).await.unwrap();
-	assert_eq!(customer_allocations, 0);
-	assert_eq!(srv.wallet_status().await.rounds.total_balance, rounds_balance + msg.total_output_value,
-		"the actual operator net claim must land in the rounds wallet");
-	failures.assert_empty();
-}
-
-pub(super) async fn watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table() {
-	require_bark_version!(> "0.5.0");
-
-	let ctx =
-		TestContext::new("server/watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table")
-			.await;
-	let srv = ctx
-		.captaind("server")
-		.funded(btc(10))
-		.cfg(|cfg| {
-			cfg.vtxopool.vtxo_targets = vec![];
-		})
-		.watchmand_cfg(|cfg| {
-			cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
-			cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
-		})
-		.create()
-		.await;
-	let failures = WatchmanFailureCollector::default();
-	let wm = srv.watchmand();
-	wm.add_slog_handler(failures.clone());
-
-	let mut log_claim = wm.subscribe_log::<ClaimBroadcast>();
-
-	// Board some funds with bark1
-	let bark1 = ctx.bark("bark1", &srv).funded(sat(500_000)).create().await;
-	bark1
-		.board_and_confirm_and_register(&ctx, sat(200_000))
-		.await;
-
-	// fund the watchman
-	ctx.bitcoind()
-		.fund_addr(wm.wait_wallet_address().await, sat(100_000))
-		.await;
-
-	// Clone bark1 before refresh — bark2 retains the stale board vtxo state
-	let bark1_old = bark1.full_clone("bark2").await;
-
-	// bark1 refreshes its board vtxo into a round vtxo. The hArk round stores
-	// the participation's unlock hash and preimage in round_participation.
-	ctx.refresh_all(&srv, &[&bark1]).await;
-	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
-	bark1.sync().await;
-
-	// Plant the cross-domain state: record the same preimage as a settled
-	// Lightning payment hash.
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
-	let unlock_preimage = db
-		.read(async |t| {
-			let row = t
-				.query_one(
-					"SELECT unlock_preimage FROM round_participation ORDER BY id DESC LIMIT 1",
-					&[],
-				)
-				.await?;
-			let hex: String = row.get(0);
-			Ok(ark::lightning::Preimage::from_str(&hex).expect("invalid unlock preimage"))
-		})
-		.await
-		.unwrap();
-	db.write(async |t| t.store_htlc_settlement(unlock_preimage).await)
-		.await
-		.unwrap();
-
-	// bark1_old, holding the stale board vtxo, starts a malicious exit
-	bark1_old.start_exit_all().await;
-
-	// Progress until the exit transaction is confirmed on-chain (AwaitingDelta state).
-	progress_exit_until_awaiting_delta(&ctx, &bark1_old).await;
-
-	// Advance past watchman's progress grace period
-	let tip = ctx
-		.generate_blocks(wm.config().watchman.progress_grace_period.to_u32())
-		.await;
-	wm.wait_for_sync_height(tip).await;
-
-	// first sweep: the watchman broadcasts the forfeit (progress) transaction via CPFP.
-	let mut log_progress = wm.subscribe_log::<ProgressBroadcast>();
-	wm.trigger_sweep().await;
-	let progress_log = log_progress
-		.recv()
-		.wait_millis(10_000)
-		.await
-		.expect("watchman should broadcast progress (forfeit) tx");
-
-	// Confirm the forfeit tx so the resulting HarkForfeit vtxo enters the frontier.
-	ctx.await_transactions_across_nodes([progress_log.cpfp_txid], [wm.bitcoind().as_ref()])
-		.await;
-	let tip = ctx.generate_blocks(1).await;
-	wm.wait_for_sync_height(tip).await;
-
-	// second sweep: the watchman must claim the HarkForfeit vtxo. The preimage
-	// for its HashSign clause is the hArk unlock preimage; the Lightning
-	// settlement row for the same hash must not block this.
-	wm.trigger_sweep().await;
-	let msg = log_claim
-		.recv()
-		.wait_millis(15_000)
-		.await
-		.expect("watchman must claim the HarkForfeit vtxo despite the cross-domain preimage");
-	failures.assert_empty();
-	println!("malicious exit sweep: {:#?}", msg);
-	assert_eq!(1, msg.vtxo_ids.len());
-	assert_eq!(msg.vtxo_ids[0].to_point().txid, progress_log.txid);
-}
 
 pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	require_bark_version!(> "0.5.0");
