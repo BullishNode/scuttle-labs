@@ -30,7 +30,7 @@ CREATE TABLE bark_properties (
 
 				network TEXT NOT NULL,
 				fingerprint TEXT NOT NULL
-			, server_pubkey TEXT, server_mailbox_pubkey TEXT, mailbox_pubkey TEXT CHECK (length(mailbox_pubkey) = 66));
+			, server_pubkey TEXT, server_mailbox_pubkey TEXT, mailbox_pubkey TEXT CHECK (length(mailbox_pubkey)=66), server_payouts INTEGER DEFAULT 0 CHECK (server_payouts IN (0,1)));
 CREATE TABLE bark_exit_states (
 				vtxo_id TEXT PRIMARY KEY,
 				state TEXT NOT NULL,
@@ -87,7 +87,7 @@ CREATE TABLE bark_vtxo (
 				amount_sat INTEGER,
 				created_at DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
 			, raw_bare BLOB, raw_genesis BLOB, exit_depth INTEGER, exit_tx_weight INTEGER, registered INTEGER NOT NULL DEFAULT 0, fallback_status TEXT
-		CHECK (fallback_status IN ('pending','spent','forfeited')));
+			CHECK (fallback_status IN ('pending','spent','forfeited')));
 CREATE TABLE IF NOT EXISTS "bark_movements" (
 					id                INTEGER  PRIMARY KEY AUTOINCREMENT NOT NULL UNIQUE,
 					status            TEXT     NOT NULL,
