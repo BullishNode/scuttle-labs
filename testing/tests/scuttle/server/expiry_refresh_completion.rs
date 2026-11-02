@@ -173,7 +173,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 			loop {
 				let row = db.read(async |tx| Ok(tx.query_opt("
 					SELECT a.id, a.sweep_tx, c.disposition
-					FROM expiry_allocation a
+					FROM expiry_allocation_state a
 					JOIN expiry_allocation_input i ON i.allocation_id=a.id
 					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
@@ -232,7 +232,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 			loop {
 				let row = db.read(async |tx| Ok(tx.query_opt("
 					SELECT a.sweep_tx
-					FROM expiry_allocation a
+					FROM expiry_allocation_state a
 					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
 					WHERE e.vtxo_id=$1
@@ -473,7 +473,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		let allocation_id: i64 = allocation.get("id");
 		let parent: Transaction = tokio::time::timeout(Duration::from_secs(20), async {
 			loop {
-				let tx = db.read(async |t| Ok(t.query_opt("SELECT sweep_tx FROM expiry_allocation
+				let tx = db.read(async |t| Ok(t.query_opt("SELECT sweep_tx FROM expiry_allocation_state
 					WHERE id=$1 AND broadcast_at IS NOT NULL", &[&allocation_id]).await?)).await.unwrap();
 				if let Some(tx) = tx { break deserialize(tx.get("sweep_tx")).unwrap(); }
 				tokio::time::sleep(Duration::from_millis(25)).await;
