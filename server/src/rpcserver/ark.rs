@@ -192,7 +192,7 @@ impl rpc::server::ArkService for Server {
 			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
 			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?,
-				t.fallback_outcomes(&[id]).await?))
+				t.fallback_outcomes(&[id], &self.bitcoind).await?))
 		}).await.to_status()?;
 
 		let spend_state = vtxo_state.spend_state;
@@ -278,7 +278,7 @@ impl rpc::server::ArkService for Server {
 				.collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
 			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?,
-				t.fallback_outcomes(&ids).await?))
+				t.fallback_outcomes(&ids, &self.bitcoind).await?))
 		}).await.to_status()?;
 
 		// An id without a client-visible user vtxo is reported as missing,
@@ -375,7 +375,7 @@ impl rpc::server::ArkService for Server {
 		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
 		let (fallback, owners, outcomes) = self.db.read(async |t| Ok((
 			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
-			t.fallback_outcomes(&ids).await?,
+			t.fallback_outcomes(&ids, &self.bitcoind).await?,
 		))).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
@@ -708,7 +708,7 @@ impl rpc::server::ArkService for Server {
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
 
 		let sub = self.check_lightning_receive(payment_hash, req.wait).await.to_status()?;
-		let outcome = self.db.read(async |t| t.receive_fallback_outcome(&sub).await).await.to_status()?;
+		let outcome = self.db.read(async |t| t.receive_fallback_outcome(&sub, &self.bitcoind).await).await.to_status()?;
 		let mut response: protos::CheckLightningReceiveResponse = sub.into();
 		response.fallback_spend_state = outcome.as_ref()
 			.map(|outcome| fallback_spend_state(protos::VtxoSpendState::Unspecified, Some(outcome)) as i32);

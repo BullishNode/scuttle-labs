@@ -159,7 +159,7 @@ impl Tx<'_> {
 	/// Follow only immutable registered OOR edges. The stage resolver below
 	/// still decides whether a descendant is actually this input owner's right;
 	/// sharing a transaction or a mailbox is not sufficient.
-	async fn source_fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+	async fn source_fallback_claims(&self, ids: &[VtxoId], bitcoind: &bitcoind_async_client::Client) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
 		if ids.is_empty() { return Ok(BTreeMap::new()); }
 		let raw = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let rows = self.query("WITH RECURSIVE branch AS (
@@ -171,15 +171,25 @@ impl Tx<'_> {
 		) SELECT vtxo_id FROM branch", &[&raw]).await?;
 		let mut candidates = ids.iter().copied().collect::<BTreeSet<_>>();
 		for row in rows { candidates.insert(row.get::<_, &str>("vtxo_id").parse()?); }
-		self.fallback_claims(&candidates.into_iter().collect::<Vec<_>>()).await
+		let candidates = candidates.into_iter().collect::<Vec<_>>();
+		let raw = candidates.iter().map(ToString::to_string).collect::<Vec<_>>();
+		// Ordinary uncommitted status reads do not depend on watchmand/Core.
+		if self.query_opt("SELECT e.id FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+			WHERE e.vtxo_id=ANY($1) AND c.disposition='customer' LIMIT 1", &[&raw]).await?.is_none() {
+			return Ok(BTreeMap::new());
+		}
+		let point = self.expiry_view().await?.context("fallback projection has no published watchman tip")?;
+		self.lock_watchman_tip(point).await?;
+		super::expiry_chain::verify_expiry_tip(point, bitcoind).await?;
+		self.fallback_claims(&candidates, point).await
 	}
 
 	/// Aggregate direct and stage-selected input-owner portions onto the
 	/// authenticated coin identity. Keep birth ownership separate from payee.
-	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
+	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId], bitcoind: &bitcoind_async_client::Client)
 		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
 	{
-		let claims = self.source_fallback_claims(ids).await?;
+		let claims = self.source_fallback_claims(ids, bitcoind).await?;
 		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
 		let owners = self.coin_owner_mailboxes(ids).await?;
 		let mut outcomes = BTreeMap::new();
@@ -197,7 +207,7 @@ impl Tx<'_> {
 	/// A collected receive can have no final coin row. Use its actual grants
 	/// and admitted destination bindings, not the provider's grant ownership.
 	/// The public hash-only response receives an outcome, never these keys.
-	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
+	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription, bitcoind: &bitcoind_async_client::Client)
 		-> anyhow::Result<Option<FallbackOutcome>>
 	{
 		let rows = self.query("SELECT v.vtxo_id,v.amount,c.output_vtxo_id,c.output_vtxo
@@ -230,7 +240,7 @@ impl Tx<'_> {
 			destinations.insert(id, mailbox_pk);
 			ids.push(id);
 		}
-		let claims = self.source_fallback_claims(&ids).await?;
+		let claims = self.source_fallback_claims(&ids, bitcoind).await?;
 		let matching = claims.values().filter(|claim| destinations.iter().any(|(id, owner)|
 			claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(id)));
 		fallback_outcome(principal, matching)
@@ -239,7 +249,7 @@ impl Tx<'_> {
 	/// Select the winning economic decision before filtering for customer claims.
 	/// The receipt describes that decision; it does not promote a pending parent
 	/// or replace the wallet's independent canonical-chain confirmation check.
-	pub(crate) async fn fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+	async fn fallback_claims(&self, ids: &[VtxoId], point: BlockRef) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let rows = self.query("SELECT c.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
 			c.payout_sat,c.forfeited_sat,a.sweep_txid,
@@ -262,9 +272,9 @@ impl Tx<'_> {
 				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
 				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) c
 			JOIN expiry_allocation a ON a.id=c.allocation_id
-			CROSS JOIN (SELECT height AS processed_height,hash AS processed_hash FROM watchmand_block ORDER BY height DESC LIMIT 1) cv
+			CROSS JOIN (SELECT $2::BIGINT AS processed_height,$3::TEXT AS processed_hash) cv
 			LEFT JOIN expiry_allocation_payout p ON p.allocation_id=c.allocation_id AND p.spk=c.spk
-			WHERE c.disposition='customer'", &[&ids]).await?;
+			WHERE c.disposition='customer'", &[&ids, &i64::from(point.height), &point.hash.to_string()]).await?;
 		let mut claims: BTreeMap<VtxoId, FallbackClaim> = rows.into_iter().map(|row| {
 			let height: Option<i64> = row.get("confirmed_height");
 			let hash: Option<&str> = row.get("confirmed_hash");
