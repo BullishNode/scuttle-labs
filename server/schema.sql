@@ -1092,21 +1092,6 @@ ALTER SEQUENCE public.htlc_settlement_id_seq OWNED BY public.htlc_settlement.id;
 
 
 --
--- Name: htlc_settlement_source; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.htlc_settlement_source (
-    settlement_id bigint NOT NULL,
-    kind text NOT NULL,
-    attempt_id bigint,
-    subscription_id bigint,
-    vtxo_id text,
-    recorded_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT htlc_settlement_source_kind_check CHECK ((kind = ANY (ARRAY['attempt'::text, 'receive'::text, 'onchain'::text, 'unknown'::text])))
-);
-
-
---
 -- Name: htlc_vtxo; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1647,7 +1632,7 @@ CREATE TABLE public.owner_key (
     blinded_id text NOT NULL,
     joint_proof text NOT NULL,
     CONSTRAINT owner_key_blinded_id_check CHECK ((length(blinded_id) = 66)),
-    CONSTRAINT owner_key_joint_proof_check CHECK ((length(joint_proof) = 326)),
+    CONSTRAINT owner_key_joint_proof_check CHECK ((length(joint_proof) = 322)),
     CONSTRAINT owner_key_mailbox_pk_check CHECK ((length(mailbox_pk) = 66)),
     CONSTRAINT owner_key_user_pubkey_check CHECK ((length(user_pubkey) = 66))
 );
@@ -2768,14 +2753,6 @@ ALTER TABLE ONLY public.htlc_settlement
 
 
 --
--- Name: htlc_settlement_source htlc_settlement_source_settlement_id_kind_attempt_id_subscr_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.htlc_settlement_source
-    ADD CONSTRAINT htlc_settlement_source_settlement_id_kind_attempt_id_subscr_key UNIQUE NULLS NOT DISTINCT (settlement_id, kind, attempt_id, subscription_id, vtxo_id);
-
-
---
 -- Name: htlc_vtxo htlc_vtxo_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3555,38 +3532,6 @@ ALTER TABLE ONLY public.expiry_split_request
 
 ALTER TABLE ONLY public.expiry_terminal_claim
     ADD CONSTRAINT expiry_terminal_claim_entitlement_id_fkey FOREIGN KEY (entitlement_id) REFERENCES public.expiry_entitlement(id);
-
-
---
--- Name: htlc_settlement_source htlc_settlement_source_attempt_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.htlc_settlement_source
-    ADD CONSTRAINT htlc_settlement_source_attempt_id_fkey FOREIGN KEY (attempt_id) REFERENCES public.lightning_payment_attempt(id);
-
-
---
--- Name: htlc_settlement_source htlc_settlement_source_settlement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.htlc_settlement_source
-    ADD CONSTRAINT htlc_settlement_source_settlement_id_fkey FOREIGN KEY (settlement_id) REFERENCES public.htlc_settlement(id);
-
-
---
--- Name: htlc_settlement_source htlc_settlement_source_subscription_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.htlc_settlement_source
-    ADD CONSTRAINT htlc_settlement_source_subscription_id_fkey FOREIGN KEY (subscription_id) REFERENCES public.lightning_htlc_subscription(id);
-
-
---
--- Name: htlc_settlement_source htlc_settlement_source_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.htlc_settlement_source
-    ADD CONSTRAINT htlc_settlement_source_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
 
 
 --
