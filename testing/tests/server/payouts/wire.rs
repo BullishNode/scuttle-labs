@@ -1,6 +1,7 @@
 use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use server_rpc::{protos, RequestExt};
 use ark_testing::{Captaind, TestContext};
+use server::database::Db;
 
 /// The inherited admin-fail gate is observation-only: the operator supplies
 /// an ID, never a requested outcome. Authority is the same private listener.
@@ -92,4 +93,48 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let error = operator.reconcile_lightning_attempt(request).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert_eq!(error.message(), "attempt_id must be positive");
+
+	// The next process configuration cannot change this store's payout mode.
+	let server_pubkey = srv.ark_info().await.server_pubkey;
+	let postgres = srv.config().postgres.clone();
+	let db = Db::connect(&postgres).await.unwrap();
+	let mode = db.read(async |tx| Ok(tx.query_one(
+		"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
+	).await?.get::<_, bool>(0))).await.unwrap();
+	assert!(mode);
+	srv.stop().await.unwrap();
+	let stderr_path = srv.config().data_dir.join("stderr.log");
+	let stderr_offset = tokio::fs::metadata(&stderr_path).await.unwrap().len() as usize;
+	srv.config_mut().expiry_payouts = false;
+	let error = srv.start().await.expect_err("an ON store must refuse an OFF configuration");
+	let stderr = tokio::fs::read(&stderr_path).await.unwrap();
+	let refusal = std::str::from_utf8(&stderr[stderr_offset..]).unwrap();
+	assert!(refusal.contains("expiry_payouts differs from the mode fixed at database creation"),
+		"startup must refuse the mode change, not fail for an unrelated reason: {error:#}");
+	let unchanged = db.read(async |tx| Ok(tx.query_one(
+		"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
+	).await?.get::<_, bool>(0))).await.unwrap();
+	assert_eq!(unchanged, mode);
+	srv.config_mut().expiry_payouts = true;
+	srv.start().await.unwrap();
+	assert_eq!(srv.ark_info().await.server_pubkey, server_pubkey);
+	let mut restored = server_rpc::ArkServiceClient::connect(srv.ark_url()).await.unwrap();
+	let restored = restored.handshake(protos::HandshakeRequest {
+		bark_version: Some(server_rpc::BARK_CRATE_VERSION.to_owned()),
+	}).await.unwrap().into_inner();
+	assert_eq!((restored.min_protocol_version, restored.max_protocol_version), (version, version));
+
+	// A separate ordinary store keeps the unmodified public version range.
+	let ordinary = ctx.captaind("ordinary").no_vtxo_pool().create().await;
+	assert!(!ordinary.config().expiry_payouts);
+	let mut public = server_rpc::ArkServiceClient::connect(ordinary.ark_url()).await.unwrap();
+	let handshake = public.handshake(protos::HandshakeRequest {
+		bark_version: Some(server_rpc::BARK_CRATE_VERSION.to_owned()),
+	}).await.unwrap().into_inner();
+	assert_eq!((handshake.min_protocol_version, handshake.max_protocol_version), (4, 5));
+	for version in [4, 5] {
+		let mut request = tonic::Request::new(protos::Empty {});
+		request.set_pver(version);
+		public.get_offboard_fee_rate(request).await.unwrap();
+	}
 }
