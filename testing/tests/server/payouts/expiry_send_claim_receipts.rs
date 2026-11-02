@@ -261,21 +261,18 @@ async fn completed_hash_cannot_discharge_another_queued_source() {
 			Ok(tx.get_open_lightning_payment_attempt_by_payment_hash(hash).await?.unwrap().id)
 		}).await.unwrap();
 		assert_ne!(queued, payment.dispatch.id);
-		// This is the real queued-before-RPC boundary: the monitor sees A's
-		// completed native history while B has not issued a payment.
-		tokio::time::timeout(Duration::from_secs(20), async {
-			loop {
-				let status = payment.db.read(async |tx| Ok(tx.query_one("SELECT status::TEXT FROM lightning_payment_attempt WHERE id=$1",
-					&[&queued]).await?.get::<_, String>(0))).await.unwrap();
-				assert_ne!(status, "succeeded", "a foreign completed hash cannot pay the queued source");
-				if status == "failed" { break; }
-				tokio::time::sleep(Duration::from_millis(20)).await;
-			}
-		}).await.expect("the existing monitor must apply the empty-own-history failure rule");
+		// B has no native dispatch of its own. Empty own history keeps it
+		// held; A's completed hash cannot authorize B's mature server claim.
 		assert_eq!(native_parts(&payment.lightning.internal, hash).await, native_before);
 		expose_and_mature(&ctx, &payment.server, &[omitted.clone()]).await;
-		let error = payment.db.write(async |tx| tx.lock_watchman_claim_inputs(&[ServerVtxo::from(omitted.to_bare())]).await)
-			.await.expect_err("the server cannot claim the unpaid queued source");
+		let error = payment.db.write(async |tx| {
+			let refusal = tx.lock_watchman_claim_inputs(&[ServerVtxo::from(omitted.to_bare())]).await;
+			let held = tx.get_open_lightning_payment_attempt_by_payment_hash(hash).await?
+				.expect("the unattempted queued source must remain held");
+			assert_eq!(held.id, queued);
+			assert_eq!(held.status, server::database::ln::LightningPaymentStatus::Requested);
+			refusal
+		}).await.expect_err("the server cannot claim the unpaid queued source");
 		assert!(format!("{error:#}").contains("Lightning source is not discharged"));
 		assert_unspent(&ctx, omitted);
 		let policy = omitted.policy().as_server_htlc_send().unwrap();
