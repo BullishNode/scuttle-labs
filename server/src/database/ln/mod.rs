@@ -1,6 +1,8 @@
 
 mod model;
 pub use model::*;
+mod settlement;
+pub use settlement::SourceSettlement;
 
 
 use std::str::FromStr;
@@ -153,6 +155,16 @@ impl<'t> Tx<'t> {
 		rows.into_iter().map(|row| row.try_into()).collect()
 	}
 
+	pub async fn get_lightning_payment_attempt_by_id(
+		&self, attempt_id: i64,
+	) -> anyhow::Result<Option<LightningPaymentAttempt>> {
+		let row = self.query_opt(&format!("
+			SELECT {LIGHTNING_PAYMENT_ATTEMPT_COLUMNS}
+			FROM lightning_payment_attempt lpa WHERE lpa.id=$1
+		"), &[&attempt_id]).await?;
+		row.map(TryInto::try_into).transpose()
+	}
+
 	pub async fn get_open_lightning_payment_attempt_by_payment_hash(
 		&self,
 		payment_hash: PaymentHash,
@@ -186,6 +198,47 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Recognize only the same recorded open obligation. This observes no
+	/// native node and never changes the original request or dispatches it.
+	pub(crate) async fn is_recorded_lightning_payment(
+		&self, invoice: &Invoice, amount: Amount, sources: &[VtxoId],
+	) -> anyhow::Result<bool> {
+		let Some(attempt) = self.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await?
+			else { return Ok(false); };
+		ensure!(invoice.amount_msat().is_none_or(|principal|
+			principal <= amount.to_msat() && principal >= amount.to_msat() / 2),
+			"recorded initiation amount exceeds invoice bounds");
+		ensure!(attempt.amount_msat == amount.to_msat()
+			|| Some(attempt.amount_msat) == invoice.amount_msat(),
+			"recorded payment amount differs from initiation");
+		let mut supplied = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
+		supplied.sort_unstable();
+		let stored = self.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
+			WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&attempt.id]).await?
+			.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+		ensure!(!supplied.is_empty() && supplied == stored, "recorded payment sources differ from initiation");
+		if let Some(subscription) = attempt.lightning_htlc_subscription_id {
+			let subscription = self.get_htlc_subscription_by_id(subscription).await?
+				.context("recorded intra-Ark payment has no subscription")?;
+			ensure!(subscription.payment_hash == attempt.payment_hash
+				&& subscription.invoice.to_string() == invoice.to_string()
+				&& amount >= subscription.amount(), "recorded intra-Ark invoice differs from initiation");
+		} else {
+			let records = super::xpay::get_xpays_by_payment_hash(&**self, attempt.payment_hash).await?;
+			let label = attempt.id.to_string();
+			let mut matching = records.into_iter().filter(|record| record.label.as_deref() == Some(label.as_str()));
+			let record = matching.next().context("recorded payment has no original xpay request")?;
+			ensure!(matching.next().is_none(), "recorded payment has ambiguous original xpay requests");
+			ensure!(record.status == super::xpay::ClnXpayStatus::Pending
+				&& record.lightning_node_id == attempt.lightning_node_id
+				&& record.payment_hash == attempt.payment_hash
+				&& record.payment_amount_msat == amount.to_msat()
+				&& record.signed_invoice.as_deref() == Some(invoice.to_string().as_str()),
+				"recorded xpay request differs from initiation");
+		}
+		Ok(true)
+	}
+
 	/// Get the open payment attempt initiated against the given htlc
 	/// subscription (an intra-Ark self-payment), if any.
 	pub async fn get_open_lightning_payment_attempt_by_subscription_id(
@@ -213,16 +266,30 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Get the attempt that funded this receive, including a terminal attempt.
+	/// Its immutable subscription link, not a same-hash open attempt, identifies
+	/// an intra-Ark payment when settlement resumes after a process failure.
+	pub async fn get_lightning_payment_attempt_by_subscription_id(
+		&self,
+		lightning_htlc_subscription_id: i64,
+	) -> anyhow::Result<Option<LightningPaymentAttempt>> {
+		let stmt = self.prepare(&format!("
+			SELECT {LIGHTNING_PAYMENT_ATTEMPT_COLUMNS}
+			FROM lightning_payment_attempt lpa
+			WHERE lpa.lightning_htlc_subscription_id = $1;
+		")).await?;
+		let row = self.query_opt(&stmt, &[&lightning_htlc_subscription_id]).await?;
+		row.map(TryInto::try_into).transpose()
+	}
+
 	/// Stores data after lightning payment start.
 	///
 	/// Creates a new payment attempt for the given invoice and links the
 	/// HTLC-send vtxos that were committed to it. Errors if there is
 	/// already an open attempt for the same payment hash.
 	///
-	/// `lightning_htlc_subscription_id` records the subscription the payment
-	/// was initiated against, making it an intra-Ark self-payment. This is
-	/// decided at initiation time and stored; it is never re-derived. It is
-	/// only cleared if that subscription refuses the payment.
+	/// `lightning_htlc_subscription_id` records the receive this attempt
+	/// successfully funded, not merely the invoice's routing destination.
 	///
 	/// `user_agent` is the raw `x-user-agent` of the initiating client
 	/// ([`crate::telemetry::current_user_agent`]), not the bucketed metric
@@ -848,18 +915,16 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// Retrieve the sender's mailbox ID for a lightning payment.
+	/// Retrieve the sender's mailbox ID for the existing payment attempt.
 	pub async fn get_lightning_sender_mailbox_id(
 		&self,
-		payment_hash: PaymentHash,
+		attempt_id: i64,
 	) -> anyhow::Result<Option<ark::mailbox::MailboxIdentifier>> {
 		let stmt = self.prepare(
 			"SELECT sender_mailbox_id FROM lightning_payment_attempt
-			WHERE payment_hash = $1
-			ORDER BY created_at DESC
-			LIMIT 1"
+			WHERE id = $1"
 		).await?;
-		let row = self.query_opt(&stmt, &[&payment_hash.to_string()]).await?;
+		let row = self.query_opt(&stmt, &[&attempt_id]).await?;
 
 		match row {
 			Some(row) => {
@@ -917,6 +982,7 @@ impl<'t> Tx<'t> {
 		preimage: Preimage,
 	) -> anyhow::Result<Option<Checkpoint>> {
 		let payment_hash = preimage.compute_payment_hash();
+		self.lock_settlement_sources(payment_hash).await?;
 
 		// ON CONFLICT DO NOTHING makes this idempotent: if an HTLC tx
 		// gets unconfirmed and re-confirmed in a reorg, the duplicate
@@ -940,26 +1006,28 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// Transition every currently-`spendable` HTLC-send vtxo linked to any
-	/// attempt for the given payment hash to `ln-spent`. Called when a
-	/// lightning send settles, so the vtxo is explicitly marked as consumed
-	/// by a paid invoice.
-	///
-	/// Returns the ids of linked vtxos left untouched because their
-	/// `spend_state` was no longer `spendable` at update time (e.g. already
-	/// `ln-spent` from a prior settlement of the same payment hash). An
-	/// empty vec means every linked vtxo transitioned.
+	/// Lock an attempt's existing source set before changing its status.
+	pub(crate) async fn lock_lightning_attempt_sources(&self, attempt_id: i64) -> anyhow::Result<()> {
+		self.query("SELECT v.vtxo_id FROM vtxo v \
+			JOIN lightning_payment_attempt_htlc_vtxo l ON l.vtxo_id=v.vtxo_id \
+			WHERE l.lightning_payment_attempt_id=$1 ORDER BY v.vtxo_id FOR UPDATE OF v", &[&attempt_id]).await?;
+		Ok(())
+	}
+
+	/// Mark only this attempt's linked, spendable sources as consumed.
+	/// Return nonspendable sources left untouched; already-ln-spent is idempotent.
 	pub async fn mark_htlc_send_vtxos_ln_spent(
 		&self,
-		payment_hash: PaymentHash,
+		attempt_id: i64,
 	) -> anyhow::Result<Vec<VtxoId>> {
+		self.lock_lightning_attempt_sources(attempt_id).await?;
 		let stmt = self.prepare("
 			WITH found AS (
 				SELECT vtxo.vtxo_id, vtxo.spend_state
 				FROM vtxo
 				JOIN lightning_payment_attempt_htlc_vtxo link ON link.vtxo_id = vtxo.vtxo_id
 				JOIN lightning_payment_attempt lpa ON lpa.id = link.lightning_payment_attempt_id
-				WHERE lpa.payment_hash = $1
+				WHERE lpa.id = $1
 			),
 			updated AS (
 				UPDATE vtxo
@@ -969,10 +1037,10 @@ impl<'t> Tx<'t> {
 				RETURNING vtxo.vtxo_id
 			)
 			SELECT vtxo_id FROM found
-			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated)
+			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated) AND spend_state <> 'ln-spent'
 		").await?;
 
-		let rows = self.query(&stmt, &[&payment_hash.to_string()]).await
+		let rows = self.query(&stmt, &[&attempt_id]).await
 			.context("failed to mark HTLC-send vtxos as ln-spent")?;
 
 		rows.iter()
@@ -1006,19 +1074,25 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// The sole sanctioned settlement gate for any fund-releasing path
-	/// (revocation, refund, re-issuing sender vtxos): errors with a
+	/// Serialize the final claim/refund decision with the existing settlement WAL.
+	pub async fn lock_htlc_settlements(&self) -> anyhow::Result<()> {
+		self.execute("SELECT pg_advisory_xact_lock_shared($1)",
+			&[&(super::AdvisoryLock::HtlcSettlementWrite as i64)]).await?;
+		Ok(())
+	}
+
+	/// Conservative hash-level gate retained alongside the source predicate
+	/// until the source-specific release controls have passed: errors with a
 	/// [`BadArgument`](crate::error::BadArgument) if the invoice was already paid.
 	///
 	/// The `htlc_settlement` table is the single source of truth for
 	/// settlement. A preimage here means the payment completed, regardless of
 	/// [`LightningPaymentStatus`]: the node can settle without the status write
-	/// committing (a lost optimistic-lock race, or a crash between recording the
-	/// preimage and updating the status), so the status may still read
+	/// committing (for example a lost optimistic-lock race), so status may read
 	/// `Submitted`/`Failed` for a payment that actually went through. Never gate
 	/// a fund-releasing decision on the status; call this instead.
 	///
-	/// Call this INSIDE the write transaction that releases the funds so a
+	/// Hold the shared settlement lock INSIDE the write transaction so a
 	/// settlement racing between an earlier read-check and the write cannot
 	/// slip through.
 	pub async fn ensure_not_settled(

@@ -16,7 +16,7 @@ use ark::{ProtocolEncoding, Vtxo};
 use ark::lightning::{PaymentHash, Preimage};
 use ark::vtxo::Full;
 
-use crate::{VtxoId, WalletProperties};
+use crate::{MailboxIdentity, VtxoId, WalletProperties};
 use crate::actions::{WalletActionCheckpoint, WalletActionId};
 use crate::exit::{ExitState, ExitStateKind, ExitTxOrigin};
 use crate::movement::{Movement, MovementId, MovementStatus, MovementSubsystem, PaymentMethod};
@@ -36,8 +36,8 @@ pub (crate) fn set_properties(
 	properties: &WalletProperties,
 ) -> anyhow::Result<()> {
 	let query =
-		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey)
-		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey)";
+		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey, server_payouts)
+		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey, :server_payouts)";
 	let mut statement = conn.prepare(query)?;
 
 	statement.execute(named_params! {
@@ -45,6 +45,8 @@ pub (crate) fn set_properties(
 		":fingerprint": properties.fingerprint.to_string(),
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
+		":server_payouts": properties.server_payouts,
+		":mailbox_pubkey": properties.mailbox_identity.as_ref().map(|identity| identity.public_key.to_string()),
 	})?;
 
 	Ok(())
@@ -89,7 +91,7 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT * FROM bark_properties";
+	let query = "SELECT network,fingerprint,server_pubkey,server_mailbox_pubkey,mailbox_pubkey,server_payouts FROM bark_properties";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -98,6 +100,11 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
+		let mailbox_pubkey: Option<String> = row.get("mailbox_pubkey")?;
+		let mailbox_identity = mailbox_pubkey.map(|key| Ok::<_, anyhow::Error>(MailboxIdentity {
+			network: Network::from_str(&network).context("invalid network")?,
+			public_key: PublicKey::from_str(&key).context("invalid mailbox public key")?,
+		})).transpose()?;
 
 		let server_pubkey = server_pubkey
 			.map(|s| PublicKey::from_str(&s))
@@ -115,6 +122,8 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
+				server_payouts: row.get("server_payouts")?,
+				mailbox_identity,
 			}
 		))
 	} else {
@@ -401,7 +410,8 @@ pub fn get_pending_round_state_ids(
 /// Columns the `vtxo_view`-based listings always select, in the order
 /// [`row_to_wallet_vtxo`] expects them.
 const VTXO_VIEW_COLUMNS: &str =
-	"raw_bare, exit_depth, exit_tx_weight, state, registered";
+	"raw_bare, exit_depth, exit_tx_weight, state, registered,
+	(SELECT fallback_status FROM bark_vtxo b WHERE b.id=vtxo_view.id) AS fallback_status";
 
 pub fn get_wallet_vtxo_by_id(
 	conn: &Connection,
@@ -685,6 +695,19 @@ pub fn release_vtxo_lock(
 		bail!("Corrupted database: inserted {nb_inserted} state rows for a single vtxo");
 	}
 	Ok(())
+}
+
+pub fn set_vtxo_fallback_status(
+	tx: &Transaction, id: VtxoId, status: crate::vtxo::FallbackStatus,
+) -> anyhow::Result<WalletVtxo> {
+	let coin = get_wallet_vtxo_by_id(tx, id)?.context("fallback source is not stored")?;
+	let state = status.state_for(&coin.state);
+	tx.execute("UPDATE bark_vtxo SET fallback_status=?2 WHERE id=?1 AND fallback_status IS NOT ?2",
+		params![id.to_string(), status.as_str()])?;
+	tx.execute("INSERT INTO bark_vtxo_state(vtxo_id,state_kind,state)
+		SELECT ?1,?2,?3 FROM most_recent_vtxo_state WHERE vtxo_id=?1 AND state!=?3",
+		params![id.to_string(), state.kind().as_str(), serde_json::to_vec(&state)?])?;
+	get_wallet_vtxo_by_id(tx, id)?.context("fallback source disappeared")
 }
 
 /// Set the `registered` flag on the given vtxos, recording that their
@@ -1056,7 +1079,6 @@ pub fn remove_wallet_action_checkpoint(
 	Ok(())
 }
 
-
 pub fn record_paid_invoice(
 	conn: &Connection,
 	payment_hash: PaymentHash,
@@ -1092,7 +1114,6 @@ pub fn get_paid_invoice(
 	let paid_at: chrono::DateTime<chrono::Local> = row.get("paid_at")?;
 	Ok(Some(PaidInvoice { payment_hash, preimage, paid_at }))
 }
-
 
 pub fn record_settled_lightning_receive(
 	conn: &Connection,
@@ -1138,7 +1159,6 @@ pub fn get_settled_lightning_receive(
 	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
 	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
 }
-
 
 #[cfg(test)]
 mod test {

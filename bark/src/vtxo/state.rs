@@ -23,6 +23,7 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::str::FromStr;
 
 use bitcoin::Weight;
 use bitcoin_ext::BlockHeight;
@@ -201,6 +202,33 @@ pub struct WalletVtxo {
 	/// migration can reset it to re-upload every VTXO.
 	#[serde(default)]
 	pub registered: bool,
+
+	/// Last observed fallback status for display. Ordinary Spent retirement
+	/// is sticky even if this status changes after a reorg.
+	#[serde(default)]
+	pub fallback_status: Option<FallbackStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackStatus { Pending, Spent, Forfeited }
+
+impl FallbackStatus {
+	pub fn as_str(self) -> &'static str {
+		match self { Self::Pending => "pending", Self::Spent => "spent", Self::Forfeited => "forfeited" }
+	}
+
+	pub(crate) fn state_for(self, current: &VtxoState) -> VtxoState {
+		if *current == VtxoState::Exited { current.clone() } else { VtxoState::Spent }
+	}
+}
+
+impl FromStr for FallbackStatus {
+	type Err = anyhow::Error;
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		Ok(match value { "pending" => Self::Pending, "spent" => Self::Spent,
+			"forfeited" => Self::Forfeited, _ => bail!("unknown fallback outcome") })
+	}
 }
 
 impl VtxoRef for WalletVtxo {

@@ -4,7 +4,7 @@ mod signing;
 mod state;
 
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
-pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+pub use self::state::{FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
@@ -58,6 +58,12 @@ pub enum ServerStatusAdoption {
 	Spendable,
 	/// The server considers the VTXO spent.
 	Spent,
+	/// Terminal fallback first discovered during recovery or import.
+	FallbackSpent,
+	/// Allocated customer principal awaiting independent payout verification.
+	FallbackPending,
+	/// Canonical terminal policy result with no Bitcoin payout output.
+	Forfeited,
 	/// Neither spendable nor spent: the server is still waiting on a preimage
 	/// or on the VTXO's transaction chain. No wallet state describes this, and
 	/// finishing that flow is what decides where the VTXO belongs.
@@ -65,6 +71,10 @@ pub enum ServerStatusAdoption {
 }
 
 impl ServerStatusAdoption {
+	pub(crate) fn from_status(state: VtxoSpendState, committed: bool) -> anyhow::Result<Self> {
+		if committed && state == VtxoSpendState::Spent { Ok(Self::FallbackSpent) }
+		else { Self::from_spend_state(state) }
+	}
 	/// Errors when the server gave no usable answer.
 	///
 	/// Matched exhaustively (no catch-all) so a new spend state forces an
@@ -73,6 +83,8 @@ impl ServerStatusAdoption {
 		Ok(match spend_state {
 			VtxoSpendState::Spendable => ServerStatusAdoption::Spendable,
 			VtxoSpendState::Spent => ServerStatusAdoption::Spent,
+			VtxoSpendState::FallbackPending => ServerStatusAdoption::FallbackPending,
+			VtxoSpendState::FallbackForfeited => ServerStatusAdoption::Forfeited,
 			state @ (
 				VtxoSpendState::Unclaimed
 				| VtxoSpendState::Unregistered
@@ -359,9 +371,8 @@ impl Wallet {
 	}
 
 	/// Ask the server for the status of `vtxo_id` and move the wallet's vtxo along
-	/// with it. Adoption only ever moves a vtxo towards spent or in-flight
-	/// resolution: a vtxo the wallet has as spent stays spent, even when the server
-	/// reports it spendable.
+	/// with it. An ordinary spendable reply keeps a locally spent vtxo spent.
+	/// A fallback commitment is also retired to ordinary Spent.
 	///
 	/// A locked vtxo is left alone and the server isn't asked at all: returns
 	/// `Ok(None)`. Unlock the vtxo first if you want its status adopted.
@@ -397,6 +408,9 @@ impl Wallet {
 			},
 			ServerStatusAdoption::Spent => {
 				self.mark_vtxos_as_spent(&[vtxo_id]).await?;
+			},
+			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited => {
+				self.mark_vtxos_as_spent([vtxo_id]).await?;
 			},
 			ServerStatusAdoption::InFlight(_) => {},
 		}

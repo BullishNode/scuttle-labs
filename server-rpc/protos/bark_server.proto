@@ -217,6 +217,10 @@ enum VtxoSpendState {
 	VTXO_SPEND_STATE_UNREGISTERED = 4;
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
+	// A committed fallback decision has unresolved relevant portions.
+	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
+	// Terminal policy result with no Bitcoin payout.
+	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 7;
 }
 
 message GetVtxoStatusRequest {
@@ -227,6 +231,8 @@ message GetVtxoStatusRequest {
 
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
+	bytes owner_mailbox = 2;
+	bool fallback_committed = 3;
 }
 
 message VtxoStatusQuery {
@@ -243,6 +249,8 @@ message GetVtxosStatusByIdsRequest {
 message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
+	bytes owner_mailbox = 3;
+	bool fallback_committed = 4;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -276,6 +284,8 @@ message RecoveredVtxo {
 	// xpub/derivation_index.
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
+	bytes owner_mailbox = 4;
+	bool fallback_committed = 5;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -295,6 +305,13 @@ message RecoverVtxosByXpubResponse {
 
 // boarding
 
+// Coin and mailbox authorization of a server-specific link.
+message OwnerProof {
+	bytes blinded_mailbox_id = 1;
+	bytes signature = 2;
+	bytes mailbox_signature = 3;
+}
+
 message BoardCosignRequest {
 	uint64 amount = 1;
 	bytes utxo = 2;
@@ -302,6 +319,7 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
+	OwnerProof owner_proof = 7;
 }
 
 message BoardCosignResponse {
@@ -324,11 +342,13 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorCosignRequest {
@@ -376,6 +396,8 @@ message InitiateLightningPaymentRequest {
 message CheckLightningPaymentRequest {
 	bytes hash = 1;
 	bool wait = 2;
+	// Complete HTLC input set of the payment attempt being checked.
+	repeated bytes htlc_vtxo_ids = 3;
 }
 
 message PaymentSuccessStatus {
@@ -390,6 +412,8 @@ message LightningPaymentStatus {
 		// unchanged and an older peer still matches the `failed` arm.
 		core.LightningPaymentFailure failed = 3;
 	};
+	// Input scope validated against the server's recorded payment attempt.
+	repeated bytes htlc_vtxo_ids = 4;
 }
 
 message FetchBolt12InvoiceRequest {
@@ -407,6 +431,8 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
+	// Point-in-time check for an explicit recipient before invoice creation.
+	VtxoRequest claim_destination = 7;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
 	optional uint64 expiry_secs = 6;
@@ -429,6 +455,7 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
+	OwnerProof owner_proof = 6;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -466,6 +493,9 @@ message CheckLightningReceiveResponse {
 	LightningReceiveStatus status = 3;
 	// Empty until the status is HTLCS_READY or SETTLED
 	repeated bytes htlc_vtxos = 4;
+	// Aggregate expiry outcome of the actual collected receive destination.
+	// This hash-only query never returns mailbox identities or allocation data.
+	optional VtxoSpendState fallback_spend_state = 5;
 }
 
 // offboard
@@ -684,7 +714,21 @@ service RoundAdminService {
 	rpc TriggerRound(core.Empty) returns (core.Empty) {}
 }
 
+message ReconcileLightningAttemptRequest {
+	int64 attempt_id = 1;
+	// Privileged operator confirms complete same-backend CLN/plugin cessation,
+	// restart of its original persistent store and exclusion of new dispatch.
+	bool native_cold_restart_confirmed = 2;
+}
+
+message ReconcileLightningAttemptResponse {
+	int64 attempt_id = 1;
+	bytes payment_hash = 2;
+	string status = 3;
+}
+
 service LightningAdminService {
+	rpc ReconcileLightningAttempt(ReconcileLightningAttemptRequest) returns (ReconcileLightningAttemptResponse) {}
 	rpc StartLightningNode(LightningNodeUri) returns (core.Empty) {}
 	rpc StopLightningNode(LightningNodeUri) returns (core.Empty) {}
 }

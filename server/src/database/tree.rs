@@ -5,10 +5,11 @@ use anyhow::{Context, bail};
 use bitcoin::{Transaction, Txid};
 use tracing::debug;
 
-use ark::{ProtocolEncoding, ServerVtxo, Vtxo, VtxoId};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId};
 use ark::vtxo::{Bare, Full};
 
 use super::model::{SpendState, VirtualTransaction};
+use super::Tx;
 
 // -- Update structs --
 
@@ -226,7 +227,7 @@ impl VtxoTreeUpdate {
 	}
 
 	// -- vtxo inserts --
-	//
+
 	// Spendable/unclaimed/bare inserts are silent on conflict: re-inserting
 	// the same vtxo_id is a no-op. `insert_oor_spent_vtxos` is stricter —
 	// it bails if an existing row has a different `oor_spent_txid`, so that
@@ -448,16 +449,54 @@ impl VtxoTreeUpdate {
 /// VTXO row was written, `0` means every insert hit `ON CONFLICT DO NOTHING`
 /// (i.e. an idempotent retry of an already-applied update).
 pub async fn execute_vtxo_tree_update(
-	tx: &tokio_postgres::Transaction<'_>,
+	tx: &Tx<'_>,
 	update: VtxoTreeUpdate,
 ) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
+	let mut customer_ids = Vec::new();
+	let mut customer_pubkeys = Vec::new();
+	for index in 0..update.vtxo_inserts.vtxo_ids.len() {
+		let state = update.vtxo_inserts.spend_states[index].parse::<SpendState>()?;
+		let customer_birth = match state {
+			SpendState::Spendable | SpendState::Unregistered | SpendState::Unclaimed
+				| SpendState::HtlcRecvUnclaimed => true,
+			SpendState::Spent | SpendState::Pool | SpendState::LnSpent | SpendState::RoundForfeit
+				| SpendState::OffboardForfeit | SpendState::OffboardConnector => false,
+		};
+		if !customer_birth { continue; }
+		let policy = ServerVtxoPolicy::deserialize(&update.vtxo_inserts.policies[index])?;
+		if let Some(key) = policy.user_pubkey() {
+			customer_ids.push(update.vtxo_inserts.vtxo_ids[index].clone());
+			customer_pubkeys.push(key.to_string());
+		}
+	}
+
+	let changes = &update.vtxo_updates;
+	let mut obligation_ids = changes.oor_spends.iter().map(|s| s.vtxo_id)
+		.chain(changes.round_spends.iter().map(|s| s.vtxo_id))
+		.chain(changes.offboard_spends.iter().map(|s| s.vtxo_id))
+		.chain(changes.round_forfeits.iter().map(|s| s.vtxo_id))
+		.chain(changes.claims.iter().copied())
+		.chain(changes.registrations.iter().copied())
+		.chain(changes.provide_signatures.iter().map(|v| v.id()))
+		.collect::<Vec<_>>();
+	obligation_ids.sort_unstable();
+	obligation_ids.dedup();
+	super::expiry_guard::guard_obligation_changes(tx, &obligation_ids).await?;
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
 	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
+	// Only actual births get ownership metadata. A replay or a
+	// recovery upload cannot backfill consent or rewrite an existing owner.
+	tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
+		SELECT birth.vtxo_id, owner_key.mailbox_pk
+		FROM UNNEST($1::text[], $2::text[]) AS birth(vtxo_id, user_pubkey)
+		JOIN owner_key ON owner_key.user_pubkey=birth.user_pubkey
+		WHERE birth.vtxo_id=ANY($3)
+		ON CONFLICT (vtxo_id) DO NOTHING", &[&customer_ids, &customer_pubkeys, &inserted]).await?;
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 
-	Ok(inserted)
+	Ok(inserted.len() as u64)
 }
 
 async fn do_provide_signatures(
@@ -543,13 +582,13 @@ async fn upsert_virtual_transactions(
 async fn insert_vtxos(
 	tx: &tokio_postgres::Transaction<'_>,
 	vi: &VtxoInserts,
-) -> anyhow::Result<u64> {
-	if vi.is_empty() { return Ok(0) }
+) -> anyhow::Result<Vec<String>> {
+	if vi.is_empty() { return Ok(Vec::new()) }
 	// ON CONFLICT DO NOTHING just continues if the vtxo already exists. For
 	// rows inserted via `insert_oor_spent_vtxos`, we then validate that the
 	// existing row's oor_spent_txid actually matches — otherwise the insert
 	// would silently authorize a double-spend.
-	let inserted = tx.execute("
+	let inserted = tx.query("
 		INSERT INTO vtxo (
 			vtxo_id, vtxo_txid, vtxo, expiry, exit_delta, policy_type, policy,
 			server_pubkey, amount, anchor_point,
@@ -562,6 +601,7 @@ async fn insert_vtxos(
 			UNNEST($12::text[]), NOW(), NOW()
 		)
 		ON CONFLICT DO NOTHING
+		RETURNING vtxo_id
 	", &[
 		&vi.vtxo_ids, &vi.vtxo_txids, &vi.data, &vi.expiry,
 		&vi.exit_deltas, &vi.policy_types, &vi.policies, &vi.server_pubkeys,
@@ -581,7 +621,7 @@ async fn insert_vtxos(
 		let vtxo_id: &str = row.get("vtxo_id");
 		bail!("vtxo {} is already spent", vtxo_id);
 	}
-	Ok(inserted)
+	Ok(inserted.into_iter().map(|row| row.get("vtxo_id")).collect())
 }
 
 async fn apply_vtxo_updates(
@@ -801,6 +841,7 @@ async fn do_undo_round_updates(
 		UPDATE vtxo
 		SET spend_state = 'spendable', spent_in_round = NULL, oor_spent_txid = NULL, updated_at = NOW()
 		WHERE spent_in_round = ANY($1::int8[])
+			AND NOT EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id)
 	", &[&round_ids]).await.context("failed to undo round spend on VTXOs")?;
 	Ok(())
 }

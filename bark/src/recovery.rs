@@ -18,12 +18,14 @@
 //!
 //! Note that recovery is a trusted process. The server can withhold VTXOs
 //! or may falsely represent spendable VTXOs as spent. Its word on the spend
-//! state is final: a VTXO it reports spent is stored spent without being
-//! validated, and only a VTXO it reports spendable is validated and checked
-//! against the chain. Prefer to maintain back-ups and use recovery from the
+//! state is authoritative for ordinary spends. Fallback allocations remain
+//! pending until independently verified on chain. An ordinary spent VTXO is
+//! stored without validation. Spendable and fallback-pending bodies are
+//! validated before contributing to the balance. Prefer to maintain back-ups and use recovery from the
 //! mnemonic as a last resort.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;
@@ -463,12 +465,12 @@ impl Wallet {
 		// The server is the authority on whether a vtxo was spent elsewhere,
 		// and recovery has nothing else to go on.
 		let queries = owned.iter().map(|(vtxo, keypair)| (vtxo.id(), keypair)).collect::<Vec<_>>();
-		let states = self.fetch_vtxo_spend_states(&queries).await?;
+		let states = self.fetch_vtxo_statuses(&queries).await?;
 
 		let vtxos = owned.into_iter().map(|(vtxo, _)| {
 			// The fetch logged why an answer is missing.
 			let adoption = match states.get(&vtxo.id()) {
-				Some(state) => ServerStatusAdoption::from_spend_state(*state),
+				Some((state, committed)) => ServerStatusAdoption::from_status(*state, *committed),
 				None => Err(anyhow::anyhow!("no answer from the server")),
 			};
 			(vtxo, adoption)
@@ -478,24 +480,29 @@ impl Wallet {
 
 	/// Store owned VTXOs in the state the server reported for them.
 	///
-	/// The server's word on the spend state is final, so it is taken before any
-	/// chain lookup: a VTXO it reports spent is stored spent as is, and only a
-	/// VTXO it reports spendable is validated and checked for an exit. Rows are
-	/// written once per state, not once per VTXO.
+	/// Ordinary spent history follows upstream trust. Validate recovered bodies;
+	/// fallback commitments are stored Spent and reported as skipped.
 	async fn store_recovered_vtxos(
 		&self,
 		report: &mut RecoveryReport,
 		vtxos: Vec<(Vtxo<Full>, anyhow::Result<ServerStatusAdoption>)>,
 	) -> anyhow::Result<()> {
+		let mut fallback_pending = Vec::new();
 		let mut spendable = Vec::new();
 		let mut spent = Vec::new();
 		let mut unclaimed = Vec::new();
 		let mut locked = Vec::new();
 		for (vtxo, adoption) in vtxos {
 			let id = vtxo.id();
+
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),
+				Ok(adoption @ (ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited)) => {
+					let status = match adoption { ServerStatusAdoption::FallbackPending => crate::vtxo::FallbackStatus::Pending,
+						ServerStatusAdoption::FallbackSpent => crate::vtxo::FallbackStatus::Spent, _ => crate::vtxo::FallbackStatus::Forfeited };
+					fallback_pending.push((vtxo, status));
+				},
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
 				// Finishing the flow the VTXO is stuck in is what decides where it
@@ -519,11 +526,22 @@ impl Wallet {
 		// vtxo as spendable again. A row from an earlier, failed attempt is
 		// forced along.
 		if !spent.is_empty() {
-			self.store_vtxos(spent.iter(), &VtxoState::Spent).await?;
-			self.mark_vtxos_as_spent(spent.iter().map(|v| v.id())).await?;
+			self.store_spent_vtxos(spent.iter()).await?;
+			self.mark_vtxos_as_spent(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
 			for vtxo in &spent {
 				debug!("Recovery vtxo {} already spent, skipping", vtxo.id());
 				report.push_skipped(vtxo);
+			}
+		}
+
+		for (vtxo, status) in fallback_pending {
+			if let Err(error) = self.validate_vtxo(&vtxo).await {
+				warn!("Invalid fallback recovery source {}: {error:#}", vtxo.id());
+				report.push_failed(vtxo.id(), Some(vtxo.amount()));
+			} else {
+				report.push_skipped(&vtxo);
+				self.store_spent_vtxos([&vtxo]).await?;
+				self.inner.db.set_vtxo_fallback_status(vtxo.id(), status).await?;
 			}
 		}
 
@@ -612,7 +630,8 @@ impl Wallet {
 	/// and no gap limit: the server scans a fixed range of key indices per
 	/// call, and we ask for the next range for as long as the server reports
 	/// that more VTXOs may follow. Each VTXO comes with its body and spend
-	/// state, so it needs no further request. Every index up to the highest
+	/// state; first storage rechecks status under the wallet lock after chain
+	/// validation. Every index up to the highest
 	/// one whose key matches its VTXO is stored as revealed, so the key lookups
 	/// of later scans resolve from the database.
 	///
@@ -620,6 +639,7 @@ impl Wallet {
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
 		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
+		let payouts = self.properties().await?.server_payouts.context("server payout capability is not known")?;
 
 		let mut start_index = 0u32;
 		let mut cursor_vtxo_id = None;
@@ -636,6 +656,7 @@ impl Wallet {
 				authorization: auth.serialize(),
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
+
 			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {
@@ -673,12 +694,17 @@ impl Wallet {
 				}
 				max_index = max_index.max(Some(index));
 
-				let adoption = VtxoSpendState::try_from(entry.spend_state)
-					.map_err(|_| anyhow::anyhow!(
-						"server returned unknown spend state {}; this wallet may need updating",
-						entry.spend_state,
-					))
-					.and_then(ServerStatusAdoption::from_spend_state);
+				if payouts && bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
+					!= Some(self.mailbox_keypair().public_key()) {
+					warn!("Recovery coin {} belongs to another or unknown mailbox", vtxo.id());
+					report.push_foreign(&vtxo);
+					continue;
+				}
+				let adoption = match VtxoSpendState::try_from(entry.spend_state) {
+					Ok(state) => self.observe_server_vtxo_status(vtxo.id(), &entry.owner_mailbox, state, entry.fallback_committed).await
+						.and_then(|state| ServerStatusAdoption::from_status(state, entry.fallback_committed)),
+					Err(_) => Err(anyhow::anyhow!("server returned an unknown spend state")),
+				};
 				vtxos.push((vtxo, adoption));
 			}
 

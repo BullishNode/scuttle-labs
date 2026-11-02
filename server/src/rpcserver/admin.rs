@@ -40,6 +40,21 @@ impl rpc::server::WalletAdminService for Server {
 }
 
 #[async_trait]
+impl rpc::server::WalletAdminService for crate::watchman::Daemon {
+	#[tracing::instrument(skip(self, _req))]
+	async fn wallet_status(
+		&self,
+		_req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::WalletStatusResponse>, tonic::Status> {
+		let watchman = self.watchman_wallet().lock().await.status();
+		Ok(tonic::Response::new(protos::WalletStatusResponse {
+			rounds: None,
+			watchman: Some(watchman.into()),
+		}))
+	}
+}
+
+#[async_trait]
 impl rpc::server::RoundAdminService for Server {
 	#[tracing::instrument(skip(self, _req))]
 	async fn trigger_round(
@@ -61,6 +76,19 @@ impl rpc::server::RoundAdminService for Server {
 
 #[async_trait]
 impl rpc::server::LightningAdminService for Server {
+	async fn reconcile_lightning_attempt(
+		&self, req: tonic::Request<protos::ReconcileLightningAttemptRequest>,
+	) -> Result<tonic::Response<protos::ReconcileLightningAttemptResponse>, tonic::Status> {
+		let req = req.into_inner();
+		let id = req.attempt_id;
+		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }
+		let attempt = self.lightning_manager.reconcile_lightning_attempt(id, req.native_cold_restart_confirmed).await.to_status()?
+			.ok_or_else(|| tonic::Status::not_found("unknown Lightning payment attempt"))?;
+		Ok(tonic::Response::new(protos::ReconcileLightningAttemptResponse {
+			attempt_id: attempt.id, payment_hash: attempt.payment_hash.to_vec(), status: attempt.status.to_string(),
+		}))
+	}
+
 	#[tracing::instrument(skip(self, req))]
 	async fn start_lightning_node(
 		&self,
@@ -220,6 +248,7 @@ impl rpc::server::BanAdminService for Server {
 	}
 }
 
+
 /// Run the captaind admin gRPC endpoint.
 pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	RPC_RICH_ERRORS.store(srv.config.rpc_rich_errors, atomic::Ordering::Relaxed);
@@ -249,7 +278,7 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	Ok(())
 }
 
-/// Run the watchmand admin gRPC server: `SweepAdminService` and `BlocklistAdminService`.
+/// Run the watchmand wallet, sweep and blocklist admin gRPC services.
 pub async fn run_watchmand_admin_rpc_server(
 	addr: SocketAddr,
 	daemon: Arc<crate::watchman::Daemon>,
@@ -258,6 +287,7 @@ pub async fn run_watchmand_admin_rpc_server(
 	info!("Starting watchmand admin gRPC service on address {}", addr);
 
 	let routes = tonic::service::Routes::default()
+		.add_service(rpc::server::WalletAdminServiceServer::from_arc(daemon.clone()))
 		.add_service(rpc::server::SweepAdminServiceServer::from_arc(daemon.clone()))
 		.add_service(rpc::server::BlocklistAdminServiceServer::from_arc(daemon));
 

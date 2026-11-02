@@ -31,6 +31,7 @@
 //!   force-exit a freshly claimed VTXO
 //! * `4`: ppm fees round up to a satoshi instead of down; ppm expiry fees
 //!   are calculated on the exact total across all VTXOs
+//! * `6`: joint ownership for automatic expired-backing payouts
 
 #[cfg(all(any(target_os = "android", target_os = "ios"), feature = "tls-native-roots"))]
 compile_error!("feature `tls-native-roots` can't be used on Android or iOS, use `tls-webpki-roots` instead");
@@ -104,14 +105,12 @@ pub mod mailbox {
 	pub use crate::protos::mailbox_server::mailbox_service_client::MailboxServiceClient;
 }
 
-
 use std::borrow::BorrowMut;
 use std::str::FromStr;
 use std::time::Duration;
 
 use bitcoin::{Address, Amount, OutPoint};
 use bitcoin::address::NetworkUnchecked;
-
 
 /// The minimum protocol version supported by the client.
 ///
@@ -121,7 +120,7 @@ pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
 /// The maximum protocol version supported by the client.
 ///
 /// For info on protocol versions, see [server_rpc](crate) module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
 
 /// The bark client version sent in HandshakeRequest. Exposed so
 /// alternate callers (e.g. integration tests) send the same string a
@@ -154,7 +153,6 @@ pub const MAX_NB_MAILBOX_ARKOOR_VTXOS: usize = 100;
 
 /// The maximum number of inputs of a board funding tx
 pub const MAX_NB_BOARD_FUNDING_INPUTS: usize = 100;
-
 
 #[derive(Debug, Clone)]
 pub struct WalletStatus {

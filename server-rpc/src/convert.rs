@@ -16,6 +16,7 @@ use ark::attestations::{
 };
 use ark::board::BoardCosignResponse;
 use ark::fees::PpmFeeRate;
+use ark::fallback::OwnerLink;
 use ark::forfeit::HashLockedForfeitBundle;
 use ark::lightning::{PaymentHash, Preimage};
 use ark::mailbox::BlindedMailboxIdentifier;
@@ -25,7 +26,6 @@ use ark::tree::signed::{LeafVtxoCosignRequest, LeafVtxoCosignResponse, VtxoTreeS
 use ark::vtxo::{Bare, Full, VtxoRef};
 
 use crate::protos;
-
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("rpc conversion error: {msg}")]
@@ -42,6 +42,30 @@ impl From<&'static str> for ConvertError {
 impl From<ConvertError> for tonic::Status {
 	fn from(e: ConvertError) -> Self {
 		tonic::Status::invalid_argument(e.msg)
+	}
+}
+
+impl From<OwnerLink> for protos::OwnerProof {
+	fn from(link: OwnerLink) -> Self {
+		Self {
+			blinded_mailbox_id: link.blinded_id.as_ref().to_vec(),
+			signature: link.signature.serialize().to_vec(),
+			mailbox_signature: link.mailbox_signature.serialize().to_vec(),
+		}
+	}
+}
+
+impl TryFrom<protos::OwnerProof> for OwnerLink {
+	type Error = ConvertError;
+	fn try_from(proof: protos::OwnerProof) -> Result<Self, Self::Error> {
+		let blinded_id = BlindedMailboxIdentifier::deserialize(&proof.blinded_mailbox_id)
+			.map_err(|_| "invalid blinded mailbox identifier")?;
+		let signature = schnorr::Signature::from_slice(&proof.signature)
+			.map_err(|_| "invalid mailbox link signature")?;
+		let mailbox_signature = schnorr::Signature::from_slice(&proof.mailbox_signature)
+			.map_err(|_| "invalid mailbox authorization signature")?;
+		OwnerLink::from_joint_parts(blinded_id, signature, mailbox_signature)
+			.map_err(|_| "invalid blinded mailbox identifier".into())
 	}
 }
 
@@ -146,7 +170,6 @@ macro_rules! impl_try_from_bytes_bitcoin {
 	};
 }
 impl_try_from_bytes_bitcoin!(Transaction, "bitcoin transaction");
-
 
 impl From<ark::ArkInfo> for protos::ArkInfo {
 	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
@@ -488,10 +511,10 @@ impl TryFrom<protos::WalletStatus> for crate::WalletStatus {
 	}
 }
 
-
 impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
 	fn from(v: &'a VtxoRequest) -> Self {
 		protos::VtxoRequest {
+			owner_proof: None,
 			amount: v.amount.to_sat(),
 			policy: v.policy.serialize(),
 		}
@@ -521,6 +544,8 @@ impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
 impl From<ArkoorDestination> for protos::ArkoorDestination {
 	fn from(v: ArkoorDestination) -> Self {
 		Self {
+
+			owner_proof: None,
 			total_amount: v.total_amount.to_sat(),
 			policy: v.policy.serialize(),
 		}
@@ -531,6 +556,7 @@ impl From<SignedVtxoRequest> for protos::SignedVtxoRequest {
 	fn from(v: SignedVtxoRequest) -> Self {
 		protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
+				owner_proof: None,
 				amount: v.vtxo.amount.to_sat(),
 				policy: v.vtxo.policy.serialize(),
 			}),
@@ -545,10 +571,7 @@ impl TryFrom<protos::SignedVtxoRequest> for SignedVtxoRequest {
 	fn try_from(v: protos::SignedVtxoRequest) -> Result<Self, Self::Error> {
 		let vtxo = v.vtxo.ok_or("vtxo field missing")?;
 		Ok(SignedVtxoRequest {
-			vtxo: VtxoRequest {
-				amount: Amount::from_sat(vtxo.amount),
-				policy: VtxoPolicy::from_bytes(&vtxo.policy)?,
-			},
+			vtxo: vtxo.try_into()?,
 			cosign_pubkey: PublicKey::from_bytes(&v.cosign_pubkey)?,
 			nonces: v.public_nonces.into_iter()
 				.map(|n| musig::PublicNonce::from_bytes(n))
@@ -786,6 +809,63 @@ mod test {
 	use std::str::FromStr;
 	use bitcoin::hex::FromHex;
 	use super::*;
+
+	#[test]
+	fn scuttle_preserves_upstream_invoice_expiry_tag() {
+		use prost::Message;
+
+		#[derive(Clone, PartialEq, prost::Message)]
+		struct UpstreamReceive {
+			#[prost(uint64, optional, tag = "6")]
+			expiry_secs: Option<u64>,
+		}
+		let old = UpstreamReceive { expiry_secs: Some(60) };
+		let new = protos::StartLightningReceiveRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(new.expiry_secs, Some(60));
+		assert!(new.claim_destination.is_none());
+		let new = protos::StartLightningReceiveRequest {
+			expiry_secs: Some(90), claim_destination: Some(protos::VtxoRequest::default()),
+			..Default::default()
+		};
+		let old = UpstreamReceive::decode(new.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(old.expiry_secs, Some(90));
+		let decoded = protos::StartLightningReceiveRequest::decode(new.encode_to_vec().as_slice()).unwrap();
+		assert!(decoded.claim_destination.is_some());
+	}
+
+	#[test]
+	fn owner_link_proto_roundtrip_rejects_malformed_evidence() {
+		let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../lib/testdata/owner-joint-v2.json")).unwrap();
+		let link = OwnerLink::deserialize_hex(vectors[0]["proof"].as_str().unwrap()).unwrap();
+		let proto = protos::OwnerProof::from(link);
+		assert_eq!(OwnerLink::try_from(proto.clone()).unwrap(), link);
+		for length in [0, 32, 34] {
+			let mut malformed = proto.clone(); malformed.blinded_mailbox_id.resize(length, 0);
+			assert!(OwnerLink::try_from(malformed).is_err());
+		}
+		for length in [0, 63, 65] {
+			let mut malformed = proto.clone(); malformed.signature.resize(length, 0);
+			assert!(OwnerLink::try_from(malformed).is_err());
+		}
+		let mut malformed = proto; malformed.blinded_mailbox_id.fill(0);
+		assert!(OwnerLink::try_from(malformed).is_err());
+	}
+
+	#[test]
+	fn joint_owner_link_proto_requires_both_signatures() {
+		let key = |n| { let mut bytes = [0; 32]; bytes[31] = n;
+			bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &bytes).unwrap() };
+		let server = key(11); let mailbox = key(17); let coin = key(3);
+		let link = OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
+		let proto = protos::OwnerProof::from(link);
+		assert_eq!(OwnerLink::try_from(proto.clone()).unwrap(), link);
+		for length in [0, 63, 65] {
+			let mut changed = proto.clone(); changed.mailbox_signature.resize(length, 0);
+			assert!(OwnerLink::try_from(changed).is_err());
+		}
+		let mut legacy_proto = proto; legacy_proto.mailbox_signature.clear();
+		assert!(OwnerLink::try_from(legacy_proto).is_err());
+	}
 
 	#[test]
 	fn test_preimage_bytes() {

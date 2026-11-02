@@ -16,6 +16,7 @@ use lightning_invoice::Bolt11Invoice;
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
 use ark::test_util::VTXO_VECTORS;
+use ark::ProtocolEncoding;
 use ark::VtxoId;
 
 use super::BarkPersister;
@@ -59,6 +60,7 @@ macro_rules! bark_persister_tests {
 	($setup:expr) => {
 		$crate::persist::test_suite::bark_persister_tests!(@tests $setup,
 			test_init_and_read_properties,
+			test_external_mailbox_public_identity_roundtrip,
 			test_set_server_pubkey,
 			test_set_server_mailbox_pubkey,
 
@@ -78,6 +80,7 @@ macro_rules! bark_persister_tests {
 			test_remove_vtxo,
 			test_has_spent_vtxo,
 			test_store_vtxos_idempotent,
+			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
 			test_steal_lock_to_spent,
 			test_steal_lock,
 
@@ -123,6 +126,8 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
+		server_payouts: None,
+		mailbox_identity: Some(crate::MailboxIdentity { network: Network::Regtest, public_key: test_pubkey() }),
 	}
 }
 
@@ -182,6 +187,7 @@ fn empty_round_state() -> RoundState {
 	RoundState {
 		done: false,
 		participation: RoundParticipation {
+			owner_proofs: Default::default(),
 			inputs: vec![],
 			outputs: vec![],
 			unblinded_mailbox_id: None,
@@ -190,6 +196,7 @@ fn empty_round_state() -> RoundState {
 		new_vtxos: vec![],
 		sent_forfeit_sigs: false,
 		movement_id: None,
+		fallback_refusal: None,
 	}
 }
 
@@ -292,6 +299,19 @@ pub async fn test_init_and_read_properties(db: &impl BarkPersister) {
 
 	let read = db.read_properties().await.expect("read_properties");
 	assert_eq!(read, Some(props), "read_properties should return the stored properties");
+}
+
+pub async fn test_external_mailbox_public_identity_roundtrip(db: &impl BarkPersister) {
+	let secp = Secp256k1::new();
+	let key = test_pubkey();
+	let key = if key.serialize()[0] == 3 { key } else { key.negate(&secp) };
+	assert_eq!(key.serialize()[0], 3);
+	let mut props = test_properties();
+	props.mailbox_identity = Some(crate::MailboxIdentity { network: props.network, public_key: key });
+	db.init_wallet(&props).await.expect("init external mailbox identity");
+	let read = db.read_properties().await.unwrap().unwrap();
+	assert_eq!(read, props);
+	assert_eq!(read.mailbox_identity.unwrap().public_key.serialize(), key.serialize());
 }
 
 pub async fn test_set_server_pubkey(db: &impl BarkPersister) {
@@ -546,6 +566,29 @@ pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 		"a repeated store must not insert a second row");
 }
 
+/// Insert retries cannot erase an owned lock, remove a recovery registration,
+/// or resurrect a terminal coin. The original idempotency case only repeated
+/// the SAME initial state and therefore did not exercise this contract.
+pub async fn test_store_existing_vtxo_preserves_holder_discharge_and_registration(db: &impl BarkPersister) {
+	let vtxo = &VTXO_VECTORS.board_vtxo;
+	let exited = &VTXO_VECTORS.round1_vtxo;
+	db.store_vtxos(&[(vtxo, &VtxoState::Spendable), (exited, &VtxoState::Exited)]).await.unwrap();
+	db.mark_vtxos_registered(&[vtxo.id()]).await.unwrap();
+	let holder = VtxoState::Locked { holder: Some(MovementId::new(42).into()) };
+	db.update_vtxo_state_checked(vtxo.id(), holder.clone(), &[VtxoStateKind::Spendable]).await.unwrap();
+	db.store_vtxos(&[(vtxo, &VtxoState::Locked { holder: None })]).await.unwrap();
+	let stored = db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap();
+	assert_eq!(stored.state, holder, "recovery insertion cannot remove a real operation holder");
+	assert!(stored.registered, "recovery registration is monotonic");
+	assert_eq!(db.get_full_vtxo(vtxo.id()).await.unwrap().as_ref(), Some(vtxo));
+	db.update_vtxo_state_checked(vtxo.id(), VtxoState::Spent, &[VtxoStateKind::Locked]).await.unwrap();
+	db.store_vtxos(&[(vtxo, &VtxoState::Spendable), (exited, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().state, VtxoState::Spent);
+	assert!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().registered);
+	assert_eq!(db.get_wallet_vtxo(exited.id()).await.unwrap().unwrap().state, VtxoState::Exited);
+	assert_eq!(db.get_all_vtxos().await.unwrap().len(), 2);
+}
+
 pub async fn test_steal_lock_to_spent(db: &impl BarkPersister) {
 	let spendable = &VTXO_VECTORS.round1_vtxo;
 	let locked = &VTXO_VECTORS.round2_vtxo;
@@ -739,7 +782,17 @@ pub async fn test_get_or_create_movement_for_action(db: &impl BarkPersister) {
 // ---------------------------------------------------------------------------
 
 pub async fn test_store_and_get_round_state(db: &impl BarkPersister) {
-	let state = empty_round_state();
+	let mut state = empty_round_state();
+	let server = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
+	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[18; 32]).unwrap();
+	let coin = VTXO_VECTORS.arkoor3_user_key;
+	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &recipient, &coin).unwrap();
+	state.participation.outputs.push(ark::VtxoRequest {
+		amount: Amount::from_sat(1_000), policy: ark::VtxoPolicy::new_pubkey(coin.public_key()),
+	});
+	state.participation.owner_proofs.insert(coin.public_key(), link);
+	state.flow = RoundFlowState::Failed { error: "diagnostic text is not a refusal code".into() };
+	state.fallback_refusal = Some(crate::FallbackRefusal::DecidedForFallback);
 
 	let id = db.store_round_state(&state).await.expect("store_round_state");
 
