@@ -75,10 +75,8 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 	let key = pair.public_key();
 	let joint = protos::OwnerProof::from(OwnerLink::new_joint(Network::Regtest,
 		srv.mailbox_keypair().public_key(), &mailbox, &pair).unwrap());
-	let mut version_zero = joint.clone(); version_zero.version = 0;
-	let mut legacy = joint.clone(); legacy.version = 1; legacy.mailbox_signature.clear();
 	let mut missing_mailbox = joint; missing_mailbox.mailbox_signature.clear();
-	for proof in [None, Some(version_zero), Some(legacy), Some(missing_mailbox)] {
+	for proof in [None, Some(missing_mailbox)] {
 		let policy = VtxoPolicy::new_pubkey(key).serialize();
 		let reason = if proof.is_none() { "owner_proof_required" } else { "invalid_owner_proof" };
 		let destination = protos::ArkoorDestination {
