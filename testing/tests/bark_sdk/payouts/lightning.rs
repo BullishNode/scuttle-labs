@@ -18,6 +18,7 @@ use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::{OnchainWallet, OnchainWalletTrait};
 use bark::persist::sqlite::SqliteClient;
 use bitcoin::Network;
+use bitcoin::consensus::deserialize;
 use bitcoin::{OutPoint, Transaction};
 use bitcoin_ext::rpc::RpcApi;
 use cln_rpc::plugins::hold;
