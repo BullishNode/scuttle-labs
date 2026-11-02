@@ -36,17 +36,11 @@ impl<'a> PaymentAttemptHandler<'a> {
 	pub async fn fail_payment_attempt(
 		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
 	) -> anyhow::Result<Option<DateTime<Local>>> {
-		self.fail_attempt(attempt, error, false).await
-	}
-
-	async fn fail_attempt(
-		&self, attempt: &LightningPaymentAttempt, error: Option<&str>, unlink_subscription: bool,
-	) -> anyhow::Result<Option<DateTime<Local>>> {
 		let updated_at = self.db.write(async |t| {
 			t.lock_settlement_sources(attempt.payment_hash).await?;
 			t.lock_htlc_settlements().await?;
 			t.ensure_attempt_sources_allow_failure(attempt).await?;
-			Self::fail_attempt_in_tx(t, attempt, error, unlink_subscription).await
+			Self::fail_attempt_in_tx(t, attempt, error).await
 		}).await?;
 
 		if updated_at.is_some() {
@@ -59,19 +53,15 @@ impl<'a> PaymentAttemptHandler<'a> {
 	/// its validity/source/settlement locks and source failure predicate.
 	pub(crate) async fn fail_attempt_in_tx(
 		t: &database::Tx<'_>, attempt: &LightningPaymentAttempt,
-		error: Option<&str>, unlink_subscription: bool,
+		error: Option<&str>,
 	) -> anyhow::Result<Option<DateTime<Local>>> {
-		if unlink_subscription {
-			t.fail_refused_lightning_payment_attempt(attempt, error).await
-		} else {
-			let updated_at = t.update_lightning_payment_attempt_status(
-				attempt, LightningPaymentStatus::Failed, error,
-			).await?;
-			if updated_at.is_some() {
-				end_xpay(t, attempt, ClnXpayOutcome::Fail { error_code: None }).await?;
-			}
-			Ok(updated_at)
+		let updated_at = t.update_lightning_payment_attempt_status(
+			attempt, LightningPaymentStatus::Failed, error,
+		).await?;
+		if updated_at.is_some() {
+			end_xpay(t, attempt, ClnXpayOutcome::Fail { error_code: None }).await?;
 		}
+		Ok(updated_at)
 	}
 
 	/// Notify only after the caller's failure transaction committed.
