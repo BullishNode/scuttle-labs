@@ -31,12 +31,10 @@ mod fallback;
 mod lightning;
 mod lightning_dispatch_reply_loss;
 mod lightning_forwarded_ack;
-mod lightning_forwarded_reopen;
 mod lightning_receive_fallback;
 mod lightning_receive_unmaterialized;
 mod mailbox;
 mod offboard_reply_restore;
-mod offboard_restart;
 mod watchman_wallet;
 
 use std::str::FromStr;
