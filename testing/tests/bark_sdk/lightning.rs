@@ -582,4 +582,4 @@ async fn pay_with_retry_for() {
 /// The first real upstream claim succeeds, but its reply never reaches the
 /// client. This observes the durable checkpoint while the request is in flight.
 
-include!("../scuttle/bark_sdk/lightning_helpers.rs");
+include!("payouts/lightning_helpers.rs");

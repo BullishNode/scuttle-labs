@@ -4735,4 +4735,4 @@ async fn stalled_hold_node_does_not_block_healthy_settlement() {
 		.await.unwrap().into_inner().invoices, paid_b);
 }
 
-include!("../scuttle/server/lightning_helpers.rs");
+include!("payouts/lightning_helpers.rs");

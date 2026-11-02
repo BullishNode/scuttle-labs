@@ -1,3 +1,4 @@
+mod payouts;
 //! Integration tests that exercise the bark Rust SDK (the `bark-wallet`
 //! crate's public API) directly, rather than driving the `bark` CLI binary
 //! as a subprocess.

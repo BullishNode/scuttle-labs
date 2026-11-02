@@ -1,4 +1,5 @@
-#[path = "../scuttle/server/owner_helpers.rs"]
+mod payouts;
+#[path = "payouts/owner_helpers.rs"]
 mod expiry_admission;
 mod ban;
 mod blocklist;
@@ -3039,4 +3040,4 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	assert!(next_attempt, "a participant's exit must not terminate the round coordinator");
 }
 
-include!("../scuttle/server/mod_fallback.rs");
+include!("payouts/mod_fallback.rs");

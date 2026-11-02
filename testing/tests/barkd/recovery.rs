@@ -1565,4 +1565,4 @@ async fn recovered_wallet_recovery_is_repeatable() {
 	}
 }
 
-include!("../scuttle/barkd/recovery_fallback.rs");
+include!("payouts/recovery_fallback.rs");
