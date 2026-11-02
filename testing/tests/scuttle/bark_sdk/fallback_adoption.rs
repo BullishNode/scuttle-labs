@@ -216,7 +216,7 @@ impl captaind::proxy::ArkRpcProxy for HoldArkoorRegistration {
 
 #[tokio::test]
 async fn provisional_recipient_transfer_pays_input_owner() {
-	Box::pin(stalled_change(false, false, false)).await;
+	Box::pin(stalled_change()).await;
 }
 
 async fn stalled_change() {
