@@ -7,10 +7,10 @@ unresolved.
 ## Enable payouts
 
 Set `expiry_payouts` before the server database is created. The default is
-`false`. The database records this choice and refuses a different value on
-reopen. With payouts enabled, the server requires protocol version 6 and a
-verified owner for every customer VTXO. With payouts disabled, it accepts the
-ordinary upstream protocol range.
+`false`. The database records this choice. The server refuses a mode that differs
+from its database. With payouts enabled, the server requires protocol version 6
+and a verified owner for every customer VTXO. With payouts disabled, it accepts
+the ordinary upstream protocol range.
 
 Run captaind and watchmand against the same database. Keep the watchman fee
 wallet funded. Use the ordinary server and wallet migration runners.

@@ -68,7 +68,9 @@ A stored error or empty lookup cannot recreate that authority.
 
 An ambiguous outcome stays held. Operator resolution uses the private
 administrative interface and evidence about the same persistent native
-backend. A cold-restart confirmation is the operator's lifecycle assertion;
-the RPC does not stop Core Lightning or prove that assertion. Native success
-uses the normal preimage settlement path. Use unmodified Core Lightning with
-matching plugins; no Scuttle xpay patch or slow-mode setting is required.
+backend. A cold-restart assertion means the original daemon and every plugin
+have stopped and been reaped, the same persistent backend has restarted, and
+dispatch was excluded during maintenance. The RPC does not stop Core Lightning
+or prove that assertion. Native success uses the normal preimage settlement
+path. Use unmodified Core Lightning with matching plugins; no Scuttle xpay patch
+or slow-mode setting is required.
