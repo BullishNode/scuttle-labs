@@ -454,7 +454,7 @@ async fn try_create_wallet(
 	// chain source client
 	let chain_spec = config.chain_source()
 		.context("failed to create a chain source client with the config")?;
-	let chain = ChainSource::new(chain_spec, net.as_bitcoin(), None, config.socks5_proxy.as_deref()).await
+	let chain = ChainSource::new(chain_spec, net.as_bitcoin(), None, None).await
 		.context("failed to create a chain source client with the config")?;
 	chain.require_version().await.context("chain source version check failed")?;
 

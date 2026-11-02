@@ -219,9 +219,7 @@ impl Wallet {
 		opts: LightningSendOptions,
 	) -> anyhow::Result<Invoice> {
 		let comment = comment.as_ref();
-		let invoice: Invoice = lnaddr_invoice(addr, amount, comment,
-			#[cfg(feature = "socks5-proxy")] &self.inner.config.socks5_proxy,
-		).await
+		let invoice: Invoice = lnaddr_invoice(addr, amount, comment).await
 			.context("lightning address error")?.into();
 		info!("Sending {} to lightning address {}", amount, addr);
 		self.make_lightning_payment_with(&invoice, addr.clone().into(), None, opts).await?;
@@ -252,9 +250,7 @@ impl Wallet {
 		comment: Option<impl AsRef<str>>,
 		opts: LightningSendOptions,
 	) -> anyhow::Result<Invoice> {
-		let invoice: Invoice = lnurlp_invoice(&lnurl.url, amount, comment,
-			#[cfg(feature = "socks5-proxy")] &self.inner.config.socks5_proxy,
-		).await
+		let invoice: Invoice = lnurlp_invoice(&lnurl.url, amount, comment).await
 			.context("lnurl-pay error")?.into();
 		info!("Sending {} to lnurl {}", amount, lnurl);
 		self.make_lightning_payment_with(&invoice, lnurl.clone().into(), None, opts).await?;
