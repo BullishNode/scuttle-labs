@@ -580,7 +580,7 @@ impl Wallet {
 		}
 		// NB we don't use store_spendable_vtxos to avoid posting the vtxos again
 		if !recovered.is_empty() {
-			self.store_spendable_vtxos(recovered.iter()).await?;
+			self.store_vtxos(recovered.iter(), &VtxoState::Spendable).await?;
 			// A locked row from an earlier attempt without an answer is released.
 			self.unlock_vtxos(recovered.iter(), None).await?;
 			for vtxo in &recovered {
