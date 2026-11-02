@@ -79,7 +79,6 @@ impl rpc::server::LightningAdminService for Server {
 	async fn reconcile_lightning_attempt(
 		&self, req: tonic::Request<protos::ReconcileLightningAttemptRequest>,
 	) -> Result<tonic::Response<protos::ReconcileLightningAttemptResponse>, tonic::Status> {
-		super::validate_pver(&req, true)?;
 		let req = req.into_inner();
 		let id = req.attempt_id;
 		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }

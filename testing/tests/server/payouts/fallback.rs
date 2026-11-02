@@ -4,25 +4,6 @@ use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin::{Network, ScriptBuf};
 
 #[tokio::test]
-async fn fallback_fresh_schema_reopens_concurrently_without_resetting_state() {
-	let mut ctx = TestContext::new_minimal("postgresd/fallback_fresh_schema_reopen").await;
-	ctx.init_central_postgres().await;
-	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = server::database::Db::create_with_payouts(&config, true).await.unwrap();
-	let client = ctx.postgres_manager().database_client(Some(&config.name)).await;
-	let history = client.query("SELECT version, checksum FROM refinery_schema_history ORDER BY version", &[]).await.unwrap()
-		.into_iter().map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
-	assert_eq!(history.iter().filter(|(version, _)| *version == 73).count(), 1);
-	assert_eq!(history.last().unwrap().0, 77);
-	let (first, second) = tokio::join!(server::database::Db::connect(&config), server::database::Db::connect(&config));
-	drop(first.unwrap());
-	drop(second.unwrap());
-	let after = client.query("SELECT version, checksum FROM refinery_schema_history ORDER BY version", &[]).await.unwrap()
-		.into_iter().map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
-	assert_eq!(after, history);
-}
-
-#[tokio::test]
 async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	let mut ctx = TestContext::new_minimal("postgresd/fallback_links_are_authenticated_conflict_safe_and_transactional").await;
 	ctx.init_central_postgres().await;

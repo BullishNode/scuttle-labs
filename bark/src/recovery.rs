@@ -639,6 +639,7 @@ impl Wallet {
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
 		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
+		let payouts = self.properties().await?.server_payouts.context("server payout capability is not known")?;
 
 		let mut start_index = 0u32;
 		let mut cursor_vtxo_id = None;
@@ -693,7 +694,7 @@ impl Wallet {
 				}
 				max_index = max_index.max(Some(index));
 
-				if bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
+				if payouts && bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
 					!= Some(self.mailbox_keypair().public_key()) {
 					warn!("Recovery coin {} belongs to another or unknown mailbox", vtxo.id());
 					report.push_foreign(&vtxo);

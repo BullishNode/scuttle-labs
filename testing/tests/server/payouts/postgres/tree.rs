@@ -8,7 +8,6 @@ use ark::encode::ProtocolEncoding;
 use ark::fallback::OwnerLink;
 use ark::test_util::VTXO_VECTORS;
 
-use server::OwnershipRefusal;
 use server::owner_proof::OwnerLinks;
 use server::database::{Db, SpendState};
 use server::database::expiry_attribution::Attribution;

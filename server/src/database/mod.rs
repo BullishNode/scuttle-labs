@@ -42,7 +42,7 @@ use std::borrow::Borrow;
 use std::str::FromStr;
 use std::task;
 use std::backtrace::Backtrace;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -87,7 +87,6 @@ const DEFAULT_DATABASE: &str = "postgres";
 enum AdvisoryLock {
 	MailboxWrite = 1,
 	HtlcSettlementWrite = 2,
-	SchemaMigrations = 3,
 }
 
 /// An uncommitted offboard fetched for the retry-task commit path. Carries
@@ -104,7 +103,6 @@ pub struct StoredUncommittedOffboard {
 pub struct MailboxEntry {
 	pub checkpoint: Checkpoint,
 	pub payload: MailboxPayload,
-	pub owner_mailboxes: BTreeMap<VtxoId, PublicKey>,
 }
 
 impl MailboxEntry {
@@ -165,17 +163,9 @@ pub struct Db {
 impl Db {
 	async fn run_migrations(&self) -> anyhow::Result<()> {
 		let mut conn = self.get_conn().await?;
-		let lock = AdvisoryLock::SchemaMigrations as i64;
-		conn.query_one("SELECT pg_advisory_lock($1)", &[&lock]).await?;
-		let result: anyhow::Result<()> = async {
-			conn.query_one("SELECT set_config('ark.expiry_payouts', $1, false)",
-				&[&self.expiry_payouts.to_string()]).await?;
-			embedded::migrations::runner().run_async::<Client>(&mut *conn).await?;
-			Ok(())
-		}.await;
-		let unlocked = conn.query_one("SELECT pg_advisory_unlock($1)", &[&lock]).await;
-		result?;
-		unlocked?;
+		conn.query_one("SELECT set_config('ark.expiry_payouts', $1, false)",
+			&[&self.expiry_payouts.to_string()]).await?;
+		embedded::migrations::runner().run_async::<Client>(&mut *conn).await?;
 		info!("All migrations got successfully run");
 		Ok(())
 	}
@@ -524,11 +514,6 @@ impl<'t> Tx<'t> {
 		if vtxos.is_empty() {
 			return Ok(None);
 		}
-		// Check the complete batch before allocating any message checkpoint.
-		let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
-		if !self.delivery_owners_match(&ids, mailbox_id).await? {
-			return crate::error::badarg!("mailbox delivery has missing or mismatched coin ownership");
-		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
@@ -650,7 +635,6 @@ impl<'t> Tx<'t> {
 					res.push(MailboxEntry {
 						checkpoint: cp,
 						payload: MailboxPayload::LightningReceive { payment_hash, amount },
-						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -671,7 +655,6 @@ impl<'t> Tx<'t> {
 					res.push(MailboxEntry {
 						checkpoint: cp,
 						payload: MailboxPayload::RoundParticipationCompleted { unlock_hash },
-						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 
@@ -695,7 +678,6 @@ impl<'t> Tx<'t> {
 						payload: MailboxPayload::LightningSendFinished {
 							payment_hash, preimage, failure,
 						},
-						owner_mailboxes: BTreeMap::new(),
 					});
 					telemetry::set_mailbox_get_metric(mailbox_type, 1);
 					continue;
@@ -708,7 +690,6 @@ impl<'t> Tx<'t> {
 			// we check if we have an item ongoing
 			let entry = current_entry.get_or_insert_with(|| MailboxEntry {
 				checkpoint: cp,
-				owner_mailboxes: BTreeMap::new(),
 				payload: match mailbox_type {
 					MailboxType::ArkoorReceive => MailboxPayload::Arkoor { vtxos: vec![], },
 					MailboxType::RecoveryVtxoId => {
@@ -754,21 +735,7 @@ impl<'t> Tx<'t> {
 			telemetry::set_mailbox_get_metric(entry.mailbox_type(), entry.len());
 			res.push(entry);
 		}
-		let mut ids = Vec::new();
-		for entry in &res {
-			match &entry.payload {
-				MailboxPayload::Arkoor { vtxos } => ids.extend(vtxos.iter().map(|v| v.id())),
-				_ => {},
-			}
-		}
-		let owners = self.coin_owner_mailboxes(&ids).await?;
-		for entry in &mut res {
-			let ids = match &entry.payload {
-				MailboxPayload::Arkoor { vtxos } => vtxos.iter().map(|v| v.id()).collect::<Vec<_>>(),
-				_ => continue,
-			};
-			entry.owner_mailboxes = ids.into_iter().filter_map(|id| owners.get(&id).map(|owner| (id, *owner))).collect();
-		}
+
 
 		Ok(res)
 	}

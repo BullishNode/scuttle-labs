@@ -208,8 +208,9 @@ impl<'t> Tx<'t> {
 		ensure!(invoice.amount_msat().is_none_or(|principal|
 			principal <= amount.to_msat() && principal >= amount.to_msat() / 2),
 			"recorded initiation amount exceeds invoice bounds");
-		ensure!(attempt.amount_msat == invoice.amount_msat().unwrap_or(amount.to_msat()),
-			"recorded payment principal differs from initiation");
+		ensure!(attempt.amount_msat == amount.to_msat()
+			|| Some(attempt.amount_msat) == invoice.amount_msat(),
+			"recorded payment amount differs from initiation");
 		let mut supplied = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
 		supplied.sort_unstable();
 		let stored = self.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
@@ -311,9 +312,6 @@ impl<'t> Tx<'t> {
 		max_routing_fee: Option<Amount>,
 	) -> anyhow::Result<i64> {
 		let payment_hash = invoice.payment_hash();
-		let principal_msat = i64::try_from(invoice.amount_msat().unwrap_or(amount.to_msat()))
-			.context("Lightning payment principal exceeds database range")?;
-		super::expiry_guard::guard_new_lightning_inputs(self, htlc_vtxo_ids).await?;
 
 		let check_stmt = self.prepare("
 			SELECT id FROM lightning_payment_attempt
@@ -363,7 +361,7 @@ impl<'t> Tx<'t> {
 		let row = self.query_one(
 			&stmt,
 			&[
-				&node_id, &payment_hash.to_string(), &principal_msat,
+				&node_id, &payment_hash.to_string(), &(amount.to_msat() as i64),
 				&mailbox_str, &requested_status,
 				&block_height_i32, &user_fee_sat_i64, &user_agent, &retry_for_secs_i32,
 				&max_routing_fee_msat_i64,

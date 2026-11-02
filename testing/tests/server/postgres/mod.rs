@@ -1629,8 +1629,7 @@ async fn lightning_payment_attempt_lifecycle() {
 	// One open attempt
 	let attempts = db.read(async |t| t.get_open_lightning_payment_attempts(node_id).await).await.unwrap();
 	assert_eq!(attempts.len(), 1);
-	assert_eq!(attempts[0].amount_msat, invoice.amount_msat().unwrap(),
-		"the fixed invoice principal is independent of the caller funding amount");
+	assert_eq!(attempts[0].amount_msat, 2000);
 
 	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
 		(&bolt11).into()

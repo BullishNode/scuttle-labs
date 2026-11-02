@@ -57,7 +57,6 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	}).await.unwrap().into_inner().messages;
 	assert_eq!(messages.len(), 1);
 	let Some(Message::RecoveryVtxoIds(message)) = &messages[0].message else { panic!("expected recovery hints"); };
-	assert!(message.owners.is_empty(), "recovery locator must not disclose foreign ownership: {:?}", message.owners);
 	let mut actual = message.vtxo_ids.clone();
 	let mut expected = request().vtxo_ids;
 	actual.sort_unstable();
@@ -69,47 +68,7 @@ async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	let streamed = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap();
 	assert_eq!(streamed.checkpoint, messages[0].checkpoint);
 	let Some(Message::RecoveryVtxoIds(streamed)) = &streamed.message else { panic!("expected streamed recovery hints"); };
-	assert!(streamed.owners.is_empty(), "streamed locator must not disclose foreign ownership: {:?}", streamed.owners);
 	assert_eq!(streamed.vtxo_ids, message.vtxo_ids);
-}
-
-#[tokio::test]
-async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
-	let mut ctx = TestContext::new_minimal("postgresd/delivery_owner_batch").await;
-	ctx.init_central_postgres().await;
-	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create_with_payouts(&config, true).await.unwrap();
-	let server = super::test_server_mailbox_key();
-	let first = Keypair::new(&SECP, &mut thread_rng());
-	let second = Keypair::new(&SECP, &mut thread_rng());
-	let a = Keypair::new(&SECP, &mut thread_rng());
-	let b = Keypair::new(&SECP, &mut thread_rng());
-	super::register_test_owners(&db, server, &first, &[a]).await;
-	super::register_test_owners(&db, server, &second, &[b]).await;
-	let one = DummyTestVtxoSpec { user_keypair: a, ..Default::default() }.build().1;
-	let two = DummyTestVtxoSpec { user_keypair: b, ..Default::default() }.build().1;
-	let unknown = DummyTestVtxoSpec { ..Default::default() }.build().1;
-	db.write(async |tx| tx.upsert_vtxos([ServerVtxo::from(one.clone()), ServerVtxo::from(two.clone())]).await).await.unwrap();
-	let mailbox = MailboxIdentifier::from_pubkey(first.public_key());
-	let snapshot = async || db.read(async |tx| {
-		let row = tx.query_one("SELECT (SELECT count(*) FROM mailbox),
-			(SELECT to_jsonb(s)::TEXT FROM checkpoint_state s WHERE type_id=1)", &[]).await?;
-		Ok((row.get::<_, i64>(0), row.get::<_, String>(1)))
-	}).await.unwrap();
-	let before = snapshot().await;
-	for batch in [vec![one.clone(), two.clone()], vec![one.clone(), unknown]] {
-		let refused = db.write(async |tx| {
-			tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &batch).await
-		}).await.unwrap_err();
-		assert!(refused.root_cause().to_string().contains("mailbox delivery has missing or mismatched coin ownership"));
-		assert_eq!(snapshot().await, before, "no partial message or checkpoint may be consumed");
-	}
-	let post = async || db.write(async |tx| {
-		tx.store_vtxos_in_mailbox(MailboxType::ArkoorReceive, mailbox, &[one.clone(), one.clone()]).await
-	}).await.unwrap();
-	assert!(post().await.is_some());
-	assert!(post().await.is_none(), "a valid delivery replay remains idempotent");
-	assert_eq!(snapshot().await.0, before.0 + 1);
 }
 
 #[tokio::test]
@@ -138,14 +97,7 @@ async fn mailbox_authorization_delivery_and_commit_notifications() {
 	unauthenticated.authorization = None;
 	assert_eq!(rpc.read_mailbox(unauthenticated.clone()).await.unwrap_err().code(), tonic::Code::InvalidArgument);
 	assert_eq!(rpc.subscribe_mailbox(unauthenticated).await.err().expect("unauthorized stream refused").code(), tonic::Code::InvalidArgument);
-	let foreign = Keypair::new(&SECP, &mut thread_rng());
-	let foreign_mailbox = MailboxIdentifier::from_pubkey(foreign.public_key());
-	let foreign_post = protos::mailbox_server::PostArkoorMessageRequest {
-		blinded_id: foreign_mailbox.to_blinded(server_key.public_key(), &coin_key).unwrap().serialize(),
-		vtxos: vec![coin.serialize()],
-	};
-	assert_eq!(rpc.post_arkoor_message(foreign_post).await.unwrap_err().code(), tonic::Code::InvalidArgument);
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM mailbox", &[]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+
 	assert!(rpc.read_mailbox(request()).await.unwrap().into_inner().messages.is_empty());
 	let mut stream = rpc.subscribe_mailbox(request()).await.unwrap().into_inner();
 	// Force an error at commit, after the real writer produced its checkpoint.
@@ -170,9 +122,7 @@ async fn mailbox_authorization_delivery_and_commit_notifications() {
 	let message = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap();
 	let Some(Message::Arkoor(delivery)) = &message.message else { panic!("expected committed delivery"); };
 	assert_eq!(delivery.vtxos, vec![coin.serialize()]);
-	assert_eq!(delivery.owners, vec![protos::core::VtxoOwner {
-		vtxo_id: coin.id().to_bytes().to_vec(), owner_mailbox: target_key.public_key().serialize().to_vec(),
-	}]);
+
 	let stored = rpc.read_mailbox(request()).await.unwrap().into_inner();
 	assert_eq!(stored.messages.len(), 1);
 	assert_eq!(stored.messages[0], message, "authorized read and stream retain the same genuine delivery ownership");
@@ -182,5 +132,4 @@ async fn mailbox_authorization_delivery_and_commit_notifications() {
 	let message = tokio::time::timeout(Duration::from_secs(5), stream.message()).await.unwrap().unwrap().unwrap();
 	let Some(Message::RecoveryVtxoIds(hint)) = message.message else { panic!("expected recovery locator"); };
 	assert_eq!(hint.vtxo_ids, vec![coin.id().to_bytes().to_vec()]);
-	assert!(hint.owners.is_empty());
 }

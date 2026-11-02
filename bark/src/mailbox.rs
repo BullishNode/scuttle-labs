@@ -423,7 +423,7 @@ impl Wallet {
 		// message is informational/ignored.
 		let advance = match mailbox_msg.message {
 			Some(Message::Arkoor(msg)) => {
-				match self.process_received_arkoor_package(msg.vtxos, msg.owners).await {
+				match self.process_received_arkoor_package(msg.vtxos).await {
 					Ok(()) => true,
 					Err(e) => {
 						error!("Error processing received arkoor package: {:#}", e);
@@ -481,21 +481,8 @@ impl Wallet {
 	async fn process_received_arkoor_package(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
-		owners: Vec<protos::core::VtxoOwner>,
 	) -> anyhow::Result<()> {
-		let (srv, _) = self.require_server().await?;
-		let ownership_required = srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
-		let mut owner_map = HashMap::new();
-		for owner in owners {
-			let id = VtxoId::from_slice(&owner.vtxo_id)?;
-			let mailbox = bitcoin::secp256k1::PublicKey::from_slice(&owner.owner_mailbox)?;
-			ensure!(owner_map.insert(id, mailbox).is_none(), "duplicate mailbox ownership metadata");
-		}
-		let vtxos = self.process_raw_vtxos(raw_vtxos).await?.into_iter().filter(|vtxo| {
-			let ours = !ownership_required || owner_map.get(&vtxo.id()) == Some(&self.mailbox_keypair().public_key());
-			if !ours { warn!("Not counting mailbox coin {}: missing or foreign owner mailbox", vtxo.id()); }
-			ours
-		}).collect::<Vec<_>>();
+		let vtxos = self.process_raw_vtxos(raw_vtxos).await?;
 
 		// Serialize the receive dedup across all consumers of this wallet's
 		// mailbox so two of them can't both record a movement for the same
