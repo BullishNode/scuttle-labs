@@ -5,7 +5,7 @@ use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use bitcoin_ext::BlockHeight;
 use bitcoin_ext::rpc::RpcApi;
 use server::database::{Db, SpendState};
-use server_rpc::{protos, RequestExt};
+use server_rpc::protos;
 
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::constants::ROUND_CONFIRMATIONS;

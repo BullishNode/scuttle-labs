@@ -10,7 +10,6 @@ use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::attestations::RoundParticipationStatusAttestation;
 use ark::vtxo::Full;
 use ark::tree::signed::UnlockHash;
-use ark::fees::RefreshFees;
 use ark::rounds::RoundEvent;
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::movement::{MovementId, MovementStatus};
@@ -26,7 +25,7 @@ use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin::{Amount, Network, OutPoint, Transaction};
 use bitcoin_ext::TxOutExt;
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
-use server_log::{NoRoundPayments, RoundFinished, RoundParticipationRejected};
+use server_log::RoundFinished;
 use server_rpc::protos;
 
 use ark_testing::{btc, sat, secs, TestContext};

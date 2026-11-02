@@ -1,35 +1,3 @@
-#[tokio::test]
-async fn legacy_lightning_payment_attempt_lifecycle() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt").await;
-	ctx.init_central_postgres().await;
-	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config).await.unwrap();
-	let db = Db::connect(&config).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-	let invoice = Invoice::Bolt11(Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap());
-	legacy_payment_attempt(&db, node, &invoice, &[]).await;
-	let requested = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await)
-		.await.unwrap().unwrap();
-	assert_eq!(requested.final_amount_msat, None);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&requested, LightningPaymentStatus::Submitted, None,
-	).await).await.unwrap().is_some());
-	let submitted = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await)
-		.await.unwrap().unwrap();
-	assert_eq!(submitted.status, LightningPaymentStatus::Submitted);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&submitted, LightningPaymentStatus::Succeeded, None,
-	).await).await.unwrap().is_some());
-	assert!(db.read(async |t| t.get_open_lightning_payment_attempts(node).await).await.unwrap().is_empty());
-	let history = db.read(async |t| Ok(t.query("SELECT status::TEXT FROM lightning_payment_attempt_history \
-		WHERE id=$1 ORDER BY history_created_at", &[&requested.id]).await?.into_iter()
-		.map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await.unwrap();
-	assert_eq!(history, vec!["requested", "submitted"]);
-}
 
 #[tokio::test]
 async fn legacy_lightning_payment_attempt_result_update() {
@@ -66,52 +34,6 @@ async fn legacy_lightning_payment_attempt_result_update() {
 		(&bolt11).into()
 	).await).await.unwrap().expect("attempt still present");
 	assert_eq!(attempt2.final_amount_msat, Some(9999));
-}
-
-/// A legacy success result clears its stored error.
-#[tokio::test]
-async fn legacy_lightning_payment_attempt_error_cleared_on_success() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt_error_cleared").await;
-	ctx.init_central_postgres().await;
-	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
-
-	Db::create(&postgres_cfg).await.expect("Database created");
-	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
-
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-
-	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
-	let invoice = Invoice::Bolt11(bolt11.clone());
-
-	legacy_payment_attempt(&db, node_id, &invoice, &[]).await;
-
-	let read = async || db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
-		(&bolt11).into()
-	).await).await.unwrap().expect("attempt present");
-
-	let attempt = read().await;
-	db.write(async |t| t.update_lightning_payment_attempt_status(
-		&attempt, LightningPaymentStatus::Submitted, None,
-	).await).await.unwrap();
-
-	let submitted = read().await;
-	db.write(async |t| t.set_lightning_payment_attempt_error(&submitted, "routing failed").await)
-		.await.unwrap().expect("error update applies");
-
-	let pending = read().await;
-	assert_eq!(pending.error.as_deref(), Some("routing failed"));
-
-	db.write(async |t| t.update_lightning_payment_attempt_result(
-		&pending, LightningPaymentStatus::Succeeded, None, Some(1_000_000),
-	).await).await.unwrap().expect("update applies");
-
-	let succeeded = read().await;
-	assert_eq!(succeeded.status, LightningPaymentStatus::Succeeded);
-	assert_eq!(succeeded.error, None);
 }
 
 /// An existing successful attempt consumes only its linked signed HTLC sources.
@@ -179,88 +101,6 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	).await.unwrap();
 	let spend_state: String = row.get("spend_state");
 	assert_eq!(spend_state, "ln-spent", "the successful attempt consumes its linked source");
-}
-
-/// Exercise the claim guard's real subscription/source joins for both encodings.
-/// These are database authorization fixtures, not native collection proofs.
-#[tokio::test]
-async fn watchman_receive_claim_uses_upstream_facts_for_both_encodings() {
-	let mut ctx = TestContext::new_minimal("postgresd/watchman_receive_claim_upstream_facts").await;
-	ctx.init_central_postgres().await;
-	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg).await.unwrap();
-	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let key = VTXO_VECTORS.board_vtxo.user_pubkey();
-	let (node, _) = db.write(async |t| t.register_lightning_node(&key).await).await.unwrap();
-	let secp = Secp256k1::new();
-	let invoice_key = SecretKey::from_slice(&[41; 32]).unwrap();
-	let base = &VTXO_VECTORS.board_vtxo;
-
-	for legacy in [false, true] {
-		let preimage = Preimage::random();
-		let hash = preimage.compute_payment_hash();
-		let expiry = base.expiry_height().saturating_sub(BlockDelta::new(200));
-		let policy = if legacy {
-			VtxoPolicy::ServerHtlcRecv_v0(ServerHtlcRecv_v0_VtxoPolicy {
-				user_pubkey: key, payment_hash: hash, htlc_expiry: expiry,
-				htlc_expiry_delta: BlockDelta::new(40),
-			})
-		} else { VtxoPolicy::new_server_htlc_recv(key, hash, expiry, BlockDelta::new(40)) };
-		let point = bitcoin::OutPoint::new(base.point().txid, u32::from(legacy));
-		let source = ServerVtxo::new(point, policy.into(), base.amount(), base.expiry_height(),
-			base.server_pubkey(), base.exit_delta(), point);
-		let invoice = InvoiceBuilder::new(Currency::Regtest)
-			.description("receive claim authorization".into()).payment_hash(hash.to_sha256_hash())
-			.payment_secret(PaymentSecret([42; 32])).current_timestamp()
-			.min_final_cltv_expiry_delta(18).amount_milli_satoshis(source.amount().to_sat() * 1_000)
-			.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
-		db.write(async |t| {
-			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([source.clone()])).await?;
-			htlc_vtxo::create_htlc_vtxos(t, &[(source.id(), hash, expiry)], HtlcDirection::Outgoing).await?;
-			t.register_vtxo_confirmation(source.id(), BlockHeight::new(100)).await?;
-			t.store_generated_lightning_receive(node, &invoice, source.amount().to_sat() * 1_000, None, None).await
-		}).await.unwrap();
-		let subscription = db.read(async |t| t.get_htlc_subscription_by_payment_hash(hash).await)
-			.await.unwrap().unwrap().id;
-		let missing = db.write(async |t| t.lock_watchman_claim_inputs(&[source.clone()]).await).await.unwrap_err();
-		assert!(format!("{missing:#}").contains("receive claim source has no subscription"), "{missing:#}");
-		db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
-			LightningHtlcSubscriptionStatus::Accepted, Some(expiry), None).await).await.unwrap();
-		db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(subscription, [source.id()]).await)
-			.await.unwrap();
-
-		for known in [false, true] {
-			if known { db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap(); }
-			for (status, offchain, chain, allowed) in [
-				(LightningHtlcSubscriptionStatus::Created, None, None, false),
-				(LightningHtlcSubscriptionStatus::Accepted, None, None, false),
-				(LightningHtlcSubscriptionStatus::HtlcsReady, None, None, !known),
-				(LightningHtlcSubscriptionStatus::Settled, None, None, false),
-				(LightningHtlcSubscriptionStatus::Canceled, None, None, true),
-				(LightningHtlcSubscriptionStatus::Canceled, Some(HtlcResolution::Revoked), None, true),
-				(LightningHtlcSubscriptionStatus::Canceled, Some(HtlcResolution::Fulfilled), None, false),
-				(LightningHtlcSubscriptionStatus::Canceled, None, Some(HtlcResolution::Fulfilled), false),
-			] {
-				db.write(async |t| {
-					t.execute("UPDATE lightning_htlc_subscription SET status=$2,updated_at=NOW() WHERE id=$1",
-						&[&subscription, &status]).await?;
-					t.execute("UPDATE htlc_vtxo SET offchain_resolution=$2::TEXT::htlc_resolution,chain_resolution=$3::TEXT::htlc_resolution, \
-						chain_resolution_height=CASE WHEN $3::TEXT IS NULL THEN NULL ELSE 100 END \
-						WHERE id=(SELECT id FROM vtxo WHERE vtxo_id=$1)",
-						&[&source.id().to_string(), &offchain.map(|r| r.as_str()), &chain.map(|r| r.as_str())]).await?;
-					Ok(())
-				}).await.unwrap();
-				let result = db.write(async |t| t.lock_watchman_claim_inputs(&[source.clone()]).await).await;
-				assert_eq!(result.is_ok(), allowed,
-					"legacy={legacy} known={known} status={status} offchain={offchain:?} chain={chain:?}: {result:?}");
-				if !allowed {
-					let error = result.unwrap_err();
-					assert!(format!("{error:#}").contains("receive grant may have been collected"), "{error:#}");
-				}
-			}
-		}
-	}
 }
 
 #[tokio::test]

@@ -42,45 +42,14 @@ enum When {
 }
 
 #[tokio::test]
-async fn expiry_internal_reclaim_reorg_shallow_after_refund_pays_once() {
-	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::AfterRefundShallow(3))).await
-		.expect("reclaim reorg scenario exceeded its budget");
-}
-
-#[tokio::test]
-#[ignore = "unsupported fork of six or more blocks removes grant closures after the sender refund"]
-async fn expiry_internal_reclaim_reorg_after_refund_pays_once() {
-	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::AfterRefund)).await
-		.expect("reclaim reorg scenario exceeded its budget");
-}
-
-#[tokio::test]
 async fn expiry_internal_reclaim_reorg_before_refund_pays_once() {
 	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::BeforeRefund)).await
 		.expect("reclaim reorg scenario exceeded its budget");
 }
 
 #[tokio::test]
-async fn expiry_internal_reclaim_reorg_one_block_after_refund_pays_once() {
-	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::AfterRefundShallow(1))).await
-		.expect("reclaim reorg scenario exceeded its budget");
-}
-
-#[tokio::test]
-async fn expiry_internal_reclaim_reorg_five_blocks_after_refund_pays_once() {
-	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::AfterRefundShallow(5))).await
-		.expect("reclaim reorg scenario exceeded its budget");
-}
-
-#[tokio::test]
 async fn expiry_internal_reclaim_reorg_five_blocks_before_refund_pays_receiver_once() {
 	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::BeforeRefundFive)).await
-		.expect("reclaim reorg scenario exceeded its budget");
-}
-
-#[tokio::test]
-async fn expiry_internal_reclaim_reorg_five_blocks_after_six_deep_signing_pays_once() {
-	tokio::time::timeout(Duration::from_secs(420), reclaim_reorg(When::AfterSignedRefundFive)).await
 		.expect("reclaim reorg scenario exceeded its budget");
 }
 

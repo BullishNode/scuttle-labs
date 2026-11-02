@@ -1,17 +1,12 @@
 use ark_testing::util::ToAltString;
 use bitcoin::{Txid};
-use bitcoin::secp256k1::{rand, Keypair};
 use chrono::{DateTime, Local};
 use bitcoin::hashes::Hash;
 
 use ark::{ServerVtxo, VtxoId};
 use ark::encode::ProtocolEncoding;
-use ark::fallback::OwnerLink;
-use ark::mailbox::MailboxIdentifier;
 use ark::test_util::VTXO_VECTORS;
 
-use server::OwnershipRefusal;
-use server::owner_proof::OwnerLinks;
 use server::database::{Db, SpendState};
 use server::database::tree::VtxoTreeUpdate;
 

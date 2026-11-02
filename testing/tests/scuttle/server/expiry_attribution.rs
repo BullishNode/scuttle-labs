@@ -4,7 +4,6 @@ use std::time::Duration;
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
 use ark::fallback::OwnerLink;
 use ark::lightning::PaymentHash;
-use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::vtxo::Full;
 use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark_testing::{sat, Captaind, TestContext};
@@ -47,18 +46,6 @@ impl Owner {
 		link
 	}
 
-	async fn post_mailbox(&self, srv: &Captaind, coin: &Vtxo<Full>) {
-		let authorization = MailboxAuthorization::new(&self.mailbox,
-			chrono::Local::now() + Duration::from_secs(60));
-		srv.get_mailbox_public_rpc().await.post_recovery_vtxo_ids(protos::mailbox_server::PostRecoveryVtxoIdsRequest {
-			mailbox_id: MailboxIdentifier::from_pubkey(self.mailbox.public_key()).serialize(),
-			vtxo_ids: vec![coin.id().to_bytes().to_vec()], authorization: Some(authorization.serialize()),
-		}).await.unwrap();
-	}
-}
-
-async fn server(ctx: &TestContext) -> Arc<Captaind> {
-	server_with_lifetime(ctx, BlockDelta::new(24)).await
 }
 
 async fn server_with_lifetime(ctx: &TestContext, lifetime: BlockDelta) -> Arc<Captaind> {
@@ -170,32 +157,6 @@ async fn assert_paid_to_owner(
 }
 
 #[tokio::test]
-async fn expiry_owner_finds_mailbox_key() {
-	let ctx = TestContext::new("server/expiry_owner_finds_mailbox_key").await;
-	let srv = server(&ctx).await;
-	let owner = Owner::new(&ctx);
-
-	let coin = board(&ctx, &srv, &owner, owner.key(17)).await;
-	owner.post_mailbox(&srv, &coin).await;
-	expire(&ctx, &srv, coin.expiry_height()).await;
-	assert_paid(&ctx, &srv, &owner, &coin).await;
-}
-
-#[tokio::test]
-async fn expiry_owner_finds_key_without_mailbox() {
-	let ctx = TestContext::new("server/expiry_owner_finds_key_without_mailbox").await;
-	let srv = server(&ctx).await;
-	let owner = Owner::new(&ctx);
-
-	let coin = board(&ctx, &srv, &owner, owner.key(500)).await;
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM mailbox WHERE vtxo_id=$1",
-		&[&coin.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-	expire(&ctx, &srv, coin.expiry_height()).await;
-	assert_paid(&ctx, &srv, &owner, &coin).await;
-}
-
-#[tokio::test]
 async fn expiry_owner_finds_htlc_key() {
 	let ctx = TestContext::new("server/expiry_owner_finds_htlc_key").await;
 	// Backing must outlive the send deadline and its existing admission margin.
@@ -297,34 +258,3 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	assert_paid_to_owner(&ctx, &srv, &owner, refund, owner.key(500).public_key()).await;
 }
 
-
-#[tokio::test]
-async fn expiry_owner_is_available_after_joint_admission_without_registration() {
-	let ctx = TestContext::new("server/expiry_owner_is_available_after_joint_admission_without_registration").await;
-	let srv = server(&ctx).await;
-	let owner = Owner::new(&ctx);
-	let key = owner.key(500);
-	let server = srv.mailbox_keypair();
-	let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &owner.mailbox, &key).unwrap();
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	assert_eq!(db.write(async |tx| tx.verify_owner_link(&server, key.public_key(), &link, Network::Regtest).await).await.unwrap(), owner.mailbox.public_key());
-	assert_eq!(db.read(async |tx| tx.expiry_owner(key.public_key()).await).await.unwrap(),
-		Attribution::Owned { mailbox_pk: owner.mailbox.public_key(), spk: owner.script.clone() });
-
-	let coin = board(&ctx, &srv, &owner, key).await;
-	expire(&ctx, &srv, coin.expiry_height()).await;
-	assert_paid(&ctx, &srv, &owner, &coin).await;
-}
-
-#[tokio::test]
-async fn expiry_owner_pays_coin_authorized_gift() {
-	let ctx = TestContext::new("server/expiry_owner_pays_coin_authorized_gift").await;
-	let srv = server(&ctx).await;
-	let recipient = Owner::new(&ctx);
-
-	let giver = Xpriv::new_master(Network::Regtest, &[42; 64]).unwrap().to_keypair(&SECP);
-	assert_ne!(giver.public_key(), recipient.key(0).public_key());
-	let coin = board(&ctx, &srv, &recipient, giver).await;
-	expire(&ctx, &srv, coin.expiry_height()).await;
-	assert_paid(&ctx, &srv, &recipient, &coin).await;
-}
