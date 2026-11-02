@@ -1,13 +1,8 @@
 #[path = "payouts/watchman_fallback.rs"]
 mod fallback;
 
-pub(super) use ark_testing::onchain::observed_payout_fee_child;
-
-
-use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use bdk_wallet::KeychainKind;
 use std::time::Duration;
 
 use log::{error, warn};
@@ -18,14 +13,11 @@ use ark::fees::{BoardFees, PpmFeeRate};
 use ark::lightning::PaymentHash;
 use bark::exit::ExitState;
 use bark_json::primitives::VtxoStateInfo;
-use bitcoin::{Amount, Network, OutPoint, Transaction};
-use bitcoin::consensus::deserialize;
-use bitcoin::hex::DisplayHex;
+use bitcoin::Amount;
 use bitcoin_ext::rpc::BitcoinRpcExt;
-use bitcoin_ext::{BlockDelta, TxOutExt, TxStatus};
+use bitcoin_ext::{BlockDelta, TxStatus};
 use server::database::Db;
 use server::vtxopool::VtxoTarget;
-use server_rpc::protos;
 use server_log::{
 	ArkFeeRecorded, ClaimBroadcast, ClaimBroadcastFailure, ClaimChunkBroadcastFailure,
 	ProgressBroadcast, ProgressCpfpFailure,
@@ -33,8 +25,7 @@ use server_log::{
 
 use ark_testing::{TestContext, btc, require_bark_version, sat};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
-use ark_testing::daemon::captaind::{SlogHandler, WalletAdminClient};
-use ark_testing::daemon::watchmand::Watchmand;
+use ark_testing::daemon::captaind::SlogHandler;
 use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
 use ark_testing::util::FutureExt;
 
@@ -71,8 +62,6 @@ impl WatchmanFailureCollector {
 	}
 }
 
-/// Observe the fee sponsor from Core, including after its package confirms.
-/// No server child history or subsidy classification participates in this check.
 
 #[tokio::test]
 async fn watchman_sweeps_boards() {

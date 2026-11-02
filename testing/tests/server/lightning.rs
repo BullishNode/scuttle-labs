@@ -1187,7 +1187,7 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 			for row in rows {
 				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 				deep &= row.get::<_, bool>("confirmed");
-				let Some((child, child_fee)) = super::watchman::observed_payout_fee_child(&ctx, &parent) else { deep = false; continue; };
+				let Some((child, child_fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) else { deep = false; continue; };
 				assert_eq!(parent.compute_txid().to_string(), row.get::<_, String>("sweep_txid"));
 				let granted_id = row.get::<_, String>("vtxo_id");
 				let granted = grants.iter().find(|grant| grant.id().to_string() == granted_id).unwrap();

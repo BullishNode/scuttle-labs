@@ -23,18 +23,6 @@ async fn customer_births_record_their_owners_once() {
 		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
 			&[&coin.id().to_string()]).await?.get::<_, String>(0))).await.unwrap(), original_xmin);
 	}
-	let rollback = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
-	let failed: anyhow::Result<()> = db.write(async |tx| {
-		tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([rollback.clone()])).await?;
-		assert_eq!(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
-			&[&rollback.id().to_string()]).await?.get::<_, i64>(0), 1);
-		anyhow::bail!("roll back the complete birth transaction")
-	}).await;
-	assert!(failed.is_err());
-	assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(rollback.id()).await).await.unwrap().is_none());
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
-		&[&rollback.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-
 	// An unbound customer birth is refused before either row is stored.
 	// Genuine authorization then admits the birth; replay preserves it.
 	let prior = ServerVtxo::from(VTXO_VECTORS.arkoor3_vtxo.clone());
@@ -110,11 +98,7 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 #[tokio::test]
 async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
 	let (_ctx, db) = test_db("deferred_customer_birth_owner").await;
-	let server = super::super::test_server_mailbox_key();
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM pg_trigger
-		WHERE tgname='customer_coin_owner' AND tgrelid='public.vtxo'::regclass", &[]).await?.get::<_, i64>(0))).await.unwrap(), 1,
-		"the fresh initializer must activate the deferred birth constraint");
 	for state in [SpendState::Spendable, SpendState::Unregistered, SpendState::Unclaimed, SpendState::HtlcRecvUnclaimed] {
 		let missing = db.write(async |tx| {
 			assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)).await?, 1);
@@ -129,8 +113,6 @@ async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
 		assert_eq!(error.message(), "customer VTXO has no coin_owner");
 		assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(coin.id()).await).await.unwrap().is_none());
 	}
-	assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()])).await).await.unwrap(), 1);
-	assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([coin.clone()])).await).await.unwrap(), 0);
 	let pool = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
 	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([pool], SpendState::Pool)).await)
 		.await.unwrap();

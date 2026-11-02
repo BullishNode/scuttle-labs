@@ -1,5 +1,5 @@
 use ark_testing::util::ToAltString;
-use bitcoin::{Txid};
+use bitcoin::Txid;
 use chrono::{DateTime, Local};
 use bitcoin::hashes::Hash;
 
