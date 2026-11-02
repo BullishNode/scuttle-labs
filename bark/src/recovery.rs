@@ -480,9 +480,8 @@ impl Wallet {
 
 	/// Store owned VTXOs in the state the server reported for them.
 	///
-	/// Ordinary spent history follows upstream trust. Validate spendable and
-	/// fallback-pending bodies before admitting positive principal; a fallback
-	/// allocation is not evidence of payment.
+	/// Ordinary spent history follows upstream trust. Validate recovered bodies;
+	/// fallback commitments are stored Spent and reported as skipped.
 	async fn store_recovered_vtxos(
 		&self,
 		report: &mut RecoveryReport,
@@ -499,7 +498,11 @@ impl Wallet {
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),
-				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
+				Ok(adoption @ (ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited)) => {
+					let status = match adoption { ServerStatusAdoption::FallbackPending => crate::vtxo::FallbackStatus::Pending,
+						ServerStatusAdoption::FallbackSpent => crate::vtxo::FallbackStatus::Spent, _ => crate::vtxo::FallbackStatus::Forfeited };
+					fallback_pending.push((vtxo, status));
+				},
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
 				// Finishing the flow the VTXO is stuck in is what decides where it
@@ -523,25 +526,24 @@ impl Wallet {
 		// vtxo as spendable again. A row from an earlier, failed attempt is
 		// forced along.
 		if !spent.is_empty() {
-			self.store_vtxos_with_server_status(spent.iter()).await?;
-			self.trust_ordinary_spends(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
+			self.store_spent_vtxos(spent.iter()).await?;
+			self.mark_vtxos_as_spent(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
 			for vtxo in &spent {
 				debug!("Recovery vtxo {} already spent, skipping", vtxo.id());
 				report.push_skipped(vtxo);
 			}
 		}
 
-		let mut pending = Vec::new();
-		for vtxo in fallback_pending {
+		for (vtxo, status) in fallback_pending {
 			if let Err(error) = self.validate_vtxo(&vtxo).await {
 				warn!("Invalid fallback recovery source {}: {error:#}", vtxo.id());
 				report.push_failed(vtxo.id(), Some(vtxo.amount()));
 			} else {
 				report.push_skipped(&vtxo);
-				pending.push(vtxo);
+				self.store_spent_vtxos([&vtxo]).await?;
+				self.inner.db.set_vtxo_fallback_status(vtxo.id(), status).await?;
 			}
 		}
-		self.retain_fallback_pending(&pending).await?;
 
 		// An unclaimed output of a delegated round participation lacks its
 		// unlock preimage, so it can't validate yet. The participation is
@@ -578,7 +580,7 @@ impl Wallet {
 		}
 		// NB we don't use store_spendable_vtxos to avoid posting the vtxos again
 		if !recovered.is_empty() {
-			self.store_vtxos_with_server_status(recovered.iter()).await?;
+			self.store_spendable_vtxos(recovered.iter()).await?;
 			// A locked row from an earlier attempt without an answer is released.
 			self.unlock_vtxos(recovered.iter(), None).await?;
 			for vtxo in &recovered {
@@ -635,8 +637,7 @@ impl Wallet {
 	///
 	/// Returns `Ok(false)` when the server doesn't offer the rpc.
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
-		let (mut srv, ark_info) = self.require_server_with_deadline(
-			Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT)).await?;
+		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
 
 		let mut start_index = 0u32;
@@ -654,9 +655,8 @@ impl Wallet {
 				authorization: auth.serialize(),
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
-			let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-			let deadline = Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT);
-			let resp = match Self::server_read(deadline, srv.client.recover_vtxos_by_xpub(req)).await? {
+
+			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {
 					info!("Server doesn't support VTXO recovery by xpub: {}", status.message());
@@ -713,7 +713,6 @@ impl Wallet {
 				self.reveal_vtxo_keys_up_to(max_index).await
 					.context("failed to store recovered vtxo keys")?;
 			}
-			drop(history_guard);
 			self.store_recovered_vtxos(report, vtxos).await?;
 
 			// A server that moved neither past a key nor within one would have

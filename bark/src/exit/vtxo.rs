@@ -14,7 +14,7 @@ use log::{debug, trace};
 
 use ark::{Vtxo, VtxoId};
 use ark::vtxo::{Bare, Full};
-use bitcoin_ext::{BlockHeight, TxStatus};
+use bitcoin_ext::BlockHeight;
 
 use crate::exit::models::{ExitError, ExitState};
 use crate::exit::progress::{ExitStateProgress, ProgressContext, ProgressStep};
@@ -163,36 +163,6 @@ impl ExitVtxo {
 		}
 
 		let vtxo = self.get_vtxo(&*wallet.inner.db).await?;
-		let commitments = crate::exit::fallback_commitments(&*wallet.inner.db).await
-			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
-		let observe_only = crate::exit::fallback_blocks_abortable_exit(&self.state, self.id(), &commitments)
-			&& vtxo.state.kind() != crate::vtxo::VtxoStateKind::Spent;
-		if observe_only && matches!(tx_manager.sync_exit_tx(vtxo.point().txid).await?, TxStatus::NotFound) {
-			// Refresh the tracked chain before selecting its conflict frontier, without publication.
-			if let ExitState::Processing(state) = self.state.clone() {
-				let mut context = ProgressContext {
-					vtxo: &vtxo,
-					exit_txids: self.txids.as_ref().unwrap(),
-					wallet,
-					tx_manager,
-					allow_broadcast: false,
-				};
-				match state.progress(&mut context).await {
-					Ok(new_state) => {
-						let resolved = matches!(new_state, ExitState::VtxoSwept(_) | ExitState::AwaitingDelta(_));
-						self.update_state_if_newer(new_state, &*wallet.inner.db).await?;
-						if resolved { return Ok(()); }
-					},
-					Err(e) => {
-						if let Some(new_state) = e.state {
-							self.update_state_if_newer(new_state, &*wallet.inner.db).await?;
-						}
-						return Err(e.error);
-					},
-				}
-			}
-			return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot progress an abortable exit".into() });
-		}
 		const MAX_ITERATIONS: usize = 100;
 		for _ in 0..MAX_ITERATIONS {
 			let mut context = ProgressContext {
@@ -200,7 +170,6 @@ impl ExitVtxo {
 				exit_txids: self.txids.as_ref().unwrap(),
 				wallet,
 				tx_manager,
-				allow_broadcast: !observe_only,
 			};
 			// Attempt to move to the next state, which may or may not generate a new state
 			if log::log_enabled!(log::Level::Trace) {

@@ -30,7 +30,7 @@ CREATE TABLE bark_properties (
 
 				network TEXT NOT NULL,
 				fingerprint TEXT NOT NULL
-			, server_pubkey TEXT, server_mailbox_pubkey TEXT);
+			, server_pubkey TEXT, server_mailbox_pubkey TEXT, mailbox_pubkey TEXT CHECK (length(mailbox_pubkey) = 66));
 CREATE TABLE bark_exit_states (
 				vtxo_id TEXT PRIMARY KEY,
 				state TEXT NOT NULL,
@@ -202,7 +202,7 @@ CREATE TABLE bark_settled_lightning_receive (
 				invoice      TEXT NOT NULL,
 				amount_sat   INTEGER NOT NULL,
 				settled_at   DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%d %H:%M:%f', 'now'))
-			, association BLOB);
+			);
 CREATE UNIQUE INDEX idx_bark_movements_action_id
 				ON bark_movements (action_id) WHERE action_id IS NOT NULL;
 CREATE VIEW vtxo_view AS
@@ -222,8 +222,3 @@ CREATE VIEW vtxo_view AS
 			JOIN most_recent_vtxo_state as vs
 				ON v.id = vs.vtxo_id
 /* vtxo_view(id,expiry_height,amount_sat,raw_bare,exit_depth,exit_tx_weight,registered,created_at,state,state_kind,last_updated_at) */;
-CREATE TABLE bark_mailbox_identity (
-		id INTEGER PRIMARY KEY CHECK (id = 1),
-		public_key TEXT NOT NULL CHECK (length(public_key) = 66),
-		network TEXT NOT NULL
-	);

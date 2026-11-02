@@ -13,7 +13,6 @@ mod migrations;
 mod query;
 mod scuttle;
 
-
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -37,7 +36,6 @@ use crate::persist::{BarkPersister, RoundStateId, StoredRoundState, Unlocked};
 use crate::persist::models::{PaidInvoice, SettledLightningReceive, StoredExit};
 use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
-
 
 /// The default sqlite db file for when no file path was provided
 pub const DEFAULT_DB_FILE: &str = "db.sqlite";
@@ -288,25 +286,12 @@ impl BarkPersister for SqliteClient {
 		tx.commit().context("Failed to commit transaction")
 	}
 
-
-
 	async fn set_vtxo_fallback_status(&self, id: VtxoId, status: crate::vtxo::FallbackStatus)
 		-> anyhow::Result<WalletVtxo>
 	{
 		let mut conn = self.connect()?;
 		let tx = conn.transaction()?;
 		let coin = query::set_vtxo_fallback_status(&tx, id, status)?;
-		tx.commit()?;
-		Ok(coin)
-	}
-
-	async fn store_fallback_vtxo(&self, vtxo: &Vtxo<Full>, status: crate::vtxo::FallbackStatus)
-		-> anyhow::Result<WalletVtxo>
-	{
-		let mut conn = self.connect()?;
-		let tx = conn.transaction()?;
-		query::store_vtxo_with_initial_state(&tx, vtxo, &VtxoState::Locked { holder: None })?;
-		let coin = query::set_vtxo_fallback_status(&tx, vtxo.id(), status)?;
 		tx.commit()?;
 		Ok(coin)
 	}
@@ -387,10 +372,9 @@ impl BarkPersister for SqliteClient {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
-		association: Option<&crate::persist::models::ReceiveAssociation>,
 	) -> anyhow::Result<()> {
 		let conn = self.connect()?;
-		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount, association)
+		query::record_settled_lightning_receive(&conn, payment_hash, preimage, invoice, amount)
 	}
 
 	async fn get_settled_lightning_receive(
@@ -399,14 +383,6 @@ impl BarkPersister for SqliteClient {
 	) -> anyhow::Result<Option<SettledLightningReceive>> {
 		let conn = self.connect()?;
 		query::get_settled_lightning_receive(&conn, payment_hash)
-	}
-
-	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
-		query::fallback_lightning_receives(&self.connect()?)
-	}
-
-	async fn set_receive_fallback_status(&self, hash: PaymentHash, status: crate::vtxo::FallbackStatus) -> anyhow::Result<()> {
-		query::set_receive_fallback_status(&mut self.connect()?, hash, status)
 	}
 
 	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
@@ -553,30 +529,6 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_outcomes_reopen_without_rewriting_upstream_history() {
-		let (path, mut conn) = in_memory_db();
-		let db = SqliteClient::open(&path).unwrap();
-		let history = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
-			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
-			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		let coin = &VTXO_VECTORS.board_vtxo;
-		let tx = conn.transaction().unwrap();
-		query::store_vtxo_with_initial_state(&tx, coin, &VtxoState::Spendable).unwrap();
-		query::set_vtxo_fallback_status(&tx, coin.id(), crate::vtxo::FallbackStatus::Pending).unwrap();
-		tx.commit().unwrap();
-		drop(db);
-		let _reopened = SqliteClient::open(&path).unwrap();
-		let stored = query::get_wallet_vtxo_by_id(&conn, coin.id()).unwrap().unwrap();
-		assert_eq!(stored.fallback_status, Some(crate::vtxo::FallbackStatus::Pending));
-		assert_eq!(stored.state, VtxoState::Locked { holder: None });
-		assert_eq!(query::get_full_vtxo_by_id(&conn, coin.id()).unwrap().unwrap().serialize(), coin.serialize());
-		let after = conn.prepare("SELECT id,value,created_at FROM migrations ORDER BY id").unwrap()
-			.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?)))
-			.unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-		assert_eq!(history, after);
-	}
-
-	#[test]
 	fn receipt_bearing_wallet_is_refused_without_writes() {
 		let (path, conn) = in_memory_db();
 		let current = SqliteClient::open(&path).unwrap();
@@ -589,7 +541,6 @@ mod test {
 		assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bark_fallback_receipt')", [],
 			|row| row.get::<_, bool>(0)).unwrap());
 	}
-
 
 	#[test]
 	fn registration_shaped_wallet_is_refused_even_with_mailbox_identity() {

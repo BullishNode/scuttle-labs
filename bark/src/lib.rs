@@ -436,7 +436,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use bark_runtime::Instant;
 use bip39::Mnemonic;
 use bitcoin::{Amount, Network, OutPoint};
 use bitcoin::bip32::{self, ChildNumber, Fingerprint};
@@ -487,7 +486,6 @@ const BARK_PURPOSE_INDEX: u32 = 350;
 const VTXO_KEYS_INDEX: u32 = 0;
 /// Derivation index used to generate keypair for the recovery mailbox
 const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
-const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MISSING_SERVER_TRANSPORT_HELP: &str =
 	"This build of bark-wallet does not include an Ark server transport backend. Enable feature `bark-wallet/native` or `bark-wallet/wasm-web` to use server-backed wallet functionality.";
 
@@ -1195,7 +1193,6 @@ impl Wallet {
 		let network = properties.network;
 		let keypair = self.peek_keypair(index).await?;
 
-
 		let (server_pubkey, mailbox_pubkey) =
 			if let (Some(spk), Some(mpk)) = (properties.server_pubkey, properties.server_mailbox_pubkey) {
 				(spk, mpk)
@@ -1367,14 +1364,16 @@ impl Wallet {
 		// Decode the current coin/operation formats once at open, before any
 		// property or server-key write. Do not put this full-record read on
 		// read_properties, which is also used in ordinary payment processing.
-		let coins = db.get_all_vtxos().await?.len();
+		let coins = db.get_all_vtxos().await?;
+		ensure!(coins.iter().all(|coin| coin.fallback_status.is_none()
+			|| matches!(coin.state, crate::vtxo::VtxoState::Spent | crate::vtxo::VtxoState::Exited)),
+			"legacy fallback reservations require a fresh wallet store");
 		let actions = db.get_all_wallet_action_checkpoints().await?.len();
-		let receives = db.fallback_lightning_receives().await?.len();
 		let mut created_now = false;
 		let properties = if let Some(p) = db.read_properties().await? {
 			p
 		} else if args.create_if_not_exists {
-			ensure!(coins == 0 && actions == 0 && receives == 0,
+			ensure!(coins.is_empty() && actions == 0,
 				"partial wallet state requires a fresh store");
 			Self::create(
 				network, &seed, &config, &*db, &*lock_manager, args.create_without_server,
@@ -1536,44 +1535,17 @@ impl Wallet {
 			.context("Failed to connect to Ark server")
 	}
 
-	/// Only the remote/transport read awaits use this deadline. Callers must
-	/// keep validation, local persistence and adoption outside this future.
-	async fn server_read<T>(deadline: Option<Instant>, read: impl Future<Output = T>) -> anyhow::Result<T> {
-		if let Some(deadline) = deadline {
-			let remaining = deadline.saturating_duration_since(Instant::now());
-			ensure!(!remaining.is_zero(), "Ark server read deadline elapsed");
-			bark_runtime::timeout(remaining, read).await.context("Ark server read deadline elapsed")
-		} else {
-			Ok(read.await)
-		}
-	}
-
 	async fn require_server(&self) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		Box::pin(self.require_server_with_deadline(None)).await
-	}
+		// Connect lazily if not yet connected. `get_or_try_init` ensures
+		// concurrent callers on a cold cell all await the same in-flight
+		// connect future instead of each opening a fresh gRPC channel.
+		let conn = self.inner.server.get_or_try_init(|| async {
+			let network = self.properties().await?.network;
+			Self::connect_to_server(&self.inner.config, network).await
+				.context("You should be connected to Ark server to perform this action")
+		}).await?.clone();
 
-	async fn require_server_with_deadline(&self, deadline: Option<Instant>) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		let existing = { Self::server_read(deadline, self.inner.server.read()).await?.clone() };
-		let conn = if let Some(connection) = existing {
-			connection
-		} else {
-			let mut server = Self::server_read(deadline, self.inner.server.write()).await?;
-			if let Some(connection) = server.as_ref() {
-				connection.clone()
-			} else {
-				let network = self.properties().await?.network;
-				let mut connection = Self::server_read(deadline,
-					Self::connect_to_server(&self.inner.config, network)).await?
-					.context("You should be connected to Ark server to perform this action")?;
-				let ark_info = Self::server_read(deadline, connection.ark_info()).await?;
-				check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-				self.check_and_store_server_keys(&ark_info).await?;
-				*server = Some(connection.clone());
-				connection
-			}
-		};
-
-		let ark_info = Self::server_read(deadline, conn.ark_info()).await?;
+		let ark_info = conn.ark_info().await;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
 		self.check_and_store_server_keys(&ark_info).await?;
 
@@ -1581,23 +1553,22 @@ impl Wallet {
 	}
 
 	pub async fn refresh_server(&self) -> anyhow::Result<()> {
-		let deadline = Some(Instant::now() + SERVER_READ_TIMEOUT);
-		// Remove the cached connection before refreshing it. On failure or
-		// cancellation, future callers must connect and authenticate again.
-		let mut server = Self::server_read(deadline, self.inner.server.write()).await?;
-		let mut connection = if let Some(connection) = server.take() {
-			connection
-		} else {
+		// If the cell is still cold, initialise it with a fresh connection.
+		// If it is already initialised, run a heartbeat against the existing
+		// one — `OnceCell` does not support replacing a stored value, but
+		// `ServerConnection` is built around a tonic `Channel` which
+		// transparently reconnects, so we don't need to swap it.
+		let srv = self.inner.server.get_or_try_init(|| async {
 			let properties = self.properties().await?;
-			Self::server_read(deadline, Self::connect_to_server(&self.inner.config, properties.network)).await??
-		};
+			Self::connect_to_server(&self.inner.config, properties.network).await
+				.map_err(anyhow::Error::from)
+		}).await?;
 
-		Self::server_read(deadline, connection.check_connection()).await??;
-		let ark_info = Self::server_read(deadline, connection.ark_info()).await?;
+		srv.check_connection().await?;
+		let ark_info = srv.ark_info().await;
 		ark_info.fees.validate().context("invalid fee schedule")?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
 		self.check_and_store_server_keys(&ark_info).await?;
-		*server = Some(connection);
 
 		Ok(())
 	}
@@ -1686,24 +1657,16 @@ impl Wallet {
 		Ok(self.fetch_vtxo_status(vtxo_id, keypair).await?.0)
 	}
 
+	/// Adopt authenticated commitments as Spent; retain the status only for display.
 	pub(crate) async fn fetch_vtxo_status(&self, vtxo_id: VtxoId, keypair: &Keypair)
 		-> anyhow::Result<(VtxoSpendState, bool)>
 	{
-		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		self.fetch_vtxo_status_locked(vtxo_id, keypair).await
-	}
-
-	/// Caller retains FallbackHistory from before the request through adoption
-	/// and any first-seen body/marker write using the returned status.
-	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair)
-		-> anyhow::Result<(VtxoSpendState, bool)>
-	{
-		let (mut srv, _) = self.require_server_with_deadline(Some(Instant::now() + SERVER_READ_TIMEOUT)).await?;
+		let (mut srv, _) = self.require_server().await?;
 		let attestation = VtxoStatusAttestation::new(vtxo_id, keypair);
-		let resp = Self::server_read(Some(Instant::now() + SERVER_READ_TIMEOUT), srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+		let resp = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
 			vtxo_id: vtxo_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
-		})).await?.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
+		}).await.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
 
 		let state = VtxoSpendState::try_from(resp.spend_state).map_err(|_| anyhow::anyhow!(
 			"server returned unknown spend state {} for vtxo {vtxo_id}; this wallet may need updating", resp.spend_state,
@@ -1718,9 +1681,8 @@ impl Wallet {
 	/// Each keypair must be its VTXO's private key so we can prove ownership.
 	///
 	/// Unknown IDs, failed RPC batches, undecodable IDs and unknown spend states
-	/// are absent from the result. A read timeout stops later chunks and returns
-	/// answers already processed; `Ok` does not imply complete coverage.
-	/// History acquisition, server admission, integrity checks and local adoption
+	/// are absent from the result; `Ok` does not imply complete coverage.
+	/// Server admission, integrity checks and local adoption
 	/// or storage can return errors. Earlier adopted updates remain durable.
 	pub(crate) async fn fetch_vtxo_spend_states(
 		&self,
@@ -1732,13 +1694,13 @@ impl Wallet {
 	pub(crate) async fn fetch_vtxo_statuses(&self, queries: &[(VtxoId, &Keypair)])
 		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
 	{
-		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
+
 		let mut ret = HashMap::with_capacity(queries.len());
 		if queries.is_empty() {
 			return Ok(ret);
 		}
 
-		let (mut srv, _) = self.require_server_with_deadline(Some(Instant::now() + SERVER_READ_TIMEOUT)).await?;
+		let (mut srv, _) = self.require_server().await?;
 		for chunk in queries.chunks(MAX_NB_VTXO_IDS) {
 			let req = protos::GetVtxosStatusByIdsRequest {
 				vtxos: chunk.iter().map(|(id, keypair)| protos::VtxoStatusQuery {
@@ -1746,13 +1708,9 @@ impl Wallet {
 					attestation: VtxoStatusAttestation::new(*id, keypair).serialize(),
 				}).collect(),
 			};
-			let resp = match Self::server_read(Some(Instant::now() + SERVER_READ_TIMEOUT), srv.client.get_vtxos_status_by_ids(req)).await {
-				Err(error) => {
-					warn!("Stopping status reads with {} answers retained: {:#}", ret.len(), error);
-					break;
-				},
-				Ok(Ok(resp)) => resp.into_inner(),
-				Ok(Err(e)) => {
+			let resp = match srv.client.get_vtxos_status_by_ids(req).await {
+				Ok(resp) => resp.into_inner(),
+				Err(e) => {
 					warn!("Could not fetch the status of {} vtxos from server: {:#}", chunk.len(), e);
 					continue;
 				},
@@ -1892,7 +1850,6 @@ impl Wallet {
 	/// Returns all spendable vtxos
 	pub async fn spendable_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
 		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
-		vtxos.retain(|vtxo| vtxo.fallback_status.is_none());
 		Ok(vtxos)
 	}
 
@@ -2370,7 +2327,7 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = V>,
 		height: Option<BlockHeight>,
 	) -> anyhow::Result<Option<RoundParticipation>> {
-		let selected = self.filter_expired_refresh_inputs(vtxos.into_iter().collect()).await?;
+		let selected = vtxos.into_iter().collect::<Vec<_>>();
 		let (vtxos, total_amount) = {
 			let iter = selected.into_iter();
 			let size_hint = iter.size_hint();
@@ -2499,7 +2456,7 @@ impl Wallet {
 		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
 		RefreshStrategy::should_refresh_if_must(self, self.inner.chain.tip().await?,
 			self.inner.chain.fee_rates().await.fast).filter_vtxos(&mut vtxos).await?;
-		self.filter_expired_refresh_inputs(vtxos).await
+		Ok(vtxos)
 	}
 
 	/// Similar to [Wallet::get_vtxos_to_refresh] but it allows VTXOs to be excluded from the

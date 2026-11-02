@@ -6,7 +6,6 @@ mod reconcile;
 pub use refusal::FallbackRefusal;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 use anyhow::Context;
 use bitcoin::ScriptBuf;
 use bitcoin::secp256k1::PublicKey;
@@ -23,11 +22,6 @@ pub(crate) fn next_key_index(last: Option<u32>) -> anyhow::Result<u32> {
 }
 
 impl Wallet {
-	pub(crate) async fn lock_fallback_history(&self, timeout: Duration)
-		-> anyhow::Result<Box<dyn crate::lock_manager::LockGuard>>
-	{
-		self.inner.lock_manager.lock(&format!("{}.fallback-history", self.fingerprint()), timeout).await
-	}
 
 	/// BIP86 destination of the exact mailbox identity checked at open.
 	pub fn fallback_script(&self) -> ScriptBuf {

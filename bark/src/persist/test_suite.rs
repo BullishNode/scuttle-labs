@@ -16,8 +16,7 @@ use lightning_invoice::Bolt11Invoice;
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
 use ark::test_util::VTXO_VECTORS;
-use ark::{ProtocolEncoding, Vtxo};
-use ark::vtxo::Full;
+use ark::ProtocolEncoding;
 use ark::VtxoId;
 
 use super::BarkPersister;
@@ -34,7 +33,7 @@ use crate::persist::models::{SerdeRoundState, StoredExit, StoredRoundState, Unlo
 use crate::lock_manager::LockManager;
 use crate::lock_manager::memory::MemoryLockManager;
 use crate::round::{RoundFlowState, RoundParticipation, RoundState};
-use crate::vtxo::{FallbackStatus, VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
 use crate::WalletProperties;
 
 // ---------------------------------------------------------------------------
@@ -83,7 +82,6 @@ macro_rules! bark_persister_tests {
 			test_store_vtxos_idempotent,
 			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
 			test_steal_lock_to_spent,
-			test_fallback_status_keeps_commitment_and_exit_state,
 			test_steal_lock,
 
 			test_create_and_get_movement,
@@ -567,44 +565,6 @@ pub async fn test_store_vtxos_idempotent(db: &impl BarkPersister) {
 		"a repeated store must not insert a second row");
 }
 
-pub async fn test_fallback_status_keeps_commitment_and_exit_state(db: &impl BarkPersister) {
-	let coin = &VTXO_VECTORS.board_vtxo;
-	let exited = &VTXO_VECTORS.round1_vtxo;
-	let holder = Some(MovementId::new(42).into());
-	let locked = VtxoState::Locked { holder: holder.clone() };
-	db.store_vtxos(&[(coin, &locked), (exited, &VtxoState::Exited)]).await.unwrap();
-	let pending = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Pending).await.unwrap();
-	assert_eq!(pending.state, locked, "a pending decision preserves its original holder");
-	assert_eq!(pending.fallback_status, Some(FallbackStatus::Pending));
-	db.release_vtxo_lock(coin.id(), holder.as_ref()).await.unwrap();
-	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
-	for state in [VtxoState::Spendable, VtxoState::Spent] {
-		assert!(db.update_vtxo_state_checked(coin.id(), state, VtxoStateKind::ALL).await.is_err());
-	}
-	assert!(db.remove_vtxo(coin.id()).await.is_err());
-	db.store_vtxos(&[(coin, &VtxoState::Spendable)]).await.unwrap();
-	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap(), pending);
-	let terminal = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Spent).await.unwrap();
-	assert_eq!(terminal.state, VtxoState::Spent);
-	assert_eq!(db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Spent).await.unwrap(), terminal);
-	assert_eq!(db.get_vtxos_by_state(&[VtxoStateKind::Spent]).await.unwrap(), vec![terminal]);
-	let reorg = db.set_vtxo_fallback_status(coin.id(), FallbackStatus::Pending).await.unwrap();
-	assert_eq!(reorg.state, VtxoState::Locked { holder: None });
-	assert_eq!(reorg.fallback_status, Some(FallbackStatus::Pending));
-	assert_eq!(db.get_full_vtxo(coin.id()).await.unwrap().unwrap().serialize(), coin.serialize());
-	for status in [FallbackStatus::Pending, FallbackStatus::Forfeited] {
-		let preserved = db.set_vtxo_fallback_status(exited.id(), status).await.unwrap();
-		assert_eq!(preserved.state, VtxoState::Exited, "an exposed exit keeps its ordinary observation lifecycle");
-		assert_eq!(preserved.fallback_status, Some(status));
-	}
-	let discovered = &VTXO_VECTORS.round2_vtxo;
-	let adopted = db.store_fallback_vtxo(discovered, FallbackStatus::Spent).await.unwrap();
-	assert_eq!(adopted.state, VtxoState::Spent);
-	assert_eq!(adopted.fallback_status, Some(FallbackStatus::Spent),
-		"a first-seen terminal body must not exist without its durable recheck marker");
-	assert_eq!(db.get_full_vtxo(discovered.id()).await.unwrap().unwrap().serialize(), discovered.serialize());
-}
-
 /// Insert retries cannot erase an owned lock, remove a recovery registration,
 /// or resurrect a terminal coin. The original idempotency case only repeated
 /// the SAME initial state and therefore did not exercise this contract.
@@ -1004,31 +964,14 @@ pub async fn test_settled_lightning_receive_record_and_get(db: &impl BarkPersist
 	let preimage = test_preimage();
 	let invoice = test_bolt11();
 	let amount = Amount::from_sat(12_345);
-	let association = crate::persist::models::ReceiveAssociation {
-		key_index: 7, claim_destination: None, grant_ids: vec![VTXO_VECTORS.board_vtxo.id()],
-		fallback_status: Some(FallbackStatus::Pending),
-	};
 
-	db.record_settled_lightning_receive(hash, preimage, &invoice, amount, Some(&association)).await.unwrap();
+	db.record_settled_lightning_receive(hash, preimage, &invoice, amount).await.unwrap();
 
 	let stored = db.get_settled_lightning_receive(hash).await.expect("get").expect("present");
 	assert_eq!(stored.payment_hash, hash, "payment hash round-trip");
 	assert_eq!(stored.preimage, preimage, "preimage round-trip");
 	assert_eq!(stored.invoice, invoice, "invoice round-trip");
 	assert_eq!(stored.amount, amount, "amount round-trip");
-	assert_eq!(stored.association, Some(association.clone()));
-	db.set_receive_fallback_status(hash, FallbackStatus::Spent).await.unwrap();
-	let retired = db.get_settled_lightning_receive(hash).await.unwrap().unwrap();
-	assert_eq!(retired.association.as_ref().unwrap().fallback_status, Some(FallbackStatus::Spent));
-	assert_eq!(retired.settled_at, stored.settled_at);
-	assert_eq!(db.fallback_lightning_receives().await.unwrap(), vec![retired.clone()]);
-	let changed = crate::persist::models::ReceiveAssociation { key_index: 8, ..association.clone() };
-	assert!(db.record_settled_lightning_receive(hash, preimage, &invoice, amount, Some(&changed)).await.is_err());
-	assert_eq!(db.get_settled_lightning_receive(hash).await.unwrap().unwrap(), retired);
-	db.set_receive_fallback_status(hash, FallbackStatus::Pending).await.unwrap();
-	let reorg = db.get_settled_lightning_receive(hash).await.unwrap().unwrap();
-	assert_eq!(reorg.association.as_ref().unwrap().fallback_status, Some(FallbackStatus::Pending));
-	assert_eq!(reorg.association.as_ref().unwrap().grant_ids, association.grant_ids);
 }
 
 pub async fn test_settled_lightning_receive_record_is_idempotent(db: &impl BarkPersister) {
@@ -1036,11 +979,11 @@ pub async fn test_settled_lightning_receive_record_is_idempotent(db: &impl BarkP
 	let preimage = test_preimage();
 	let invoice = test_bolt11();
 
-	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(12_345), None)
+	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(12_345))
 		.await.unwrap();
 
 	// A second record with a different amount must be a no-op: the original row wins.
-	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(999), None)
+	db.record_settled_lightning_receive(hash, preimage, &invoice, Amount::from_sat(999))
 		.await.expect("second record should be a no-op");
 
 	let stored = db.get_settled_lightning_receive(hash).await.unwrap().expect("row still present");

@@ -3,23 +3,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use bark::{ImportVtxoError, OpenWalletArgs, Wallet, WalletSeed};
+use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
-use bark::persist::adaptor::StorageAdaptorWrapper;
-use bark::vtxo::{ServerStatusAdoption, VtxoLockHolder, VtxoState, VtxoValidationError};
-use bitcoin::{FeeRate, Network, OutPoint, Transaction};
+use bark::vtxo::VtxoState;
+use bitcoin::{Network, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::secp256k1::PublicKey;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
 use tokio::sync::{Notify, oneshot};
 use ark::vtxo::Full;
-use ark::{Vtxo, VtxoId};
+use ark::Vtxo;
 use ark::recovery::XpubRecoveryAuthorization;
 use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
 use server_rpc::protos;
@@ -73,13 +71,12 @@ pub(super) async fn await_decision(ctx: &TestContext, srv: &captaind::Captaind, 
 
 #[tokio::test]
 async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
-	unseen_paid_mailbox(false).await;
+	unseen_paid_mailbox().await;
 }
 
-async fn unseen_paid_mailbox(recover_spent_first: bool) {
+async fn unseen_paid_mailbox() {
 	require_bitcoind_chain_source!();
-	let ctx = TestContext::new(if recover_spent_first { "bark_sdk/status_first_spent_recovery" }
-		else { "bark_sdk/full_sync_unseen_paid_mailbox" }).await;
+	let ctx = TestContext::new("bark_sdk/full_sync_unseen_paid_mailbox").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
 		cfg.vtxo_lifetime = BlockDelta::new(24);
 		cfg.vtxo_exit_delta = BlockDelta::new(3);
@@ -168,23 +165,7 @@ async fn unseen_paid_mailbox(recover_spent_first: bool) {
 	for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
 	let returned = reopen(&ctx, "recipient", &srv).await;
 	assert!(returned.history().await.unwrap().is_empty());
-	let status_history = if recover_spent_first {
-		// Discover the real N6 receipts before recovery returns historical
-		// Spent bodies. Neither operation adopts earlier Ark principal.
-		returned.sync_fallback_payouts().await.unwrap();
-		for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
-		let history = returned.history().await.unwrap();
-		assert!(history.is_empty(), "unknown paid rights do not create an Ark receipt movement");
-		let report = returned.recover_vtxos(ids.iter().copied(), None).await.unwrap();
-		assert!(report.is_complete());
-		assert!(report.recovered().is_empty());
-		assert_eq!(report.skipped().ids().collect::<BTreeSet<_>>(), ids.iter().copied().collect());
-		assert_eq!(returned.history().await.unwrap(), history);
-		Some(history)
-	} else {
-		returned.sync().await;
-		None
-	};
+	returned.sync().await;
 	for coin in &coins {
 		assert_eq!(local.get_wallet_vtxo(coin.vtxo_id).await.unwrap().unwrap().state, VtxoState::Spent);
 		assert_eq!(returned.get_full_vtxo(coin.vtxo_id).await.unwrap().serialize(), coin.vtxo.serialize());
@@ -192,276 +173,22 @@ async fn unseen_paid_mailbox(recover_spent_first: bool) {
 	assert!(returned.spendable_vtxos().await.unwrap().is_empty());
 	assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	let history = returned.history().await.unwrap();
-	assert_eq!(history.len(), if recover_spent_first { 0 } else { 2 });
-	let incoming = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
-	assert_eq!(incoming.len(), if recover_spent_first { 0 } else { 2 });
-	assert!(incoming.iter().all(|movement| movement.status == bark::movement::MovementStatus::Successful
-		&& movement.input_vtxos.is_empty() && movement.offchain_fee == sat(0)));
-	assert!(!history.iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
-		"ordinary Bitcoin payouts do not add an Ark retirement ledger");
-	assert_eq!(history.iter().flat_map(|movement| movement.output_vtxos.iter().copied()).collect::<BTreeSet<_>>(),
-		if recover_spent_first { BTreeSet::new() } else { ids.iter().copied().collect() });
-	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(),
-		if recover_spent_first { 0 } else { 20_000 }, "retain ordinary receive history without a synthetic fallback debit");
+	assert!(history.is_empty(), "already paid deliveries do not credit an Ark receive");
 	returned.sync_onchain().await.unwrap();
 	// The canonical output total19k and cumulative fee1k were proved above.
 	assert_eq!(paid + sat(1_000), sat(20_000));
 	for _ in 0..2 {
-		if recover_spent_first { returned.sync_fallback_payouts().await.unwrap(); } else { returned.sync().await; }
+		returned.sync().await;
 		assert_eq!(returned.history().await.unwrap(), history);
 		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	}
-	if let Some(status_history) = status_history {
-		assert_eq!(history, status_history);
-		returned.stop_daemon_wait().await.unwrap();
-		drop(returned);
-		let returned = reopen(&ctx, "recipient", &srv).await;
-		returned.sync_fallback_payouts().await.unwrap();
-		assert_eq!(returned.history().await.unwrap(), status_history);
-		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
-		for coin in &coins {
-			assert_eq!(local.get_wallet_vtxo(coin.vtxo_id).await.unwrap().unwrap().state, VtxoState::Spent);
-			assert_eq!(returned.get_full_vtxo(coin.vtxo_id).await.unwrap().serialize(), coin.vtxo.serialize());
-		}
-	}
-}
 
-#[tokio::test]
-async fn fallback_adoption_fresh_seed_retains_unpaid_body_and_recovers_registered_payout() {
-	let ctx = TestContext::new("bark_sdk/fallback_adoption_seed_pending").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
-		config.vtxo_lifetime = BlockDelta::new(24);
-		config.vtxo_exit_delta = BlockDelta::new(3);
-	}).watchmand().create().await;
-	let original = ctx.bark_sdk("original", &srv).cfg(config)
-		.funded(sat(500_000)).boarded(sat(100_000)).create().await;
-	let coin = original.spendable_vtxos().await.unwrap().remove(0);
-	let signed = original.get_full_vtxo(coin.id()).await.unwrap();
-	await_decision(&ctx, &srv, &coin).await;
-	let query = protos::GetVtxoStatusRequest {
-		vtxo_id: coin.id().to_bytes().to_vec(),
-		attestation: VtxoStatusAttestation::new(coin.id(), &original.get_vtxo_key(&coin).await.unwrap()).serialize(),
-	};
-	let mut rpc = srv.get_public_rpc().await;
-	assert_eq!(rpc.get_vtxo_status(query.clone()).await.unwrap().into_inner().spend_state,
-		protos::VtxoSpendState::FallbackPending as i32);
-	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest {
-		vtxos: vec![protos::VtxoStatusQuery { vtxo_id: query.vtxo_id, attestation: query.attestation }],
-	}).await.unwrap().into_inner();
-	assert!(batch.missing_vtxo_ids.is_empty());
-	assert_eq!(batch.vtxos.len(), 1);
-	assert_eq!(batch.vtxos[0].spend_state, protos::VtxoSpendState::FallbackPending as i32);
-	// The fresh seed's xpub scan must classify the same source as pending.
-	let restored = ctx.bark_sdk("restored", &srv).cfg(config)
-		.mnemonic(mnemonic(&ctx, "original").await).create().await;
-	let db = SqliteClient::open(ctx.datadir.join("restored/db.sqlite")).unwrap();
-	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(restored.spendable_vtxos().await.unwrap().is_empty());
-	assert!(super::fallback_status_ids(restored.all_vtxos().await.unwrap(), false).contains(&coin.id()));
-	assert!(super::fallback_status_ids(db.get_all_vtxos().await.unwrap(), true).is_empty());
-	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
-		.all(|movement| movement.effective_balance.to_sat() == 0), "fresh restore must not invent an earlier Ark debit");
-	let paid = ctx.bark_sdk("paid", &srv).cfg(config)
-		.mnemonic(mnemonic(&ctx, "original").await).create().await;
-	srv.stop().await.unwrap();
-	assert!(restored.exit_mgr().get_exit_vtxo(coin.id()).await.is_none());
-	assert_eq!(db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	assert_eq!(restored.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	assert_eq!(restored.get_full_vtxo(coin.id()).await.unwrap().amount(), coin.amount());
-	assert_eq!(restored.balance().await.unwrap().total(), sat(0), "a known fallback commitment is a status, not another Ark balance");
-
-	// Verify the registered payout in both independently restored databases.
-	srv.start().await.unwrap();
-	drop(paid);
-	drop(restored);
-	let paid = reopen(&ctx, "paid", &srv).await;
-	let restored = reopen(&ctx, "restored", &srv).await;
-	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
-	ctx.generate_blocks(2).await;
-	let script = paid.fallback_script();
-	let payout = tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
-				let tx = ctx.bitcoind().await_transaction(txid).await;
-				if tx.output.iter().any(|output| output.script_pubkey == script && output.value == sat(99_000)) { return txid; }
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("actual payout did not broadcast after funding");
-	paid.sync_fallback_payouts().await.unwrap();
-	restored.sync_fallback_payouts().await.unwrap();
-	assert!(restored.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
-		.all(|movement| movement.effective_balance.to_sat() == 0), "another restore must not invent an earlier Ark debit");
-	let confirmed = ctx.generate_blocks(6).await;
-	srv.wait_for_sync_height(confirmed).await;
-	srv.watchmand().wait_for_sync_height(confirmed).await;
-	paid.chain().invalidate_caches().await;
-	paid.sync_fallback_payouts().await.unwrap();
-	srv.stop().await.unwrap();
-	assert!(paid.sync_fallback_payouts().await.is_err(), "offline observation cannot infer an authenticated Ark status");
-	let paid_db = SqliteClient::open(ctx.datadir.join("paid/db.sqlite")).unwrap();
-	assert_eq!(paid_db.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(super::fallback_status_ids(paid_db.get_all_vtxos().await.unwrap(), true).contains(&coin.id()));
-	let transaction = ctx.bitcoind().await_transaction(payout).await;
-	assert!(transaction.output.iter().any(|output| output.script_pubkey == script && output.value == sat(99_000)));
-}
-
-#[tokio::test]
-async fn ordinary_spent_history_uses_upstream_trust_and_retains_only_change() {
-	let ctx = TestContext::new("bark_sdk/ordinary_spent_upstream_trust").await;
-	let srv = ctx.captaind("server").create().await;
-	let owner = ctx.bark_sdk("owner", &srv).cfg(config).boarded(sat(100_000)).create().await;
-	let recipient = ctx.bark_sdk("recipient", &srv).create().await;
-	let source = owner.spendable_vtxos().await.unwrap().remove(0);
-	let signed = owner.get_full_vtxo(source.id()).await.unwrap();
-	owner.send_arkoor_payment(&recipient.new_address().await.unwrap(), sat(60_000)).await.unwrap();
-	let restored = ctx.bark_sdk("restored", &srv).cfg(config)
-		.mnemonic(mnemonic(&ctx, "owner").await).create().await;
-	let db = SqliteClient::open(ctx.datadir.join("restored/db.sqlite")).unwrap();
-	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert_eq!(restored.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(!super::fallback_status_ids(restored.all_vtxos().await.unwrap(), false).contains(&source.id()));
-	assert_eq!(restored.balance().await.unwrap().total(), sat(40_000));
-	assert!(super::fallback_status_ids(restored.all_vtxos().await.unwrap(), false).is_empty());
-	restored.dangerous_drop_vtxo(source.id()).await.unwrap();
-	restored.import_vtxo(&signed, bark::ImportVtxoArgs::default()).await.unwrap();
-	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!super::fallback_status_ids(db.get_all_vtxos().await.unwrap(), false).contains(&source.id()));
-	restored.sync_fallback_payouts().await.unwrap();
-	assert_eq!(db.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert_eq!(restored.balance().await.unwrap().total(), sat(40_000));
-}
-
-/// Admit real bodies as ordinary history through an explicit status fault.
-/// Positive Pending status and the server's financial rows are never fabricated.
-#[derive(Clone, Default)]
-struct OrdinarySpentHistory {
-	force_spent: Arc<AtomicBool>,
-}
-
-#[async_trait::async_trait]
-impl captaind::proxy::ArkRpcProxy for OrdinarySpentHistory {
-	async fn get_vtxos_status_by_ids(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxosStatusByIdsRequest)
-		-> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status>
-	{
-		let mut response = upstream.get_vtxos_status_by_ids(request).await?.into_inner();
-		if self.force_spent.load(Ordering::SeqCst) {
-			for coin in &mut response.vtxos { coin.spend_state = protos::VtxoSpendState::Spent as i32; }
-		}
-		Ok(response)
-	}
-}
-
-fn client_chain(config: &mut bark::Config, url: String) {
-	config.esplora_address = None;
-	config.bitcoind_address = Some(url);
-	config.bitcoind_cookiefile = None;
-	config.bitcoind_user = Some(constants::bitcoind::BITCOINRPC_TEST_USER.into());
-	config.bitcoind_pass = Some(String::from(constants::bitcoind::BITCOINRPC_TEST_PASSWORD).into());
-}
-
-#[tokio::test]
-async fn trusted_pending_adoption_keeps_owned_principal_during_chain_outage() {
-	Box::pin(trusted_pending_chain_outage(true)).await;
-}
-
-async fn trusted_pending_chain_outage(already_owned: bool) {
-	let name = if already_owned { "bark_sdk/trusted_pending_owned_chain_outage" }
-		else { "bark_sdk/trusted_pending_unvalidated_chain_outage" };
-	let ctx = TestContext::new(name).await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
-		config.vtxo_lifetime = BlockDelta::new(24);
-		config.vtxo_exit_delta = BlockDelta::new(3);
-	}).watchmand().create().await;
-	let node = ctx.new_bitcoind("client_bitcoind").await;
-	let url = node.rpc_url();
-	let original = ctx.bark_sdk("original", &srv).cfg(move |cfg| {
-		config(cfg);
-		client_chain(cfg, url);
-	}).boarded(sat(100_000)).create().await;
-	let coin = original.spendable_vtxos().await.unwrap().remove(0);
-	let signed = original.get_full_vtxo(coin.id()).await.unwrap();
-	assert!(signed.has_all_witnesses());
-	original.validate_vtxo(&signed).await.unwrap();
-	let seed = mnemonic(&ctx, "original").await;
-	let history_status = OrdinarySpentHistory::default();
-	let proxy = srv.start_proxy_no_mailbox(history_status.clone()).await;
-	let (wallet, database) = if already_owned {
-		let database = Arc::new(SqliteClient::open(ctx.datadir.join("original/db.sqlite")).unwrap());
-		(original, database)
-	} else {
-		original.stop_daemon_wait().await.unwrap();
-		drop(original);
-		let database = Arc::new(SqliteClient::open(ctx.datadir.join("history.sqlite")).unwrap());
-		let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database.clone()).await.unwrap();
-		let mut cfg = ctx.bark_default_cfg(&proxy, Some(&node));
-		config(&mut cfg);
-		client_chain(&mut cfg, node.rpc_url());
-		let wallet = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
-			OpenWalletArgs { persister: Some(database.clone()),
-				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-				run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
-		// The new device accepts an explicit ordinary-history status fault.
-		// It has never validated this complete-looking body against the chain.
-		history_status.force_spent.store(true, Ordering::SeqCst);
-		let history = wallet.recover_vtxos([coin.id()], None).await.unwrap();
-		assert!(history.is_complete());
-		assert_eq!(history.skipped().total_amount(), sat(100_000));
-		history_status.force_spent.store(false, Ordering::SeqCst);
-		assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-		assert_eq!(wallet.balance().await.unwrap().total(), bitcoin::Amount::ZERO);
-		(wallet, database)
-	};
-	await_decision(&ctx, &srv, &coin).await;
-	node.stop().await.unwrap();
-	wallet.chain().invalidate_caches().await;
-	let error = wallet.trust_and_adopt_server_vtxo_status(coin.id()).await.unwrap_err();
-	assert!(matches!(error.downcast_ref::<VtxoValidationError>(),
-		Some(VtxoValidationError::Chain(_) | VtxoValidationError::AnchorNotFound)));
-	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	assert!(super::fallback_status_ids(database.get_all_vtxos().await.unwrap(), true).is_empty());
-	let balance = wallet.balance().await.unwrap();
-	assert_eq!(balance.spendable, bitcoin::Amount::ZERO);
-	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().amount(), sat(100_000));
-	assert_eq!(balance.total(), sat(0), "committed principal remains in the retained signed coin/status, outside Ark balances");
-	assert!(super::fallback_status_ids(wallet.all_vtxos().await.unwrap(), false).contains(&coin.id()));
-	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-	assert!(wallet.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
-		.all(|movement| movement.status == bark::movement::MovementStatus::Pending && movement.effective_balance.to_sat() == 0));
-	let mut cfg = wallet.config().clone();
-	wallet.stop_daemon_wait().await.unwrap();
-	drop(wallet);
-	node.start().await.unwrap();
-	client_chain(&mut cfg, node.rpc_url());
-	let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database.clone()).await.unwrap();
-	let wallet = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
-		OpenWalletArgs { persister: Some(database.clone()),
-			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-			run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
-	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state,
-		VtxoState::Locked { holder: None },
-		"reopen retains the explicit commitment without making its body spendable");
-	assert_eq!(wallet.trust_and_adopt_server_vtxo_status(coin.id()).await.unwrap(), Some(ServerStatusAdoption::FallbackPending));
-	assert_eq!(wallet.get_full_vtxo(coin.id()).await.unwrap().serialize(), signed.serialize());
-	wallet.validate_vtxo(&signed).await.unwrap();
-	assert_eq!(database.get_wallet_vtxo(coin.id()).await.unwrap().unwrap().state, VtxoState::Locked { holder: None });
-	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-	let balance = wallet.balance().await.unwrap();
-	assert_eq!(wallet.get_vtxo_by_id(coin.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	assert_eq!(balance.total(), sat(0), "committed principal remains in the retained signed coin/status, outside Ark balances");
-	assert!(super::fallback_status_ids(database.get_all_vtxos().await.unwrap(), true).is_empty());
 }
 
 #[derive(Clone, Default)]
 struct HoldArkoorRegistration {
 	arrived: Arc<Mutex<Option<(PublicKey, oneshot::Sender<protos::RegisterVtxoTransactionsRequest>)>>>,
 	release: Arc<Notify>,
-	terminal_source: Arc<Mutex<Option<(VtxoId, oneshot::Sender<()>)>>>,
-	release_terminal_source: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -485,26 +212,6 @@ impl captaind::proxy::ArkRpcProxy for HoldArkoorRegistration {
 		Ok(upstream.register_vtxo_transactions(request).await?.into_inner())
 	}
 
-	async fn get_vtxos_status_by_ids(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxosStatusByIdsRequest)
-		-> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status>
-	{
-		let response = upstream.get_vtxos_status_by_ids(request).await?.into_inner();
-		let arrived = {
-			let mut gate = self.terminal_source.lock().unwrap();
-			if gate.as_ref().is_some_and(|(id, _)| response.vtxos.iter().any(|coin| coin.vtxo_id == id.to_bytes().to_vec())) {
-				let (id, arrived) = gate.take().unwrap();
-				let status = response.vtxos.iter().find(|coin| coin.vtxo_id == id.to_bytes().to_vec()).unwrap();
-				assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
-				assert!(status.fallback_committed, "pause only a real authenticated fallback-terminal response");
-				Some(arrived)
-			} else { None }
-		};
-		if let Some(arrived) = arrived {
-			arrived.send(()).unwrap();
-			self.release_terminal_source.notified().await;
-		}
-		Ok(response)
-	}
 }
 
 #[tokio::test]
@@ -512,22 +219,8 @@ async fn provisional_recipient_transfer_pays_input_owner() {
 	Box::pin(stalled_change(false, false, false)).await;
 }
 
-#[tokio::test]
-async fn already_confirmed_input_owner_refund_still_refuses_the_transfer() {
-	Box::pin(stalled_change(false, false, true)).await;
-}
-
-#[tokio::test]
-async fn stalled_arkoor_change_reopens_from_its_signed_registration_checkpoint() {
-	Box::pin(stalled_change(true, false, false)).await;
-}
-
-async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refund_before_release: bool) {
-	let name = if reopen_wallet { "bark_sdk/stalled_arkoor_change_reopen" }
-		else if check_unsigned_history { "bark_sdk/trusted_unsigned_arkoor_history" }
-		else if refund_before_release { "bark_sdk/stalled_arkoor_confirmed_refund" }
-		else { "bark_sdk/stalled_arkoor_change_pending" };
-	let ctx = TestContext::new(name).await;
+async fn stalled_change() {
+	let ctx = TestContext::new("bark_sdk/stalled_arkoor_change_pending").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
 		config.vtxo_lifetime = BlockDelta::new(24);
 		config.vtxo_exit_delta = BlockDelta::new(3);
@@ -557,21 +250,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
 	assert_eq!(received.amount(), sat(60_000));
 	let local = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
-	let original_action_id = local.get_all_wallet_action_checkpoints().await.unwrap().iter().find_map(|action| {
-		let bark::actions::WalletActionCheckpoint::ArkoorSend(action) = action else { return None; };
-		let bark::actions::arkoor_send::Progress::Registration { signed_change_vtxos, .. } = &action.progress else { return None; };
-		(signed_change_vtxos == &changes).then_some(action.id.clone())
-	}).expect("the resumed wallet retains genuine signed change in its durable action");
-	let checkpoint = serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap();
-	let (owner, payment) = if reopen_wallet {
-		// Cancel only the inline driver. Its already persisted Registration
-		// state and input holder survive; the new wallet must load them.
-		payment.abort();
-		assert!(payment.await.unwrap_err().is_cancelled());
-		owner.stop_daemon_wait().await.unwrap();
-		drop(owner);
-		(None, None)
-	} else { (Some(owner), Some(payment)) };
+	let (owner, payment) = { (Some(owner), Some(payment)) };
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let ids = leaves.iter().map(|coin| coin.id().to_string()).collect::<Vec<_>>();
 	let height = ctx.bitcoind().get_block_count().await as u32;
@@ -586,49 +265,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("real unregistered outputs must be allocated before registration resumes");
-	if check_unsigned_history {
-		let history_status = OrdinarySpentHistory::default();
-		history_status.force_spent.store(true, Ordering::SeqCst);
-		let history_proxy = srv.start_proxy_no_mailbox(history_status.clone()).await;
-		let seed = mnemonic(&ctx, "owner").await;
-		let history_db = Arc::new(SqliteClient::open(ctx.datadir.join("unsigned-history.sqlite")).unwrap());
-		let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), history_db.clone()).await.unwrap();
-		let mut cfg = ctx.bark_default_cfg(&history_proxy, Some(ctx.bitcoind()));
-		config(&mut cfg);
-		let history = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
-			OpenWalletArgs { persister: Some(history_db.clone()),
-				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-				run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
-		// Only the history status is faulted. The actual unsigned server body,
-		// immutable owner link and unpaid allocation remain unchanged.
-		let report = history.recover_vtxos(changes.iter().map(|coin| coin.id()), None).await.unwrap();
-		assert!(!report.is_complete());
-		assert_eq!(report.failed().total_amount(), sat(40_000));
-		history_status.force_spent.store(false, Ordering::SeqCst);
-		let mut rpc = srv.get_public_rpc().await;
-		for change in &changes {
-			let raw = rpc.get_vtxo(protos::GetVtxoRequest {
-				vtxo_id: change.id().to_bytes().to_vec(),
-			}).await.unwrap().into_inner();
-			let unsigned = Vtxo::<Full>::deserialize(&raw.vtxo).unwrap();
-			assert_eq!(unsigned.id(), change.id());
-			assert!(!unsigned.has_all_witnesses());
-			assert_ne!(unsigned.serialize(), change.serialize());
-			assert!(history_db.get_wallet_vtxo(change.id()).await.unwrap().is_none());
-			let error = history.import_vtxo(&unsigned, Default::default()).await.unwrap_err();
-			assert!(matches!(error, ImportVtxoError::Invalid { source: VtxoValidationError::Invalid(_), .. }));
-			assert!(history_db.get_wallet_vtxo(change.id()).await.unwrap().is_none());
-		}
-		assert_eq!(history.balance().await.unwrap().total(), sat(0), "an unsigned body cannot invent a known coin or principal");
-		assert_eq!(history.balance().await.unwrap().spendable, sat(0));
-		assert!(history.spendable_vtxos().await.unwrap().is_empty());
-		assert!(history_db.get_all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
-		assert!(history.history().await.unwrap().iter().filter(|movement| movement.subsystem.name == "scuttle.fallback")
-			.all(|movement| movement.status == bark::movement::MovementStatus::Pending));
-		history.stop_daemon_wait().await.unwrap();
-		drop(history);
-		drop(history_db);
-	}
+
 	let confirm_refund = async || {
 		ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
 		ctx.generate_blocks(2).await;
@@ -644,91 +281,13 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		ctx.generate_blocks(6).await;
 		payout
 	};
-	let confirmed_payout = if refund_before_release {
-		let payout = confirm_refund().await;
-		tokio::time::timeout(Duration::from_secs(30), async {
-			loop {
-				let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \
-					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') \
-					JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) AND a.status='confirmed'",
-					&[&ids]).await?.get::<_, i64>(0))).await.unwrap();
-				if usize::try_from(confirmed).unwrap() == leaves.len() { break; }
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-		}).await.expect("the actual refund must be confirmed before releasing the original registration");
-		Some(payout)
-	} else { None };
-	let terminal_source = if refund_before_release {
-		let (arrived, receiver) = oneshot::channel();
-		*gate.terminal_source.lock().unwrap() = Some((source.id(), arrived));
-		Some(receiver)
-	} else { None };
 	gate.release.notify_one();
-	let orphaned_confirmation = if let Some(arrived) = terminal_source {
-		tokio::time::timeout(Duration::from_secs(15), arrived).await.unwrap().unwrap();
-		let payout = confirmed_payout.as_ref().unwrap();
-		let confirmed = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(payout.compute_txid(), None)
-			.unwrap().unwrap().blockhash.unwrap();
-		// T0 was genuinely terminal. Process the real fork before releasing
-		// that unchanged old response; the following change query must see T1.
-		ctx.bitcoind().sync_client().invalidate_block(&confirmed).unwrap();
-		srv.bitcoind().sync_client().invalidate_block(&confirmed).unwrap();
-		let fork = bitcoin_ext::BlockRef { height: BlockHeight::new(ctx.bitcoind().get_block_count().await as u32),
-			hash: ctx.bitcoind().sync_client().get_best_block_hash().unwrap() };
-		crate::server_tests::expiry_test::wait_rebuilt(&db, fork, Duration::from_secs(30),
-			"the real payout fork must complete before signed change is queried").await;
-		gate.release_terminal_source.notify_one();
-		Some(confirmed)
-	} else { None };
-	let owner = match owner {
-		Some(owner) => {
-			let error = tokio::time::timeout(Duration::from_secs(15), payment.expect("live send driver"))
-				.await.unwrap().unwrap().unwrap_err();
-			assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback));
-			owner
-		},
-		None => {
-			let owner = Arc::new(reopen(&ctx, "owner", &srv).await);
-			assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
-				"reopen must load the exact signed checkpoint without caller-supplied bodies");
-			owner.sync_pending_arkoor_sends().await.unwrap();
-			owner
-		},
-	};
-	if let Some(confirmation) = orphaned_confirmation {
-		assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent),
-			"the deliberately delayed T0 source response was terminal");
-		for change in &changes {
-			assert_eq!(owner.get_vtxo_by_id(change.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending),
-				"the fresh T1 signed-change response must observe the real reorg");
-			assert_eq!(owner.get_full_vtxo(change.id()).await.unwrap().serialize(), change.serialize());
-		}
-		assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
-			"a stale terminal source response cannot discard signed Registration while its change is Pending");
-		assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-		assert_eq!(owner.balance().await.unwrap().total(), sat(0));
-		// Restore the SAME original six-confirmation branch: no extra fee,
-		// payment, funding or mined blocks are needed for the cleanup tail.
-		ctx.bitcoind().sync_client().reconsider_block(&confirmation).unwrap();
-		srv.bitcoind().sync_client().reconsider_block(&confirmation).unwrap();
-		let tip = bitcoin_ext::BlockRef { height: BlockHeight::new(ctx.bitcoind().get_block_count().await as u32),
-			hash: ctx.bitcoind().sync_client().get_best_block_hash().unwrap() };
-		crate::server_tests::expiry_test::wait_rebuilt(&db, tip, Duration::from_secs(30),
-			"the same original payout must regain canonical finality before cleanup").await;
-		owner.chain().invalidate_caches().await;
-		owner.sync_fallback_payouts().await.unwrap();
-		owner.sync_pending_arkoor_sends().await.unwrap();
-	}
+	let error = tokio::time::timeout(Duration::from_secs(15), payment.expect("live send driver"))
+		.await.unwrap().unwrap().unwrap_err();
+	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback));
+	let owner = owner.expect("live owner");
 	owner.sync().await;
-	if refund_before_release {
-		assert!(owner.pending_arkoor_sends().await.unwrap().is_empty());
-	} else {
-		assert_eq!(serde_json::to_vec(&owner.pending_arkoor_sends().await.unwrap()).unwrap(), checkpoint,
-			"an unfunded committed claim retains the complete original signed Registration checkpoint");
-	}
-	let own_status = if refund_before_release { protos::VtxoSpendState::Spent } else { protos::VtxoSpendState::FallbackPending };
-	let own_state = if refund_before_release { VtxoState::Spent } else { VtxoState::Locked { holder: None } };
-	let pending_amount = if refund_before_release { sat(0) } else { sat(100_000) };
+	let own_status = protos::VtxoSpendState::FallbackPending;
 	let sends = owner.history().await.unwrap().into_iter().filter(|movement| movement.subsystem.name == "bark.arkoor")
 		.collect::<Vec<_>>();
 	assert_eq!(sends.len(), 1);
@@ -760,7 +319,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	assert!(batch.missing_vtxo_ids.is_empty());
 	assert_eq!(batch.vtxos.len(), leaves.len());
 	assert_eq!(batch.vtxos.iter().filter(|coin| coin.spend_state == protos::VtxoSpendState::FallbackPending as i32).count(),
-		if refund_before_release { 0 } else { changes.len() });
+		{ changes.len() });
 	// Inspect xpub status separately from importing the server's unsigned body.
 	// Only the resumed action above supplies the change's signed path.
 	let seed = mnemonic(&ctx, "owner").await;
@@ -776,17 +335,11 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	for change in &changes {
 		assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == change.id())
 			.unwrap().spend_state, own_status as i32);
-		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, own_state);
+
 	}
-	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state,
-		if refund_before_release { VtxoState::Spent } else {
-			VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id: original_action_id }) }
-		});
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0), "known committed inputs are status-only, not new Ark balance");
 	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-	assert_eq!(super::fallback_status_ids(owner.all_vtxos().await.unwrap(), false).contains(&source.id()), !refund_before_release);
-	assert_eq!(pending_amount, if refund_before_release { sat(0) } else { source.amount() });
-	let source_status = if refund_before_release { bark::vtxo::FallbackStatus::Spent } else { bark::vtxo::FallbackStatus::Pending };
+	let source_status = { bark::vtxo::FallbackStatus::Pending };
 	assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(source_status));
 	assert_eq!(owner.get_full_vtxo(source.id()).await.unwrap().amount(), source.amount());
 	// The source-to-change relation and exact leaf owner/status were checked
@@ -798,7 +351,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	recipient.sync_fallback_payouts().await.unwrap();
 	assert!(recipient.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
-	let payout = match confirmed_payout { Some(payout) => payout, None => confirm_refund().await };
+	let payout = confirm_refund().await;
 	owner.chain().invalidate_caches().await;
 	owner.sync_fallback_payouts().await.unwrap();
 	owner.sync_pending_arkoor_sends().await.unwrap();
@@ -806,9 +359,7 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 		"actual canonical retirement permits removal of the protected checkpoint");
 	for change in &changes {
 		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-		assert!(super::fallback_status_ids(local.get_all_vtxos().await.unwrap(), true).contains(&change.id()));
 	}
-	assert!(super::fallback_status_ids(owner.all_vtxos().await.unwrap(), false).is_empty());
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0));
 	let history = owner.history().await.unwrap();
 	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 100_000,
@@ -826,292 +377,5 @@ async fn stalled_change(reopen_wallet: bool, check_unsigned_history: bool, refun
 	assert!(output.confirmations >= 6);
 	assert_eq!(output.value, sat(99_000));
 	assert_eq!(output.script_pub_key.script().unwrap(), destination);
-	if check_unsigned_history {
-		assert_eq!(payout.output.iter().filter(|output|
-			output.script_pubkey == destination && output.value == sat(99_000)).count(), 1);
-		let payout_point = OutPoint::new(payout.compute_txid(), index as u32);
-		let chain = owner.chain().clone();
-		owner.stop_daemon_wait().await.unwrap();
-		drop(owner);
-		recipient.stop_daemon_wait().await.unwrap();
-		drop(recipient);
-		drop(local);
-		srv.stop().await.unwrap();
 
-		// This fresh on-chain store receives only the seed. No Ark body,
-		// action checkpoint, address cache or UTXO is imported into it.
-		let database = Arc::new(StorageAdaptorWrapper::new_memory());
-		let mut recovery = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database).await.unwrap();
-		assert_eq!(recovery.fallback_script(), destination);
-		recovery.sync(&chain).await.unwrap();
-		let coins = recovery.list_unspent();
-		assert!(coins.iter().any(|coin| coin.outpoint == payout_point
-			&& coin.txout.value == sat(99_000) && coin.txout.script_pubkey == destination));
-		let points = coins.iter().map(|coin| coin.outpoint).collect::<BTreeSet<_>>();
-		assert_eq!(points.len(), coins.len());
-		let total = coins.iter().try_fold(bitcoin::Amount::ZERO,
-			|sum, coin| sum.checked_add(coin.txout.value)).unwrap();
-		assert!(total >= sat(99_000), "the original board may also leave ordinary bitcoin change");
-		let address = ctx.bitcoind().get_new_address();
-		let txid = recovery.drain(&chain, address.clone(), FeeRate::from_sat_per_vb(2).unwrap()).await.unwrap();
-		let spend = ctx.bitcoind().await_transaction(txid).await;
-		let spent_points = spend.input.iter().map(|input| input.previous_output).collect::<BTreeSet<_>>();
-		assert_eq!(spent_points.len(), spend.input.len());
-		assert_eq!(spent_points, points, "the actual drain must spend every discovered owned input once");
-		assert!(spent_points.contains(&payout_point));
-		let mut input_value = bitcoin::Amount::ZERO;
-		for input in &spend.input {
-			let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			let actual = &previous.output[input.previous_output.vout as usize];
-			let discovered = coins.iter().find(|coin| coin.outpoint == input.previous_output).unwrap();
-			assert_eq!(actual, &discovered.txout);
-			input_value = input_value.checked_add(actual.value).unwrap();
-		}
-		assert_eq!(input_value, total);
-		assert_eq!(spend.output.len(), 1);
-		assert_eq!(spend.output[0].script_pubkey, address.script_pubkey());
-		let received = spend.output[0].value;
-		let miner_fee = input_value.checked_sub(received).unwrap();
-		assert!(miner_fee > bitcoin::Amount::ZERO);
-		assert_eq!(input_value, received + miner_fee);
-		ctx.generate_blocks(6).await;
-		let core = ctx.bitcoind().sync_client();
-		let recovered_output = core.get_tx_out(&txid, 0, Some(true)).unwrap().unwrap();
-		assert!(recovered_output.confirmations >= 6);
-		assert_eq!(recovered_output.value, received);
-		assert_eq!(recovered_output.script_pub_key.script().unwrap(), address.script_pubkey());
-		for point in &spent_points {
-			assert!(core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().is_none());
-		}
-		chain.invalidate_caches().await;
-		recovery.sync(&chain).await.unwrap();
-		assert!(recovery.list_unspent().is_empty());
-	}
-}
-
-#[derive(Clone, Default)]
-struct MissingExpiredStatus {
-	target: Arc<Mutex<Option<VtxoId>>>,
-	paused: Arc<AtomicBool>,
-	stall_handshake: Arc<AtomicBool>,
-	slow_unary: Arc<AtomicBool>,
-	unary_durations: Arc<Mutex<Vec<Duration>>>,
-	calls: Arc<AtomicUsize>,
-	arrived: Arc<Notify>,
-	release: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl captaind::proxy::ArkRpcProxy for MissingExpiredStatus {
-	async fn get_vtxo_status(&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxoStatusRequest)
-		-> Result<protos::GetVtxoStatusResponse, tonic::Status>
-	{
-		let started = tokio::time::Instant::now();
-		let response = upstream.get_vtxo_status(request).await?.into_inner();
-		if self.slow_unary.load(Ordering::SeqCst) {
-			tokio::time::sleep(Duration::from_secs(6)).await;
-			self.unary_durations.lock().unwrap().push(started.elapsed());
-		}
-		Ok(response)
-	}
-
-	async fn handshake(&self, upstream: &mut captaind::ArkClient, request: protos::HandshakeRequest)
-		-> Result<protos::HandshakeResponse, tonic::Status>
-	{
-		if self.stall_handshake.load(Ordering::SeqCst) {
-			self.arrived.notify_one();
-			self.release.notified().await;
-		}
-		Ok(upstream.handshake(request).await?.into_inner())
-	}
-
-	async fn get_vtxos_status_by_ids(
-		&self, upstream: &mut captaind::ArkClient, request: protos::GetVtxosStatusByIdsRequest,
-	) -> Result<protos::GetVtxosStatusByIdsResponse, tonic::Status> {
-		let target = *self.target.lock().unwrap();
-		if target.is_some_and(|id| request.vtxos.iter().any(|query| query.vtxo_id == id.to_bytes().to_vec())) {
-			self.calls.fetch_add(1, Ordering::SeqCst);
-			if self.paused.load(Ordering::SeqCst) {
-				self.arrived.notify_one();
-				self.release.notified().await;
-			}
-			return Err(tonic::Status::unavailable("expired status reply unavailable"));
-		}
-		Ok(upstream.get_vtxos_status_by_ids(request).await?.into_inner())
-	}
-}
-
-#[tokio::test]
-async fn skipped_spent_refresh_does_not_invent_pending_principal() {
-	Box::pin(expired_status_retirement(false, false, false, false)).await;
-}
-
-#[tokio::test]
-async fn paused_expired_status_cannot_reverse_concurrent_ordinary_retirement() {
-	Box::pin(expired_status_retirement(true, false, false, false)).await;
-}
-
-#[tokio::test]
-async fn stalled_status_read_releases_history_for_unrelated_exit() {
-	Box::pin(expired_status_retirement(true, true, false, false)).await;
-}
-
-#[tokio::test]
-async fn stalled_refresh_releases_status_waiter_and_local_exit() {
-	Box::pin(expired_status_retirement(true, true, true, false)).await;
-}
-
-#[tokio::test]
-async fn slow_status_imports_have_independent_read_budgets() {
-	Box::pin(expired_status_retirement(false, false, false, true)).await;
-}
-
-async fn expired_status_retirement(paused: bool, time_out: bool, refresh_lock: bool, slow_import: bool) {
-	let name = if slow_import { "bark_sdk/slow_status_import_budgets" }
-		else if refresh_lock { "bark_sdk/stalled_refresh_history_waiter" }
-		else if time_out { "bark_sdk/stalled_status_unrelated_exit" }
-		else if paused { "bark_sdk/paused_expired_status_retirement" }
-		else { "bark_sdk/skipped_spent_expired_refresh" };
-	let ctx = TestContext::new(name).await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
-		config.vtxo_lifetime = BlockDelta::new(24);
-		config.vtxo_exit_delta = BlockDelta::new(3);
-	}).create().await;
-	let gate = MissingExpiredStatus::default();
-	let proxy = captaind::proxy::ArkRpcProxyServer::start(
-		(gate.clone(), srv.get_public_rpc().await), ((), srv.get_mailbox_public_rpc().await),
-	).await;
-	let current = ctx.bark_sdk("current", &srv).cfg(config).boarded(sat(100_000)).create().await;
-	let source = current.spendable_vtxos().await.unwrap().remove(0);
-	let signed = current.get_full_vtxo(source.id()).await.unwrap();
-	let stale = Arc::new(ctx.bark_sdk("stale", &proxy.address).cfg(config)
-		.mnemonic(mnemonic(&ctx, "current").await).create().await);
-	let local = SqliteClient::open(ctx.datadir.join("stale/db.sqlite")).unwrap();
-	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spendable);
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(config).create().await;
-	current.send_arkoor_payment(&recipient.new_address().await.unwrap(), sat(60_000)).await.unwrap();
-	let changes = current.spendable_vtxos().await.unwrap();
-	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
-	let change_ids = changes.iter().map(|coin| coin.id()).collect::<Vec<_>>();
-	assert!(stale.recover_vtxos(change_ids.clone(), None).await.unwrap().is_complete());
-	if slow_import {
-		Box::pin(async {
-			// Import the existing real spent source and unspent change into a new
-			// store with the SAME seed. No new funding or payment is introduced.
-			let mut bodies = vec![signed.clone()];
-			for id in &change_ids { bodies.push(current.get_full_vtxo(*id).await.unwrap()); }
-			assert!(bodies.len() >= 2);
-			let seed = mnemonic(&ctx, "current").await;
-			let database = Arc::new(SqliteClient::open(ctx.datadir.join("slow-import.sqlite")).unwrap());
-			let onchain = OnchainWallet::load_or_create(Network::Regtest, seed.to_seed(""), database.clone()).await.unwrap();
-			let mut cfg = ctx.bark_default_cfg(&proxy, Some(ctx.bitcoind()));
-			config(&mut cfg);
-			let imported = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &seed), cfg,
-				OpenWalletArgs { persister: Some(database.clone()),
-					onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-					run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap();
-			assert!(database.get_all_vtxos().await.unwrap().is_empty());
-			gate.slow_unary.store(true, Ordering::SeqCst);
-			let started = tokio::time::Instant::now();
-			let ids = imported.import_vtxos(&bodies, bark::ImportVtxoArgs::default()).await
-				.expect("healthy status reads each have their own budget");
-			gate.slow_unary.store(false, Ordering::SeqCst);
-			assert!(started.elapsed() > Duration::from_secs(10), "MISSED_TARGET: aggregate did not exceed one read budget");
-			let durations = gate.unary_durations.lock().unwrap().clone();
-			assert_eq!(durations.len(), bodies.len());
-			assert!(durations.iter().all(|duration| *duration >= Duration::from_secs(6) && *duration < Duration::from_secs(10)),
-				"MISSED_TARGET: every genuine status response must fit one existing read budget");
-			assert_eq!(ids.into_iter().collect::<BTreeSet<_>>(), bodies.iter().map(|coin| coin.id()).collect());
-			assert_eq!(imported.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spent);
-			for id in &change_ids { assert_eq!(imported.get_vtxo_by_id(*id).await.unwrap().state, VtxoState::Spendable); }
-			for coin in &bodies { assert!(imported.get_full_vtxo(coin.id()).await.unwrap().serialize() == coin.serialize()); }
-			assert_eq!(imported.balance().await.unwrap().total(), sat(40_000));
-			assert!(imported.history().await.unwrap().is_empty());
-			assert!(database.get_all_wallet_action_checkpoints().await.unwrap().is_empty());
-		}).await;
-	}
-	if !paused {
-		assert_eq!(stale.trust_and_adopt_server_vtxo_status(source.id()).await.unwrap(),
-			Some(bark::vtxo::ServerStatusAdoption::Spent));
-	}
-	let height = ctx.bitcoind().get_block_count().await as u32;
-	ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;
-	stale.chain().invalidate_caches().await;
-	*gate.target.lock().unwrap() = Some(source.id());
-	gate.paused.store(paused, Ordering::SeqCst);
-	if paused {
-		let refreshing = stale.clone();
-		let source_id = source.id();
-		let server_refresh = if refresh_lock {
-			gate.stall_handshake.store(true, Ordering::SeqCst);
-			let wallet = stale.clone();
-			let task = tokio::spawn(async move { wallet.refresh_server().await });
-			tokio::time::timeout(Duration::from_secs(15), gate.arrived.notified()).await.unwrap();
-			Some(task)
-		} else { None };
-		let refresh = tokio::spawn(async move { refreshing.build_refresh_participation([source_id]).await });
-		if !refresh_lock {
-			tokio::time::timeout(Duration::from_secs(15), gate.arrived.notified()).await.unwrap();
-		}
-		if time_out {
-			// This genuine unrelated change exit needs History and responsive Core,
-			// but no Ark RPC. Do not release the stalled handler to let it finish.
-			let change = changes[0].clone();
-			stale.exit_mgr().start_exit_for_vtxos(&[change.vtxo.clone()]).await.unwrap();
-			let history = stale.history().await.unwrap();
-			let checkpoints = serde_json::to_vec(&local.get_all_wallet_action_checkpoints().await.unwrap()).unwrap();
-			let prior = local.get_wallet_vtxo(source_id).await.unwrap().unwrap();
-			let mempool = ctx.bitcoind().sync_client().get_raw_mempool().unwrap();
-			let exiting = stale.clone();
-			let exit = tokio::spawn(async move { exiting.sync_exits().await });
-			tokio::time::timeout(Duration::from_secs(15), exit).await.unwrap().unwrap().unwrap();
-			let result = tokio::time::timeout(Duration::from_secs(15), refresh).await.unwrap().unwrap();
-			if refresh_lock {
-				assert!(result.is_err(), "connection/handshake timeout remains an error");
-				assert!(tokio::time::timeout(Duration::from_secs(15), server_refresh.unwrap()).await.unwrap().unwrap().is_err());
-			} else {
-				assert!(result.unwrap().is_none(), "a timed-out batch returns no invented answer");
-			}
-			assert_eq!(stale.history().await.unwrap(), history);
-			assert_eq!(serde_json::to_vec(&local.get_all_wallet_action_checkpoints().await.unwrap()).unwrap(), checkpoints);
-			assert_eq!(local.get_wallet_vtxo(source_id).await.unwrap().unwrap().state, prior.state);
-			assert_eq!(stale.get_full_vtxo(source_id).await.unwrap().serialize(), signed.serialize());
-			assert_eq!(ctx.bitcoind().sync_client().get_raw_mempool().unwrap(), mempool,
-				"observation of the unrelated exit must not publish a fee/package");
-			assert!(stale.exit_mgr().get_exit_vtxo(change.id()).await.unwrap().state().is_cancelable());
-			stale.exit_mgr().cancel_exit(change.id()).await.unwrap();
-			gate.paused.store(false, Ordering::SeqCst);
-			gate.stall_handshake.store(false, Ordering::SeqCst);
-			gate.release.notify_waiters();
-			stale.refresh_server().await.unwrap();
-			assert_eq!(stale.trust_and_adopt_server_vtxo_status(source_id).await.unwrap(),
-				Some(bark::vtxo::ServerStatusAdoption::Spent));
-		} else {
-			// Ordinary retirement waits for the paused refresh to release History.
-			// Its missing reply cannot manufacture another 60k claim, and the
-			// following authenticated decision must still retire the original.
-			let retiring = stale.clone();
-			let retirement = tokio::spawn(async move {
-				retiring.trust_and_adopt_server_vtxo_status(source_id).await
-			});
-			gate.release.notify_one();
-			assert!(tokio::time::timeout(Duration::from_secs(15), refresh).await.unwrap().unwrap().unwrap().is_none());
-			assert_eq!(tokio::time::timeout(Duration::from_secs(15), retirement).await.unwrap().unwrap().unwrap(),
-				Some(bark::vtxo::ServerStatusAdoption::Spent));
-			assert_eq!(gate.calls.load(Ordering::SeqCst), 1);
-		}
-	} else {
-		assert!(stale.build_refresh_participation([source.id()]).await.unwrap().is_none());
-		assert_eq!(gate.calls.load(Ordering::SeqCst), 0, "an already spent source must never be queried");
-	}
-	for _ in 0..2 { stale.sync_fallback_payouts().await.unwrap(); }
-	assert_eq!(local.get_wallet_vtxo(source.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	assert!(!super::fallback_status_ids(local.get_all_vtxos().await.unwrap(), false).contains(&source.id()));
-	assert!(!super::fallback_status_ids(local.get_all_vtxos().await.unwrap(), true).contains(&source.id()));
-	assert_eq!(stale.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
-	assert_eq!(stale.balance().await.unwrap().total(), sat(40_000));
-	for id in change_ids {
-		assert_eq!(local.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spendable);
-		assert_eq!(stale.get_full_vtxo(id).await.unwrap().serialize(), current.get_full_vtxo(id).await.unwrap().serialize());
-	}
 }

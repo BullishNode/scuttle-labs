@@ -34,9 +34,9 @@ use crate::actions::{
 use crate::arkoor::{DeliveryOutcome, post_arkoor_to_mailboxes};
 use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
-use crate::persist::models::{ReceiveAssociation, SettledLightningReceive};
+use crate::persist::models::SettledLightningReceive;
 use crate::subsystem::{LightningMovement, LightningReceiveMovement, Subsystem};
-use crate::vtxo::{validate_vtxo_tree_params, FallbackStatus, VtxoLockHolder, VtxoState};
+use crate::vtxo::{validate_vtxo_tree_params, VtxoLockHolder};
 
 const LN_RECV_NAMESPACE: &str = "ln_recv";
 
@@ -94,8 +94,6 @@ pub struct LightningReceive {
 	#[serde(default)]
 	pub claim_attempts: u32,
 	pub grant_ids: Vec<VtxoId>,
-	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
-	pub fallback_status: Option<FallbackStatus>,
 }
 
 impl LightningReceive {
@@ -103,10 +101,6 @@ impl LightningReceive {
 		ln_recv_action_id(self.payment_hash)
 	}
 
-	pub(crate) fn association(&self) -> ReceiveAssociation {
-		ReceiveAssociation { key_index: self.key_index, claim_destination: self.claim_destination.clone(),
-			grant_ids: self.grant_ids.clone(), fallback_status: self.fallback_status }
-	}
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -119,31 +113,6 @@ impl WalletAction for LightningReceive {
 	}
 
 	async fn advance(self, wallet: &Wallet) -> Result<Advance<Self>, AdvanceError> {
-		if matches!(&self.progress, Progress::PreimageRevealed(_) | Progress::Delivering(_)) {
-			let _history_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await.retry()?;
-			// Observing status has not retried a claim. Keep the exact checkpoint
-			// and use the existing timed park without consuming the claim budget.
-			let outcome = match wallet.receive_fallback_status(self.payment_hash, &self.invoice, &self.grant_ids).await {
-				Ok(outcome) => outcome,
-				Err(error) => return Ok(Advance::Park {
-					state: self, wake_after: Some(BASE_RETRY_BACKOFF), error: Some(error),
-				}),
-			};
-			if let Some(status) = outcome {
-				wallet.apply_receive_fallback(self.payment_hash, &self.grant_ids, status).await.retry()?;
-				if self.fallback_status != Some(status) {
-					return Ok(Advance::Next(LightningReceive { fallback_status: Some(status), ..self }));
-				}
-				if status == FallbackStatus::Pending {
-					return Ok(Advance::Park { state: self, wake_after: Some(BASE_RETRY_BACKOFF), error: None });
-				}
-				finish_fallback_receive(wallet, &self).await.retry()?;
-				return Ok(Advance::Done);
-			}
-			if self.fallback_status.is_some() {
-				return Err(AdvanceError::Retry(anyhow::anyhow!("missing receive outcome cannot release a commitment")));
-			}
-		}
 		let new_progress = match &self.progress {
 			Progress::AwaitingPayment => {
 				match check_incoming_lightning_payment(wallet, &self).await? {
@@ -239,6 +208,11 @@ impl WalletAction for LightningReceive {
 	/// The step failed transiently. Retry it, unless the claim window
 	/// has closed or the claim retry budget is spent.
 	async fn on_retry(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if FallbackRefusal::from_error(&error) == Some(FallbackRefusal::DecidedForFallback)
+			&& matches!(&self.progress, Progress::PreimageRevealed(_) | Progress::Delivering(_)) {
+			if or_retry!(self, finish_fallback_receive(wallet, &self).await) { return Advance::Done; }
+			return Advance::Park { state: self, wake_after: None, error: Some(error) };
+		}
 		match &self.progress {
 			// No money committed; just back off. Expiry reaping happens in
 			// the step.
@@ -270,6 +244,11 @@ impl WalletAction for LightningReceive {
 	/// The step can't be completed as-is: the server rejected the request
 	/// or our own state is inconsistent.
 	async fn on_abort(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if FallbackRefusal::from_error(&error) == Some(FallbackRefusal::DecidedForFallback)
+			&& matches!(&self.progress, Progress::PreimageRevealed(_) | Progress::Delivering(_)) {
+			if or_retry!(self, finish_fallback_receive(wallet, &self).await) { return Advance::Done; }
+			return Advance::Park { state: self, wake_after: None, error: Some(error) };
+		}
 		match &self.progress {
 			// Nothing committed server-side: the executor removes the row
 			// when the action fails.
@@ -454,7 +433,6 @@ pub(crate) async fn start_lightning_receive(
 		progress: Progress::AwaitingPayment,
 		claim_attempts: 0,
 		grant_ids: Vec::new(),
-		fallback_status: None,
 	})
 }
 
@@ -842,11 +820,6 @@ async fn claim_lightning_receive_htlcs(
 	// the receive in neither balance for a moment beats counting it in both.
 	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await.retry()?;
 	wallet.store_spendable_vtxos(outputs.iter()).await.retry()?;
-	for output in &outputs {
-		if wallet.has_fallback_commitment(output.id()).await.retry()? {
-			return Err(AdvanceError::Retry(FallbackRefusal::DecidedForFallback.into()));
-		}
-	}
 
 	wallet.inner.movements.finish_movement_with_update(
 		htlcs.movement_id,
@@ -859,7 +832,7 @@ async fn claim_lightning_receive_htlcs(
 
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(effective_balance);
 	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount, Some(&recv.association()),
+		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
 	).await.retry()?;
 
 	Ok(None)
@@ -892,15 +865,16 @@ async fn deliver_lightning_receive(
 
 	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
 	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount, Some(&recv.association()),
+		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
 	).await.retry()?;
 
 	Ok(())
 }
 
-async fn finish_fallback_receive(wallet: &Wallet, recv: &LightningReceive) -> anyhow::Result<()> {
-	ensure!(matches!(recv.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited)),
-		"receive fallback is not terminal");
+async fn finish_fallback_receive(wallet: &Wallet, recv: &LightningReceive) -> anyhow::Result<bool> {
+	let Some(status) = wallet.receive_fallback_status(recv.payment_hash, &recv.invoice, &recv.grant_ids).await?
+		else { return Ok(false); };
+	wallet.apply_receive_fallback(recv.payment_hash, &recv.grant_ids, status).await?;
 	let movement_id = match &recv.progress {
 		Progress::PreimageRevealed(htlcs) => htlcs.movement_id,
 		Progress::Delivering(delivery) => delivery.movement_id,
@@ -913,13 +887,8 @@ async fn finish_fallback_receive(wallet: &Wallet, recv: &LightningReceive) -> an
 	}
 	let amount = recv.invoice.get_payment_amount(None).context("receive invoice has no amount")?;
 	wallet.inner.db.record_settled_lightning_receive(recv.payment_hash, recv.payment_preimage,
-		&recv.invoice, amount, Some(&recv.association())).await?;
-	// A normal completion record may already exist after a crash before its
-	// checkpoint was removed. Keep its identity/time, but persist the newly
-	// authenticated outcome before allowing that checkpoint to disappear.
-	wallet.inner.db.set_receive_fallback_status(recv.payment_hash,
-		recv.fallback_status.context("receive fallback status disappeared")?).await?;
-	Ok(())
+		&recv.invoice, amount).await?;
+	Ok(true)
 }
 
 async fn deliver_vtxos_to_address(

@@ -2,7 +2,7 @@
 //! Round State Machine
 //!
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::iter;
 use std::borrow::Cow;
@@ -61,7 +61,6 @@ const VTXO_EXPIRY_HEIGHT_BUFFER: BlockDelta = BlockDelta::new(6);
 /// created the participation is gone, so this is the only thing standing
 /// between a recovered wallet and a server claiming excessive fees.
 const MAX_RECOVERED_PARTICIPATION_FEE_PERCENT: u64 = 5;
-
 
 /// Struct to communicate your specific participation for an Ark round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1190,7 +1189,6 @@ async fn start_attempt(
 		.take(participation.outputs.len())
 		.collect::<Vec<(Vec<SecretNonce>, Vec<PublicNonce>)>>();
 
-
 	// The round has now started. We can submit our payment.
 	debug!("Submitting payment request with {} inputs and {} vtxo outputs",
 		participation.inputs.len(), participation.outputs.len(),
@@ -1665,24 +1663,6 @@ async fn progress_delegated(
 	// Check the confirmation status of the funding tx
 	let confirmed = check_funding_tx_confirmations(wallet, funding_txid, &funding_tx, !already_released).await
 		.context("checking funding tx confirmations")
-		.map_err(HarkForfeitError::Err)?;
-
-	// The server has issued the round and its funding tx is in our mempool or a
-	// block: the server no longer accepts these inputs, so hold them like the
-	// inputs of an interactive round before we forfeit them below. The lock
-	// can adopt a recovered historical Spent row, but cannot steal inputs
-	// reserved by another action or a protective exit. The checked write
-	// accepts an identical holder idempotently and rejects foreign locks.
-	let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
-	wallet.inner.db.update_vtxo_states_checked(
-		&wallet.inner.db.get_wallet_vtxos(&input_ids).await
-			.context("failed to read issued-round inputs").map_err(HarkForfeitError::Err)?
-			.into_iter().filter(|coin| coin.state.kind() != VtxoStateKind::Exited)
-			.map(|coin| coin.id()).collect::<Vec<_>>(),
-		VtxoState::Locked { holder: movement_id.map(Into::into) },
-		&[VtxoStateKind::Spendable, VtxoStateKind::Spent],
-	).await
-		.context("failed to lock inputs of issued delegated round")
 		.map_err(HarkForfeitError::Err)?;
 
 	if !confirmed {

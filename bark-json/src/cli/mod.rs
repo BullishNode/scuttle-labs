@@ -12,7 +12,7 @@ use utoipa::ToSchema;
 
 use ark::VtxoId;
 use ark::lightning::{PaymentHash, Preimage};
-use bitcoin_ext::{AmountExt, BlockDelta};
+use bitcoin_ext::BlockDelta;
 
 use bark::actions::lightning::pay::{LightningSendState, Progress as SendProgress};
 use bark::movement::MovementId;
@@ -21,7 +21,6 @@ use bark::actions::lightning::receive::{
 };
 
 use crate::cli::fees::FeeSchedule;
-use crate::primitives::FallbackStatusInfo;
 use crate::exit::error::ExitError;
 use crate::exit::package::ExitTransactionPackage;
 use crate::exit::ExitState;
@@ -615,10 +614,8 @@ pub struct LightningReceiveInfo {
 	/// The payment hash linked to the lightning receive
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the invoice; payout progress is `fallback_status`.
+	/// Lifecycle phase of the invoice.
 	pub state: LightningReceiveStateKind,
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub fallback_status: Option<FallbackStatusInfo>,
 	/// The invoice string, if known.
 	pub invoice: String,
 	/// The payment preimage, if known.
@@ -661,11 +658,10 @@ impl LightningReceiveInfo {
 			LightningReceiveState::Settled(s) => LightningReceiveInfo {
 				payment_hash: s.payment_hash,
 				state: LightningReceiveStateKind::Settled,
-				fallback_status: s.association.as_ref().and_then(|claim| claim.fallback_status).map(Into::into),
 				invoice: s.invoice.to_string(),
 				payment_preimage: Some(s.preimage),
 				amount: s.amount,
-				htlc_vtxo_ids: s.association.as_ref().map(|claim| claim.grant_ids.clone()).unwrap_or_default(),
+				htlc_vtxo_ids: vec![],
 				settled_at: Some(s.settled_at),
 				preimage_revealed_at: None,
 				finished_at: Some(s.settled_at),
@@ -773,7 +769,6 @@ impl From<&LightningReceive> for LightningReceiveInfo {
 		LightningReceiveInfo {
 			payment_hash: recv.payment_hash,
 			state,
-			fallback_status: recv.fallback_status.map(Into::into),
 			invoice: recv.invoice.to_string(),
 			payment_preimage: Some(recv.payment_preimage),
 			amount: recv.invoice.amount_milli_satoshis()

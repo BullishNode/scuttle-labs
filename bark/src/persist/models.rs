@@ -230,19 +230,6 @@ pub struct SettledLightningReceive {
 	pub invoice: Bolt11Invoice,
 	pub amount: Amount,
 	pub settled_at: chrono::DateTime<chrono::Local>,
-	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
-	pub association: Option<ReceiveAssociation>,
-}
-
-/// Original claim identity retained when the live checkpoint is retired.
-/// No allocation, payout output or client ancestry is stored here.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReceiveAssociation {
-	pub key_index: u32,
-	pub claim_destination: Option<ark::Address>,
-	pub grant_ids: Vec<VtxoId>,
-	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
-	pub fallback_status: Option<crate::vtxo::FallbackStatus>,
 }
 
 /// Persistable view of an [ExitVtxo].

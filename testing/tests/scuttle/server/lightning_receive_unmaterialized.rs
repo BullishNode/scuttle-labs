@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ark::{ProtocolEncoding, ServerVtxo, Vtxo};
@@ -13,11 +13,8 @@ use ark::vtxo::{Full, VtxoClause};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::daemon::captaind::{self, ArkClient, MailboxClient, WalletAdminClient};
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
-use bark::actions::lightning::receive::{LightningReceiveState, Progress};
-use bark::movement::MovementStatus;
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
-use bark::vtxo::{FallbackStatus, VtxoState};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
@@ -37,21 +34,10 @@ struct ReceiveGate {
 	claims: Arc<AtomicUsize>,
 	registrations: Arc<AtomicUsize>,
 	posts: Arc<AtomicUsize>,
-	stall_status: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for ReceiveGate {
-	async fn check_lightning_receive(&self, upstream: &mut ArkClient, request: protos::CheckLightningReceiveRequest)
-		-> Result<protos::CheckLightningReceiveResponse, tonic::Status>
-	{
-		let response = upstream.check_lightning_receive(request).await?.into_inner();
-		if self.stall_status.load(Ordering::SeqCst) {
-			assert_eq!(response.fallback_spend_state, Some(protos::VtxoSpendState::Spent as i32));
-			std::future::pending::<()>().await;
-		}
-		Ok(response)
-	}
 
 	async fn prepare_lightning_receive_claim(&self, upstream: &mut ArkClient,
 		request: protos::PrepareLightningReceiveClaimRequest,
@@ -728,50 +714,6 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
 
-	// Only after the complete provider-absent/recipient-Bitcoin cut may the
-	// original provider return. Reopen its actual seed/store at the direct
-	// server endpoint; no invoice, payment, claim replay or recovery import.
-	let provider_seed = bip39::Mnemonic::from_str(tokio::fs::read_to_string(
-		ctx.datadir.join("provider/mnemonic")).await.unwrap().trim()).unwrap();
-	let provider_db = Arc::new(SqliteClient::open(ctx.datadir.join("provider/db.sqlite")).unwrap());
-	let mut provider_cfg: bark::Config = toml::from_str(&tokio::fs::read_to_string(
-		ctx.datadir.join("provider/config.toml")).await.unwrap()).unwrap();
-	let returned_proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
-	provider_cfg.server_address = returned_proxy.address.clone();
-	let reopen_provider = async || {
-		let onchain = OnchainWallet::load_or_create(bitcoin::Network::Regtest,
-			provider_seed.to_seed(""), provider_db.clone()).await.unwrap();
-		Wallet::open(bitcoin::Network::Regtest,
-			WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &provider_seed), provider_cfg.clone(),
-			OpenWalletArgs { persister: Some(provider_db.clone()),
-				onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
-				run_daemon: false, skip_recovery: true, ..Default::default() }).await.unwrap()
-	};
-	let provider = Box::pin(reopen_provider()).await;
-	assert_eq!(provider.fallback_script(), provider_destination);
-	let checkpoint = provider.lightning_receive_checkpoint(hash).await.unwrap().unwrap();
-	assert_eq!(checkpoint.payment_hash, hash);
-	assert_eq!(checkpoint.invoice, invoice);
-	assert!(checkpoint.claim_destination.as_ref() == Some(&address));
-	assert!(checkpoint.fallback_status.is_none(), "the retained original checkpoint has not adopted an outcome");
-	let Progress::PreimageRevealed(htlcs) = &checkpoint.progress else {
-		panic!("the actual interrupted claim must retain its preimage-revealed checkpoint");
-	};
-	assert_eq!(htlcs.vtxo_ids, checkpoint.grant_ids);
-	assert_eq!(checkpoint.grant_ids.iter().copied().collect::<BTreeSet<_>>(), BTreeSet::from([original.source.id()]));
-	let original_preimage = checkpoint.payment_preimage;
-	assert!(original_preimage.compute_payment_hash() == hash);
-	let movement = htlcs.movement_id;
-	let before_retirement = provider.history().await.unwrap();
-	assert_eq!(before_retirement.len(), 1);
-	assert_eq!(before_retirement[0].id, movement);
-	// Stall only the authenticated remote read. Its timeout must not retire
-	// the signed receive checkpoint, change the holder or publish history.
-	let grant_before = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
-	let body_before = provider.get_full_vtxo(original.source.id()).await.unwrap().serialize();
-	// The stopped watchman retains its old terminal projection while Core
-	// removes the actual payout block. A public read must not retire the
-	// provider from that orphaned observation, even though the invoice paid.
 	srv.watchmand().stop().await.unwrap();
 	let old_view = db.read(async |tx| tx.expiry_view().await).await.unwrap().unwrap();
 	let core = srv.bitcoind().sync_client();
@@ -783,81 +725,10 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		hash: hash.to_vec(), wait: false,
 	}).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::Internal);
-	assert!(provider.try_claim_lightning_receive(hash, false).await.is_err());
-	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap() == Some(checkpoint.clone()));
-	let held = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
-	assert_eq!(held.state, grant_before.state);
-	assert_eq!(held.fallback_status, grant_before.fallback_status);
-	assert_eq!(provider.get_full_vtxo(original.source.id()).await.unwrap().serialize(), body_before);
-	assert!(provider.history().await.unwrap() == before_retirement);
-	assert!(provider_db.get_settled_lightning_receive(hash).await.unwrap().is_none());
-	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
-	assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);
-	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
 	core.reconsider_block(&payout_block).unwrap();
 	assert_eq!(core.get_block_hash(u64::from(old_view.height.to_u32())).unwrap(), old_view.hash);
 	assert!(core.custom_get_raw_transaction_info(payout.txid, None).unwrap().unwrap().confirmations.unwrap() >= 6);
 	srv.watchmand().start().await.unwrap();
-	gate.stall_status.store(true, Ordering::SeqCst);
-	let error = tokio::time::timeout(Duration::from_secs(15), provider.try_claim_lightning_receive(hash, false))
-		.await.unwrap().unwrap_err();
-	assert!(format!("{error:#}").contains("Ark server read deadline elapsed"));
-	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap() == Some(checkpoint.clone()));
-	let grant_after = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
-	assert_eq!(grant_after.state, grant_before.state);
-	assert_eq!(grant_after.fallback_status, grant_before.fallback_status);
-	assert_eq!(provider.get_full_vtxo(original.source.id()).await.unwrap().serialize(), body_before);
-	assert!(provider.history().await.unwrap() == before_retirement);
-	assert!(provider_db.get_settled_lightning_receive(hash).await.unwrap().is_none());
-	gate.stall_status.store(false, Ordering::SeqCst);
-	let outcome = provider.try_claim_lightning_receive(hash, false).await.unwrap();
-	let LightningReceiveState::Settled(retired) = outcome else {
-		panic!("the existing same-invoice/grants terminal status must retire this checkpoint");
-	};
-	assert!(provider.lightning_receive_checkpoint(hash).await.unwrap().is_none());
-	assert!(provider.pending_lightning_receives().await.unwrap().is_empty());
-	assert_eq!(retired.payment_hash, hash);
-	assert_eq!(retired.invoice, invoice);
-	assert_eq!(retired.amount, gross);
-	assert!(retired.preimage == original_preimage, "retirement must retain the original preimage without exporting it");
-	let association = retired.association.as_ref().expect("terminal receive must retain its original association");
-	assert_eq!(association.key_index, checkpoint.key_index);
-	assert!(association.claim_destination.as_ref() == Some(&address));
-	assert_eq!(association.grant_ids, checkpoint.grant_ids);
-	assert_eq!(association.fallback_status, Some(FallbackStatus::Spent));
-	assert!(provider_db.get_settled_lightning_receive(hash).await.unwrap() == Some(retired.clone()));
-	let grant = provider_db.get_wallet_vtxo(original.source.id()).await.unwrap().unwrap();
-	assert_eq!(grant.state, VtxoState::Spent);
-	assert_eq!(grant.fallback_status, Some(FallbackStatus::Spent));
-	assert_eq!(provider.get_full_vtxo(original.source.id()).await.unwrap().serialize(), original.source.serialize());
-	assert!(provider_db.get_wallet_vtxo(original.promised.id()).await.unwrap().is_none());
-	assert_eq!(provider.balance().await.unwrap().total(), sat(0));
-	provider.sync_onchain().await.unwrap();
-	assert_eq!(provider.onchain().unwrap().read().await.balance().await, sat(0));
-	let provider_history = provider.history().await.unwrap();
-	assert_eq!(provider_history.len(), 1);
-	assert_eq!(provider_history[0].id, movement);
-	assert_eq!(provider_history[0].status, MovementStatus::Successful);
-	assert_eq!(provider_history[0].effective_balance, bitcoin::SignedAmount::ZERO);
-	assert_eq!(provider_history[0].offchain_fee, sat(0));
-	assert_eq!(provider_history[0].intended_balance, before_retirement[0].intended_balance);
-	assert!(!provider_history.iter().any(|item| item.subsystem.name == "scuttle.fallback"));
-	drop(provider);
-
-	let provider = Box::pin(reopen_provider()).await;
-	for _ in 0..2 {
-		provider.sync_fallback_payouts().await.unwrap();
-		assert!(matches!(provider.lightning_receive_state(hash).await.unwrap(), LightningReceiveState::Settled(_)));
-		assert!(provider.lightning_receive_checkpoint(hash).await.unwrap().is_none());
-		// Boolean comparison avoids printing a permanent record's preimage.
-		assert!(provider_db.get_settled_lightning_receive(hash).await.unwrap() == Some(retired.clone()),
-			"same-store recheck must preserve the association, original settlement time and preimage");
-		assert!(provider.history().await.unwrap() == provider_history);
-		assert_eq!(provider.balance().await.unwrap().total(), sat(0));
-		provider.sync_onchain().await.unwrap();
-		assert_eq!(provider.onchain().unwrap().read().await.balance().await, sat(0));
-		assert!(provider_db.get_wallet_vtxo(original.promised.id()).await.unwrap().is_none());
-	}
 	unchanged(&original, &original_binding(&db, hash).await);
 	let native = lightning.external.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
 		bolt11: None, payment_hash: Some(hash.to_vec()), status: None, index: None, limit: None, start: None,

@@ -24,7 +24,6 @@ pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod test_suite;
 
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -555,7 +554,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
-		association: Option<&models::ReceiveAssociation>,
 	) -> anyhow::Result<()>;
 
 	/// Look up a settled lightning receive record by payment hash.
@@ -563,16 +561,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		payment_hash: PaymentHash,
 	) -> anyhow::Result<Option<SettledLightningReceive>>;
-
-	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
-		bail!("this persister does not support receive outcome rechecks")
-	}
-
-	async fn set_receive_fallback_status(&self, _hash: PaymentHash, _status: crate::vtxo::FallbackStatus)
-		-> anyhow::Result<()>
-	{
-		bail!("this persister does not support durable receive outcomes")
-	}
 
 	/// Store an entry indicating a [Vtxo] is being exited.
 	///
@@ -683,21 +671,12 @@ pub trait BarkPersister: Send + Sync + 'static {
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<WalletVtxo>;
 
-	/// Persist authenticated fallback status before changing spendability.
-	/// Keep the marker on the existing coin through terminal/reorg checks;
-	/// no ordinary cleanup may clear it or release its commitment.
+	/// Retire an authenticated commitment to ordinary Spent and retain its
+	/// last observed status for display. The status does not release funds.
 	async fn set_vtxo_fallback_status(&self, _id: VtxoId, _status: crate::vtxo::FallbackStatus)
 		-> anyhow::Result<WalletVtxo>
 	{
 		bail!("this persister does not support durable fallback outcomes")
-	}
-
-	/// Atomically retain a validated newly discovered body and its commitment.
-	/// A crash must not leave a terminal body without its recheck marker.
-	async fn store_fallback_vtxo(&self, _vtxo: &Vtxo<Full>, _status: crate::vtxo::FallbackStatus)
-		-> anyhow::Result<WalletVtxo>
-	{
-		bail!("this persister does not support atomic fallback adoption")
 	}
 
 	/// Release `holder`'s lock on the given vtxo, transitioning it to

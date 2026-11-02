@@ -19,7 +19,6 @@ use futures::{FutureExt, Stream, StreamExt};
 use log::{debug, error, info, trace, warn};
 use tokio_util::sync::CancellationToken;
 
-
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::lightning::PaymentHash;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
@@ -540,9 +539,13 @@ impl Wallet {
 		for coin in new_vtxos {
 			let key = self.get_vtxo_key(&coin).await?;
 			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
-			if state == protos::VtxoSpendState::Spent
-				&& !committed {
+			// A delivery may already have paid its recipient onchain before
+			// this wallet first sees the mailbox message. Do not credit it in Ark.
+			if committed || state == protos::VtxoSpendState::Spent {
 				self.store_vtxos([&coin], &VtxoState::Spent).await?;
+				if committed {
+					self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+				}
 				continue;
 			}
 			current.push(coin);

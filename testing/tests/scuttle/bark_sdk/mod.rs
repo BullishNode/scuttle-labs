@@ -2,7 +2,6 @@ mod arkoor;
 mod balance;
 mod fallback;
 mod fallback_adoption;
-mod fallback_protection;
 mod lightning;
 mod lightning_receive_binding;
 mod round;
