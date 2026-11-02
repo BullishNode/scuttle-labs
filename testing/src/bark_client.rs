@@ -127,18 +127,16 @@ impl BarkClient {
 		// Drain stdout concurrently with wait so a full pipe never blocks
 		// the child (see `Bark::try_run` for details).
 		let mut stdout = child.stdout.take().expect("stdout was piped");
-		let stdout_task = tokio::spawn(async move {
+		let read_fut = async move {
 			let mut buf = String::new();
 			stdout.read_to_string(&mut buf).await.unwrap();
 			buf
-		});
+		};
 
-		let exit_result = tokio::time::timeout(timeout, child.wait()).await;
-		if exit_result.is_err() {
-			child.kill().await
-				.with_context(|| format!("could not kill timed-out command '{}'", command_str))?;
-		}
-		let output = stdout_task.await.context("stdout reader panicked")?;
+		let (exit_result, output) = tokio::join!(
+			tokio::time::timeout(timeout, child.wait()),
+			read_fut,
+		);
 
 		let status = exit_result
 			.with_context(|| format!("timeout running '{}'", command_str))?
