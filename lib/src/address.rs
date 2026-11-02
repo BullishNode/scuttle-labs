@@ -107,7 +107,7 @@ impl VtxoDelivery {
 	fn encoded_length(&self) -> usize {
 		match self {
 			Self::ServerMailbox { .. } => 1 + 33,
-			Self::ServerMailboxJoint { .. } => 1 + 2 + 33 + 64 + 64,
+			Self::ServerMailboxJoint { .. } => 1 + 33 + 64 + 64,
 			Self::Unknown { data, .. } => 1usize.saturating_add(data.len()),
 		}
 	}
