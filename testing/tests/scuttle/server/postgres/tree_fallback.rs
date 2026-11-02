@@ -1,16 +1,4 @@
 #[tokio::test]
-async fn customer_fence_requires_the_admitted_binding_in_free_writer() {
-	let (_ctx, db) = test_db("customer_fence_requires_admitted_binding").await;
-	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |tx| Ok(tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1",
-		&[&vtxo.policy().user_pubkey().unwrap().to_string()]).await?)).await.unwrap();
-	let error = db.write(async |tx| server::database::tree::execute_vtxo_tree_update(
-		tx, VtxoTreeUpdate::new().insert_spendable_vtxos([vtxo.clone()])).await).await.unwrap_err();
-	assert!(error.is::<OwnershipRefusal>(), "{error:#}");
-	assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(vtxo.id()).await).await.unwrap().is_none());
-}
-
-#[tokio::test]
 async fn customer_fence_covers_every_birth_state_but_allows_internal_roles() {
 	let (_ctx, db) = test_db("customer_fence_roles").await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());

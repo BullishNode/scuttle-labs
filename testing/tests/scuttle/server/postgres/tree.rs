@@ -57,20 +57,4 @@ async fn vtxo_history_state(db: &Db, vtxo_id: VtxoId) -> (i64, DateTime<Local>) 
 	}).await.expect("query vtxo history")
 }
 
-/// Helper: insert a dummy round row and return its id.
-/// Required because spent_in_round has a foreign key to round.id.
-async fn insert_dummy_round(db: &Db, seq: i64) -> i64 {
-	let funding_txid = dummy_txid(seq as u8);
-	db.write(async |t| {
-		let row = t.query_one(
-			"INSERT INTO round (seq, funding_txid, funding_tx, signed_tree, expiry, created_at)
-			VALUES ($1, $2, '\\x00', '\\x00', 1000, NOW())
-			RETURNING id",
-			&[&seq, &funding_txid.to_string()],
-		).await.expect("insert dummy round");
-		Ok(row.get::<_, i64>("id"))
-	}).await.expect("connection")
-}
-
-
 include!("tree_fallback.rs");

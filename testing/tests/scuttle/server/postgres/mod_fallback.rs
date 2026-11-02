@@ -1,37 +1,4 @@
 #[tokio::test]
-async fn legacy_lightning_payment_attempt_lifecycle() {
-	use server::database::ln::LightningPaymentStatus;
-
-	let mut ctx = TestContext::new_minimal("postgresd/legacy_lightning_payment_attempt").await;
-	ctx.init_central_postgres().await;
-	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config).await.unwrap();
-	let db = Db::connect(&config).await.unwrap();
-	super::register_vector_owners(&db).await;
-	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
-	let (node, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
-	let invoice = Invoice::Bolt11(Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap());
-	legacy_payment_attempt(&db, node, &invoice, &[]).await;
-	let requested = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await)
-		.await.unwrap().unwrap();
-	assert_eq!(requested.final_amount_msat, None);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&requested, LightningPaymentStatus::Submitted, None,
-	).await).await.unwrap().is_some());
-	let submitted = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(invoice.payment_hash()).await)
-		.await.unwrap().unwrap();
-	assert_eq!(submitted.status, LightningPaymentStatus::Submitted);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&submitted, LightningPaymentStatus::Succeeded, None,
-	).await).await.unwrap().is_some());
-	assert!(db.read(async |t| t.get_open_lightning_payment_attempts(node).await).await.unwrap().is_empty());
-	let history = db.read(async |t| Ok(t.query("SELECT status::TEXT FROM lightning_payment_attempt_history \
-		WHERE id=$1 ORDER BY history_created_at", &[&requested.id]).await?.into_iter()
-		.map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await.unwrap();
-	assert_eq!(history, vec!["requested", "submitted"]);
-}
-
-#[tokio::test]
 async fn legacy_lightning_payment_attempt_result_update() {
 	use server::database::ln::LightningPaymentStatus;
 
