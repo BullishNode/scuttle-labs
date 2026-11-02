@@ -30,6 +30,56 @@ fn blocks_until(ctx: &TestContext, height: BlockHeight) -> u32 {
 	height.checked_blocks_since(chain_tip(ctx)).unwrap_or(0)
 }
 
+// Both native cuts retain the same shallow-confirmation and irreversible-exit checks.
+async fn assert_swept_exit(
+	ctx: &TestContext, wallet: &bark::Wallet, vtxo: ark::VtxoId, parent: &bitcoin::Transaction,
+) {
+	let before = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(parent.compute_txid(), None)
+		.unwrap().unwrap().confirmations.unwrap_or(0);
+	assert!(before <= 1, "the native parent must be observed before deep confirmation");
+	if before == 0 { ctx.generate_blocks(1).await; }
+	wallet.chain().invalidate_caches().await;
+	let mut shallow = None;
+	for _ in 0..3 {
+		wallet.sync_onchain().await.expect("onchain sync");
+		let _ = wallet.progress_exits().await;
+		shallow = wallet.exit_mgr().get_exit_vtxo(vtxo).await.map(|exit| exit.state().clone());
+	}
+	assert!(matches!(shallow, Some(ExitState::Processing(_))),
+		"one-deep customer payout must not end the exit: {:?}", shallow);
+	wallet.sync_fallback_payouts().await.unwrap();
+	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
+	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+	let registered = wallet.fallback_script();
+	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
+	assert_eq!(parent.output[payout_index as usize].script_pubkey, registered);
+	assert!(before < 6, "one confirmation cannot discharge the registered payout");
+
+	let shallow_history = wallet.history().await.unwrap();
+	assert!(!shallow_history.iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"
+		&& movement.status == bark::movement::MovementStatus::Successful));
+
+	// Give the client every chance to finish the exit and take the money.
+	let mut claimable = false;
+	let mut state = None;
+	for _ in 0..15 {
+		wallet.sync_onchain().await.expect("onchain sync");
+		wallet.chain().invalidate_caches().await;
+		// The broadcast cannot succeed once the output is gone, which is the point.
+		let _ = wallet.progress_exits().await;
+		state = wallet.exit_mgr().get_exit_vtxo(vtxo).await.map(|e| e.state().clone());
+		claimable |= matches!(state, Some(ExitState::Claimable(_) | ExitState::Claimed(_)));
+		ctx.generate_blocks(1).await;
+	}
+
+	assert!(matches!(state, Some(ExitState::VtxoSwept(_))),
+		"exit of a swept vtxo must terminate as VtxoSwept, was {:?}", state,
+	);
+	// A swept output can never be claimed, so the exit must never have offered it.
+	assert!(!claimable, "the exit of a swept vtxo must never become claimable");
+
+}
+
 #[tokio::test]
 async fn watchman_sweeps_funding_tx_during_exit() {
 	let ctx = TestContext::new("bark_sdk/payouts/watchman_sweeps_funding_tx_during_exit").await;
@@ -111,49 +161,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 
 	wallet.exit_mgr().start_exit_for_entire_wallet().await.expect("starting the exit");
 
-	let before = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(parent.compute_txid(), None)
-		.unwrap().unwrap().confirmations.unwrap_or(0);
-	assert!(before <= 1, "the native parent must be observed before deep confirmation");
-	if before == 0 { ctx.generate_blocks(1).await; }
-	wallet.chain().invalidate_caches().await;
-	let mut shallow = None;
-	for _ in 0..3 {
-		wallet.sync_onchain().await.expect("onchain sync");
-		let _ = wallet.progress_exits().await;
-		shallow = wallet.exit_mgr().get_exit_vtxo(vtxo).await.map(|exit| exit.state().clone());
-	}
-	assert!(matches!(shallow, Some(ExitState::Processing(_))),
-		"one-deep customer payout must not end the exit: {:?}", shallow);
-	wallet.sync_fallback_payouts().await.unwrap();
-	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
-	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	let registered = wallet.fallback_script();
-	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
-	assert_eq!(parent.output[payout_index as usize].script_pubkey, registered);
-	assert!(before < 6, "one confirmation cannot discharge the registered payout");
-
-	let shallow_history = wallet.history().await.unwrap();
-	assert!(!shallow_history.iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"
-		&& movement.status == bark::movement::MovementStatus::Successful));
-
-	// Give the client every chance to finish the exit and take the money.
-	let mut claimable = false;
-	let mut state = None;
-	for _ in 0..15 {
-		wallet.sync_onchain().await.expect("onchain sync");
-		wallet.chain().invalidate_caches().await;
-		// The broadcast cannot succeed once the output is gone, which is the point.
-		let _ = wallet.progress_exits().await;
-		state = wallet.exit_mgr().get_exit_vtxo(vtxo).await.map(|e| e.state().clone());
-		claimable |= matches!(state, Some(ExitState::Claimable(_) | ExitState::Claimed(_)));
-		ctx.generate_blocks(1).await;
-	}
-
-	assert!(matches!(state, Some(ExitState::VtxoSwept(_))),
-		"exit of a swept vtxo must terminate as VtxoSwept, was {:?}", state,
-	);
-	// A swept output can never be claimed, so the exit must never have offered it.
-	assert!(!claimable, "the exit of a swept vtxo must never become claimable");
+	assert_swept_exit(&ctx, &wallet, vtxo, &parent).await;
 
 	// Observe the real native confirmation projection before consuming its public receipt.
 	wm.trigger_sweep().await;
@@ -186,12 +194,6 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		let point = bitcoin::OutPoint::new(signed.compute_txid(), index);
 		assert_eq!(signed.output[index as usize].value, gross - fee);
 
-		let info = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
-		assert!(info.confirmations.unwrap_or(0) >= 6);
-		let block = info.blockhash.unwrap();
-		let header = ctx.bitcoind().sync_client().get_block_header_info(&block).unwrap();
-		assert_eq!(ctx.bitcoind().sync_client().get_block_hash(header.height as u64).unwrap(), block);
-		assert_eq!(ctx.bitcoind().await_transaction(point.txid).await, *signed);
 		let output = ctx.bitcoind().sync_client().get_tx_out(&point.txid, index, Some(true)).unwrap().unwrap();
 		assert!(output.confirmations >= 6);
 		assert_eq!(output.value, gross - fee);
@@ -372,49 +374,7 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 
 	assert!(parent.input.iter().any(|input| input.previous_output == anchor || chain.contains(&input.previous_output.txid)),
 		"the real customer parent must break the observed partial exit chain");
-	let before = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(parent.compute_txid(), None)
-		.unwrap().unwrap().confirmations.unwrap_or(0);
-	assert!(before <= 1, "the native parent must be observed before deep confirmation");
-	if before == 0 { ctx.generate_blocks(1).await; }
-	receiver.chain().invalidate_caches().await;
-	let mut shallow = None;
-	for _ in 0..3 {
-		receiver.sync_onchain().await.expect("onchain sync");
-		let _ = receiver.progress_exits().await;
-		shallow = receiver.exit_mgr().get_exit_vtxo(vtxo).await.map(|exit| exit.state().clone());
-	}
-	assert!(matches!(shallow, Some(ExitState::Processing(_))),
-		"one-deep customer payout must not end the exit: {:?}", shallow);
-	receiver.sync_fallback_payouts().await.unwrap();
-	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
-	assert_eq!(receiver.get_vtxo_by_id(vtxo).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	let registered = receiver.fallback_script();
-	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
-	assert_eq!(parent.output[payout_index as usize].script_pubkey, registered);
-	assert!(before < 6, "one confirmation cannot discharge the registered payout");
-
-	let shallow_history = receiver.history().await.unwrap();
-	assert!(!shallow_history.iter().any(|movement| movement.subsystem.name == "abandon.fallback_payout"
-		&& movement.status == bark::movement::MovementStatus::Successful));
-
-	// Give the client every chance to finish the exit and take the money.
-	let mut claimable = false;
-	let mut state = None;
-	for _ in 0..15 {
-		receiver.sync_onchain().await.expect("onchain sync");
-		receiver.chain().invalidate_caches().await;
-		// The broadcast cannot succeed once the output is gone, which is the point.
-		let _ = receiver.progress_exits().await;
-		state = receiver.exit_mgr().get_exit_vtxo(vtxo).await.map(|e| e.state().clone());
-		claimable |= matches!(state, Some(ExitState::Claimable(_) | ExitState::Claimed(_)));
-		ctx.generate_blocks(1).await;
-	}
-
-	assert!(matches!(state, Some(ExitState::VtxoSwept(_))),
-		"exit whose chain was swept must terminate as VtxoSwept, was {:?}", state,
-	);
-	// A swept output can never be claimed, so the exit must never have offered it.
-	assert!(!claimable, "the exit of a swept vtxo must never become claimable");
+	assert_swept_exit(&ctx, &receiver, vtxo, &parent).await;
 
 	// Observe the real native confirmation projection before consuming its public receipt.
 	wm.trigger_sweep().await;
@@ -447,12 +407,6 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 		let point = bitcoin::OutPoint::new(signed.compute_txid(), index);
 		assert_eq!(signed.output[index as usize].value, gross - fee);
 
-		let info = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
-		assert!(info.confirmations.unwrap_or(0) >= 6);
-		let block = info.blockhash.unwrap();
-		let header = ctx.bitcoind().sync_client().get_block_header_info(&block).unwrap();
-		assert_eq!(ctx.bitcoind().sync_client().get_block_hash(header.height as u64).unwrap(), block);
-		assert_eq!(ctx.bitcoind().await_transaction(point.txid).await, *signed);
 		let output = ctx.bitcoind().sync_client().get_tx_out(&point.txid, index, Some(true)).unwrap().unwrap();
 		assert!(output.confirmations >= 6);
 		assert_eq!(output.value, gross - fee);
