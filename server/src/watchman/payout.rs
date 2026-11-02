@@ -13,6 +13,7 @@ use tracing::warn;
 
 use crate::bitcoind as bcd;
 use crate::bitcoind::BitcoindErrorExt;
+use crate::wallet::BdkWalletExt;
 use bitcoin_ext::BlockRef;
 use crate::database::expiry_payout::{MAX_PAYOUT_VSIZE, PendingExpiryPayout};
 
@@ -198,29 +199,36 @@ impl Watchman {
 		} else {
 			MakeCpfpFees::Effective(target)
 		};
-		let mut wallet = self.watchman_wallet.lock().await;
-		if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
-			warn!(allocation_id = group.id, "Expiry payouts need confirmed usable watchman funds");
-			return Ok(());
-		}
-		let child = wallet.make_signed_p2a_cpfp(&parent, fees)
-			.context("funding expiry payout fee child")?;
-		// As with upstream's progress CPFP, the child is rebuilt from current
-		// wallet/Core state. Persist address allocation, not a child ledger.
-		wallet.persist().await?;
-		drop(wallet);
 		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
-		self.db.write(async |t| {
+		let committed_wallet = self.db.write(async |t| {
 			t.lock_watchman_tip(view).await?;
 			t.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&group.id]).await?;
 			ensure!(t.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&group.id]).await?.get::<_, &str>(0) == "pending",
 				"expiry allocation changed before package publication");
+			// Wallet sync may hold the wallet while waiting for this connection.
+			// Defer if busy; never wait for it while holding the publication tx.
+			let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(None); };
+			if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
+				warn!(allocation_id = group.id, "Expiry payouts need confirmed usable watchman funds");
+				return Ok(None);
+			}
+			let child = wallet.make_signed_p2a_cpfp(&parent, fees)
+				.context("funding expiry payout fee child")?;
 			let result = bcd::submit_package(&self.bitcoind, &[parent.clone(), child.clone()]).await?;
 			bcd::require_package_acceptance(&result, &[&parent, &child])?;
+			wallet.commit_tx(&child);
+			if let Some(change) = wallet.staged() {
+				t.store_changeset(wallet.kind(), change).await?;
+			}
 			t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) WHERE id=$1",
 				&[&group.id]).await?;
-			Ok(())
+			Ok(Some(wallet))
 		}).await?;
+		if let Some(mut wallet) = committed_wallet {
+			// Keep staged changes on any database failure, as persist() does.
+			let _ = wallet.take_staged();
+			crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
+		}
 		Ok(())
 	}
 
