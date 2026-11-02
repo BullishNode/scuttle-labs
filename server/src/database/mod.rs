@@ -515,6 +515,16 @@ impl<'t> Tx<'t> {
 			return Ok(None);
 		}
 
+		if self.expiry_payouts() {
+			let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
+			let owners = self.coin_owner_mailboxes(&ids).await?;
+			for id in ids {
+				if owners.get(&id) != Some(&mailbox_id.as_pubkey()) {
+					return crate::error::badarg!("vtxo {} does not belong to the provided mailbox", id);
+				}
+			}
+		}
+
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
