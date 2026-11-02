@@ -17,6 +17,7 @@ use cln_rpc::plugins::hold::hold_client::HoldClient;
 use crate::{fee_estimator, utils, vtxopool};
 use crate::secret::Secret;
 
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Bitcoind {
 	/// the URL of the bitcoind RPC (mandatory)
@@ -654,6 +655,11 @@ impl Config {
 		// at zero the user's preimage path opens with the server's reclaim
 		if self.network == bitcoin::Network::Bitcoin && self.htlc_expiry_delta == BlockDelta::ZERO {
 			bail!("Cannot set htlc_expiry_delta to zero on mainnet");
+		}
+
+		// at zero the watchman has no block to answer a stale exit in
+		if self.network == bitcoin::Network::Bitcoin && self.vtxo_exit_delta == BlockDelta::ZERO {
+			bail!("Cannot set vtxo_exit_delta to zero on mainnet");
 		}
 
 		Ok(())

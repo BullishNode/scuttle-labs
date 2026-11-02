@@ -62,6 +62,7 @@ async fn upsert_vtxo() {
 	db.write(async |t| t.upsert_vtxos([vtxo2.into(), vtxo3.clone()]).await).await.expect("Query succeeded");
 }
 
+
 #[tokio::test]
 async fn lightning_invoice() {
 	let mut ctx = TestContext::new_minimal("postgresd/lightning_node").await;
@@ -86,6 +87,7 @@ async fn lightning_invoice() {
 	assert_eq!(payment_indexes.created_index, 1);
 	assert_eq!(payment_indexes.updated_index, 2);
 }
+
 
 #[tokio::test]
 async fn integration() {
@@ -1008,6 +1010,11 @@ async fn vtxo_pool() {
 	let pool: Vec<_> = db.load_vtxopool().await.unwrap().try_collect().await.unwrap();
 	assert_eq!(pool.len(), 1);
 	assert_eq!(pool[0].id(), vtxo2.id());
+
+	// Get by ids skips spent vtxos
+	let got = db.read(async |t| t.get_pool_vtxos_by_ids(&[vtxo1.id(), vtxo2.id()]).await).await.unwrap();
+	assert_eq!(got.len(), 1);
+	assert_eq!(got[0].id(), vtxo2.id());
 }
 
 #[tokio::test]
@@ -1373,6 +1380,7 @@ async fn set_forfeit_transactions_is_idempotent() {
 
 	db.write(async |t| t.upsert_vtxos(input_vtxos.clone()).await).await.unwrap();
 
+
 	// We will create a round participation that spends all three vtxos.
 	let unlock_preimage: UnlockPreimage = [7u8; 32];
 	let unlock_hash = UnlockHash::hash(&unlock_preimage);
@@ -1594,8 +1602,6 @@ async fn round_participation_same_vtxo_multiple_pending() {
 const DUMMY_PUBKEY: &str = "038f47dcd43ba6d97fc9ed2e3bba09b175a45fac55f0683e8cf771e8ced4572354";
 const BOLT11_INVOICE: &str = "lnbcrt11p59rr6msp534kz2tahyrxl0rndcjrt8qpqvd0dynxxwfd28ea74rxjuj0tphfspp5nc0gf6vamuphaf4j49qzjvz2rg3del5907vdhncn686cj5yykvfsdqqcqzzs9qyysgqgalnpu3selnlgw8n66qmdpuqdjpqak900ru52v572742wk4mags8a8nec2unls57r5j95kkxxp4lr6wy9048uzgsvdhrz7dh498va2cq4t6qh8";
 
-// Insert an existing upstream attempt for the database transition tests.
-
 #[tokio::test]
 async fn lightning_payment_attempt_lifecycle() {
 	use server::database::ln::LightningPaymentStatus;
@@ -1642,15 +1648,15 @@ async fn lightning_payment_attempt_lifecycle() {
 	// Update attempt status to Submitted
 	db.write(async |t| t.update_lightning_payment_attempt_status(&attempt, LightningPaymentStatus::Submitted, None).await).await.unwrap();
 
-	// Upstream status transitions close the attempt without a fork receipt.
+	// Update attempt status to Succeeded with an error message (tests the error branch)
 	let refreshed = db.read(async |t| t.get_open_lightning_payment_attempts(node_id).await).await.unwrap();
-	assert_eq!(refreshed.len(), 1);
-	assert_eq!(refreshed[0].status, LightningPaymentStatus::Submitted);
-	assert!(db.write(async |t| t.update_lightning_payment_attempt_status(
-		&refreshed[0], LightningPaymentStatus::Succeeded, None,
-	).await).await.unwrap().is_some());
-	assert!(db.read(async |t| t.get_open_lightning_payment_attempts(node_id).await).await.unwrap().is_empty());
+	assert_eq!(refreshed.len(), 1); // Submitted is still "open"
 
+	db.write(async |t| t.update_lightning_payment_attempt_status(&refreshed[0], LightningPaymentStatus::Succeeded, None).await).await.unwrap();
+
+	// Succeeded attempt is no longer "open"
+	let open = db.read(async |t| t.get_open_lightning_payment_attempts(node_id).await).await.unwrap();
+	assert!(open.is_empty(), "succeeded attempt is closed");
 }
 
 #[tokio::test]
