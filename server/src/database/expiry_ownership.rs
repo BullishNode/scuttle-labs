@@ -1,7 +1,7 @@
 //! Resolve the selected current source under allocation and settlement locks.
 
 
-use bitcoin::{Amount, Txid};
+use bitcoin::Amount;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockHeight, BlockRef};
 
@@ -27,28 +27,28 @@ pub enum OwnershipDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipEvidence {
 	Pubkey,
-	IrreversibleEntitlement { entitlement_id: i64 },
+	IrreversibleEntitlement,
 	InputOwner,
-	LightningReceiveClaim { source: VtxoId, output: VtxoId },
+	LightningReceiveClaim,
 	Pool,
 	Padding,
 	Forfeit,
-	Offboard(Txid),
+	Offboard,
 	Exchange { participation_id: i64, unlock_hash: String, forfeited: bool },
-	HtlcOffchain { payment_hash: PaymentHash, resolution: HtlcResolution },
-	HtlcStoredPreimage { payment_hash: PaymentHash },
-	HtlcSourceDischarged { payment_hash: PaymentHash },
+	HtlcOffchain,
+	HtlcStoredPreimage,
+	HtlcSourceDischarged,
 	/// No external payment was attempted, and the admitted refund deadline is
 	/// behind both completed views. This is an expiry decision, not a forged
 	/// upstream off-chain revocation.
-	HtlcUnattemptedExpired { payment_hash: PaymentHash, htlc_expiry: BlockHeight },
-	HtlcExternalFailed { payment_hash: PaymentHash, htlc_expiry: BlockHeight },
+	HtlcUnattemptedExpired,
+	HtlcExternalFailed,
 	/// Chain-derived closure of every receive funded by these own attempts.
-	HtlcInternalGrantsReclaimed { payment_hash: PaymentHash, attempts: Vec<(i64, i64)>, block: BlockRef },
+	HtlcInternalGrantsReclaimed { payment_hash: PaymentHash, block: BlockRef },
 	/// An unsettled receive grant past its HTLC expiry and unspent on chain.
 	/// The operator takes it back with the expiry sweep of its tree output.
 	/// Chain-derived: a later preimage spend conflicts the sweep.
-	HtlcRecvExpired { payment_hash: PaymentHash, htlc_expiry: BlockHeight },
+	HtlcRecvExpired,
 }
 
 #[derive(Debug, Clone)]
@@ -100,7 +100,7 @@ impl Tx<'_> {
 			ensure!(self.query_opt("SELECT txid FROM offboards WHERE txid=$1", &[&txid.to_string()]).await?.is_some(),
 				"expiry offboard reference has no durable transaction");
 			proposal.disposition = OwnershipDisposition::Operator;
-			proposal.evidence = Some(OwnershipEvidence::Offboard(txid));
+			proposal.evidence = Some(OwnershipEvidence::Offboard);
 			return Ok(proposal);
 		}
 
@@ -133,7 +133,7 @@ impl Tx<'_> {
 					} else if row.get::<_, &str>("disposition") == "operator" {
 						OwnershipDisposition::Operator
 					} else { return Ok(proposal); };
-					proposal.evidence = Some(OwnershipEvidence::IrreversibleEntitlement { entitlement_id: row.get("id") });
+					proposal.evidence = Some(OwnershipEvidence::IrreversibleEntitlement);
 					return Ok(proposal);
 				}
 			}
@@ -190,9 +190,9 @@ impl Tx<'_> {
 			proposal.evidence = Some(OwnershipEvidence::Padding);
 			return Ok(proposal);
 		}
-		if let Some((output, key)) = self.receive_claim_recipient(state.vtxo_id).await? {
+		if let Some((_, key)) = self.receive_claim_recipient(state.vtxo_id).await? {
 			proposal.disposition = OwnershipDisposition::Customer { user_pubkey: key };
-			proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim { source: state.vtxo_id, output });
+			proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim);
 			return Ok(proposal);
 		}
 		if state.spend_state == SpendState::Unregistered {
@@ -272,15 +272,15 @@ impl Tx<'_> {
 					match subscription.status {
 						LightningHtlcSubscriptionStatus::Settled => {
 							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
-							proposal.evidence = Some(OwnershipEvidence::HtlcStoredPreimage { payment_hash: hash });
+							proposal.evidence = Some(OwnershipEvidence::HtlcStoredPreimage);
 						},
 						LightningHtlcSubscriptionStatus::Canceled if expired_contract => {
 							proposal.disposition = OwnershipDisposition::Operator;
-							proposal.evidence = Some(OwnershipEvidence::HtlcRecvExpired { payment_hash: hash, htlc_expiry: htlc.htlc.htlc_expiry });
+							proposal.evidence = Some(OwnershipEvidence::HtlcRecvExpired);
 						},
 						LightningHtlcSubscriptionStatus::HtlcsReady if expired_contract && !proposal.has_stored_preimage => {
 							proposal.disposition = OwnershipDisposition::Operator;
-							proposal.evidence = Some(OwnershipEvidence::HtlcRecvExpired { payment_hash: hash, htlc_expiry: htlc.htlc.htlc_expiry });
+							proposal.evidence = Some(OwnershipEvidence::HtlcRecvExpired);
 						},
 						_ => proposal.disposition = OwnershipDisposition::Unresolved("Lightning receive remains open"),
 					}
@@ -288,18 +288,18 @@ impl Tx<'_> {
 				}
 				if source == LightningSourceState::Discharged {
 					proposal.disposition = OwnershipDisposition::Operator;
-					proposal.evidence = Some(OwnershipEvidence::HtlcSourceDischarged { payment_hash: hash });
+					proposal.evidence = Some(OwnershipEvidence::HtlcSourceDischarged);
 					return Ok(proposal);
 				}
 				if source == LightningSourceState::Failed && fact.onchain_spent_height.is_none()
 					&& fact.onchain_spent_txid.is_none() && htlc.htlc.chain_resolution.is_none() {
 					if let Some(watchman_tip) = watchman_tip {
-						if let Some((attempts, block)) = self.internal_grants_reclaimed(
+						if let Some(block) = self.internal_grants_reclaimed(
 							state.vtxo_id, hash, tip, watchman_tip,
 						).await? {
 							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
 							proposal.evidence = Some(OwnershipEvidence::HtlcInternalGrantsReclaimed {
-								payment_hash: hash, attempts, block,
+								payment_hash: hash, block,
 							});
 							return Ok(proposal);
 						}
@@ -323,8 +323,8 @@ impl Tx<'_> {
 					&& htlc.htlc.htlc_expiry <= tip && watchman_tip.is_some_and(|h| htlc.htlc.htlc_expiry <= h) {
 					proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
 					proposal.evidence = Some(match source {
-						LightningSourceState::Failed => OwnershipEvidence::HtlcExternalFailed { payment_hash: hash, htlc_expiry: htlc.htlc.htlc_expiry },
-						_ => OwnershipEvidence::HtlcUnattemptedExpired { payment_hash: hash, htlc_expiry: htlc.htlc.htlc_expiry },
+						LightningSourceState::Failed => OwnershipEvidence::HtlcExternalFailed,
+						_ => OwnershipEvidence::HtlcUnattemptedExpired,
 					});
 				} else {
 					proposal.disposition = OwnershipDisposition::Unresolved("Lightning settlement pending");
@@ -339,7 +339,7 @@ impl Tx<'_> {
 				return Ok(proposal);
 			}
 			if htlc.htlc.chain_resolution.is_some() { return Ok(proposal); }
-			proposal.evidence = Some(OwnershipEvidence::HtlcOffchain { payment_hash: hash, resolution });
+			proposal.evidence = Some(OwnershipEvidence::HtlcOffchain);
 			proposal.disposition = match (htlc.direction(), resolution) {
 				(HtlcDirection::Incoming, HtlcResolution::Fulfilled) | (HtlcDirection::Outgoing, HtlcResolution::Revoked) => OwnershipDisposition::Operator,
 				_ => OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() },

@@ -63,24 +63,24 @@ pub struct CommittedExpiryGroup {
 
 fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
 	match evidence {
-		OwnershipEvidence::IrreversibleEntitlement { .. } => serde_json::json!({"kind":"irreversible_entitlement"}),
+		OwnershipEvidence::IrreversibleEntitlement => serde_json::json!({"kind":"irreversible_entitlement"}),
 		OwnershipEvidence::Pubkey => serde_json::json!({"kind":"pubkey"}),
 		OwnershipEvidence::InputOwner => serde_json::json!({"kind":"input_owner"}),
-		OwnershipEvidence::LightningReceiveClaim { .. } => serde_json::json!({"kind":"lightning_receive_claim"}),
+		OwnershipEvidence::LightningReceiveClaim => serde_json::json!({"kind":"lightning_receive_claim"}),
 		OwnershipEvidence::Pool => serde_json::json!({"kind":"pool"}),
 		OwnershipEvidence::Padding => serde_json::json!({"kind":"padding"}),
 		OwnershipEvidence::Forfeit => serde_json::json!({"kind":"forfeit"}),
-		OwnershipEvidence::Offboard(_) => serde_json::json!({"kind":"offboard"}),
+		OwnershipEvidence::Offboard => serde_json::json!({"kind":"offboard"}),
 		OwnershipEvidence::Exchange { .. } => serde_json::json!({"kind":"exchange"}),
-		OwnershipEvidence::HtlcStoredPreimage { .. } => serde_json::json!({"kind":"htlc_stored_preimage"}),
-		OwnershipEvidence::HtlcSourceDischarged { .. } => serde_json::json!({"kind":"htlc_source_discharged"}),
-		OwnershipEvidence::HtlcExternalFailed { .. } => serde_json::json!({"kind":"htlc_external_failed"}),
+		OwnershipEvidence::HtlcStoredPreimage => serde_json::json!({"kind":"htlc_stored_preimage"}),
+		OwnershipEvidence::HtlcSourceDischarged => serde_json::json!({"kind":"htlc_source_discharged"}),
+		OwnershipEvidence::HtlcExternalFailed => serde_json::json!({"kind":"htlc_external_failed"}),
 		OwnershipEvidence::HtlcInternalGrantsReclaimed { block, .. } => serde_json::json!({
 			"kind":"htlc_internal_grants_reclaimed","height":block.height.to_u32(),"hash":block.hash.to_string(),
 		}),
-		OwnershipEvidence::HtlcRecvExpired { .. } => serde_json::json!({"kind":"htlc_recv_expired"}),
-		OwnershipEvidence::HtlcUnattemptedExpired { .. } => serde_json::json!({"kind":"htlc_unattempted_expired"}),
-		OwnershipEvidence::HtlcOffchain { .. } => serde_json::json!({"kind":"htlc_offchain"}),
+		OwnershipEvidence::HtlcRecvExpired => serde_json::json!({"kind":"htlc_recv_expired"}),
+		OwnershipEvidence::HtlcUnattemptedExpired => serde_json::json!({"kind":"htlc_unattempted_expired"}),
+		OwnershipEvidence::HtlcOffchain => serde_json::json!({"kind":"htlc_offchain"}),
 	}
 }
 

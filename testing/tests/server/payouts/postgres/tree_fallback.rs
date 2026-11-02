@@ -88,9 +88,7 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: destination.public_key() };
 	proposal.evidence = Some(OwnershipEvidence::InputOwner);
 	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), expected);
-	proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim {
-		source: coin.id(), output: VTXO_VECTORS.arkoor2_vtxo.id(),
-	});
+	proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim);
 	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), expected);
 	proposal.evidence = None;
 	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);

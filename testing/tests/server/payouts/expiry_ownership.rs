@@ -79,8 +79,8 @@ async fn held_coin_is_alarmed_before_decision() {
 			if user_pubkey == key.public_key()
 	));
 	assert!(matches!(ready.evidence, Some(
-		server::database::expiry_ownership::OwnershipEvidence::HtlcUnattemptedExpired { .. }
-			| server::database::expiry_ownership::OwnershipEvidence::IrreversibleEntitlement { .. }
+		server::database::expiry_ownership::OwnershipEvidence::HtlcUnattemptedExpired
+			| server::database::expiry_ownership::OwnershipEvidence::IrreversibleEntitlement
 	)));
 	// Readiness never invents an upstream off-chain revocation. A concurrent
 	// background allocation may already have recorded the spend fence.
