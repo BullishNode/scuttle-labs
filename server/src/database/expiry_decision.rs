@@ -152,8 +152,15 @@ impl Tx<'_> {
 						.context("expiry branch amount overflow"))?;
 					if amount != fact.state.vtxo.amount() {
 						// A board fee is a value-bearing P2A output, not a child VTXO.
+						// Boards retain the validated Full leaf without making its exit
+						// publishable. Use its txid-bound geometry only for this check.
 						let spend = self.get_virtual_transaction_by_txid(txid).await?
 							.context("expiry branch transaction missing")?.signed_tx
+							.map(|tx| tx.into_owned()).or_else(|| snapshot.regular.iter()
+								.filter(|child| child.state.vtxo.point().txid == txid)
+								.filter_map(|child| child.full_vtxo.as_ref())
+								.flat_map(|vtxo| vtxo.transactions())
+								.find(|step| step.tx.compute_txid() == txid).map(|step| step.tx))
 							.context("expiry branch residual lacks signed transaction")?;
 						ensure!(spend.compute_txid() == txid && spend.input.len() == 1
 							&& spend.input[0].previous_output == fact.state.vtxo.point(),
