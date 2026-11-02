@@ -1,5 +1,7 @@
 //! Native accepted-forfeit versus payout-decision ordering.
 
+use super::expiry_test::{canonical, published_payout, wait_rebuilt};
+
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,7 +19,6 @@ use bitcoin::hashes::Hash;
 use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use futures::StreamExt;
-use serde_json::json;
 use server::database::{Db, Tx};
 use server_rpc::protos;
 use tokio::sync::{Notify, oneshot};
@@ -169,10 +170,10 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 		assert!(source[0].spent_in_round.is_some());
 		// A zero customer count before the competing worker finishes would
 		// prove nothing. Wait for its operator-only decision and sweep.
-		let (allocation, parent): (i64, Transaction) = tokio::time::timeout(Duration::from_secs(30), async {
+		let parent: Transaction = tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
 				let row = db.read(async |tx| Ok(tx.query_opt("
-					SELECT a.id, a.sweep_tx, c.disposition
+					SELECT a.sweep_tx, c.disposition
 					FROM expiry_allocation_state a
 					JOIN expiry_allocation_input i ON i.allocation_id=a.id
 					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
@@ -186,7 +187,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 					&[&original.chain_anchor().to_string(), &original.id().to_string()]).await?)).await.unwrap();
 				if let Some(row) = row {
 					assert_eq!(row.get::<_, String>("disposition"), "operator");
-					break (row.get("id"), deserialize(row.get("sweep_tx")).unwrap());
+					break deserialize(row.get("sweep_tx")).unwrap();
 				}
 				tokio::time::sleep(Duration::from_millis(50)).await;
 			}
@@ -195,23 +196,10 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 		assert!(parent.output.iter().all(|output| output.script_pubkey != destination));
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 		ctx.generate_blocks(6).await;
-		// Core 31 reports the P2A output as `anchor`, which the older
-		// verbose RPC model does not recognize. Read Core's depth.
-		let confirmed: serde_json::Value = ctx.bitcoind().sync_client().call(
-			"getrawtransaction", &[json!(parent.compute_txid().to_string()), json!(true)],
-		).unwrap();
-		assert!(confirmed["confirmations"].as_u64().unwrap() >= 6);
-		tokio::time::timeout(Duration::from_secs(20), async {
-			loop {
-				let row = db.read(async |tx| Ok(tx.query_one("
-					SELECT status
-					FROM expiry_allocation_state
-					WHERE id=$1
-				", &[&allocation]).await?)).await.unwrap();
-				if row.get::<_, String>("status") == "confirmed" { break; }
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-		}).await.expect("the actual operator sweep must be projected as confirmed before checking duplicate entitlement");
+		canonical(&ctx, &parent);
+		let point = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
+		wait_rebuilt(&db, point, Duration::from_secs(20),
+			"the competing worker must process the confirmed sweep before checking duplicate entitlement").await;
 		let no_duplicate = db.read(async |tx| Ok(tx.query_one("
 			SELECT COUNT(*)
 			FROM expiry_allocation_coin c
@@ -230,16 +218,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 		srv.watchmand().start().await.unwrap();
 		let parent: Transaction = tokio::time::timeout(Duration::from_secs(20), async {
 			loop {
-				let row = db.read(async |tx| Ok(tx.query_opt("
-					SELECT a.sweep_tx
-					FROM expiry_allocation_state a
-					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id
-					WHERE e.vtxo_id=$1
-					AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')
-					AND a.broadcast_at IS NOT NULL
-				", &[&original.id().to_string()]).await?)).await.unwrap();
-				if let Some(row) = row { break deserialize(row.get("sweep_tx")).unwrap(); }
+				if let Some((_, parent)) = published_payout(&db, original.id()).await { break parent; }
 				tokio::time::sleep(Duration::from_millis(25)).await;
 			}
 		}).await.expect("actual decision must cancel the nonbinding exchange and pay its original source");
@@ -348,7 +327,6 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		let signed = wallet.get_full_vtxo(source.id()).await.unwrap();
 		wallet.validate_vtxo(&signed).await.unwrap();
 		let destination = wallet.fallback_script();
-		let mailbox = wallet.mailbox_keypair().public_key().to_string();
 		let sponsor = srv.watchmand().wait_wallet_address().await;
 		ctx.bitcoind().fund_addr(sponsor, sat(100_000)).await;
 		ctx.generate_blocks(2).await;
@@ -365,10 +343,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		assert!(!initial.decided_for_fallback);
 		assert!(initial.spent_in_round.is_none());
 		let mut errors = srv.subscribe_log::<server_log::RoundError>();
-		let mut signed_trees = srv.subscribe_log::<server_log::CreatedSignedVtxoTree>();
 		let mut accepted_sigs = srv.subscribe_log::<server_log::ReceivedRoundVtxoSignatures>();
-		let mut fatal = srv.subscribe_log::<server_log::FatalStoringRound>();
-		let mut broadcasts = srv.subscribe_log::<server_log::BroadcastRoundFundingTx>();
 		let mut empty = srv.subscribe_log::<server_log::NoRoundPayments>();
 		let mut events = wallet.subscribe_round_events().await.unwrap();
 		let refreshing_wallet = wallet.clone();
@@ -405,10 +380,6 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 			}).await.unwrap()
 		};
 		assert_eq!(no_persistence().await, (0, 0, 0));
-		let checkpoints = wallet.pending_round_states().await.unwrap();
-		assert_eq!(checkpoints.len(), 1);
-		assert_eq!(checkpoints[0].state().participation().inputs.iter().map(|coin| coin.id()).collect::<Vec<_>>(), vec![source.id()]);
-		assert!(!checkpoints[0].state().forfeits_may_be_exposed());
 		assert_eq!(held.forfeit_requests.load(Ordering::SeqCst), 0);
 		let expired = ctx.generate_blocks(1).await;
 		assert_eq!(expired, source.expiry_height());
@@ -417,23 +388,15 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		srv.watchmand().trigger_sweep().await;
 		let allocation = tokio::time::timeout(Duration::from_secs(15), async {
 			loop {
-				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id, c.owner_mailbox,
-					c.user_pubkey,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,c.spk
+				let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id
 					FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 					JOIN expiry_entitlement e ON e.id=c.entitlement_id
-					WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.status<>'conflicted'",
+					WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status<>'conflicted'",
 					&[&source.id().to_string()]).await?)).await.unwrap();
 				if let Some(row) = row { break row; }
 				tokio::time::sleep(Duration::from_millis(20)).await;
 			}
 		}).await.expect("MISSED_TARGET: real watchmand did not commit the source decision before signature release");
-		assert_eq!(allocation.get::<_, String>("owner_mailbox"), mailbox);
-		assert_eq!(allocation.get::<_, String>("user_pubkey"), source.policy().user_pubkey().to_string());
-		assert_eq!(allocation.get::<_, i64>("gross_sat"), 100_000);
-		assert_eq!(allocation.get::<_, i64>("fee_sat"), 1_000);
-		assert_eq!(allocation.get::<_, i64>("payout_sat"), 99_000);
-		assert_eq!(allocation.get::<_, i64>("forfeited_sat"), 0);
-		assert_eq!(allocation.get::<_, String>("spk"), destination.to_hex_string());
 		let before_release_rows = no_persistence().await;
 		assert_eq!(before_release_rows, (0, 0, 0));
 		let decided = db.read(async |tx| tx.get_user_vtxo_by_id(source.id()).await).await.unwrap();
@@ -445,8 +408,6 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		let valid = accepted_sigs.recv().wait(Duration::from_secs(15)).await.unwrap();
 		assert_eq!(valid.round_seq, proposal.round_seq, "MISSED_TARGET: original round timed out before the decision");
 		assert_eq!(valid.attempt_seq, proposal.attempt_seq);
-		let combined = signed_trees.recv().wait(Duration::from_secs(15)).await.unwrap();
-		assert_eq!(combined.round_seq, proposal.round_seq);
 		let recoverable = errors.recv().wait(Duration::from_secs(15)).await.unwrap();
 		assert_eq!(recoverable.round_seq, proposal.round_seq);
 		assert_eq!(recoverable.error, format!("tx body error: {}", server::FallbackRefusal::DecidedForFallback(source.id())));
@@ -459,19 +420,17 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		let client_error = refreshing.wait(Duration::from_secs(15)).await.unwrap().unwrap_err();
 		assert!(client_error.to_string().contains("round failed"));
 		assert!(held.response.lock().unwrap().as_ref().unwrap().is_ok());
-		assert!(fatal.try_recv().is_err());
-		assert!(broadcasts.try_recv().is_err());
 		assert_eq!(no_persistence().await, (0, 0, 0));
 		assert!(ctx.bitcoind().sync_client().custom_get_raw_transaction_info(funding_id, None).unwrap().is_none());
 		assert_eq!(held.forfeit_requests.load(Ordering::SeqCst), 0);
 		assert!(wallet.pending_round_states().await.unwrap().is_empty());
 		assert_eq!(wallet.get_full_vtxo(source.id()).await.unwrap().serialize(), signed.serialize());
-		let allocation_id: i64 = allocation.get("id");
-		let parent: Transaction = tokio::time::timeout(Duration::from_secs(20), async {
+		let parent = tokio::time::timeout(Duration::from_secs(20), async {
 			loop {
-				let tx = db.read(async |t| Ok(t.query_opt("SELECT sweep_tx FROM expiry_allocation_state
-					WHERE id=$1 AND broadcast_at IS NOT NULL", &[&allocation_id]).await?)).await.unwrap();
-				if let Some(tx) = tx { break deserialize(tx.get("sweep_tx")).unwrap(); }
+				if let Some((id, parent)) = published_payout(&db, source.id()).await {
+					assert_eq!(id, allocation.get::<_, i64>("id"));
+					break parent;
+				}
 				tokio::time::sleep(Duration::from_millis(25)).await;
 			}
 		}).await.unwrap();

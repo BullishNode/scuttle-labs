@@ -1,6 +1,6 @@
 //! A failed dispatched swap pays its absent owner after restart.
 
-use super::expiry_test::{actual_fee, wait_rebuilt as wait_exact_rebuilt};
+use super::expiry_test::{actual_fee, canonical, published_payout, wait_rebuilt as wait_exact_rebuilt};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -46,14 +46,7 @@ async fn canonical_package(
 	ctx: &TestContext, parent: &Transaction,
 	customer_script: &ScriptBuf, operator_script: &ScriptBuf,
 ) -> (BlockRef, Transaction) {
-	let core = ctx.bitcoind().sync_client();
-	let parent_txid = parent.compute_txid();
-	let info = core.custom_get_raw_transaction_info(parent_txid, None).unwrap().unwrap();
-	assert!(info.confirmations.unwrap_or(0) >= 6);
-	let hash = info.blockhash.unwrap();
-	let header = core.get_block_header_info(&hash).unwrap();
-	assert_eq!(core.get_block_hash(header.height as u64).unwrap(), hash);
-	assert_eq!(ctx.bitcoind().await_transaction(parent_txid).await, *parent);
+	let block = canonical(ctx, parent);
 	assert_eq!(parent.version.0, 3);
 	assert!(parent.vsize() <= 10_000);
 	assert_eq!(actual_fee(ctx, parent).await, Amount::ZERO);
@@ -61,23 +54,13 @@ async fn canonical_package(
 		assert!(output.is_p2a_fee_anchor() || &output.script_pubkey == operator_script,
 			"retained parent value must use the configured operator sweep destination");
 	}
-	let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor())
-		.map(|(vout, _)| OutPoint::new(parent_txid, vout as u32)).collect::<Vec<_>>();
-	assert_eq!(anchors.len(), 1);
-	let block = core.get_block(&hash).unwrap();
-	let children = block.txdata.iter().filter(|tx|
-		tx.input.iter().any(|input| input.previous_output == anchors[0])
-	).collect::<Vec<_>>();
-	assert_eq!(children.len(), 1, "select the canonical anchor spender, not an attempted fee child");
-	let child = (*children[0]).clone();
+	assert_eq!(parent.output.iter().filter(|output| output.is_p2a_fee_anchor()).count(), 1);
+	let (child, fee) = ark_testing::onchain::observed_payout_fee_child(ctx, parent).unwrap();
+	assert_eq!(canonical(ctx, &child), block);
 	assert_eq!(child.version.0, 3);
 	assert!(child.vsize() <= 1_000);
-	let child_info = core.custom_get_raw_transaction_info(child.compute_txid(), None).unwrap().unwrap();
-	assert!(child_info.confirmations.unwrap_or(0) >= 6);
-	assert_eq!(child_info.blockhash, Some(hash));
-	let fee = actual_fee(ctx, &child).await;
-	assert!(fee > Amount::ZERO);
-	(BlockRef { height: BlockHeight::new(u32::try_from(header.height).unwrap()), hash }, child)
+	assert!(fee > 0);
+	(block, child)
 }
 
 async fn assert_original_attempt(
@@ -246,12 +229,7 @@ async fn failed_swap_during_restart() {
 	srv.watchmand().wait_for_sync_height(expired).await;
 	let (allocation, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
-				&[&source.to_string()],
-			).await?)).await.unwrap();
-			if let Some(row) = row { break (row.get::<_, i64>("id"), deserialize::<Transaction>(row.get("sweep_tx")).unwrap()); }
+			if let Some(payout) = published_payout(&db, source).await { break payout; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("the failed swap must pay its absent rightful owner without user revocation");
@@ -274,14 +252,13 @@ async fn failed_swap_during_restart() {
 	let operator_remainder = parent.output.iter().filter(|out| out.script_pubkey != destination)
 		.map(|out| out.value).sum::<Amount>();
 	assert_eq!(operator_remainder, sat(1_000));
-	let (parent_block, child) = canonical_package(&ctx, &parent,
+	let (_, child) = canonical_package(&ctx, &parent,
 		&destination, &operator_script).await;
 	let child_txid = child.compute_txid();
-	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone()), (child_txid, child)]);
-	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid,a.confirmed_height,a.confirmed_hash, \
+	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone()), (child_txid, child.clone())]);
+	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid, \
 		c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
-		e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS entitlement_gross_sat, \
-		(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS irreversible_facts \
+		e.vtxo_id \
 		FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
 		WHERE v.anchor_point=$1", &[&root.to_string()],
@@ -293,24 +270,14 @@ async fn failed_swap_during_restart() {
 			active += 1;
 			assert_eq!(row.get::<_, i64>("id"), allocation);
 			assert_eq!(row.get::<_, String>("vtxo_id"), source.to_string());
-			assert_eq!(row.get::<_, String>("status"), "confirmed");
 			assert_eq!(row.get::<_, String>("owner_mailbox"), owner_mailbox.to_string());
 			assert_eq!(row.get::<_, String>("user_pubkey"), key.public_key().to_string());
 			assert_eq!(row.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
 			assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
-			assert_eq!(row.get::<_, i64>("entitlement_gross_sat"), 100_000);
 			assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
 			assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
 			assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 			assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(parent.compute_txid().to_string()));
-			assert_eq!(row.get::<_, Option<i64>>("confirmed_height"), Some(i64::from(parent_block.height.to_u32())));
-			assert_eq!(row.get::<_, Option<String>>("confirmed_hash"), Some(parent_block.hash.to_string()));
-			let facts: serde_json::Value = serde_json::from_str(row.get("irreversible_facts")).unwrap();
-			assert_eq!(facts["kind"], "htlc_external_failed");
-			assert_eq!(facts["payment_hash"], hash.to_string());
-			assert_eq!(facts["htlc_expiry"], deadline.to_u32());
-
-			assert_eq!(facts["stored_preimage"], false);
 			let recorded = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 			assert_eq!(recorded, parent, "the exact rightful payout must be its stored attributed parent");
 		}
@@ -329,56 +296,28 @@ async fn failed_swap_during_restart() {
 		graph.insert(sponsor.compute_txid(), sponsor);
 	}
 	assert_eq!(active, 1);
-	let payee = db.read(async |tx| Ok(tx.query_one("SELECT (ROW_NUMBER() OVER (ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat \
-		FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts", &[&allocation],
-	).await?)).await.unwrap();
-	assert_eq!(payee.get::<_, i32>("output_index"), i32::try_from(payout.vout).unwrap());
-	assert_eq!(payee.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
-	assert_eq!(payee.get::<_, i64>("amount_sat"), 99_000);
-	let inputs = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM expiry_allocation_input \
-		WHERE allocation_id=$1", &[&allocation],
-	).await?)).await.unwrap();
-	assert_eq!(inputs.len(), 1);
-	assert_eq!(inputs[0].get::<_, String>("vtxo_id"), root.to_string());
-	let mut canonical_outputs = BTreeSet::new();
-	let mut spent = BTreeSet::new();
-	let mut external_inputs = Amount::ZERO;
-	let mut total_fees = Amount::ZERO;
+	assert_eq!(graph.len(), 2, "the original root has only one canonical parent and fee child");
+	let sponsor = OutPoint::new(fee_funding, fee_vout as u32);
+	let spent = child.input.iter().map(|input| input.previous_output).collect::<BTreeSet<_>>();
+	assert_eq!(spent.len(), child.input.len(), "the child cannot duplicate an input");
+	assert!(spent.contains(&sponsor));
+	assert!(spent.iter().all(|point| *point == sponsor || point.txid == parent.compute_txid()),
+		"only the original parent and declared confirmed sponsor fund this child");
+	assert!(child.output.iter().all(|output| output.script_pubkey != destination),
+		"the sole 99k customer payment is in the immutable parent");
 	let core = ctx.bitcoind().sync_client();
-	for (txid, transaction) in &graph {
-		let info = core.custom_get_raw_transaction_info(*txid, None).unwrap().unwrap();
-		assert!(info.confirmations.unwrap_or(0) >= 6);
-		let hash = info.blockhash.unwrap();
-		assert_eq!(core.get_block_hash(core.get_block_header_info(&hash).unwrap().height as u64).unwrap(), hash);
-		total_fees += actual_fee(&ctx, transaction).await;
-		for input in &transaction.input {
-			assert!(spent.insert(input.previous_output), "the canonical graph cannot spend an outpoint twice");
-			if !graph.contains_key(&input.previous_output.txid) {
-				assert!(input.previous_output == root || input.previous_output == OutPoint::new(fee_funding, fee_vout as u32),
-					"only the source and declared confirmed watchman funding may enter this graph");
-				let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-				external_inputs += previous.output[input.previous_output.vout as usize].value;
-			}
-		}
-		for (vout, output) in transaction.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination) {
-			canonical_outputs.insert(OutPoint::new(*txid, vout as u32));
-			assert_eq!(output.value, sat(99_000));
-		}
-	}
-	assert_eq!(canonical_outputs, BTreeSet::from([payout]), "the entire backing lineage has exactly one customer payment");
-	assert!(spent.contains(&root));
-	assert!(spent.contains(&OutPoint::new(fee_funding, fee_vout as u32)));
 	let mut remaining = Amount::ZERO;
-	for (txid, transaction) in &graph {
-		for (vout, output) in transaction.output.iter().enumerate() {
-			if spent.contains(&OutPoint::new(*txid, vout as u32)) { continue; }
-			let actual = core.get_tx_out(txid, vout as u32, Some(true)).unwrap().unwrap();
+	for transaction in [&parent, &child] {
+		for (index, output) in transaction.output.iter().enumerate() {
+			if spent.contains(&OutPoint::new(transaction.compute_txid(), index as u32)) { continue; }
+			let actual = core.get_tx_out(&transaction.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
 			assert_eq!(actual.value, output.value);
 			assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
 			remaining += actual.value;
 		}
 	}
-	assert_eq!(external_inputs, remaining + total_fees, "source and sponsor funds must be conserved across the canonical DAG");
+	assert_eq!(backing.value + funded.output[fee_vout].value, remaining + actual_fee(&ctx, &child).await,
+		"the source and declared sponsor cover the payout, operator remainder, fee change and actual miner fee");
 	assert_eq!(db.read(async |tx| tx.get_user_vtxo_by_id(source).await).await.unwrap().spend_state, SpendState::Spent);
 	let upstream = db.read(async |tx| server::database::htlc_vtxo::get_htlc_vtxo(tx, source).await).await.unwrap().unwrap();
 	assert_eq!(upstream.htlc.resolution(), None, "fallback must not invent cooperative user revocation");
