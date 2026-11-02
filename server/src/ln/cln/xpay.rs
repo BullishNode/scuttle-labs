@@ -238,7 +238,7 @@ impl ClnXpayClient {
 		match attempt_res {
 			Ok(Some(attempt)) => {
 				if let Err(e) = self.reconcile_payment_attempt_locked(
-					attempt, pay_error.as_deref(), zero_part.map(|code| (&record, code)), dispatch,
+					attempt, pay_error.as_deref(), zero_part.map(|code| (&record, code)), false, dispatch,
 				).await {
 					error!("Error syncing payment attempt status: {e:#}");
 				}
@@ -300,16 +300,16 @@ impl ClnXpayClient {
 		self.reconcile_payment_attempt(attempt, pay_error).await
 	}
 
-	/// Observe existing work only. An operator cannot dispatch a new call or
-	/// turn an empty lookup into failure, nor select a different backend.
-	pub async fn reconcile_existing_payment_attempt(&self, attempt: LightningPaymentAttempt)
-		-> anyhow::Result<()>
-	{
+	/// Observe existing work. Only privileged external confirmation of complete
+	/// same-backend cold cessation permits resolving an otherwise empty orphan.
+	pub async fn reconcile_existing_payment_attempt(
+		&self, attempt: LightningPaymentAttempt, native_cold_restart_confirmed: bool,
+	) -> anyhow::Result<()> {
 		ensure!(!attempt.is_self_payment(), "intra-Ark attempts resolve through their receive");
-		let info = super::unary_rpc(self.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await?.into_inner();
-		ensure!(qualified_node(&info, self.node_pubkey, self.network), "recorded native node/version/network changed");
-		self.reconcile_payment_attempt(attempt, None).await?;
-		Ok(())
+		let dispatch = self.payment_guards.try_lock_dispatch(attempt.payment_hash)
+			.context("original dispatch is still active; attempt stays held")?;
+		self.node_info().await?;
+		self.reconcile_payment_attempt_locked(attempt, None, None, native_cold_restart_confirmed, dispatch).await
 	}
 
 	async fn reconcile_payment_attempt(
@@ -318,13 +318,13 @@ impl ClnXpayClient {
 		let payment_hash = attempt.payment_hash;
 		ensure!(attempt.lightning_node_id == self.node_id, "attempt belongs to a different native node");
 		let Some(dispatch) = self.payment_guards.try_lock_dispatch(payment_hash) else { return Ok(()); };
-		self.reconcile_payment_attempt_locked(attempt, pay_error, None, dispatch).await
+		self.reconcile_payment_attempt_locked(attempt, pay_error, None, false, dispatch).await
 	}
 
 	/// Consume a live result without releasing its dispatch lock to the monitor.
 	async fn reconcile_payment_attempt_locked(
 		&self, attempt: LightningPaymentAttempt, pay_error: Option<&str>,
-		zero_part: Option<(&ClnXpayRecord, i32)>, dispatch: PaymentGuard,
+		zero_part: Option<(&ClnXpayRecord, i32)>, native_cold_restart_confirmed: bool, dispatch: PaymentGuard,
 	) -> anyhow::Result<()> {
 		let payment_hash = attempt.payment_hash;
 		ensure!(dispatch.payment_hash() == payment_hash, "dispatch guard belongs to a different payment hash");
@@ -351,7 +351,28 @@ impl ClnXpayClient {
 		let hash_pending_or_complete = retain_own_pays(&mut listpays_response.pays, payment_hash, &label)?;
 		if listpays_response.pays.is_empty() {
 			if let Some((record, code)) = zero_part.filter(|_| !hash_pending_or_complete) {
-				self.payment_handler().process_native_failure(&self.settler, &attempt, error, record, code).await?;
+				self.payment_handler().process_native_failure(&self.settler, &attempt, error, record, Some(code)).await?;
+				return Ok(());
+			}
+			if native_cold_restart_confirmed {
+				ensure!(!hash_pending_or_complete, "same-hash native work is active or paid; orphan stays held");
+				let parts = super::unary_rpc(self.rpc.clone().list_send_pays(cln_rpc::ListsendpaysRequest {
+					payment_hash: Some(payment_hash.to_vec()), ..Default::default()
+				})).await?.into_inner().payments;
+				for part in parts {
+					ensure!(part.payment_hash == payment_hash.to_vec()
+						&& part.payment_preimage.is_none()
+						&& matches!(cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::try_from(part.status),
+							Ok(cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Failed)),
+						"same-hash native parts are paid, pending or unknown; orphan stays held");
+				}
+				self.node_info().await?;
+				let record = self.db.read(async |tx| Ok(xpay::get_xpays_by_payment_hash(&**tx, payment_hash).await?
+					.into_iter().find(|record| record.label.as_deref() == Some(label.as_str())))).await?
+					.context("orphan has no original native request")?;
+				self.payment_handler().process_native_failure(&self.settler, &attempt,
+					Some("operator confirmed same-backend cold restart; no active or successful native payment"),
+					&record, None).await?;
 				return Ok(());
 			}
 			match attempt.status {

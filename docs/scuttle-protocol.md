@@ -21,10 +21,19 @@ the public Ark or Mailbox routes. Its network trust boundary is unchanged.
 
 `captaind rpc --addr <private-admin-address> reconcile-lightning-attempt <attempt-id>`
 observes an existing external payment on its recorded online node. It returns
-the current attempt state; it cannot choose an outcome, switch nodes or dispatch
-another payment. Pending, missing and unknown outcomes remain protected. Restore
-the same original node and store before reconciling an orphaned attempt. A manual
-check, an elapsed deadline or an empty node response never authorizes a refund.
+the current attempt state without switching nodes or dispatching another payment.
+Pending, missing and unknown outcomes remain protected by default.
+
+For a genuinely empty orphan, first exclude new dispatch, stop and reap the entire
+recorded CLN/plugin process group, then restart that same persistent backend and
+verify its network/key/store continuity. After completing those operator steps,
+`--native-cold-restart-confirmed` allows reconciliation to retire an empty own
+attempt only when complete same-hash native lookups contain no pending, successful
+or unknown work and the original source/settlement guards permit failure. This
+flag trusts the privileged operator's external lifecycle assertion; the RPC does
+not itself stop CLN or prove that assertion. A stored error, elapsed deadline,
+manager-disable operation or empty lookup alone does not establish cessation.
+Actual native success follows the normal preimage/settlement path.
 
 New functional fork fields use tags `1000` and above. Upstream invoice
 `expiry_secs` retains tag `6`. The four retired owner-proof slots (board `7`,

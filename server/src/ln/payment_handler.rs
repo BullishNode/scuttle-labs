@@ -145,12 +145,13 @@ impl<'a> PaymentAttemptHandler<'a> {
 		self.process_attempt(settler, attempt, status, payment_error, final_amount_msat, preimage, None).await
 	}
 
-	/// Only the original live xpay callback supplies zero-part evidence.
+	/// An original live reply or privileged cold-lifecycle reconciliation may
+	/// retire an empty native attempt through the same source-guarded commit.
 	pub(crate) async fn process_native_failure(
 		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
-		error: Option<&str>, record: &crate::database::xpay::ClnXpayRecord, code: i32,
+		error: Option<&str>, record: &crate::database::xpay::ClnXpayRecord, code: Option<i32>,
 	) -> anyhow::Result<()> {
-		ensure!(matches!(code, 205 | 206 | 207), "unsupported native zero-part code");
+		ensure!(code.is_none_or(|code| matches!(code, 205 | 206 | 207)), "unsupported native zero-part code");
 		self.process_attempt(settler, attempt, LightningPaymentStatus::Failed,
 			error, None, None, Some((record, code))).await
 	}
@@ -159,7 +160,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
 		status: LightningPaymentStatus, payment_error: Option<&str>,
 		final_amount_msat: Option<u64>, preimage: Option<Preimage>,
-		zero_part: Option<(&crate::database::xpay::ClnXpayRecord, i32)>,
+		zero_part: Option<(&crate::database::xpay::ClnXpayRecord, Option<i32>)>,
 	) -> anyhow::Result<()> {
 		// Native success is authoritative even when an optimistic status write
 		// loses its race. Its actual attempt provenance and WAL commit together.
@@ -213,7 +214,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 						.context("live native result lost its original request")?;
 					ensure!(current == *record && current.status == crate::database::xpay::ClnXpayStatus::Pending
 						&& current.error_code.is_none(), "native request changed during its original call");
-					ensure!(crate::database::xpay::mark_xpay_fail(&**t, current.id, Some(code)).await?.is_some(),
+					ensure!(crate::database::xpay::mark_xpay_fail(&**t, current.id, code).await?.is_some(),
 						"live native result lost its pending request");
 				} else {
 					end_xpay(t, attempt, outcome).await?;
