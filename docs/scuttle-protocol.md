@@ -26,7 +26,7 @@ owes its admitted destination. Uncertain obligations stay held.
 
 The destination is BIP86 `tr(M)`, with no script tree. It is derived from `M`,
 not registered as a separate bitcoin address. The owner proof does not identify
-a person, require a common seed or authorize a bitcoin input. The
+a person, require a common seed or authorize a bitcoin input. On a payout server, the
 default Bark wallet derives its mailbox from BIP86 account zero at external index
 zero. An application that supplies another mailbox key must back up that private key
 and use its matching BIP86 derivation, discovery and spending account. The stored
