@@ -622,7 +622,8 @@ async fn check_lightning_send_payment_status(
 		Ok(response) => response.into_inner(),
 		Err(_) => return Ok(pending_status),
 	};
-	if !payment_status_scope_matches(&htlcs.vtxo_ids, &response.htlc_vtxo_ids) {
+	if wallet.properties().await?.server_payouts.context("server payout capability is not known")?
+		&& !payment_status_scope_matches(&htlcs.vtxo_ids, &response.htlc_vtxo_ids) {
 		warn!("Server returned an unbound payment status for {}", payment_hash);
 		return Ok(pending_status);
 	}
