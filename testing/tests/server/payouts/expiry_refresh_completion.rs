@@ -439,11 +439,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		let decided = db.read(async |tx| tx.get_user_vtxo_by_id(source.id()).await).await.unwrap();
 		assert!(decided.decided_for_fallback);
 		assert!(decided.spent_in_round.is_none());
-		tokio::fs::write(ctx.datadir.join("a6-before-signature-release.json"), serde_json::to_vec_pretty(&json!({
-			"source": source.id(), "round_seq": proposal.round_seq, "attempt_seq": proposal.attempt_seq,
-			"proposed_funding": funding_id, "allocation": allocation.get::<_, i64>("id"),
-			"round_input_funding_rows": before_release_rows, "forfeit_requests": held.forfeit_requests.load(Ordering::SeqCst),
-		})).unwrap()).await.unwrap();
+
 		// Forward the identical genuine signatures; no error or outcome is synthesized.
 		held.release.notify_one();
 		let valid = accepted_sigs.recv().wait(Duration::from_secs(15)).await.unwrap();
@@ -510,12 +506,6 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')",
 			&[&source.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap();
 		assert_eq!(count, 1);
-		tokio::fs::write(ctx.datadir.join("a6-recoverable-result.json"), serde_json::to_vec_pretty(&json!({
-			"source": source.id(), "round_seq": proposal.round_seq, "recoverable": recoverable.error,
-			"continued_round_seq": continued.round_seq, "proposed_funding": funding_id,
-			"allocation": allocation_id, "payout_txid": parent.compute_txid(),
-			"gross_sat":100_000, "fee_sat":1_000, "payout_sat":99_000,
-			"confirmations":depth, "forfeit_requests": held.forfeit_requests.load(Ordering::SeqCst),
-		})).unwrap()).await.unwrap();
+
 	}).await;
 }

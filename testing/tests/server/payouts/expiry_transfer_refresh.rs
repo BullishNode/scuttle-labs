@@ -8,7 +8,7 @@ use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::util::FutureExt;
 use bitcoin::{Amount, OutPoint, Transaction, Txid};
 use bitcoin::consensus::deserialize;
-use bitcoin_ext::BlockDelta;
+use bitcoin_ext::{BlockDelta, BlockRef};
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
 
@@ -107,14 +107,8 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 				assert!(mined_prefix_blocks <= prefix_block_budget);
 				let tip = ctx.generate_blocks(blocks_per_prefix).await;
 				let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
-				loop {
-					if db.read(async |tx| {
-						let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-						Ok(view.height == tip
-							&& view.hash == hash && (tx.expiry_view().await? == Some(view)))
-					}).await.unwrap() { break; }
-					tokio::time::sleep(Duration::from_millis(50)).await;
-				}
+				super::expiry_test::wait_rebuilt(&db, BlockRef { height: tip, hash },
+					Duration::from_secs(30), "signed-prefix confirmation must reach the completed view").await;
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}

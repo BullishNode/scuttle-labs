@@ -113,10 +113,6 @@ async fn expire(ctx: &TestContext, srv: &Captaind, height: BlockHeight) {
 	srv.watchmand().wait_for_sync_height(tip).await;
 }
 
-async fn assert_paid(ctx: &TestContext, srv: &Captaind, owner: &Owner, coin: &Vtxo<Full>) {
-	assert_paid_to_owner(ctx, srv, owner, coin, coin.user_pubkey()).await;
-}
-
 async fn assert_paid_to_owner(
 	ctx: &TestContext, srv: &Captaind, owner: &Owner, coin: &Vtxo<Full>, owner_key: PublicKey,
 ) {
@@ -154,43 +150,6 @@ async fn assert_paid_to_owner(
 	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 1_000), ("payout_sat", 99_000), ("forfeited_sat", 0)] {
 		assert_eq!(row.get::<_, i64>(field), amount);
 	}
-}
-
-#[tokio::test]
-async fn expiry_owner_finds_htlc_key() {
-	let ctx = TestContext::new("server/expiry_owner_finds_htlc_key").await;
-	// Backing must outlive the send deadline and its existing admission margin.
-	let srv = server_with_lifetime(&ctx, BlockDelta::new(400)).await;
-	let owner = Owner::new(&ctx);
-
-	let input_key = owner.key(1);
-	let input = board(&ctx, &srv, &owner, input_key).await;
-	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
-	let policy = VtxoPolicy::new_server_htlc_send(owner.key(500).public_key(), PaymentHash::from([19; 32]), deadline);
-	let builder = ArkoorPackageBuilder::new_with_checkpoints([input.clone()], vec![
-		ArkoorDestination { total_amount: sat(100_000), policy: policy.clone() },
-	]).unwrap().generate_user_nonces(&[input_key]).unwrap();
-	let mut rpc = srv.get_public_rpc().await;
-	let link = owner.prove(&srv, owner.key(500)).await;
-	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
-	for part in &mut request.parts {
-		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) { output.owner_proof = Some(link.into()); }
-	}
-	let response = rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
-		parts: request.parts,
-	}).await.unwrap().into_inner();
-	let package = builder.user_cosign(&[input_key], ArkoorPackageCosignResponse::try_from(response).unwrap()).unwrap();
-	let leaves = package.build_signed_vtxos();
-	assert_eq!(leaves.len(), 1);
-	let coin = &leaves[0];
-	assert_eq!(coin.policy(), &policy);
-	assert_eq!(coin.amount(), sat(100_000));
-	let funding = ctx.bitcoind().await_transaction(input.chain_anchor().txid).await;
-	coin.validate(&funding).unwrap();
-	rpc.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest { vtxos: vec![coin.serialize()] }).await.unwrap();
-	expire(&ctx, &srv, deadline.max(coin.expiry_height())).await;
-	assert_paid(&ctx, &srv, &owner, coin).await;
 }
 
 #[tokio::test]

@@ -12,15 +12,6 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{Db, SpendState};
 use server_rpc::protos;
 
-async fn actual_transaction_fee(ctx: &TestContext, tx: &Transaction) -> u64 {
-	let mut inputs = 0;
-	for input in &tx.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		inputs += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	inputs - tx.output.iter().map(|output| output.value.to_sat()).sum::<u64>()
-}
-
 async fn assert_pending_root_is_untouched(
 	ctx: &TestContext, db: &Db, htlc: VtxoId, root: OutPoint, backing: &TxOut,
 ) {
@@ -140,7 +131,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	assert_eq!(source.output[ready.chain_anchor().vout as usize].value.to_sat(),
 		parent.output.iter().map(|output| output.value.to_sat()).sum::<u64>(),
 		"the payout parent must conserve all actual backing and charge zero miner fee");
-	let actual_fee = actual_transaction_fee(&ctx, &child).await;
+	let actual_fee = super::expiry_test::actual_fee(&ctx, &child).await.to_sat();
 	assert!(actual_fee > 0);
 	assert_eq!(actual_fee, u64::try_from(recorded_fee).unwrap());
 	assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
@@ -166,7 +157,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 				assert!(info.confirmations.unwrap_or(0) >= 6,
 					"the actual canonical fee child must have six confirmations");
 				assert_eq!(ctx.bitcoind().await_transaction(sponsor.compute_txid()).await, sponsor);
-				let fee = actual_transaction_fee(&ctx, &sponsor).await;
+				let fee = super::expiry_test::actual_fee(&ctx, &sponsor).await.to_sat();
 				assert!(fee > 0);
 				assert_eq!(fee, u64::try_from(measured_fee).unwrap());
 				break;

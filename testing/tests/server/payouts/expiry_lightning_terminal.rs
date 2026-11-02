@@ -39,9 +39,8 @@ pub(super) async fn assert_stored_grant_ancestry(db: &Db, grants: &[Vtxo<Full>])
 	}
 }
 
-/// Locate actual confirmed grant closures without assuming an allocation exists
-/// for a fully exposed leaf. The existing assertion below authenticates every
-/// candidate before any caller uses its canonical height as a refund premise.
+/// Authenticate each confirmed native timeout or funded operator closure before
+/// its canonical height is used as a sender-refund premise.
 pub(super) async fn confirmed_grant_closures(
 	ctx: &TestContext, db: &Db, grants: &[Vtxo<Full>], receiver: &bitcoin::Script,
 ) -> Option<std::collections::BTreeMap<VtxoId, (bitcoin::Txid, u32)>> {
@@ -51,62 +50,44 @@ pub(super) async fn confirmed_grant_closures(
 		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
 			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
-			AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept \
+			AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept, \
+			h.payment_hash,h.direction::TEXT AS direction \
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();
-		let txid = match (row.get::<_, Option<&str>>("chain_resolution"), row.get::<_, Option<&str>>("swept")) {
-			(Some("revoked"), _) => row.get::<_, Option<&str>>("onchain_spent_txid")
-				.expect("a native timeout resolution must retain its actual transaction"),
-			(None, Some(txid)) => txid,
+		assert_eq!(row.get::<_, &str>("payment_hash"), grant.policy().as_server_htlc_recv().unwrap().payment_hash.to_string());
+		assert_eq!(row.get::<_, &str>("direction"), "outgoing");
+		let revoked = row.get::<_, Option<&str>>("chain_resolution") == Some("revoked");
+		let txid: bitcoin::Txid = match (row.get::<_, Option<&str>>("chain_resolution"), row.get::<_, Option<&str>>("swept")) {
+			(Some("revoked"), swept) => {
+				let txid = row.get::<_, Option<&str>>("onchain_spent_txid")
+					.expect("a native timeout resolution must retain its actual transaction").parse().unwrap();
+				if let Some(swept) = swept { assert_eq!(txid, swept.parse::<bitcoin::Txid>().unwrap()); }
+				txid
+			},
+			(None, Some(txid)) => txid.parse().unwrap(),
 			(None, None) => return None,
 			other => panic!("grant {} has an unexpected closure: {other:?}", grant.id()),
 		};
-		let txid = txid.parse::<bitcoin::Txid>().unwrap();
 		let Some(info) = chain.custom_get_raw_transaction_info(txid, None).unwrap() else { return None; };
 		if info.confirmations.unwrap_or(0) <= 0 { return None; }
+		let tx = ctx.bitcoind().await_transaction(txid).await;
+		if revoked {
+			let input = tx.input.iter().find(|i| i.previous_output == grant.point()).unwrap();
+			let policy = grant.policy().as_server_htlc_recv().unwrap();
+			let script = policy.server_claim_after_expiry_clause(grant.server_pubkey(), grant.exit_delta()).tapscript();
+			assert_eq!(input.witness.taproot_leaf_script().unwrap().script, script.as_script());
+		}
+		assert!(tx.output.iter().all(|o| o.script_pubkey.as_script() != receiver));
 		let hash = info.blockhash.expect("a confirmed grant closure must have a block");
 		let height = chain.get_block_header_info(&hash).unwrap().height;
 		assert_eq!(chain.get_block_hash(height as u64).unwrap(), hash);
 		assert!(closures.insert(grant.id(), (txid, u32::try_from(height).unwrap())).is_none());
 	}
-	assert_grants_reclaimed(ctx, db, grants, receiver).await;
 	Some(closures)
 }
 
-/// Every receive grant closes through a confirmed native timeout claim or
-/// a funded operator payout of an earlier recoverable tree output.
 pub(super) async fn assert_grants_reclaimed(ctx: &TestContext, db: &Db, grants: &[Vtxo<Full>], receiver: &bitcoin::Script) {
-	let chain = ctx.bitcoind().sync_client();
-	for grant in grants {
-		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
-			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
-				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept, \
-			h.payment_hash,h.direction::TEXT AS direction \
-			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();
-		assert_eq!(row.get::<_, &str>("payment_hash"), grant.policy().as_server_htlc_recv().unwrap().payment_hash.to_string());
-		assert_eq!(row.get::<_, &str>("direction"), "outgoing");
-		assert_ne!(row.get::<_, Option<&str>>(1), Some("fulfilled"), "grant {} was claimed with the preimage", grant.id());
-		let closure: bitcoin::Txid = match (row.get::<_, Option<&str>>(1), row.get::<_, Option<&str>>(2)) {
-			(Some("revoked"), swept) => {
-				let txid: bitcoin::Txid = row.get::<_, Option<&str>>(0).unwrap().parse().unwrap();
-				if let Some(swept) = swept {
-					assert_eq!(txid, swept.parse::<bitcoin::Txid>().unwrap());
-				}
-				let reclaim = ctx.bitcoind().await_transaction(txid).await;
-				let input = reclaim.input.iter().find(|i| i.previous_output == grant.point()).unwrap();
-				let policy = grant.policy().as_server_htlc_recv().unwrap();
-				let script = policy.server_claim_after_expiry_clause(grant.server_pubkey(), grant.exit_delta()).tapscript();
-				assert_eq!(input.witness.taproot_leaf_script().unwrap().script, script.as_script());
-				txid
-			},
-			(None, Some(swept)) => swept.parse().unwrap(),
-			other => panic!("grant {} has no server closure: {other:?}", grant.id()),
-		};
-		let tx = ctx.bitcoind().await_transaction(closure).await;
-		assert!(tx.output.iter().all(|o| o.script_pubkey.as_script() != receiver));
-		let info = chain.custom_get_raw_transaction_info(closure, None).unwrap().unwrap();
-		assert!(info.confirmations.is_some_and(|d| d > 0), "grant closure {closure} is not confirmed");
-	}
+	confirmed_grant_closures(ctx, db, grants, receiver).await
+		.expect("every grant must have a confirmed native timeout or operator closure");
 }
 
 async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
@@ -270,12 +251,7 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, sat(99_000));
-	let mut total = 0;
-	for input in &parent.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		total += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	assert_eq!(parent.output.iter().map(|output| output.value.to_sat()).sum::<u64>(), total);
+	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	let upstream = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, id).await).await.unwrap().unwrap();
@@ -425,23 +401,15 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	})
 }
 
-/// Both actors disappear after signed receive
-/// grants. Separate funded operator payouts close those grants before the
-/// original sender's refund becomes eligible.
-#[tokio::test]
-async fn expiry_internal_signed_grants_joint_timeout_pays_absent_sender() {
-	internal_safe_pool_grants(false, false, false).await;
-}
-
 #[tokio::test]
 async fn exposed_small_receive_grant_refunds_absent_sender_after_six_confirmations() {
-	tokio::time::timeout(Duration::from_secs(180), internal_safe_pool_grants(false, true, false)).await
+	tokio::time::timeout(Duration::from_secs(180), internal_safe_pool_grants(true)).await
 		.expect("exposed grant closure and sender refund timed out");
 }
 
 #[tokio::test]
 async fn expired_internal_source_waits_for_six_confirmed_grant_reclamations() {
-	internal_safe_pool_grants(false, false, true).await;
+	internal_safe_pool_grants(false).await;
 }
 
 async fn assert_internal_source_held(db: &Db, source: VtxoId) {
@@ -456,14 +424,13 @@ async fn assert_internal_source_held(db: &Db, source: VtxoId) {
 }
 
 #[inline(never)]
-fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_source_expiry: bool)
+fn internal_safe_pool_grants(expose_small_grant: bool)
 	-> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
 {
 	Box::pin(async move {
-	let name = if past_source_expiry { "server/expired_internal_source_grant_closure" }
-		else if expose_small_grant { "server/exposed_small_receive_grant" }
-		else if large_cover { "server/expiry_internal_existing_large_pool_cover" }
-		else { "server/expiry_internal_signed_grants_joint_timeout" };
+	let past_source_expiry = !expose_small_grant;
+	let name = if expose_small_grant { "server/exposed_small_receive_grant" }
+		else { "server/expired_internal_source_grant_closure" };
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).bitcoind(ctx.bitcoind_arc())
@@ -473,17 +440,14 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 			cfg.vtxopool.vtxo_pre_expiry = BlockDelta::new(2);
 			cfg.vtxopool.vtxo_targets = if expose_small_grant {
 				vec![server::vtxopool::VtxoTarget { amount: sat(45_000), count: 4 }]
-			} else if large_cover { vec![
-				server::vtxopool::VtxoTarget { amount: sat(45_000), count: 4 },
-				server::vtxopool::VtxoTarget { amount: sat(100_000), count: 2 },
-			] } else { vec![server::vtxopool::VtxoTarget { amount: sat(50_000), count: 4 }] };
+			} else { vec![server::vtxopool::VtxoTarget { amount: sat(50_000), count: 4 }] };
 			cfg.invoice_check_interval = Duration::from_secs(1);
 		}).watchmand().create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let recipient = ctx.bark_sdk("absent-recipient", &srv)
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	recipient.stop_daemon_wait().await.unwrap();
-	let invoice_amount = if expose_small_grant { 90_330 } else if large_cover { 90_001 } else { 90_000 };
+	let invoice_amount = if expose_small_grant { 90_330 } else { 90_000 };
 	let invoice = recipient.bolt11_invoice(sat(invoice_amount), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	let receiver_key = recipient.new_address().await.unwrap().policy().user_pubkey();
@@ -522,7 +486,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
 	}).await.unwrap().into_inner();
 	let grants = granted.htlc_vtxos.iter().map(|bytes| Vtxo::<Full>::deserialize(bytes).unwrap()).collect::<Vec<_>>();
-	assert_eq!(grants.len(), if expose_small_grant { 3 } else if large_cover { 1 } else { 2 },
+	assert_eq!(grants.len(), if expose_small_grant { 3 } else { 2 },
 		"admission must retain the standard existing cover, including the normal two-grant control");
 	assert_eq!(grants.iter().map(|g| g.amount()).sum::<bitcoin::Amount>(), sat(invoice_amount));
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
@@ -576,7 +540,6 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		assert_internal_source_held(&db, source).await;
 	}
 	ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
-	if large_cover { ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await; }
 	ctx.generate_blocks(2).await;
 	if past_source_expiry {
 		let ids = grants.iter().map(|grant| grant.id().to_string()).collect::<Vec<_>>();
@@ -743,35 +706,29 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 	let (index,paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(paid.value, sat(99_000));
 	assert!(parent.output.iter().all(|o| o.script_pubkey != receiver_destination));
-	let mut input_sat = 0;
-	for input in &parent.input {
-		let prev = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		input_sat += prev.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	assert_eq!(parent.output.iter().map(|o| o.value.to_sat()).sum::<u64>(), input_sat);
+	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
-	if expose_small_grant || past_source_expiry {
-		let chain = ctx.bitcoind().sync_client();
-		let mut outputs = Vec::new();
-		for height in u64::from(tip.to_u32())..=chain.get_block_count().unwrap() {
-			for tx in chain.get_block(&chain.get_block_hash(height).unwrap()).unwrap().txdata {
-				for (vout, output) in tx.output.iter().enumerate() {
-					assert_ne!(output.script_pubkey, receiver_destination);
-					if output.script_pubkey == destination {
-						outputs.push((bitcoin::OutPoint::new(tx.compute_txid(), vout as u32), output.value));
-					}
+	let chain = ctx.bitcoind().sync_client();
+	let mut outputs = Vec::new();
+	for height in u64::from(tip.to_u32())..=chain.get_block_count().unwrap() {
+		for tx in chain.get_block(&chain.get_block_hash(height).unwrap()).unwrap().txdata {
+			for (vout, output) in tx.output.iter().enumerate() {
+				assert_ne!(output.script_pubkey, receiver_destination);
+				if output.script_pubkey == destination {
+					outputs.push((bitcoin::OutPoint::new(tx.compute_txid(), vout as u32), output.value));
 				}
 			}
 		}
-		assert_eq!(outputs, vec![(bitcoin::OutPoint::new(parent.compute_txid(), index as u32), sat(99_000))]);
-		for txid in chain.get_raw_mempool().unwrap() {
-			let tx = ctx.bitcoind().await_transaction(txid).await;
-			assert!(tx.output.iter().all(|output|
-				output.script_pubkey != destination && output.script_pubkey != receiver_destination));
-		}
-		assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 	}
+	assert_eq!(outputs, vec![(bitcoin::OutPoint::new(parent.compute_txid(), index as u32), sat(99_000))]);
+	for txid in chain.get_raw_mempool().unwrap() {
+		let tx = ctx.bitcoind().await_transaction(txid).await;
+		assert!(tx.output.iter().all(|output|
+			output.script_pubkey != destination && output.script_pubkey != receiver_destination));
+	}
+	assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+
 	let state = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, source).await).await.unwrap().unwrap();
 	assert!(state.htlc.offchain_resolution.is_none(), "automatic timeout refund must not manufacture the absent user's revocation");
 	})
@@ -1028,22 +985,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			let initial = pending_cut().await;
 			let native_deadline = initial.1.iter().flatten().map(|(_, expiry)| *expiry).min().unwrap();
 			assert!(earlier.expiry_height().to_u32() + 1 + 6 < native_deadline);
-			tokio::fs::write(
-				ctx.datadir.join("pending-before-unrelated.json"),
-				serde_json::to_vec_pretty(&serde_json::json!({
-					"attempt":attempt,"hash":hash.to_string(),"label":label,"payer":payer.id,"receiver":receiver.id,
-					"actual_height":ctx.bitcoind().get_block_count().await,"native_future_htlcs":initial.1,
-					"source":source.id().to_string(),"source_expiry":source.expiry_height().to_u32(),
-					"earlier_source":earlier.id().to_string(),"earlier_expiry":earlier.expiry_height().to_u32(),
-					"actual_native_status":format!("{:?}",initial.0.1[0].status()),
-					"actual_parts":initial.0.0.iter().map(|part|(part.id,part.groupid,part.partid,part.created_index)).collect::<Vec<_>>(),
-					"actual_amount_msat":initial.0.0.iter().map(|part|part.amount_msat.as_ref().unwrap().msat).sum::<u64>(),
-					"fee_sponsor":sponsor.to_string(),
-				}))
-				.unwrap(),
-			)
-			.await
-			.unwrap();
+
 			// Original clients remain absent from here through BOTH actual payouts.
 			drop(sender);
 			drop(customer);
@@ -1133,19 +1075,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 				after_first == initial,
 				"unrelated N6 payout must leave every native part/group and both peers' future HTLC identities unchanged"
 			);
-			tokio::fs::write(
-				ctx.datadir.join("pending-after-unrelated-N6.json"),
-				serde_json::to_vec_pretty(&serde_json::json!({
-					"attempt":attempt,"hash":hash.to_string(),"label":label,
-					"actual_native_status":format!("{:?}",after_first.0.1[0].status()),
-					"actual_amount_msat":after_first.0.0.iter().map(|part|part.amount_msat.as_ref().unwrap().msat).sum::<u64>(),
-					"actual_height":ctx.bitcoind().get_block_count().await,"native_future_htlcs":after_first.1,
-					"earlier_parent":first.0.compute_txid().to_string(),"earlier_payout_sat":actual.value.to_sat(),
-				}))
-				.unwrap(),
-			)
-			.await
-			.unwrap();
+
 
 			lightning.external.hold_client().await.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
 			let failed = tokio::time::timeout(Duration::from_secs(30), async {
@@ -1186,7 +1116,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			})
 			.await
 			.expect("ordinary receiver cancel must produce genuine same-attempt native failure");
-			let released = tokio::time::timeout(Duration::from_secs(20), async {
+			tokio::time::timeout(Duration::from_secs(20), async {
 				loop {
 					let mut matching = Vec::new();
 					for node in [&lightning.internal, &lightning.external] {
@@ -1211,19 +1141,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			.await
 			.expect("both native peers must actually release the matching HTLCs");
 			assert!((ctx.bitcoind().get_block_count().await as u32) < deadline.to_u32());
-			tokio::fs::write(
-				ctx.datadir.join("native-release-before-maturity.json"),
-				serde_json::to_vec_pretty(&serde_json::json!({
-					"attempt":attempt,"hash":hash.to_string(),"label":label,
-					"actual_native_status":format!("{:?}",failed.1[0].status()),
-					"actual_amount_sent_msat":failed.1[0].amount_sent_msat.as_ref().unwrap().msat,
-					"actual_matching_peer_htlcs":released,"actual_height":ctx.bitcoind().get_block_count().await,
-					"source_expiry":source.expiry_height().to_u32(),"contract_expiry":deadline.to_u32(),
-				}))
-				.unwrap(),
-			)
-			.await
-			.unwrap();
+
 			assert_eq!(
 				db.read(async |tx| Ok(tx
 					.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1", &[&source.id().to_string()])

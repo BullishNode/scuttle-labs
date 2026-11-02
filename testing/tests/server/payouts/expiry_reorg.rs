@@ -1,3 +1,5 @@
+use super::expiry_test::wait_payout as wait_for_payout;
+
 use std::time::Duration;
 
 use ark_testing::{sat, TestContext};
@@ -8,24 +10,6 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{BlockTable, Db};
 use server_rpc::admin::WalletAdminServiceClient;
 use server_rpc::protos;
-
-async fn wait_for_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction) {
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let row = db.read(async |t| Ok(t.query_opt(
-				"SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id LIMIT 1",
-				&[&coin.to_string()],
-			).await?)).await.unwrap();
-			if let Some(row) = row {
-				break (row.get("id"), deserialize(row.get::<_, &[u8]>("sweep_tx")).unwrap());
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("actual background payout did not publish")
-}
 
 async fn wait_for_confirmation(db: &Db, allocation: i64, point: BlockRef, hash: BlockHash) {
 	tokio::time::timeout(Duration::from_secs(30), async {

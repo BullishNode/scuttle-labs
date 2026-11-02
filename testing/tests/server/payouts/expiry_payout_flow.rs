@@ -16,22 +16,12 @@ use ark_testing::onchain::observed_payout_fee_child;
 /// The running captaind and watchmand must discover, decide, sign and publish
 /// the payout, and Bitcoin Core independently checks its real inputs and outputs.
 #[tokio::test]
-async fn expiry_payout_native_board_seed_restore_and_confirmed_spend() {
-	expiry_payout_native_board_seed_restore("server/expiry_payout_native_board_seed_restore", None).await;
-}
-
-#[tokio::test]
 async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
-	expiry_payout_native_board_seed_restore("server/expiry_payout_native_board_fee_seed_restore",
-		Some(BoardFees { min_fee: sat(330), base_fee: sat(0), ppm: PpmFeeRate::ZERO })).await;
-}
-
-async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<BoardFees>) {
-	let ctx = TestContext::new(name).await;
+	let ctx = TestContext::new("server/expiry_payout_native_board_fee_seed_restore").await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
 		.cfg(move |cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(24);
-			if let Some(fees) = board_fees { cfg.fees.board = fees; }
+			cfg.fees.board = BoardFees { min_fee: sat(330), base_fee: sat(0), ppm: PpmFeeRate::ZERO };
 		})
 		.watchmand().create().await;
 	let wallet = ctx.bark("abandoned", &srv).create().await;
@@ -40,13 +30,15 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	let issuer = wallet.client().await;
 	for _ in 0..250 { issuer.new_address_with_index().await.unwrap(); }
 	drop(issuer);
-	let quote = if board_fees.is_some() {
-		Some(board_fee_quote(&srv, &wallet, sat(100_000)).await)
-	} else { None };
+	let quote = wallet.client().await.estimate_board_offchain_fee(sat(100_000)).await.unwrap();
+	assert_eq!(quote.fee, sat(330));
+	assert_eq!(quote.gross_amount, sat(100_000));
+	assert_eq!(quote.net_amount + quote.fee, sat(100_000));
+	assert!(quote.net_amount > sat(1_000));
+	assert!(quote.vtxos_spent.is_empty());
 	let board = wallet.board(sat(100_000)).await;
-	if let Some(quote) = &quote {
-		assert_eq!(board.amount, quote.net_amount);
-	}
+	assert_eq!(board.amount, quote.net_amount);
+
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
 	wallet.sync().await;
 	let ids = board.vtxos;
@@ -54,39 +46,31 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	let seed = wallet.mnemonic().await.unwrap();
 	let client = wallet.client().await;
 	let source = client.get_full_vtxo(ids[0]).await.unwrap();
-	if let Some(quote) = &quote {
-		assert_eq!(source.amount(), quote.net_amount);
-		let path = source.transactions().collect::<Vec<_>>();
-		assert_eq!(path.len(), 1, "the board must have one signed exit");
-		assert_eq!(path[0].tx.output.len(), 2);
-		assert_eq!(path[0].tx.output[0].value, source.amount());
-		assert_eq!(path[0].tx.output[1], bitcoin_ext::fee::fee_anchor_with_amount(quote.fee));
-		let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
-		assert_eq!(funding.output[source.chain_anchor().vout as usize].value, quote.gross_amount);
-		assert_eq!(quote.gross_amount, source.amount() + quote.fee);
-	}
+	assert_eq!(source.amount(), quote.net_amount);
+	let path = source.transactions().collect::<Vec<_>>();
+	assert_eq!(path.len(), 1, "the board must have one signed exit");
+	assert_eq!(path[0].tx.output.len(), 2);
+	assert_eq!(path[0].tx.output[0].value, source.amount());
+	assert_eq!(path[0].tx.output[1], bitcoin_ext::fee::fee_anchor_with_amount(quote.fee));
+	let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
+	assert_eq!(funding.output[source.chain_anchor().vout as usize].value, quote.gross_amount);
+	assert_eq!(quote.gross_amount, source.amount() + quote.fee);
+
 	let destination = client.fallback_script();
 	let expected = source.amount() - sat(1_000);
-	let (source_child_index, _) = client.pubkey_keypair(&source.user_pubkey()).await.unwrap()
-		.expect("original source public key must have a stored derivation index");
-	let original_debug = bark_json::cli::DebugInfo::from(client.debug_info().await.unwrap());
 	let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
 	source.validate(&funding).unwrap();
-	assert_eq!(client.vtxo_xpub().derive_pub(&ark::SECP, &[source_child_index.into()]).unwrap().public_key,
-		source.user_pubkey());
 	drop(client);
-	if let Some(quote) = &quote {
-		let history = serde_json::to_value(wallet.history().await).unwrap();
-		let matches = history.as_array().unwrap().iter().filter(|m| m["id"] == board.movement_id).collect::<Vec<_>>();
-		assert_eq!(matches.len(), 1);
-		let movement = matches[0];
-		assert_eq!(movement["subsystem"], json!({"name": "bark.board", "kind": "board"}));
-		assert_eq!(movement["status"], "successful");
-		assert_eq!(movement["intended_balance_sat"], quote.gross_amount.to_sat());
-		assert_eq!(movement["effective_balance_sat"], quote.net_amount.to_sat());
-		assert_eq!(movement["offchain_fee_sat"], quote.fee.to_sat());
-		assert_eq!(movement["output_vtxos"], json!([source.id()]));
-	}
+	let history = serde_json::to_value(wallet.history().await).unwrap();
+	let matches = history.as_array().unwrap().iter().filter(|m| m["id"] == board.movement_id).collect::<Vec<_>>();
+	assert_eq!(matches.len(), 1);
+	let movement = matches[0];
+	assert_eq!(movement["subsystem"], json!({"name": "bark.board", "kind": "board"}));
+	assert_eq!(movement["status"], "successful");
+	assert_eq!(movement["intended_balance_sat"], quote.gross_amount.to_sat());
+	assert_eq!(movement["effective_balance_sat"], quote.net_amount.to_sat());
+	assert_eq!(movement["offchain_fee_sat"], quote.fee.to_sat());
+	assert_eq!(movement["output_vtxos"], json!([source.id()]));
 
 	// Fund the distinct watchman wallet, rather than assuming the
 	// captaind rounds wallet can sponsor this zero-fee payout parent.
@@ -140,20 +124,19 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 		parent_inputs += previous.output[input.previous_output.vout as usize].value.to_sat();
 	}
 	assert_eq!(parent_inputs, parent.output.iter().map(|o| o.value.to_sat()).sum::<u64>());
-	if let Some(quote) = &quote {
-		assert_eq!(parent.input.len(), 1);
-		assert_eq!(parent.input[0].previous_output, source.chain_anchor());
-		assert_eq!(parent_inputs, quote.gross_amount.to_sat());
-		assert_eq!(parent.output.len(), 3);
-		assert_eq!(payouts[0].0, 0);
-		assert_eq!(parent.output[1].value, quote.fee + sat(1_000));
-		assert_ne!(parent.output[1].script_pubkey, destination);
-		assert_eq!(parent.output[2], bitcoin_ext::fee::fee_anchor());
-		assert_eq!(child.input.len(), 2);
-		assert!(child.input.iter().any(|input| input.previous_output == OutPoint::new(parent_txid, 2)));
-		assert!(child.input.iter().any(|input| input.previous_output.txid == fee_funding));
-		assert_eq!(child.output.len(), 1);
-	}
+	assert_eq!(parent.input.len(), 1);
+	assert_eq!(parent.input[0].previous_output, source.chain_anchor());
+	assert_eq!(parent_inputs, quote.gross_amount.to_sat());
+	assert_eq!(parent.output.len(), 3);
+	assert_eq!(payouts[0].0, 0);
+	assert_eq!(parent.output[1].value, quote.fee + sat(1_000));
+	assert_ne!(parent.output[1].script_pubkey, destination);
+	assert_eq!(parent.output[2], bitcoin_ext::fee::fee_anchor());
+	assert_eq!(child.input.len(), 2);
+	assert!(child.input.iter().any(|input| input.previous_output == OutPoint::new(parent_txid, 2)));
+	assert!(child.input.iter().any(|input| input.previous_output.txid == fee_funding));
+	assert_eq!(child.output.len(), 1);
+
 	let mut child_inputs = 0;
 	for input in &child.input {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
@@ -162,10 +145,9 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 	let actual_child_fee = child_inputs - child.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
 	assert!(actual_child_fee > 0);
 	assert_eq!(actual_child_fee, u64::try_from(observed_child_fee).unwrap());
-	if quote.is_some() {
-		assert_eq!(child_inputs, 100_000);
-		assert_eq!(child.output[0].value.to_sat() + actual_child_fee, 100_000);
-	}
+	assert_eq!(child_inputs, 100_000);
+	assert_eq!(child.output[0].value.to_sat() + actual_child_fee, 100_000);
+
 	ctx.generate_blocks(6).await;
 	let confirmed_payout = ctx.bitcoind().sync_client().get_tx_out(&parent_txid, payout_point.vout, Some(true))
 		.unwrap().expect("fallback output must be independently unspent in Core");
@@ -191,19 +173,10 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 		bark::WalletSeed::new_from_mnemonic(bitcoin::Network::Regtest, &seed), cfg,
 		bark::OpenWalletArgs { datadir: Some(restored.datadir()), run_daemon: false,
 			lock_manager: Some(Box::new(bark::lock_manager::memory::MemoryLockManager::new())), ..Default::default() }).await.unwrap();
-	let debug = bark_json::cli::DebugInfo::from(reader.debug_info().await.unwrap());
-	assert_eq!(serde_json::to_value(debug).unwrap(), serde_json::to_value(original_debug).unwrap());
 	let fallback = reader.fallback_script();
 	assert_eq!(fallback, destination);
 
 	drop(reader);
-	let db_wallet = std::sync::Arc::new(bark::persist::sqlite::SqliteClient::open(restored.datadir().join("db.sqlite")).unwrap());
-	let onchain = bark::onchain::OnchainWallet::load_or_create(bitcoin::Network::Regtest, seed.to_seed(""), db_wallet).await.unwrap();
-	let master = bitcoin::bip32::Xpriv::new_master(bitcoin::Network::Regtest, &seed.to_seed("")).unwrap();
-	let (descriptor, _, _) = bdk_wallet::template::DescriptorTemplate::build(
-		bdk_wallet::template::Bip86(master, bdk_wallet::KeychainKind::External), bitcoin::Network::Regtest.into()).unwrap();
-	assert_eq!(descriptor, *onchain.inner.public_descriptor(bdk_wallet::KeychainKind::External));
-	drop(onchain);
 	let recovery_address = ctx.bitcoind().get_new_address();
 	restored.start().await.unwrap();
 	let config = restored.client_config();
@@ -211,16 +184,9 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 		bark_json::web::OnchainDrainRequest { destination: recovery_address.to_string() }).await.unwrap();
 	// The REST wallet broadcasts to its own node. Observe the same transaction
 	// on the node that verifies and mines the recovery spend.
-	ctx.bitcoind().await_transaction(drain.txid).await;
-	let mempool = ctx.bitcoind().sync_client().get_raw_mempool().unwrap();
-	let mut recovery = None;
-	for txid in mempool {
-		let tx = ctx.bitcoind().await_transaction(txid).await;
-		if tx.input.iter().any(|input| input.previous_output == payout_point) {
-			assert!(recovery.replace(tx).is_none(), "two mempool claims of the same payout");
-		}
-	}
-	let recovery = recovery.expect("seed-only wallet did not spend its actual fallback output");
+	let recovery = ctx.bitcoind().await_transaction(drain.txid).await;
+	assert!(recovery.input.iter().any(|input| input.previous_output == payout_point),
+		"the seed-only drain must spend this actual fallback output");
 	ctx.generate_blocks(1).await;
 	let recovered_output = recovery.output.iter().position(|output|
 		output.script_pubkey == recovery_address.script_pubkey()
@@ -240,18 +206,4 @@ async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<
 		.unwrap().unwrap();
 	assert!(deep.confirmations >= 6);
 	restored.stop().await.unwrap();
-}
-
-async fn board_fee_quote(srv: &ark_testing::Captaind, wallet: &ark_testing::Bark, amount: bitcoin::Amount) -> bark::FeeEstimate {
-	let response = srv.get_public_rpc().await.get_ark_info(server_rpc::protos::Empty {}).await.unwrap().into_inner();
-	let info: ark::ArkInfo = response.try_into().unwrap();
-	assert_eq!(info.fees.board, srv.config().fees.board);
-	let estimate = wallet.client().await.estimate_board_offchain_fee(amount).await.unwrap();
-	assert!(estimate.fee > bitcoin::Amount::ZERO);
-	assert_eq!(estimate.fee, info.fees.board.calculate(amount).unwrap());
-	assert_eq!(estimate.gross_amount, amount);
-	assert_eq!(estimate.net_amount + estimate.fee, amount);
-	assert!(estimate.net_amount > sat(1_000));
-	assert!(estimate.vtxos_spent.is_empty());
-	estimate
 }

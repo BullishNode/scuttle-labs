@@ -13,26 +13,6 @@ use bark::onchain::{MakeCpfpFees, OnchainWalletTrait};
 use server::database::Db;
 use server_rpc::protos;
 
-async fn payout(db: &Db, id: ark::VtxoId) -> Transaction {
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let row = db.read(async |t| Ok(t.query_opt(
-				"
-					SELECT a.sweep_tx
-					FROM expiry_allocation a
-					JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id
-					WHERE e.vtxo_id=$1
-					AND a.broadcast_at IS NOT NULL
-				",
-				&[&id.to_string()],
-			).await?)).await.unwrap();
-			if let Some(row) = row { return deserialize(row.get("sweep_tx")).unwrap(); }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("native watchman did not publish this sibling's payout")
-}
-
 /// Exercise the split API on a registered mixed tree, not manufactured
 /// vtxo/transaction rows. The test requests the first split explicitly to cover
 /// its SQL checks; both daemon progression and subsequent payouts are automatic.
@@ -205,7 +185,7 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 	};
 	srv.wait_for_sync_height(progressed).await;
 	srv.watchmand().wait_for_sync_height(progressed).await;
-	let first = payout(&db, ordinary).await;
+	let (_, first) = super::expiry_test::wait_payout(&db, ordinary).await;
 	assert_eq!(ctx.bitcoind().await_transaction(first.compute_txid()).await, first);
 	let backing = first.input.iter().map(|i| ark::VtxoId::from(i.previous_output)).collect::<Vec<_>>();
 	let reserved = db.write(async |t| t.lock_unallocated_watchman_inputs(&backing).await).await
@@ -232,7 +212,7 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 	let final_tip = ctx.generate_blocks(deadline.to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(final_tip).await;
 	srv.watchmand().wait_for_sync_height(final_tip).await;
-	let second = payout(&db, htlc).await;
+	let (_, second) = super::expiry_test::wait_payout(&db, htlc).await;
 	assert_ne!(first.compute_txid(), second.compute_txid());
 	assert_eq!(ctx.bitcoind().await_transaction(second.compute_txid()).await, second);
 	assert_eq!(second.output.iter().find(|o| o.script_pubkey == destination).unwrap().value, sat(50_000));

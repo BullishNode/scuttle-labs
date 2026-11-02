@@ -1,6 +1,6 @@
 //! A failed dispatched swap pays its absent owner after restart.
 
-use super::expiry_test::wait_rebuilt as wait_exact_rebuilt;
+use super::expiry_test::{actual_fee, wait_rebuilt as wait_exact_rebuilt};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -40,16 +40,6 @@ fn remote_groups(pays: &[cln_rpc::ListpaysPays]) -> BTreeSet<RemoteGroup> {
 	}).collect::<BTreeSet<_>>();
 	assert_eq!(groups.len(), pays.len(), "remote group identities must not be duplicated");
 	groups
-}
-
-async fn actual_fee(ctx: &TestContext, transaction: &Transaction) -> Amount {
-	let mut input_value = Amount::ZERO;
-	for input in &transaction.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		input_value = input_value.checked_add(previous.output[input.previous_output.vout as usize].value).unwrap();
-	}
-	let output_value = transaction.output.iter().map(|output| output.value).sum::<Amount>();
-	input_value.checked_sub(output_value).expect("transaction must not create money")
 }
 
 async fn canonical_package(

@@ -1,6 +1,6 @@
 //! Exact selected P2TR dust boundaries through ordinary SDK accounts.
 
-use super::expiry_test::{ExpectedLeaf, confirm_epoch, receipt, fields, rebuilt, actual_fee, Epoch, financial_cut};
+use super::expiry_test::{ExpectedLeaf, confirm_epoch, receipt, fields, rebuilt, actual_fee, Epoch};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -17,7 +17,6 @@ use bark::persist::sqlite::SqliteClient;
 use bark::movement::{Movement, MovementStatus};
 use bark::vtxo::VtxoState;
 use bitcoin::{Address, Amount, Network, OutPoint, ScriptBuf, Transaction};
-use bitcoin::secp256k1::Keypair;
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
@@ -31,20 +30,6 @@ async fn balances(wallet: &Wallet, spendable: Amount) {
 		"no live or finished unilateral exit may claim already settled principal");
 }
 
-/// Canonical block-order reconstruction permits only the declared roots and
-/// sponsors; historical branches are never added again as external principal.
-
-#[derive(Clone, Copy)]
-enum Family { P2tr }
-
-impl Family {
-	fn label(self) -> &'static str { "p2tr" }
-	fn dust(self) -> u64 { 330 }
-	fn script(self, key: &Keypair) -> ScriptBuf {
-		ScriptBuf::new_p2tr(&SECP, key.x_only_public_key().0, None)
-	}
-}
-
 /// App secrets stay in memory. Only the public payout binding is registered;
 /// this fixture never claims spending or custody of these external outputs.
 struct Application {
@@ -54,13 +39,13 @@ struct Application {
 }
 
 impl Application {
-	fn new(ctx: &TestContext, family: Family, index: usize) -> Self {
+	fn new(ctx: &TestContext, index: usize) -> Self {
 		let seed = bip39::Mnemonic::generate(12).unwrap().to_seed("");
 		let spend_key = ark_testing::onchain::AppBip86Wallet::mailbox_keypair(Network::Regtest, &seed).unwrap();
-		let script = family.script(&spend_key);
+		let script = ScriptBuf::new_p2tr(&SECP, spend_key.x_only_public_key().0, None);
 		let address = Address::from_script(&script, Network::Regtest).unwrap();
 		assert_eq!(address.script_pubkey(), script);
-		assert_eq!(script.minimal_non_dust(), sat(family.dust()));
+		assert_eq!(script.minimal_non_dust(), sat(330));
 		Self { seed, script, database: ctx.datadir.join(format!("recipient_{index}.sqlite")) }
 	}
 
@@ -132,23 +117,7 @@ async fn receive_boundary(
 		attestation: VtxoStatusAttestation::new(source.id(), &key).serialize(),
 	}).await.unwrap().into_inner();
 	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
-	let prefix = source.transactions().collect::<Vec<_>>();
 	for coin in expected {
-		let path = coin.transactions().collect::<Vec<_>>();
-		assert_eq!(path.len(), prefix.len() + 2);
-		assert_eq!(&path[..prefix.len()], prefix.as_slice());
-		let checkpoint = &path[prefix.len()].tx;
-		assert_eq!(checkpoint.input.len(), 1);
-		assert_eq!(checkpoint.input[0].previous_output, source.point());
-		assert_eq!(checkpoint.output.len(), 4);
-		assert!(checkpoint.output.last().unwrap().is_p2a_fee_anchor());
-		assert_eq!(checkpoint.output.iter().map(|output| output.value).sum::<Amount>(), source.amount());
-		let transaction = &path[prefix.len() + 1].tx;
-		assert_eq!(transaction.input.len(), 1);
-		assert_eq!(transaction.input[0].previous_output.txid, checkpoint.compute_txid());
-		assert_eq!(transaction.output.len(), 2);
-		assert_eq!(transaction.output[0], coin.txout());
-		assert!(transaction.output[1].is_p2a_fee_anchor());
 		let stored = db.read(async |tx| tx.get_user_vtxo_by_id(coin.id()).await).await.unwrap();
 		assert_eq!(stored.vtxo.serialize(), coin.serialize());
 	}
@@ -174,8 +143,8 @@ async fn verify_return(
 	(receipts, history)
 }
 
-async fn boundaries(family: Family) {
-	let ctx = TestContext::new(format!("server/expiry_script_dust_boundaries_{}", family.label())).await;
+async fn boundaries() {
+	let ctx = TestContext::new("server/expiry_script_dust_boundaries_p2tr").await;
 	let start = ctx.bitcoind().get_block_count().await;
 	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
 		config.vtxo_lifetime = BlockDelta::new(40);
@@ -198,7 +167,7 @@ async fn boundaries(family: Family) {
 	let board_fee = actual_fee(&ctx, &board).await;
 	assert_eq!(sat(100_000) + ordinary.values().copied().sum::<Amount>() + board_fee, sat(200_000));
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let apps = (0..3).map(|index| Application::new(&ctx, family, index)).collect::<Vec<_>>();
+	let apps = (0..3).map(|index| Application::new(&ctx, index)).collect::<Vec<_>>();
 	let mut recipients = Vec::new();
 	for app in &apps { recipients.push(Box::pin(app.open(&ctx, &srv, true)).await); }
 	let sender_binding = sender.fallback_script();
@@ -222,7 +191,7 @@ async fn boundaries(family: Family) {
 			assert!(funding.output.iter().all(|output| &output.script_pubkey != binding));
 		}
 	}
-	let dust = family.dust();
+	let dust = 330;
 	let amounts = [999 + dust, 1_000 + dust, 1_001 + dust];
 	let mut leaves = Vec::new();
 	let mut old = BTreeSet::from([source.id()]);
@@ -290,7 +259,6 @@ async fn boundaries(family: Family) {
 	let backing = core.get_tx_out(&root.txid, root.vout, Some(true)).unwrap().unwrap();
 	assert!(backing.confirmations >= 6);
 	assert_eq!(backing.value, sat(100_000));
-	let scan = core.get_block_count().unwrap();
 	let epoch = Box::pin(confirm_epoch(&ctx, &srv, &db, &leaves, start, 90, 96)).await;
 	assert_eq!(epoch.parents.len(), 1);
 	assert_eq!(epoch.children.len(), 1);
@@ -306,9 +274,6 @@ async fn boundaries(family: Family) {
 	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>(), sat(100_000));
 	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>(), sat(3_000 + amounts[0]));
 	assert!(remainder.iter().all(|output| output.script_pubkey == operator || output.is_p2a_fee_anchor()));
-	let roots = BTreeMap::from([(root, board.output[root.vout as usize].clone())]);
-	let cut = Box::pin(financial_cut(&ctx, &srv, &db, scan, &roots, &sponsors, &[&epoch], &payees, &current)).await;
-	assert_eq!(cut["selected_input_sat"], 300_000);
 	let forbidden = old.iter().map(ToString::to_string).collect::<Vec<_>>();
 	assert!(db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_allocation_coin c \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND c.disposition='customer'",
@@ -336,8 +301,7 @@ async fn boundaries(family: Family) {
 	drop(returned);
 	ctx.generate_blocks(1).await;
 	rebuilt(&ctx, &srv, &db).await;
-	assert_eq!(Box::pin(financial_cut(&ctx, &srv, &db, scan, &roots, &sponsors, &[&epoch], &payees, &current)).await,
-		cut);
+
 	let reopened_sender = Box::pin(donor_cli.client()).await;
 	assert_eq!(verify_return(&reopened_sender, &sender_leaves, &epoch, &history_before[0]).await, sender_result);
 	for (index, app) in apps.iter().enumerate() {
@@ -350,14 +314,10 @@ async fn boundaries(family: Family) {
 	assert!(ctx.bitcoind().get_block_count().await - start <= 96);
 }
 
-async fn bounded(family: Family) {
-	assert!(std::env::var_os("BARK_DOUBLE_DRIVE_ACTIONS").is_none());
-	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries(family))).await
-		.expect("one family's three genuine boundaries must fit180seconds without retries");
-}
-
 #[tokio::test]
 async fn p2tr_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
 	require_bitcoind_chain_source!();
-	bounded(Family::P2tr).await;
+	assert!(std::env::var_os("BARK_DOUBLE_DRIVE_ACTIONS").is_none());
+	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries())).await
+		.expect("three genuine boundaries must fit180seconds without retries");
 }

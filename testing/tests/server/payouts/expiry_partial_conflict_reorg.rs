@@ -1,13 +1,11 @@
 //! A real terminal user claim and its backing conflict disappear after regrouping.
 
-use super::expiry_test::wait_rebuilt as wait_exact_rebuilt;
+use super::expiry_test::{actual_fee, canonical as canonical_point, wait_rebuilt as wait_exact_rebuilt};
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::str::FromStr;
 use std::time::Duration;
 
 use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
-use ark_testing::daemon::captaind::WalletAdminClient;
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
@@ -16,27 +14,6 @@ use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{BlockTable, Db};
-use server_rpc::protos;
-
-fn canonical_point(ctx: &TestContext, transaction: &Transaction) -> BlockRef {
-	let core = ctx.bitcoind().sync_client();
-	let info = core.custom_get_raw_transaction_info(transaction.compute_txid(), None).unwrap().unwrap();
-	assert!(info.confirmations.unwrap_or(0) >= 6);
-	let hash = info.blockhash.unwrap();
-	let header = core.get_block_header_info(&hash).unwrap();
-	assert_eq!(core.get_block_hash(header.height as u64).unwrap(), hash);
-	assert!(core.get_block(&hash).unwrap().txdata.iter().any(|actual| actual == transaction));
-	BlockRef { height: BlockHeight::new(u32::try_from(header.height).unwrap()), hash }
-}
-
-async fn actual_fee(ctx: &TestContext, transaction: &Transaction) -> Amount {
-	let mut inputs = Amount::ZERO;
-	for input in &transaction.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		inputs += previous.output[input.previous_output.vout as usize].value;
-	}
-	inputs.checked_sub(transaction.output.iter().map(|output| output.value).sum::<Amount>()).unwrap()
-}
 
 /// Reconcile the winning parents and their canonical anchor spenders.
 /// Losing allocations remain signed and immutable; neither their age nor an
@@ -212,12 +189,9 @@ async fn assert_physical_cut(
 		child_change.insert(*point); // An unused declared sponsor must still be owned.
 		assert!(retained.insert(*point, output.value).is_none());
 	}
-	let address = server.watchmand().config().admin_address.unwrap();
 	tokio::time::timeout(Duration::from_secs(10), async {
 		loop {
-			let mut rpc = WalletAdminClient::connect(format!("http://{address}")).await.unwrap();
-			let owned = rpc.wallet_status(protos::Empty {}).await.unwrap().into_inner().watchman.unwrap()
-				.confirmed_utxos.into_iter().map(|point| OutPoint::from_str(&point).unwrap()).collect::<BTreeSet<_>>();
+			let owned = super::expiry_test::watchman_coins(server.watchmand()).await;
 			if child_change.is_subset(&owned) { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
