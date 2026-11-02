@@ -73,8 +73,6 @@ check-use-bark-as-dependency:
 
 checks: prechecks check-lib-arithmetic check-wasm-tests check
 
-final-series-checks: checks fork-canary
-
 check-commits:
 	bash contrib/check-commits.sh
 
@@ -638,7 +636,3 @@ _nix-build-checksums:
 	rm -f SHA256SUMS
 	LC_ALL=C sha256sum * > SHA256SUMS
 	cat SHA256SUMS
-
-# Read-only Git maintenance canary; no application or native test is started.
-fork-canary:
-	python3 -B contrib/check-scuttle-delta.py
