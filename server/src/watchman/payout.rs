@@ -1,4 +1,6 @@
-//! Immutable zero-fee sweep parents. Fee replacements affect only their child.
+//! Pays expired coins to their owners. Fee bumps keep the payout transaction unchanged.
+
+use std::collections::HashMap;
 
 use anyhow::Context;
 use bitcoin::{Amount, Transaction, TxOut, Txid, Weight};
@@ -14,9 +16,9 @@ use crate::bitcoind::BitcoindErrorExt;
 use bitcoin_ext::BlockRef;
 use crate::database::expiry_payout::{MAX_PAYOUT_VSIZE, PendingExpiryPayout};
 
-use ark::ServerVtxo;
+use ark::{ServerVtxo, ServerVtxoPolicy, VtxoPolicy};
 
-use super::Watchman;
+use super::{saturating_add_feerates, Watchman};
 
 /// The current anchor spender supplies only Core's replacement fee and inputs.
 /// Customer settlement depends on the immutable parent, not its fee sponsor.
@@ -39,6 +41,94 @@ pub(super) async fn mempool_child_fee(
 }
 
 impl Watchman {
+	/// Sweep server coins, pay expired customer coins, and advance pending splits.
+	pub(super) async fn process_expiry_sweeps(&self) -> anyhow::Result<()> {
+		// Confiscated OffboardForfeit outputs are exclusively server-owned.
+		// Their Bare encoding needs no customer genesis or payout allocation.
+		// Use the original native claim: its miner fee comes from operator
+		// collateral, not from a customer payout or a new wallet subsidy.
+		let sweeps = self.scan_frontier().await.sweeps;
+		let ids = sweeps.iter().filter(|v| matches!(v.policy(), ServerVtxoPolicy::ServerOwned
+			| ServerVtxoPolicy::User(VtxoPolicy::Pubkey(_))))
+			.map(|v| v.id().to_string()).collect::<Vec<_>>();
+		let eligible = self.db.read(async |t| Ok(t.query(
+			"SELECT vtxo_id,spend_state::TEXT FROM vtxo WHERE vtxo_id=ANY($1) AND spend_state IN ('offboard-forfeit','pool')",
+			&[&ids]).await?.into_iter().map(|r| (r.get::<_, String>(0),r.get::<_, String>(1))).collect::<HashMap<_, _>>()
+		)).await?;
+		let mut claims = Vec::new();
+		for vtxo in &sweeps {
+			let state = eligible.get(&vtxo.id().to_string()).map(String::as_str);
+			let owned = match (vtxo.policy(), state) {
+				(ServerVtxoPolicy::ServerOwned, Some("offboard-forfeit")) => true,
+				(ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)), Some("pool")) => {
+					policy.user_pubkey == vtxo.server_pubkey() || self.db.read(async |t|
+						t.fetch_ephemeral_tweak(policy.user_pubkey).await
+					).await?.is_some()
+				},
+				_ => false,
+			};
+			if owned {
+				self.update_mempool_spend(vtxo.id()).await;
+				claims.push(vtxo.clone());
+			}
+		}
+		if !claims.is_empty() { self.process_claims(claims).await?; }
+		// Operator-only claims above do not depend on customer view readiness.
+		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
+		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+		self.expiry_readiness_pass(view, sweeps).await?;
+		// Expired customer backing never reaches upstream's drain-only builder.
+		self.process_expiry_payouts(view).await?;
+		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
+		for (txid, root) in splits {
+			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+			let ids = [root.id()];
+			let mut fee_rate = self.fee_estimator.regular();
+			self.update_mempool_spend(root.id()).await;
+			if let Some(spend) = self.get_mempool_spend(root.id()) {
+				if spend.txid != txid {
+					warn!(vtxo_id = %root.id(), expected = %txid, actual = %spend.txid,
+						"Expiry progress is pinned by a different spender; retaining its hold");
+					continue;
+				}
+				if spend.fee_rate >= fee_rate { continue; }
+				fee_rate = fee_rate.max(saturating_add_feerates(
+					spend.fee_rate, self.config.incremental_relay_fee
+				));
+			}
+			if let Err(error) = self.db.write(async |t| {
+				// Reorg callbacks also acquire the wallet. Take validity first,
+				// so no wallet holder can wait behind exclusive invalidation.
+				t.lock_watchman_tip(view).await?;
+				let mut wallet = self.watchman_wallet.lock().await;
+				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
+					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
+					return Ok(());
+				}
+				// A request may outlive a later refresh, offboard or key drop.
+				// Reprove preservation and retain its sorted path locks through
+				// publication, rather than trusting the old request's txid alone.
+				if !t.request_expiry_split(view, &root).await
+					.context("expiry split request revalidation")? { return Ok(()); }
+				let current = t.query_one("
+					SELECT progress_txid FROM expiry_split_request
+					WHERE vtxo_id=$1
+				", &[&root.id().to_string()]).await.context("expiry split instruction lookup")?;
+				ensure!(
+					current.get::<_, &str>("progress_txid") == txid.to_string(),
+					"expiry split instruction changed"
+				);
+				t.lock_unallocated_watchman_inputs(&ids).await.context("expiry split input locks")?;
+				self.process_progress_tx(t, &mut wallet, txid, &root, fee_rate).await
+					.context("expiry split progress publication")
+			}).await {
+				warn!(vtxo_id = %ids[0], progress_txid = %txid, error = %format!("{error:#}"),
+					"Expiry split remains pending");
+			}
+		}
+		Ok(())
+	}
+
 	/// Build the complete group as one transaction; callers must never feed a
 	/// committed group through process_claims, which retries individual inputs.
 	pub(crate) async fn build_expiry_payout(
