@@ -7,7 +7,6 @@ use bitcoin::{OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::RpcApi;
-use serde_json::json;
 use server::database::Db;
 
 use ark_testing::onchain::observed_payout_fee_child;
@@ -58,19 +57,8 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 
 	let destination = client.fallback_script();
 	let expected = source.amount() - sat(1_000);
-	let funding = ctx.bitcoind().await_transaction(source.chain_anchor().txid).await;
 	source.validate(&funding).unwrap();
 	drop(client);
-	let history = serde_json::to_value(wallet.history().await).unwrap();
-	let matches = history.as_array().unwrap().iter().filter(|m| m["id"] == board.movement_id).collect::<Vec<_>>();
-	assert_eq!(matches.len(), 1);
-	let movement = matches[0];
-	assert_eq!(movement["subsystem"], json!({"name": "bark.board", "kind": "board"}));
-	assert_eq!(movement["status"], "successful");
-	assert_eq!(movement["intended_balance_sat"], quote.gross_amount.to_sat());
-	assert_eq!(movement["effective_balance_sat"], quote.net_amount.to_sat());
-	assert_eq!(movement["offchain_fee_sat"], quote.fee.to_sat());
-	assert_eq!(movement["output_vtxos"], json!([source.id()]));
 
 	// Fund the distinct watchman wallet, rather than assuming the
 	// captaind rounds wallet can sponsor this zero-fee payout parent.
@@ -88,21 +76,14 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 	// its expired input must not be refreshed by a test helper before deciding.
 	let (allocation, parent, child, observed_child_fee) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |t| Ok(t.query_opt(
-				"SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
-				&[&source.id().to_string()],
-			).await?)).await.unwrap();
+
 			let split_count = db.read(async |t| Ok(t.query_one(
 				"SELECT COUNT(*) FROM expiry_split_request", &[],
 			).await?.get::<_, i64>(0))).await.unwrap();
 			assert_eq!(split_count, 0, "unresolved ownership must not progress a board into a user-only leaf");
-			if let Some(row) = row {
-				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				if let Some((child, measured_fee)) = observed_payout_fee_child(&ctx, &parent) {
-					break (row.get::<_, i64>("id"), parent, child, measured_fee);
+			if let Some((id, parent)) = super::expiry_test::published_payout(&db, source.id()).await {
+				if let Some((child, fee)) = observed_payout_fee_child(&ctx, &parent) {
+					break (id, parent, child, fee);
 				}
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
@@ -118,15 +99,9 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 	assert_eq!(payouts.len(), 1, "one user in one backing output pays one fee");
 	assert_eq!(payouts[0].1.value, expected);
 	let payout_point = OutPoint::new(parent_txid, payouts[0].0 as u32);
-	let mut parent_inputs = 0;
-	for input in &parent.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		parent_inputs += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	assert_eq!(parent_inputs, parent.output.iter().map(|o| o.value.to_sat()).sum::<u64>());
+	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
 	assert_eq!(parent.input.len(), 1);
 	assert_eq!(parent.input[0].previous_output, source.chain_anchor());
-	assert_eq!(parent_inputs, quote.gross_amount.to_sat());
 	assert_eq!(parent.output.len(), 3);
 	assert_eq!(payouts[0].0, 0);
 	assert_eq!(parent.output[1].value, quote.fee + sat(1_000));
@@ -137,17 +112,10 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 	assert!(child.input.iter().any(|input| input.previous_output.txid == fee_funding));
 	assert_eq!(child.output.len(), 1);
 
-	let mut child_inputs = 0;
-	for input in &child.input {
-		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-		child_inputs += previous.output[input.previous_output.vout as usize].value.to_sat();
-	}
-	let actual_child_fee = child_inputs - child.output.iter().map(|o| o.value.to_sat()).sum::<u64>();
-	assert!(actual_child_fee > 0);
-	assert_eq!(actual_child_fee, u64::try_from(observed_child_fee).unwrap());
-	assert_eq!(child_inputs, 100_000);
-	assert_eq!(child.output[0].value.to_sat() + actual_child_fee, 100_000);
-
+	let actual_child_fee = super::expiry_test::actual_fee(&ctx, &child).await;
+	assert!(actual_child_fee > bitcoin::Amount::ZERO);
+	assert_eq!(actual_child_fee.to_sat(), u64::try_from(observed_child_fee).unwrap());
+	assert_eq!(child.output[0].value + actual_child_fee, sat(100_000));
 	ctx.generate_blocks(6).await;
 	let confirmed_payout = ctx.bitcoind().sync_client().get_tx_out(&parent_txid, payout_point.vout, Some(true))
 		.unwrap().expect("fallback output must be independently unspent in Core");

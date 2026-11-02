@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::mailbox::MailboxIdentifier;
-use ark::vtxo::Full;
+use ark::vtxo::{Full, TapScriptClause};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::daemon::captaind::WalletAdminClient;
 use ark_testing::daemon::watchmand::Watchmand;
@@ -245,4 +245,65 @@ pub(super) async fn wait_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("actual background payout did not publish")
+}
+
+/// Observe one current customer payout; never manufacture its allocation.
+pub(super) async fn published_payout(db: &Db, coin: VtxoId) -> Option<(i64, Transaction)> {
+	let rows = db.read(async |t| Ok(t.query("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a
+		JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id
+		WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
+		&[&coin.to_string()]).await?)).await.unwrap();
+	assert!(rows.len() <= 1, "one source cannot have duplicate current payouts");
+	rows.first().map(|row| (row.get("id"), deserialize(row.get("sweep_tx")).unwrap()))
+}
+
+/// Authenticate each confirmed native timeout or funded operator closure before
+/// its canonical height is used as a sender-refund premise.
+pub(super) async fn confirmed_grant_closures(
+	ctx: &TestContext, db: &Db, grants: &[Vtxo<Full>], receiver: &bitcoin::Script,
+) -> Option<std::collections::BTreeMap<VtxoId, (bitcoin::Txid, u32)>> {
+	let chain = ctx.bitcoind().sync_client();
+	let mut closures = std::collections::BTreeMap::new();
+	for grant in grants {
+		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
+			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
+			AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept, \
+			h.payment_hash,h.direction::TEXT AS direction \
+			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();
+		assert_eq!(row.get::<_, &str>("payment_hash"), grant.policy().as_server_htlc_recv().unwrap().payment_hash.to_string());
+		assert_eq!(row.get::<_, &str>("direction"), "outgoing");
+		let revoked = row.get::<_, Option<&str>>("chain_resolution") == Some("revoked");
+		let txid: bitcoin::Txid = match (row.get::<_, Option<&str>>("chain_resolution"), row.get::<_, Option<&str>>("swept")) {
+			(Some("revoked"), swept) => {
+				let txid = row.get::<_, Option<&str>>("onchain_spent_txid")
+					.expect("a native timeout resolution must retain its actual transaction").parse().unwrap();
+				if let Some(swept) = swept { assert_eq!(txid, swept.parse::<bitcoin::Txid>().unwrap()); }
+				txid
+			},
+			(None, Some(txid)) => txid.parse().unwrap(),
+			(None, None) => return None,
+			other => panic!("grant {} has an unexpected closure: {other:?}", grant.id()),
+		};
+		let Some(info) = chain.custom_get_raw_transaction_info(txid, None).unwrap() else { return None; };
+		if info.confirmations.unwrap_or(0) <= 0 { return None; }
+		let tx = ctx.bitcoind().await_transaction(txid).await;
+		if revoked {
+			let input = tx.input.iter().find(|i| i.previous_output == grant.point()).unwrap();
+			let policy = grant.policy().as_server_htlc_recv().unwrap();
+			let script = policy.server_claim_after_expiry_clause(grant.server_pubkey(), grant.exit_delta()).tapscript();
+			assert_eq!(input.witness.taproot_leaf_script().unwrap().script, script.as_script());
+		}
+		assert!(tx.output.iter().all(|o| o.script_pubkey.as_script() != receiver));
+		let hash = info.blockhash.expect("a confirmed grant closure must have a block");
+		let height = chain.get_block_header_info(&hash).unwrap().height;
+		assert_eq!(chain.get_block_hash(height as u64).unwrap(), hash);
+		assert!(closures.insert(grant.id(), (txid, u32::try_from(height).unwrap())).is_none());
+	}
+	Some(closures)
+}
+
+pub(super) async fn assert_grants_reclaimed(ctx: &TestContext, db: &Db, grants: &[Vtxo<Full>], receiver: &bitcoin::Script) {
+	confirmed_grant_closures(ctx, db, grants, receiver).await
+		.expect("every grant must have a confirmed native timeout or operator closure");
 }
