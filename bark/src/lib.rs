@@ -484,6 +484,8 @@ compile_error!("`wasm-web` does not support the `bitcoind-rpc` feature");
 const BARK_PURPOSE_INDEX: u32 = 350;
 /// Derivation index used to generate keypairs to sign VTXOs
 const VTXO_KEYS_INDEX: u32 = 0;
+/// Derivation index used to generate keypair for the server mailbox
+const MAILBOX_KEY_INDEX: u32 = 1;
 /// Derivation index used to generate keypair for the recovery mailbox
 const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
 const MISSING_SERVER_TRANSPORT_HELP: &str =
@@ -701,6 +703,10 @@ impl WalletProperties {
 		ensure!(self.network == network, "mailbox wallet is for a different network");
 		ensure!(self.mailbox_identity.is_some() || self.server_payouts != Some(true),
 			"payout wallet is missing its original mailbox identity");
+		if self.mailbox_identity.is_none() {
+			ensure!(seed.to_mailbox_keypair().public_key() == seed.legacy_mailbox_keypair().public_key(),
+				"legacy wallet mailbox key differs from its seed");
+		}
 		if let Some(identity) = &self.mailbox_identity {
 			ensure!(*identity == seed.mailbox_identity(network),
 				"mailbox key is missing or differs from the wallet identity");
@@ -771,6 +777,19 @@ impl WalletSeed {
 	fn to_mailbox_keypair(&self) -> Keypair {
 		if let Some(keypair) = self.external_mailbox { return keypair; }
 		self.mailbox
+	}
+
+	fn legacy_mailbox_keypair(&self) -> Keypair {
+		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
+		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
+	}
+
+	fn mailbox_keypair_for_mode(&self, payouts: bool, identity: Option<&MailboxIdentity>) -> Keypair {
+		if !payouts && self.external_mailbox.is_none() {
+			let legacy = self.legacy_mailbox_keypair();
+			if identity.is_none_or(|stored| stored.public_key == legacy.public_key()) { return legacy; }
+		}
+		self.to_mailbox_keypair()
 	}
 
 	fn to_recovery_mailbox_keypair(&self) -> Keypair {
@@ -1324,7 +1343,8 @@ impl Wallet {
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
 			server_payouts,
-			mailbox_identity: Some(seed.mailbox_identity(network)),
+			mailbox_identity: Some(MailboxIdentity { network,
+				public_key: seed.mailbox_keypair_for_mode(server_payouts.unwrap_or(true), None).public_key() }),
 		};
 
 		// write the config to db
@@ -1405,8 +1425,14 @@ impl Wallet {
 		if properties.fingerprint != fingerprint {
 			bail!("incorrect mnemonic")
 		}
+		// V42 SQLite and old adaptor properties used the upstream mailbox.
+		// A wallet created offline already has an identity; preserve that key.
+		let mut seed = seed;
+		seed.mailbox = seed.mailbox_keypair_for_mode(properties.server_payouts.unwrap_or(false),
+			properties.mailbox_identity.as_ref());
 		properties.check_mailbox_identity(network, &seed)?;
 		if properties.mailbox_identity.is_none() {
+			if properties.server_payouts.is_none() { db.set_server_payouts(false).await?; }
 			db.set_mailbox_identity(seed.mailbox_identity(network)).await?;
 		}
 
@@ -2781,6 +2807,36 @@ mod tests {
 		assert!(derived.check_mailbox_identity(Network::Regtest, &external()).is_err());
 		let restored: super::WalletProperties = serde_json::from_slice(&serde_json::to_vec(&props).unwrap()).unwrap();
 		assert_eq!(restored, props);
+	}
+
+	#[test]
+	fn payout_off_preserves_upstream_and_already_bound_mailbox_keys() {
+		let seed = || super::WalletSeed::new_from_seed(Network::Regtest, &[17; 64]);
+		let root = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[17; 64]).unwrap();
+		let path = [bitcoin::bip32::ChildNumber::from_hardened_idx(350).unwrap(),
+			bitcoin::bip32::ChildNumber::from_hardened_idx(1).unwrap()];
+		let upstream = root.derive_priv(&super::SECP, &path).unwrap().to_keypair(&super::SECP);
+		let props = super::WalletProperties {
+			network: Network::Regtest, fingerprint: seed().fingerprint(),
+			server_pubkey: None, server_mailbox_pubkey: None,
+			server_payouts: Some(false), mailbox_identity: None,
+		};
+		let mut reopened = seed();
+		reopened.mailbox = reopened.mailbox_keypair_for_mode(false, None);
+		props.check_mailbox_identity(Network::Regtest, &reopened).unwrap();
+		assert_eq!(reopened.to_mailbox_keypair().public_key(), upstream.public_key());
+		let bound = reopened.mailbox_identity(Network::Regtest);
+		assert_eq!(seed().mailbox_keypair_for_mode(false, Some(&bound)).public_key(), upstream.public_key());
+		assert_eq!(reopened.to_recovery_mailbox_keypair().public_key(), seed().to_recovery_mailbox_keypair().public_key());
+		assert_eq!(reopened.derive_vtxo_keypair(0).public_key(), seed().derive_vtxo_keypair(0).public_key());
+		let bip86 = seed().mailbox_identity(Network::Regtest);
+		assert_ne!(bip86.public_key, upstream.public_key());
+		assert_eq!(seed().mailbox_keypair_for_mode(true, None).public_key(), bip86.public_key);
+		// An offline-created wallet bound its BIP86 identity before knowing
+		// the server's mode; an OFF handshake must not change it on reopen.
+		assert_eq!(seed().mailbox_keypair_for_mode(false, Some(&bip86)).public_key(), bip86.public_key);
+		let other = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[1; 32]).unwrap();
+		assert!(props.check_mailbox_identity(Network::Regtest, &seed().with_external_mailbox_keypair(other)).is_err());
 	}
 
 	#[test]
