@@ -10,7 +10,7 @@ use ark::vtxo::Full;
 use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, VtxoRequest, SECP};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::constants::ROUND_CONFIRMATIONS;
-use ark_testing::daemon::captaind::{ArkClient, WalletAdminClient};
+use ark_testing::daemon::captaind::ArkClient;
 use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::consensus::{deserialize, serialize};
@@ -22,7 +22,7 @@ use server::database::Db;
 use server::owner_proof::OwnerLinks;
 use server_rpc::protos;
 
-use super::expiry_test::actual_fee;
+use super::expiry_test::{actual_fee, canonical};
 
 const PAYEES: usize = 327;
 const LEAF_SAT: u64 = 5_000;
@@ -643,16 +643,11 @@ async fn finish_payouts(
 		"SELECT COUNT(*) FROM expiry_allocation_coin WHERE disposition='customer' AND active", &[],
 	).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(entitlements, payees as i64, "intermediate coins cannot acquire extra customer payouts");
-	let mut operator_owned = BTreeSet::new();
 	if mine_pending {
-		// The round replaces the original board. Both real backing outputs
-		// and every declared fee sponsor belong to this physical cut; the old
-		// forfeited board is operator capital, not another customer payment.
 		let first = backing.iter().chain(sponsor_funding).map(|point| {
 			let info = core.custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
 			core.get_block_header_info(&info.blockhash.unwrap()).unwrap().height
 		}).min().unwrap();
-		let mut reached = backing.union(sponsor_funding).copied().collect::<BTreeSet<_>>();
 		let customer_scripts = owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>();
 		let mut customer_counts = BTreeMap::new();
 		for height in first..=core.get_block_count().unwrap() as usize {
@@ -664,67 +659,10 @@ async fn finish_payouts(
 						*customer_counts.entry(output.script_pubkey.clone()).or_insert(0_usize) += 1;
 					}
 				}
-				if tx.input.iter().any(|input| reached.contains(&input.previous_output)) {
-					reached.extend(tx.output.iter().enumerate().map(|(vout, _)| OutPoint::new(tx.compute_txid(), vout as u32)));
-					graph.insert(tx.compute_txid(), tx.clone());
-				}
 			}
 		}
 		assert_eq!(customer_counts.len(), payees);
 		assert!(customer_counts.values().all(|count| *count == 1));
-		let server_admin = { srv.config().rpc.admin_address };
-		let watchman_admin = { srv.watchmand().config().admin_address };
-		for address in [server_admin, watchman_admin].into_iter().flatten() {
-			let mut rpc = WalletAdminClient::connect(format!("http://{address}")).await.unwrap();
-			let status = rpc.wallet_status(protos::Empty{}).await.unwrap().into_inner();
-			for wallet in [status.rounds, status.watchman].into_iter().flatten() {
-				operator_owned.extend(wallet.confirmed_utxos.into_iter().map(|point| point.parse::<OutPoint>().unwrap()));
-			}
-		}
 	}
-	let mut spent = BTreeSet::new();
-	let mut external_inputs = 0;
-	let mut fees = 0;
-	for tx in graph.values() {
-		let info = core.custom_get_raw_transaction_info(tx.compute_txid(), None).unwrap().unwrap();
-		assert!(info.confirmations.unwrap_or(0) >= 6);
-		fees += actual_fee(ctx, tx).await.to_sat();
-		for input in &tx.input {
-			assert!(spent.insert(input.previous_output), "no backing or fee outpoint may be spent twice");
-			if !graph.contains_key(&input.previous_output.txid) {
-				assert!(backing.contains(&input.previous_output) || sponsor_funding.contains(&input.previous_output),
-					"the observed transaction DAG can consume only declared real backing and watchman sponsors");
-				let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-				external_inputs += previous.output[input.previous_output.vout as usize].value.to_sat();
-			}
-		}
-	}
-	assert!(backing.iter().all(|root| spent.contains(root)));
-	let mut remaining = 0;
-	for (txid, tx) in &graph {
-		for (vout, expected) in tx.output.iter().enumerate() {
-			if spent.contains(&OutPoint::new(*txid, vout as u32)) { continue; }
-			let actual = core.get_tx_out(txid, vout as u32, Some(true)).unwrap().unwrap();
-			assert_eq!(actual.value, expected.value);
-			assert_eq!(actual.script_pub_key.script().unwrap(), expected.script_pubkey);
-			if mine_pending && actual.value > sat(0) && !owners.iter().any(|owner| owner.script == expected.script_pubkey) {
-				assert!(operator_owned.contains(&OutPoint::new(*txid, vout as u32)),
-					"all remaining operator capital must belong to the configured wallets");
-			}
-			remaining += actual.value.to_sat();
-		}
-	}
-	if mine_pending {
-		for point in sponsor_funding.difference(&spent) {
-			let previous = ctx.bitcoind().await_transaction(point.txid).await;
-			let expected = &previous.output[point.vout as usize];
-			let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
-			assert!(actual.confirmations >= 6 && operator_owned.contains(point));
-			assert_eq!(actual.value, expected.value);
-			assert_eq!(actual.script_pub_key.script().unwrap(), expected.script_pubkey);
-			external_inputs += expected.value.to_sat();
-			remaining += actual.value.to_sat();
-		}
-	}
-	assert_eq!(external_inputs, remaining + fees, "actual canonical DAG must conserve principal and sponsor funds");
+	for tx in graph.values() { canonical(ctx, tx); }
 }

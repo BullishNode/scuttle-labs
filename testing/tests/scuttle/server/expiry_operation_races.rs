@@ -101,6 +101,12 @@ async fn offboard_allocations(
 		 row.get::<_, i64>(3),row.get::<_, i64>(4),row.get::<_, i64>(5))).collect::<Vec<_>>())).await.unwrap()
 }
 
+fn assert_canceled_movement(cancelled: &bark::movement::Movement) {
+	assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
+	assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
+	assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+}
+
 async fn offboard_race(offboard_wins: bool, finality: bool) {
 	let name = if finality { "server/expiry_native_offboard_fallback_finality" }
 		else if offboard_wins { "server/expiry_native_offboard_wins" }
@@ -220,10 +226,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			_ => unreachable!(),
 		};
 		if finality {
-			let cancelled = wallet_db.get_movement_by_id(movement).await.unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(&wallet_db.get_movement_by_id(movement).await.unwrap());
 			wallet.sync_fallback_payouts().await.unwrap();
 			assert_eq!(wallet.offboard_checkpoint(&prepared.id).await.unwrap(), Some(prepared.clone()));
 			let history = wallet.history().await.unwrap();
@@ -246,10 +249,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			assert_eq!(wallet.get_full_vtxo(id).await.unwrap(), signed, "payment must retain signed recovery material");
 			let history = wallet.history().await.unwrap();
 			assert_eq!(history.iter().map(|entry| entry.effective_balance.to_sat()).sum::<i64>(), native_balance);
-			let cancelled = history.iter().find(|entry| entry.id == movement).unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(history.iter().find(|entry| entry.id == movement).unwrap());
 			let rpc = ctx.bitcoind().sync_client();
 			let confirmed = rpc.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().unwrap();
 			rpc.invalidate_block(&confirmed.blockhash.unwrap()).unwrap();
@@ -266,10 +266,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			assert!(wallet.lock_vtxos([id], None).await.is_err());
 			assert_eq!(signed.amount(), coin.amount());
 			let history = wallet.history().await.unwrap();
-			let cancelled = history.iter().find(|entry| entry.id == movement).unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(history.iter().find(|entry| entry.id == movement).unwrap());
 			assert_eq!(history.iter().map(|entry| entry.effective_balance.to_sat()).sum::<i64>(), native_balance);
 
 			// Keep the offline cut above unchanged. Bring back the SAME server
@@ -328,10 +325,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 			wallet.sync_pending_offboards().await.unwrap();
 			assert!(wallet.offboard_checkpoint(&prepared.id).await.unwrap().is_none(),
 				"authenticated terminal fallback must finish the superseded offboard after its session was lost");
-			let cancelled = wallet_db.get_movement_by_id(movement).await.unwrap();
-			assert_eq!(cancelled.status, bark::movement::MovementStatus::Canceled);
-			assert_eq!(cancelled.effective_balance, bitcoin::SignedAmount::ZERO);
-			assert_eq!(cancelled.offchain_fee, bitcoin::Amount::ZERO);
+			assert_canceled_movement(&wallet_db.get_movement_by_id(movement).await.unwrap());
 			assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
 			assert!(wallet.lock_vtxos([id], None).await.is_err());
 			assert_eq!(wallet_db.get_wallet_vtxo(id).await.unwrap().unwrap().state, VtxoState::Spent);
