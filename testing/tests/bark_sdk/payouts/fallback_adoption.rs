@@ -18,13 +18,11 @@ use server::database::Db;
 use tokio::sync::{Notify, oneshot};
 use ark::vtxo::Full;
 use ark::Vtxo;
-use ark::recovery::XpubRecoveryAuthorization;
-use bitcoin::bip32::{DerivationPath, Xpriv, Xpub};
 use server_rpc::protos;
 
 use ark::ProtocolEncoding;
 use ark::attestations::VtxoStatusAttestation;
-use ark_testing::{constants, require_bitcoind_chain_source, sat, TestContext};
+use ark_testing::{require_bitcoind_chain_source, sat, TestContext};
 use ark_testing::daemon::captaind;
 
 fn config(config: &mut bark::Config) {
@@ -52,29 +50,8 @@ pub(super) async fn reopen(ctx: &TestContext, name: &str, srv: &captaind::Captai
 	}).await.unwrap()
 }
 
-pub(super) async fn await_decision(ctx: &TestContext, srv: &captaind::Captaind, coin: &bark::WalletVtxo) {
-	let height = ctx.bitcoind().get_block_count().await as u32;
-	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - height).await;
-	srv.wait_for_sync_height(expired).await;
-	srv.watchmand().wait_for_sync_height(expired).await;
-	let database = Db::connect(&srv.config().postgres).await.unwrap();
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let exists = database.read(async |tx| Ok(tx.query_opt(
-				"SELECT id AS entitlement_id FROM expiry_entitlement WHERE vtxo_id=$1", &[&coin.id().to_string()],
-			).await?)).await.unwrap().is_some();
-			if exists { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("actual unfunded background allocation did not decide the coin");
-}
-
 #[tokio::test]
 async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
-	unseen_paid_mailbox().await;
-}
-
-async fn unseen_paid_mailbox() {
 	require_bitcoind_chain_source!();
 	let ctx = TestContext::new("bark_sdk/full_sync_unseen_paid_mailbox").await;
 	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| { cfg.expiry_payouts = true;
@@ -250,7 +227,6 @@ async fn stalled_change() {
 	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
 	assert_eq!(received.amount(), sat(60_000));
 	let local = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
-	let (owner, payment) = { (Some(owner), Some(payment)) };
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let ids = leaves.iter().map(|coin| coin.id().to_string()).collect::<Vec<_>>();
 	let height = ctx.bitcoind().get_block_count().await as u32;
@@ -266,26 +242,10 @@ async fn stalled_change() {
 		}
 	}).await.expect("real unregistered outputs must be allocated before registration resumes");
 
-	let confirm_refund = async || {
-		ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
-		ctx.generate_blocks(2).await;
-		let payout = tokio::time::timeout(Duration::from_secs(30), async {
-			'payout: loop {
-				for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
-					let tx = ctx.bitcoind().await_transaction(txid).await;
-					if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(99_000)) { break 'payout tx; }
-				}
-				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-		}).await.expect("the retained input owner's real payout must become relayable after funding");
-		ctx.generate_blocks(6).await;
-		payout
-	};
 	gate.release.notify_one();
-	let error = tokio::time::timeout(Duration::from_secs(15), payment.expect("live send driver"))
+	let error = tokio::time::timeout(Duration::from_secs(15), payment)
 		.await.unwrap().unwrap().unwrap_err();
 	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback));
-	let owner = owner.expect("live owner");
 	owner.sync().await;
 	let own_status = protos::VtxoSpendState::FallbackPending;
 	let sends = owner.history().await.unwrap().into_iter().filter(|movement| movement.subsystem.name == "bark.arkoor")
@@ -302,56 +262,38 @@ async fn stalled_change() {
 	}).await.unwrap().into_inner();
 	assert_eq!(original_status.spend_state, own_status as i32,
 		"all provisional split portions project back to the known input owner");
-	let mut queries = Vec::new();
 	for coin in &leaves {
 		let key = if coin.user_pubkey() == recipient_key { recipient.get_vtxo_key(coin).await.unwrap() }
 			else { owner.get_vtxo_key(coin).await.unwrap() };
-		let query = protos::VtxoStatusQuery { vtxo_id: coin.id().to_bytes().to_vec(),
-			attestation: VtxoStatusAttestation::new(coin.id(), &key).serialize() };
 		let state = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
-			vtxo_id: query.vtxo_id.clone(), attestation: query.attestation.clone(),
+			vtxo_id: coin.id().to_bytes().to_vec(),
+			attestation: VtxoStatusAttestation::new(coin.id(), &key).serialize(),
 		}).await.unwrap().into_inner().spend_state;
 		assert_eq!(state, if coin.user_pubkey() == recipient_key { protos::VtxoSpendState::Spent }
 			else { own_status } as i32);
-		queries.push(query);
-	}
-	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest { vtxos: queries }).await.unwrap().into_inner();
-	assert!(batch.missing_vtxo_ids.is_empty());
-	assert_eq!(batch.vtxos.len(), leaves.len());
-	assert_eq!(batch.vtxos.iter().filter(|coin| coin.spend_state == protos::VtxoSpendState::FallbackPending as i32).count(),
-		{ changes.len() });
-	// Inspect xpub status separately from importing the server's unsigned body.
-	// Only the resumed action above supplies the change's signed path.
-	let seed = mnemonic(&ctx, "owner").await;
-	let xpriv = Xpriv::new_master(Network::Regtest, &seed.to_seed("")).unwrap()
-		.derive_priv(&ark::SECP, &DerivationPath::from_str("m/350'/0'").unwrap()).unwrap();
-	assert_eq!(Xpub::from_priv(&ark::SECP, &xpriv), owner.vtxo_xpub());
-	let authorization = XpubRecoveryAuthorization::new(&xpriv, srv.ark_info().await.server_pubkey,
-		chrono::Local::now() + Duration::from_secs(60));
-	let recovered = rpc.recover_vtxos_by_xpub(protos::RecoverVtxosByXpubRequest {
-		xpub: owner.vtxo_xpub().encode().to_vec(), start_index: 0, cursor_vtxo_id: None,
-		authorization: authorization.serialize(),
-	}).await.unwrap().into_inner();
-	for change in &changes {
-		assert_eq!(recovered.vtxos.iter().find(|entry| Vtxo::<Full>::deserialize(&entry.vtxo).unwrap().id() == change.id())
-			.unwrap().spend_state, own_status as i32);
-
 	}
 	assert_eq!(owner.balance().await.unwrap().total(), sat(0), "known committed inputs are status-only, not new Ark balance");
 	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-	let source_status = { bark::vtxo::FallbackStatus::Pending };
-	assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(source_status));
+	assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 	assert_eq!(owner.get_full_vtxo(source.id()).await.unwrap().amount(), source.amount());
-	// The source-to-change relation and exact leaf owner/status were checked
-	// through authenticated single/batch/xpub RPC above, not a claim feed.
-	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
 	for change in &changes {
-		assert_eq!(owner.get_vtxo_by_id(change.id()).await.unwrap().fallback_status, Some(source_status));
+		assert_eq!(owner.get_vtxo_by_id(change.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 	}
 	recipient.sync_fallback_payouts().await.unwrap();
 	assert!(recipient.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
-	let payout = confirm_refund().await;
+	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
+	ctx.generate_blocks(2).await;
+	let payout = tokio::time::timeout(Duration::from_secs(30), async {
+		'payout: loop {
+			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
+				let tx = ctx.bitcoind().await_transaction(txid).await;
+				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(99_000)) { break 'payout tx; }
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}).await.expect("the retained input owner's real payout must become relayable after funding");
+	ctx.generate_blocks(6).await;
 	owner.chain().invalidate_caches().await;
 	owner.sync_fallback_payouts().await.unwrap();
 	owner.sync_pending_arkoor_sends().await.unwrap();

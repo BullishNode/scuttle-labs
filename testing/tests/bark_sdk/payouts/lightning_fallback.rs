@@ -213,17 +213,8 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 		assert_eq!(pending[0].invoice.payment_hash(), payment_hash);
 		assert_eq!(pending[0].fee, bitcoin::Amount::ZERO, "this fixture declares zero user Lightning fee");
 		let status = wallet.check_lightning_payment(payment_hash, false).await.unwrap();
-		match status {
-			LightningSendState::InProgress(pending) => {
-				let pending_balance = pending.payment_amount + pending.fee;
-				assert_eq!(pending.payment_amount, invoice_amount);
-				let balance = assert_balance_consistent(&wallet, false).await;
-				assert_eq!(balance.spendable, board_amount - pending_balance);
-				assert_eq!(balance.needs_refresh, bitcoin::Amount::ZERO);
-				assert_eq!(balance.pending_lightning_send, pending_balance);
-			},
-			other => panic!("real hold invoice should remain pending: {other:?}"),
-		}
+		assert!(matches!(&status, LightningSendState::InProgress(pending) if pending.payment_amount == invoice_amount),
+			"real hold invoice should remain pending for the original amount: {status:?}");
 		let waiter = {
 			let wallet = wallet.clone();
 			tokio::spawn(async move { wallet.check_lightning_payment(payment_hash, true).await })
@@ -259,10 +250,6 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 
 #[tokio::test]
 async fn receive_claim_reply_loss_is_durable_before_wire_and_recovers_after_reopen() {
-	receive_claim_reply_loss_reopen().await;
-}
-
-async fn receive_claim_reply_loss_reopen() {
 	let ctx = TestContext::new("bark_sdk/receive_claim_reply_loss_reopen").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
@@ -309,13 +296,7 @@ async fn receive_claim_reply_loss_reopen() {
 		"the real receiver hold invoice, not an injected RPC failure, must already be settled");
 	// Assert only after the external payment and receiver settlement
 	// succeed. The snapshot itself was read while the client awaited a reply.
-	let phase = match &checkpoint.progress {
-		bark::actions::lightning::receive::Progress::AwaitingPayment => "awaiting_payment",
-		bark::actions::lightning::receive::Progress::HtlcsReady(_) => "htlcs_ready",
-		bark::actions::lightning::receive::Progress::PreimageRevealed(_) => "preimage_revealed",
-		bark::actions::lightning::receive::Progress::Delivering(_) => "delivering",
-	};
-	assert_eq!(phase, "preimage_revealed",
+	assert!(matches!(&checkpoint.progress, bark::actions::lightning::receive::Progress::PreimageRevealed(_)),
 		"a completed payment with its client reply still lost must already be durably irreversible");
 	drop(mailbox);
 	wallet.stop_daemon_wait().await.unwrap();

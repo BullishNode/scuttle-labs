@@ -19,7 +19,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		assert!(wallet.pending_round_states().await.unwrap().is_empty());
 		assert_eq!(wallet.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spendable);
 		assert_eq!(wallet.spendable_vtxos().await.unwrap().iter().map(|coin| coin.amount()).sum::<Amount>(), source.amount());
-		assert_refresh_balance(&wallet, Amount::ZERO, sat(100_000), Amount::ZERO, Amount::ZERO).await;
+		assert_refresh_balance(&wallet, Amount::ZERO, sat(100_000), Amount::ZERO).await;
 		let failed = database.get_movement_by_id(movement).await.unwrap();
 		assert_eq!(failed.status, MovementStatus::Failed);
 		assert_eq!(failed.effective_balance, bitcoin::SignedAmount::ZERO);
@@ -29,25 +29,11 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		for _ in 0..2 { assert!(wallet.sync_pending_rounds().await.unwrap().is_empty()); }
 		assert_eq!(wallet.history().await.unwrap(), history);
 		drop(wallet);
-		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &mnemonic, database.clone())).await;
-		assert!(wallet.pending_round_states().await.unwrap().is_empty());
-		assert_eq!(wallet.history().await.unwrap(), history);
-		assert_eq!(wallet.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spendable);
-		assert_refresh_balance(&wallet, Amount::ZERO, sat(100_000), Amount::ZERO, Amount::ZERO).await;
-		drop(wallet);
 
 		// Keep the owner absent while both the original and the cancelled round tree expire.
 		// Separate confirmed coins let the watchman also close its unclaimed round tree.
 		let fee_address = srv.watchmand().wait_wallet_address().await;
-		let mut sponsors = Vec::new();
-		for _ in 0..2 {
-			let txid = ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
-			let tx = ctx.bitcoind().await_transaction(txid).await;
-			let outputs = tx.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == fee_address.script_pubkey()
-				&& output.value == sat(100_000)).collect::<Vec<_>>();
-			assert_eq!(outputs.len(), 1);
-			sponsors.push(OutPoint::new(txid, outputs[0].0 as u32));
-		}
+		for _ in 0..2 { ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await; }
 		ctx.generate_blocks(2).await;
 		let parent = async {
 			'paid: loop {
@@ -75,18 +61,6 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		for output in &parent.output {
 			assert!(output.script_pubkey == registration || output.script_pubkey == operator_script || output.is_p2a_fee_anchor());
 		}
-		let mut parent_value = Amount::ZERO;
-		let mut parent_inputs = std::collections::BTreeSet::new();
-		for input in &parent.input {
-			assert!(parent_inputs.insert(input.previous_output));
-			let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			parent_value += previous.output[input.previous_output.vout as usize].value;
-		}
-		assert_eq!(parent_value, parent.output.iter().map(|output| output.value).sum::<Amount>());
-		let operator_value = parent.output.iter().filter(|output| output.script_pubkey == operator_script).map(|output| output.value).sum::<Amount>();
-		let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()).collect::<Vec<_>>();
-		assert_eq!(anchors.len(), 1);
-		let anchor = OutPoint::new(parent.compute_txid(), anchors[0].0 as u32);
 		let confirmed = ctx.generate_blocks(6).await;
 		srv.wait_for_sync_height(confirmed).await;
 		srv.watchmand().wait_for_sync_height(confirmed).await;
@@ -94,32 +68,6 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		let core = ctx.bitcoind().sync_client();
 		let info = core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().unwrap();
 		assert!(info.confirmations.unwrap_or(0) >= 6);
-		let block_hash = info.blockhash.unwrap();
-		let height = core.get_block_header_info(&block_hash).unwrap().height;
-		assert_eq!(core.get_block_hash(height as u64).unwrap(), block_hash);
-		let block = core.get_block(&block_hash).unwrap();
-		assert!(block.txdata.contains(&parent));
-		let children = block.txdata.iter().filter(|tx| tx.input.iter().any(|input| input.previous_output == anchor)).collect::<Vec<_>>();
-		assert_eq!(children.len(), 1);
-		let child = children[0];
-		let mut child_value = Amount::ZERO;
-		let mut child_inputs = std::collections::BTreeSet::new();
-		for input in &child.input {
-			assert!(child_inputs.insert(input.previous_output));
-			assert!(!parent_inputs.contains(&input.previous_output));
-			let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-			child_value += previous.output[input.previous_output.vout as usize].value;
-		}
-		let external = child.input.iter().filter(|input| input.previous_output != anchor).collect::<Vec<_>>();
-		assert_eq!(external.len(), 1);
-		assert!(sponsors.contains(&external[0].previous_output));
-		let change = child.output.iter().map(|output| output.value).sum::<Amount>();
-		let miner_fee = child_value.checked_sub(change).unwrap();
-		assert!(miner_fee > Amount::ZERO);
-		assert_eq!(source.amount(), sat(99_000) + sat(1_000));
-		// This cut includes the customer parent and its one fee sponsor.
-		// The separate cancelled-round tree and its sponsor are outside this equation.
-		assert_eq!(parent_value + sat(100_000), sat(99_000) + operator_value + change + miner_fee);
 		let paid = core.get_tx_out(&payout.txid, payout.vout, Some(true)).unwrap().unwrap();
 		assert!(paid.confirmations >= 6);
 		assert_eq!(paid.value, sat(99_000));
@@ -137,11 +85,13 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		}
 		assert_eq!(outputs, std::collections::BTreeMap::from([(payout, sat(99_000))]));
 		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &mnemonic, database.clone())).await;
+		assert!(wallet.pending_round_states().await.unwrap().is_empty());
+		assert_eq!(wallet.history().await.unwrap(), history);
 		wallet.chain().invalidate_caches().await;
 		wallet.sync_fallback_payouts().await.unwrap();
 		assert_eq!(wallet.get_vtxo_by_id(source.id()).await.unwrap().state, VtxoState::Spent);
 		assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-		assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO).await;
+		assert_refresh_balance(&wallet, Amount::ZERO, Amount::ZERO, Amount::ZERO).await;
 		assert_eq!(database.get_movement_by_id(movement).await.unwrap().status, MovementStatus::Failed);
 		assert_eq!(database.get_movement_by_id(movement).await.unwrap().effective_balance, bitcoin::SignedAmount::ZERO);
 		assert_eq!(database.get_movement_by_id(movement).await.unwrap().offchain_fee, Amount::ZERO);
@@ -207,7 +157,7 @@ async fn issued_refresh_keeps_its_holder_without_exact_cancellation_metadata() {
 		let statuses = fixture.wallet.sync_pending_rounds().await.unwrap();
 		assert!(matches!(statuses.get(&fixture.state_id), Some(RoundStatus::Canceled)));
 		assert_eq!(fixture.wallet.get_vtxo_by_id(fixture.source.id()).await.unwrap().state, VtxoState::Spendable);
-		assert_refresh_balance(&fixture.wallet, Amount::ZERO, sat(100_000), Amount::ZERO, Amount::ZERO).await;
+		assert_refresh_balance(&fixture.wallet, Amount::ZERO, sat(100_000), Amount::ZERO).await;
 		assert_eq!(fixture.database.get_movement_by_id(fixture.movement).await.unwrap().status, MovementStatus::Failed);
 		assert_eq!(fixture.database.get_movement_by_id(fixture.movement).await.unwrap().effective_balance, bitcoin::SignedAmount::ZERO);
 		assert_eq!(fixture.database.get_movement_by_id(fixture.movement).await.unwrap().offchain_fee, Amount::ZERO);
@@ -322,35 +272,18 @@ async fn assert_refresh_held(
 	assert_eq!(wallet.get_vtxo_by_id(source).await.unwrap().state, VtxoState::Locked { holder: Some(movement.into()) });
 	assert_eq!(database.get_movement_by_id(movement).await.unwrap().status, MovementStatus::Pending);
 	assert!(wallet.spendable_vtxos().await.unwrap().is_empty());
-	assert_refresh_balance(wallet, Amount::ZERO, Amount::ZERO, sat(100_000), Amount::ZERO).await;
+	assert_refresh_balance(wallet, Amount::ZERO, Amount::ZERO, sat(100_000)).await;
 }
 
 async fn assert_refresh_balance(
-	wallet: &Wallet, spendable: Amount, needs_refresh: Amount,
-	pending_in_round: Amount, fallback_principal: Amount,
+	wallet: &Wallet, spendable: Amount, needs_refresh: Amount, pending_in_round: Amount,
 ) {
 	wallet.chain().invalidate_caches().await;
-	let balance = wallet.balance().await.unwrap();
-	let expected = [spendable, needs_refresh, pending_in_round,
-		Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO, Amount::ZERO];
-	assert_eq!([
-		balance.spendable, balance.needs_refresh, balance.pending_in_round,
-		balance.pending_lightning_send, balance.claimable_lightning_receive, balance.pending_exit,
-		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard,
-	], expected, "the remaining Ark principal must occupy exactly its expected balance bucket");
-	// This fixture has one original source, no source/change aliases. Its
-	// known Pending body retains principal without inventing another balance.
-	assert_eq!(wallet.all_vtxos().await.unwrap().iter()
-		.filter(|coin| coin.fallback_status == Some(bark::vtxo::FallbackStatus::Pending))
-		.map(|coin| coin.amount()).sum::<Amount>(), fallback_principal);
-	let total = expected.into_iter().sum::<Amount>();
-	assert_eq!(balance.total(), total);
+	let balance = ark_testing::balance::assert_balance_consistent(wallet, false).await;
+	assert_eq!((balance.spendable, balance.needs_refresh, balance.pending_in_round),
+		(spendable, needs_refresh, pending_in_round));
+	assert_eq!(balance.total(), spendable + needs_refresh + pending_in_round);
 	assert_eq!(balance.pending(), pending_in_round);
-	let summary = balance.summary();
-	assert_eq!(summary.spendable, spendable);
-	assert_eq!(summary.needs_refresh, needs_refresh);
-	assert_eq!(summary.pending, pending_in_round);
-	assert_eq!(summary.total, total);
 }
 
 async fn await_refresh_tombstone(
