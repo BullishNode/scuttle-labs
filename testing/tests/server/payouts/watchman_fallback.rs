@@ -78,14 +78,13 @@ pub(super) async fn watchman_sweeps_boards() {
 		let core = ctx.bitcoind().sync_client();
 		assert_eq!(core.get_block_count().unwrap(), u64::from(tip.to_u32()));
 		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		let participation = forfeits[0].get::<_, i64>("id").to_string();
 		// Height alone can precede captaind's background ownership decision.
 		loop {
 			if db.read(async |tx| {
 				let authorized = tx.query_opt("SELECT e.id FROM expiry_entitlement e JOIN LATERAL (SELECT gross_sat,evidence,disposition FROM expiry_allocation_coin WHERE entitlement_id=e.id ORDER BY allocation_id LIMIT 1) first_coin ON TRUE WHERE e.vtxo_id=$1 AND first_coin.gross_sat=100000 \
-					AND first_coin.evidence->>'kind'='exchange' AND first_coin.evidence->>'forfeited'='true' \
-					AND first_coin.disposition='operator' AND first_coin.evidence->>'participation_id'=$2",
-					&[&original.id().to_string(), &participation]).await?.is_some();
+					AND first_coin.evidence->>'kind'='exchange' \
+					AND first_coin.disposition='operator'",
+					&[&original.id().to_string()]).await?.is_some();
 				if !authorized { return Ok(false); }
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
 				Ok(view.height == tip

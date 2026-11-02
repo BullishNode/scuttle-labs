@@ -416,8 +416,6 @@ async fn bounded_round_inventory() {
 		let facts: serde_json::Value = serde_json::from_str(allocation.get("facts")).unwrap();
 		assert_eq!(facts["kind"], "exchange");
 
-		assert_eq!(facts["forfeited"], true);
-		assert_eq!(facts["participation_id"].as_i64(), Some(forfeit.get::<_, i64>("id")));
 
 		if let Some(disposition) = allocation.get::<_, Option<String>>("disposition") {
 			assert_eq!(disposition, "operator");

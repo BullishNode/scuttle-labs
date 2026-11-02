@@ -61,39 +61,27 @@ pub struct CommittedExpiryGroup {
 	pub dropped: usize,
 }
 
-fn evidence_json(evidence: &OwnershipEvidence, preimage: bool) -> serde_json::Value {
-	let mut value = match evidence {
-		OwnershipEvidence::IrreversibleEntitlement { entitlement_id } =>
-			serde_json::json!({"kind":"irreversible_entitlement","entitlement_id":entitlement_id}),
+fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
+	match evidence {
+		OwnershipEvidence::IrreversibleEntitlement { .. } => serde_json::json!({"kind":"irreversible_entitlement"}),
 		OwnershipEvidence::Pubkey => serde_json::json!({"kind":"pubkey"}),
 		OwnershipEvidence::InputOwner => serde_json::json!({"kind":"input_owner"}),
-		OwnershipEvidence::LightningReceiveClaim { source, output } =>
-			serde_json::json!({"kind":"lightning_receive_claim","source":source.to_string(),"output":output.to_string()}),
+		OwnershipEvidence::LightningReceiveClaim { .. } => serde_json::json!({"kind":"lightning_receive_claim"}),
 		OwnershipEvidence::Pool => serde_json::json!({"kind":"pool"}),
 		OwnershipEvidence::Padding => serde_json::json!({"kind":"padding"}),
 		OwnershipEvidence::Forfeit => serde_json::json!({"kind":"forfeit"}),
-		OwnershipEvidence::Offboard(txid) => serde_json::json!({"kind":"offboard","txid":txid.to_string()}),
-		OwnershipEvidence::Exchange { participation_id, unlock_hash, forfeited } =>
-			serde_json::json!({"kind":"exchange","participation_id":participation_id,"unlock_hash":unlock_hash,"forfeited":forfeited}),
-		OwnershipEvidence::HtlcStoredPreimage { payment_hash } =>
-			serde_json::json!({"kind":"htlc_stored_preimage","payment_hash":payment_hash.to_string()}),
-		OwnershipEvidence::HtlcSourceDischarged { payment_hash } =>
-			serde_json::json!({"kind":"htlc_source_discharged","payment_hash":payment_hash.to_string()}),
-		OwnershipEvidence::HtlcExternalFailed { payment_hash, htlc_expiry } =>
-			serde_json::json!({"kind":"htlc_external_failed","payment_hash":payment_hash.to_string(),"htlc_expiry":htlc_expiry.to_u32()}),
-		OwnershipEvidence::HtlcInternalGrantsReclaimed { payment_hash, attempts, block } =>
-			serde_json::json!({"kind":"htlc_internal_grants_reclaimed","payment_hash":payment_hash.to_string(),
-				"attempts":attempts,"height":block.height.to_u32(),"hash":block.hash.to_string()}),
-		OwnershipEvidence::HtlcRecvExpired { payment_hash, htlc_expiry } =>
-			serde_json::json!({"kind":"htlc_recv_expired","payment_hash":payment_hash.to_string(),"htlc_expiry":htlc_expiry.to_u32()}),
-		OwnershipEvidence::HtlcUnattemptedExpired { payment_hash, htlc_expiry } =>
-			serde_json::json!({"kind":"htlc_unattempted_expired","payment_hash":payment_hash.to_string(),"htlc_expiry":htlc_expiry.to_u32()}),
-		OwnershipEvidence::HtlcOffchain { payment_hash, resolution } =>
-			serde_json::json!({"kind":"htlc_offchain","payment_hash":payment_hash.to_string(),"resolution":resolution.as_str()}),
-
-	};
-	value["stored_preimage"] = serde_json::json!(preimage);
-	value
+		OwnershipEvidence::Offboard(_) => serde_json::json!({"kind":"offboard"}),
+		OwnershipEvidence::Exchange { .. } => serde_json::json!({"kind":"exchange"}),
+		OwnershipEvidence::HtlcStoredPreimage { .. } => serde_json::json!({"kind":"htlc_stored_preimage"}),
+		OwnershipEvidence::HtlcSourceDischarged { .. } => serde_json::json!({"kind":"htlc_source_discharged"}),
+		OwnershipEvidence::HtlcExternalFailed { .. } => serde_json::json!({"kind":"htlc_external_failed"}),
+		OwnershipEvidence::HtlcInternalGrantsReclaimed { block, .. } => serde_json::json!({
+			"kind":"htlc_internal_grants_reclaimed","height":block.height.to_u32(),"hash":block.hash.to_string(),
+		}),
+		OwnershipEvidence::HtlcRecvExpired { .. } => serde_json::json!({"kind":"htlc_recv_expired"}),
+		OwnershipEvidence::HtlcUnattemptedExpired { .. } => serde_json::json!({"kind":"htlc_unattempted_expired"}),
+		OwnershipEvidence::HtlcOffchain { .. } => serde_json::json!({"kind":"htlc_offchain"}),
+	}
 }
 
 impl Tx<'_> {
@@ -255,7 +243,7 @@ impl Tx<'_> {
 			for coin in &output.1 {
 				let proposal = &coin.ownership;
 				let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
-				let observed = evidence_json(evidence, proposal.has_stored_preimage);
+				let observed = evidence_json(evidence);
 				let entitlement = if let Some(existing) = existing_entitlements.get(&proposal.id) {
 					*existing
 				} else {
