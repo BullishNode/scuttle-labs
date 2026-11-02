@@ -880,10 +880,11 @@ struct WalletInner {
 
 	/// Live connection to an Ark server for round participation and synchronization.
 	///
-	/// Lazily initialized by [`Wallet::require_server`]. Concurrent cold callers
-	/// share a connection only after its stored server keys match.
-	/// An explicit refresh removes it until those checks succeed again.
-	server: tokio::sync::RwLock<Option<ServerConnection>>,
+	/// Lazily initialised on first use via [`Wallet::require_server`]. A
+	/// [`OnceCell`] is the right primitive here: concurrent callers on a
+	/// cold cell all await the same in-flight `connect_to_server` future
+	/// instead of each opening a fresh gRPC channel.
+	server: tokio::sync::OnceCell<ServerConnection>,
 
 	/// Onchain wallet used for boarding, exit fee-bumping, and onchain syncing.
 	///
@@ -1424,7 +1425,7 @@ impl Wallet {
 		chain.require_version().await
 			.context("provided chain source doesn't meet version requirement")?;
 
-		let server = tokio::sync::RwLock::new(None);
+		let server = tokio::sync::OnceCell::new();
 
 		let notifications = NotificationDispatch::new();
 		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
@@ -1620,8 +1621,7 @@ impl Wallet {
 
 	/// Return [ArkInfo] fetched on last handshake with the Ark server
 	pub async fn ark_info(&self) -> anyhow::Result<Option<ArkInfo>> {
-		let server = { self.inner.server.read().await.clone() };
-		match server {
+		match self.inner.server.get() {
 			Some(srv) => Ok(Some(srv.ark_info().await)),
 			None => Ok(None),
 		}
