@@ -172,7 +172,90 @@ async fn watchman_sweeps_offboard_connectors() {
 /// expires.
 #[tokio::test]
 async fn watchman_sweeps_offboard_forfeit_after_confiscation() {
-	fallback::watchman_sweeps_offboard_forfeit_after_confiscation().await
+	let ctx = TestContext::new("server/watchman_sweeps_offboard_forfeit_after_confiscation").await;
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).funded(btc(10)).cfg(|cfg| {
+		cfg.vtxo_lifetime = BlockDelta::new(144);
+		cfg.vtxopool.vtxo_targets = vec![];
+	}).watchmand_cfg(|cfg| {
+		cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
+		cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
+	}).create().await;
+	let failures = WatchmanFailureCollector::default();
+	let wm = srv.watchmand();
+	wm.add_slog_handler(failures.clone());
+
+	let mut log_claim = wm.subscribe_log::<ClaimBroadcast>();
+
+	// fund the watchman so it can pay CPFP fees for the forfeit broadcast
+	ctx.bitcoind().fund_addr(wm.wait_wallet_address().await, sat(1_000_000)).await;
+
+	let bark = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
+	bark.board_and_confirm_and_register(&ctx, sat(400_000)).await;
+	bark.sync().await;
+	let exit_point = bark.vtxo_ids().await[0].to_point();
+
+	// snapshot the wallet before offboarding; the attacker keeps the stale vtxo
+	let evil = bark.full_clone("evil").await;
+
+	let payout = ctx.bitcoind().get_new_address();
+	bark.offboard_all(&payout).await;
+	ctx.generate_blocks(1).await;
+
+	// the attacker exits the now-forfeited vtxo
+	evil.start_exit_all().await;
+	progress_exit_until_awaiting_delta(&ctx, &evil).await;
+
+	// drive the watchman until it confiscates the exit output
+	let tip = ctx.generate_blocks(wm.config().watchman.progress_grace_period.to_u32()).await;
+	wm.wait_for_sync_height(tip).await;
+	let client = ctx.bitcoind().sync_client();
+	for _ in 0..25 {
+		wm.trigger_sweep().await;
+		tokio::time::sleep(Duration::from_secs(2)).await;
+		let tip = ctx.generate_blocks(1).await;
+		wm.wait_for_sync_height(tip).await;
+		if client.get_tx_out(&exit_point.txid, exit_point.vout, Some(true)).unwrap().is_none() {
+			break;
+		}
+	}
+	assert!(
+		client.get_tx_out(&exit_point.txid, exit_point.vout, Some(true)).unwrap().is_none(),
+		"the watchman should have confiscated the exit output",
+	);
+
+	// Wait for the input vtxo to expire, then the watchman should sweep the
+	// confiscated forfeit output. The exit output, the connector and the board
+	// output are all spent by now, so the forfeit output is the only sweep:
+	// the input amount plus the connector dust.
+	let tip = ctx.generate_blocks(200).await;
+	wm.wait_for_sync_height(tip).await;
+	let rounds_balance = srv.wallet_status().await.rounds.total_balance;
+
+	wm.trigger_sweep().await;
+	let msg = log_claim.recv().wait_millis(15000).await.expect("no claim log");
+	failures.assert_empty();
+	println!("Offboard forfeit sweep: {:#?}", msg);
+	assert_eq!(400_330, msg.total_input_value.to_sat());
+
+	// the forfeit output must actually be gone from the utxo set
+	let forfeit_point = msg.vtxo_ids[0].to_point();
+	let tip = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(tip).await;
+	wm.wait_for_sync_height(tip).await;
+	let claim = client.get_raw_transaction(&msg.txid, None).unwrap();
+	fallback::assert_canonical_watchman_tx(&ctx, &claim);
+	let forfeit = client.get_raw_transaction(&forfeit_point.txid, None).unwrap();
+	fallback::assert_canonical_watchman_tx(&ctx, &forfeit);
+	assert!(
+		client.get_tx_out(&forfeit_point.txid, forfeit_point.vout, Some(true)).unwrap().is_none(),
+		"forfeit output {} should be spent by the sweep", forfeit_point,
+	);
+
+	// the confiscated funds must land in the rounds wallet
+	assert_eq!(srv.wallet_status().await.rounds.total_balance,
+		rounds_balance + msg.total_output_value,
+		"forfeit sweep must pay out to the rounds wallet",
+	);
 }
 
 #[tokio::test]
@@ -256,7 +339,109 @@ async fn watchman_sweeps_exit_after_forfeit() {
 /// reclaim the forfeited coins while keeping their new round vtxos.
 #[tokio::test]
 async fn watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table() {
-	fallback::watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table().await
+	require_bark_version!(> "0.5.0");
+
+	let ctx =
+		TestContext::new("server/watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table")
+			.await;
+	let srv = ctx
+		.captaind("server")
+		.funded(btc(10))
+		.cfg(|cfg| {
+			cfg.vtxopool.vtxo_targets = vec![];
+		})
+		.watchmand_cfg(|cfg| {
+			cfg.watchman.reaction_interval = Duration::from_secs(15 * 60);
+			cfg.watchman.sweep_interval = Duration::from_secs(15 * 60);
+		})
+		.create()
+		.await;
+	let failures = WatchmanFailureCollector::default();
+	let wm = srv.watchmand();
+	wm.add_slog_handler(failures.clone());
+
+	let mut log_claim = wm.subscribe_log::<ClaimBroadcast>();
+
+	// Board some funds with bark1
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(500_000)).create().await;
+	bark1
+		.board_and_confirm_and_register(&ctx, sat(200_000))
+		.await;
+
+	// fund the watchman
+	ctx.bitcoind()
+		.fund_addr(wm.wait_wallet_address().await, sat(100_000))
+		.await;
+
+	// Clone bark1 before refresh — bark2 retains the stale board vtxo state
+	let bark1_old = bark1.full_clone("bark2").await;
+
+	// bark1 refreshes its board vtxo into a round vtxo. The hArk round stores
+	// the participation's unlock hash and preimage in round_participation.
+	ctx.refresh_all(&srv, &[&bark1]).await;
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	bark1.sync().await;
+
+	// Plant the cross-domain state: record the same preimage as a settled
+	// Lightning payment hash.
+	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
+	let unlock_preimage = db
+		.read(async |t| {
+			let row = t
+				.query_one(
+					"SELECT unlock_preimage FROM round_participation ORDER BY id DESC LIMIT 1",
+					&[],
+				)
+				.await?;
+			let hex: String = row.get(0);
+			Ok(ark::lightning::Preimage::from_str(&hex).expect("invalid unlock preimage"))
+		})
+		.await
+		.unwrap();
+	db.write(async |t| t.store_htlc_settlement(unlock_preimage).await)
+		.await
+		.unwrap();
+
+	// bark1_old, holding the stale board vtxo, starts a malicious exit
+	bark1_old.start_exit_all().await;
+
+	// Progress until the exit transaction is confirmed on-chain (AwaitingDelta state).
+	progress_exit_until_awaiting_delta(&ctx, &bark1_old).await;
+
+	// Advance past watchman's progress grace period
+	let tip = ctx
+		.generate_blocks(wm.config().watchman.progress_grace_period.to_u32())
+		.await;
+	wm.wait_for_sync_height(tip).await;
+
+	// first sweep: the watchman broadcasts the forfeit (progress) transaction via CPFP.
+	let mut log_progress = wm.subscribe_log::<ProgressBroadcast>();
+	wm.trigger_sweep().await;
+	let progress_log = log_progress
+		.recv()
+		.wait_millis(10_000)
+		.await
+		.expect("watchman should broadcast progress (forfeit) tx");
+
+	// Confirm the forfeit tx so the resulting HarkForfeit vtxo enters the frontier.
+	ctx.await_transactions_across_nodes([progress_log.cpfp_txid], [wm.bitcoind().as_ref()])
+		.await;
+	let tip = ctx.generate_blocks(1).await;
+	wm.wait_for_sync_height(tip).await;
+
+	// second sweep: the watchman must claim the HarkForfeit vtxo. The preimage
+	// for its HashSign clause is the hArk unlock preimage; the Lightning
+	// settlement row for the same hash must not block this.
+	wm.trigger_sweep().await;
+	let msg = log_claim
+		.recv()
+		.wait_millis(15_000)
+		.await
+		.expect("watchman must claim the HarkForfeit vtxo despite the cross-domain preimage");
+	failures.assert_empty();
+	println!("malicious exit sweep: {:#?}", msg);
+	assert_eq!(1, msg.vtxo_ids.len());
+	assert_eq!(msg.vtxo_ids[0].to_point().txid, progress_log.txid);
 }
 
 /// One clone sends an OOR payment to bark2 and bark2 refreshes (forfeiting the OOR vtxo
