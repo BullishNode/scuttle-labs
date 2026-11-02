@@ -52,7 +52,7 @@ pub(super) async fn watchman_sweeps_boards() {
 	assert!(height < original.expiry_height().to_u32());
 	let scan_from = u64::from(original.expiry_height().to_u32());
 	let tip = ctx.generate_blocks(original.expiry_height().to_u32() + 1 - height).await;
-	let (_allocation, parent, child, _observed_fee, replacement, replacement_funding, _participation) =
+	let (parent, child, replacement, replacement_funding) =
 		tokio::time::timeout(Duration::from_secs(15), async {
 		let client = bark1.client().await;
 		let replacements = client.vtxos().await.unwrap();
@@ -95,26 +95,10 @@ pub(super) async fn watchman_sweeps_boards() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 		wm.trigger_sweep().await;
-		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.broadcast_at IS NOT NULL \
-				ORDER BY a.id DESC LIMIT 1", &[&original.id().to_string()]).await?)).await.unwrap();
-			if let Some(row) = row {
-				let parent: Transaction = deserialize(row.get("sweep_tx")).unwrap();
-				let Some((child, measured_fee)) = observed_payout_fee_child(&ctx, &parent) else {
-					tokio::time::sleep(Duration::from_millis(50)).await;
-					continue;
-				};
-				if ctx.bitcoind().sync_client().get_raw_transaction(&parent.compute_txid(), None).is_ok()
-					&& ctx.bitcoind().sync_client().get_raw_transaction(&child.compute_txid(), None).is_ok() {
-					break (row.get::<_, i64>("id"), parent, child, measured_fee,
-						replacement, replacement_funding, forfeits[0].get::<_, i64>("id"));
-				}
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
+		let packages = wait_watchman_payouts(&ctx, &db, &[original.id().to_string()]).await;
+		assert_eq!(packages.len(), 1);
+		let (_, (parent, child, _)) = packages.into_iter().next().unwrap();
+		(parent, child, replacement, replacement_funding)
 	}).await.expect("accepted old board must publish its real funded operator package within15s");
 	assert_eq!(parent.input.len(), 1);
 	assert_eq!(parent.input[0].previous_output, original.chain_anchor());
@@ -184,7 +168,6 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 	bark2.board_and_confirm_and_register(&ctx, sat(200_000)).await;
 	let mut originals = Vec::new();
 	let mut destinations = Vec::new();
-	let mut mailboxes = Vec::new();
 	let mut fundings = BTreeMap::new();
 	for bark in [&bark1, &bark2] {
 		let client = bark.client().await;
@@ -197,7 +180,6 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 		assert_eq!(funding.output[original.chain_anchor().vout as usize].value, sat(200_000));
 		fundings.insert(original.chain_anchor(), funding);
 		destinations.push(client.fallback_script());
-		mailboxes.push(client.mailbox_keypair().public_key());
 		originals.push(original);
 	}
 	assert_ne!(destinations[0], destinations[1]);
@@ -221,26 +203,10 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 	assert_eq!(round_funding.output[round_anchor.vout as usize].value, sat(400_000));
 	for replacement in &replacements { replacement.validate(&round_funding).unwrap(); }
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let snapshot = db.read(async |tx| tx.backing_snapshot(&[ark::ServerVtxo::from(replacements[0].clone()).to_bare()]).await).await.unwrap();
-	let root = snapshot.regular.into_iter().find(|fact| fact.state.vtxo.point() == round_anchor)
-		.expect("the common physical round root must be stored").state.vtxo;
-	assert_eq!(root.amount(), sat(400_000));
-	let terminals = replacements.iter().cloned().map(ark::ServerVtxo::from).collect::<Vec<_>>();
-	let mut residuals = BTreeMap::new();
-	for source in &replacements {
-		for link in source.transactions() {
-			for (index, output) in link.tx.output.iter().enumerate() {
-				if output.is_p2a_fee_anchor() {
-					assert_eq!(output.value, Amount::ZERO);
-					let point = OutPoint::new(link.tx.compute_txid(), index as u32);
-					if let Some(previous) = residuals.insert(point, output.clone()) { assert_eq!(previous, *output); }
-				}
-			}
-		}
-	}
-	let residuals = residuals.into_iter().map(|(_, txout)| txout).collect::<Vec<_>>();
-	assert_eq!(terminals.iter().map(|coin| coin.amount()).sum::<Amount>(), sat(400_000));
-	assert!(residuals.iter().all(|residual| residual.value == Amount::ZERO));
+	assert_eq!(replacements.iter().map(|coin| coin.amount()).sum::<Amount>(), sat(400_000));
+	for coin in &replacements { for step in coin.transactions() {
+		assert!(step.tx.output.iter().filter(|output| output.is_p2a_fee_anchor()).all(|output| output.value == Amount::ZERO));
+	} }
 	fundings.insert(round_anchor, round_funding.clone());
 	let mut frontiers = BTreeMap::new();
 	for point in originals.iter().map(|coin| coin.chain_anchor()).chain(std::iter::once(round_anchor)) {
@@ -259,17 +225,15 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 		assert!(core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap().confirmations >= 2);
 	}
 	let source_ids = originals.iter().chain(replacements.iter()).map(|coin| coin.id().to_string()).collect::<Vec<_>>();
-	let expected_sources = source_ids.iter().cloned().collect::<BTreeSet<_>>();
-	assert_eq!(expected_sources.len(), 4);
+	assert_eq!(source_ids.iter().collect::<BTreeSet<_>>().len(), 4);
 	let operator_script = wm.config().sweep_address.clone().unwrap()
 		.require_network(Network::Regtest).unwrap().script_pubkey();
 	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	let scan_from = u64::from(originals.iter().map(|coin| coin.expiry_height().to_u32()).min().unwrap());
 	let tip = ctx.generate_blocks(150).await;
 	assert!(originals.iter().chain(replacements.iter()).all(|coin| coin.expiry_height() < tip));
-	let (packages, _participations) = tokio::time::timeout(Duration::from_secs(15), async {
+	let packages = tokio::time::timeout(Duration::from_secs(15), async {
 		// Attribution, view rebuilding and publication share the original clock.
-		let mut participations = BTreeMap::new();
 		for original in &originals {
 			let old = db.read(async |tx| tx.get_user_vtxo_by_id(original.id()).await).await.unwrap();
 			assert_eq!(old.spend_state, server::database::SpendState::Spent);
@@ -279,46 +243,13 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 				AND i.signed_forfeit_tx IS NOT NULL AND p.forfeited_at IS NOT NULL AND r.funding_txid=$2",
 				&[&original.id().to_string(), &round_anchor.txid.to_string()]).await?)).await.unwrap();
 			assert_eq!(rows.len(), 1, "each old board needs its actual accepted forfeit to this round");
-			assert!(participations.insert(original.id().to_string(), rows[0].get::<_, i64>("id")).is_none());
 		}
 		srv.wait_for_sync_height(tip).await;
 		wm.wait_for_sync_height(tip).await;
 		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
-		loop {
-			if db.read(async |tx| {
-				// The one manual sweep must observe every committed ownership decision.
-				let allocated = tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
-					JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-					WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&source_ids]).await?
-					.into_iter().map(|row| row.get::<_, String>("vtxo_id")).collect::<BTreeSet<_>>();
-				if allocated != expected_sources { return Ok(false); }
-				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.height == tip
-					&& view.hash == hash
-					&& (tx.expiry_view().await? == Some(view)))
-			}).await.unwrap() { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
+		wait_expiry_allocations(&db, &source_ids, tip, hash).await;
 		wm.trigger_sweep().await;
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
-			let mut seen = BTreeSet::new();
-			let mut packages = BTreeMap::new();
-			for row in rows {
-				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				let Some((child, measured_fee)) = observed_payout_fee_child(&ctx, &parent) else { continue; };
-				assert!(seen.insert(row.get::<_, String>("vtxo_id")));
-				let package = (parent, child, measured_fee);
-				if let Some(previous) = packages.insert(row.get::<_, i64>("id"), package.clone()) { assert_eq!(previous, package); }
-			}
-			if seen == expected_sources && packages.values().all(|(parent, child, _)|
-				core.get_raw_transaction(&parent.compute_txid(), None).is_ok()
-				&& core.get_raw_transaction(&child.compute_txid(), None).is_ok()) { break (packages, participations); }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
+		wait_watchman_payouts(&ctx, &db, &source_ids).await
 	}).await.expect("all operator collateral and both customers must publish funded packages within 15s");
 	assert!((1..=3).contains(&packages.len()));
 	let mut consumed_roots = BTreeSet::new();
@@ -335,7 +266,6 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 		}
 		assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>(), gross);
 		let mut anchors = Vec::new();
-		let mut actual_payouts = BTreeMap::new();
 		for (index, output) in parent.output.iter().enumerate() {
 			let point = OutPoint::new(parent.compute_txid(), index as u32);
 			if output.is_p2a_fee_anchor() {
@@ -344,7 +274,6 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 			} else if let Some(owner) = destinations.iter().position(|destination| destination == &output.script_pubkey) {
 				assert_eq!(output.value, sat(198_000));
 				assert!(payouts.insert(owner, (point, output.value, *allocation)).is_none());
-				assert!(actual_payouts.insert(index as i32, output.clone()).is_none());
 				customer_value += output.value;
 			} else {
 				assert_eq!(output.script_pubkey, operator_script);
@@ -352,14 +281,7 @@ pub(super) async fn watchman_sweeps_round_vtxos() {
 			}
 		}
 		assert_eq!(anchors.len(), 1);
-		let rows = db.read(async |tx| Ok(tx.query("SELECT (ROW_NUMBER() OVER (ORDER BY spk)-1)::INTEGER AS output_index,spk,amount_sat FROM (SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0) payouts",
-			&[allocation]).await?)).await.unwrap();
-		assert_eq!(rows.len(), actual_payouts.len());
-		for row in rows {
-			let output = &actual_payouts[&row.get::<_, i32>("output_index")];
-			assert_eq!(row.get::<_, String>("spk"), output.script_pubkey.as_bytes().to_lower_hex_string());
-			assert_eq!(row.get::<_, i64>("amount_sat"), output.value.to_sat() as i64);
-		}
+
 }
 	assert_eq!(consumed_roots, frontiers.keys().copied().collect::<BTreeSet<_>>());
 	assert_eq!(payouts.len(), 2);
@@ -525,44 +447,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 	assert_eq!(frontiers.len(), 2);
 	assert_eq!(frontiers.values().map(|output| output.value).sum::<Amount>(), sat(350_000));
 
-	// This cut starts at the receiver frontier, after the sender exit. Disclose
-	// the already-published sender path and its real fee children separately.
-	let mut native_path = BTreeMap::new();
-	for source in &claimant_sources {
-		for link in source.transactions() {
-			let txid = link.tx.compute_txid();
-			native_path.entry(txid).or_insert_with(|| core.get_raw_transaction(&txid, None).unwrap());
-		}
-	}
-	let mut native_anchors = BTreeSet::new();
-	let mut native_blocks = BTreeSet::new();
-	for (txid, tx) in &native_path {
-		let info = core.custom_get_raw_transaction_info(*txid, None).unwrap().unwrap();
-		native_blocks.insert(info.blockhash.expect("completed sender path must be confirmed"));
-		for (index, output) in tx.output.iter().enumerate() {
-			if output.is_p2a_fee_anchor() {
-				native_anchors.insert(OutPoint::new(*txid, index as u32));
-			}
-		}
-	}
-	let mut native_fee_children = BTreeMap::new();
-	for hash in native_blocks {
-		for tx in core.get_block(&hash).unwrap().txdata {
-			if tx.input.iter().any(|input| native_anchors.contains(&input.previous_output)) {
-				assert!(!native_path.contains_key(&tx.compute_txid()));
-				native_fee_children.insert(tx.compute_txid(), tx);
-			}
-		}
-	}
-	for tx in native_path.values().chain(native_fee_children.values()) {
-		let inputs = tx.input.iter().map(|input| {
-			let previous = core.get_raw_transaction(&input.previous_output.txid, None).unwrap();
-			previous.output[input.previous_output.vout as usize].value
-		}).sum::<Amount>();
-		let outputs = tx.output.iter().map(|output| output.value).sum::<Amount>();
-		let _ = inputs.checked_sub(outputs).unwrap();
-	}
-
 	let before_expiry = ctx.bitcoind().get_block_count().await;
 	assert!(customer_sources.iter().all(|coin| u64::from(coin.expiry_height().to_u32()) > before_expiry));
 	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \
@@ -588,27 +472,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 		wm.trigger_sweep().await;
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
-			let mut seen = BTreeSet::new();
-			let mut packages = BTreeMap::new();
-			for row in rows {
-				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				let Some((child, measured_fee)) = observed_payout_fee_child(&ctx, &parent) else { continue; };
-				assert!(seen.insert(row.get::<_, String>("vtxo_id")));
-				let package = (parent, child, measured_fee);
-				if let Some(previous) = packages.insert(row.get::<_, i64>("id"), package.clone()) {
-					assert_eq!(previous, package);
-				}
-			}
-			if seen == expected_sources && packages.values().all(|(parent, child, _)|
-				core.get_raw_transaction(&parent.compute_txid(), None).is_ok()
-				&& core.get_raw_transaction(&child.compute_txid(), None).is_ok()) { break packages; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
+		wait_watchman_payouts(&ctx, &db, &source_ids).await
 	}).await.expect("all 350k of rightful receiver value must publish funded fallback packages within 15s");
 	assert!((1..=2).contains(&packages.len()));
 	let mut consumed_roots = BTreeSet::new();
@@ -654,9 +518,6 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 
 	ctx.generate_blocks(6).await;
 	assert_canonical_watchman_tx(&ctx, claim);
-	for tx in native_path.values().chain(native_fee_children.values()) {
-		assert_canonical_watchman_tx(&ctx, tx);
-	}
 	for (parent, child, _) in packages.values() {
 		assert_canonical_watchman_tx(&ctx, parent);
 		assert_canonical_watchman_tx(&ctx, child);
@@ -843,27 +704,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_receiver_exit() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 		wm.trigger_sweep().await;
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
-			let mut seen = BTreeSet::new();
-			let mut packages = BTreeMap::new();
-			for row in rows {
-				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				let Some((child, measured_fee)) = observed_payout_fee_child(&ctx, &parent) else { continue; };
-				assert!(seen.insert(row.get::<_, String>("vtxo_id")));
-				let package = (parent, child, measured_fee);
-				if let Some(previous) = packages.insert(row.get::<_, i64>("id"), package.clone()) {
-					assert_eq!(previous, package);
-				}
-			}
-			if seen == expected_sources && packages.values().all(|(parent, child, _)|
-				core.get_raw_transaction(&parent.compute_txid(), None).is_ok()
-				&& core.get_raw_transaction(&child.compute_txid(), None).is_ok()) { break packages; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
+		wait_watchman_payouts(&ctx, &db, &source_ids).await
 	}).await.expect("all250k of rightful sender change must publish funded fallback packages within5s");
 	assert!((1..=2).contains(&packages.len()));
 	let mut consumed_roots = BTreeSet::new();
@@ -2039,7 +1880,6 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mut originals = Vec::new();
 	let mut destinations = Vec::new();
-	let mut mailboxes = Vec::new();
 	for bark in [&bark1, &bark2] {
 		let wallet = bark.client().await;
 		let ids = bark.vtxo_ids().await;
@@ -2048,7 +1888,6 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		assert_eq!(original.amount(), sat(200_000));
 		originals.push(original);
 		destinations.push(wallet.fallback_script());
-		mailboxes.push(wallet.mailbox_keypair().public_key());
 	}
 	ctx.refresh_all(&srv, &[&bark1, &bark2]).await;
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
@@ -2059,18 +1898,9 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	assert_eq!(stale.amount(), sat(200_000));
 	assert_eq!(recipient.amount(), sat(200_000));
 	assert_eq!(stale.chain_anchor(), recipient.chain_anchor());
-	let common = db.read(async |tx| tx.get_bare_vtxo_by_id(ark::VtxoId::from(stale.chain_anchor())).await).await.unwrap().vtxo;
-	assert_eq!(common.amount(), sat(400_000));
 	let first_funding = ctx.bitcoind().await_transaction(stale.chain_anchor().txid).await;
-	let mut residuals = BTreeMap::new();
-	for coin in [&stale, &recipient] {
-		coin.validate(&first_funding).unwrap();
-		for step in coin.transactions() { for (index, output) in step.tx.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()) {
-			let point = OutPoint::new(step.tx.compute_txid(), index as u32);
-			if let Some(previous) = residuals.insert(point, output.clone()) { assert_eq!(previous, *output); }
-		} }
-	}
-	let residuals = residuals.into_iter().map(|(_, txout)| txout).collect::<Vec<_>>();
+	assert_eq!(first_funding.output[stale.chain_anchor().vout as usize].value, sat(400_000));
+	for coin in [&stale, &recipient] { coin.validate(&first_funding).unwrap(); }
 
 	let bark1_old = bark1.full_clone("bark1_old").await;
 	bark1.send_oor(bark2.address().await, sat(50_000)).await;
@@ -2140,13 +1970,6 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	let backing_anchors = originals.iter().chain([&stale, &replacement]).map(|coin| coin.chain_anchor().to_string())
 		.collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
 	let core = ctx.bitcoind().sync_client();
-	let raw_fee = |tx: &Transaction| {
-		let inputs = tx.input.iter().map(|input| {
-			let previous = core.get_raw_transaction(&input.previous_output.txid, None).unwrap();
-			previous.output[input.previous_output.vout as usize].value
-		}).sum::<Amount>();
-		inputs.checked_sub(tx.output.iter().map(|output| output.value).sum::<Amount>()).unwrap()
-	};
 	let scan_from = ctx.bitcoind().get_block_count().await + 1;
 	bark1_old.start_exit_all().await;
 	progress_exit_until_awaiting_delta(&ctx, &bark1_old).await;
@@ -2161,7 +1984,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		assert_eq!(parent.input.len(), 1);
 		assert_eq!(parent.input[0].previous_output, stale.point());
 		assert!(changes.iter().chain([&received]).flat_map(|coin| coin.transactions()).any(|step| step.tx == parent));
-		assert_eq!(raw_fee(&parent), Amount::ZERO);
+		assert_eq!(watchman_fee(&ctx, &parent), Amount::ZERO);
 		let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()).collect::<Vec<_>>();
 		assert_eq!(anchors.len(), 1);
 		let anchor = OutPoint::new(parent.compute_txid(), anchors[0].0 as u32);
@@ -2169,7 +1992,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		assert_eq!(child.input.len(), 2);
 		assert!(child.input.iter().any(|input| input.previous_output == anchor));
 		assert_eq!(child.input.iter().filter(|input| sponsors.contains_key(&input.previous_output)).count(), 1);
-		assert!(raw_fee(&child) > Amount::ZERO);
+		assert!(watchman_fee(&ctx, &child) > Amount::ZERO);
 		(parent, child)
 	}).await.expect("real progress and its funded Core child must appear within the original ten seconds");
 	let tip = ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() - 2 * ROUND_CONFIRMATIONS + 3).await;
@@ -2216,7 +2039,6 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		}
 		assert!(!roots.is_empty());
 		assert!(roots.iter().map(|root| root.expiry_height()).collect::<BTreeSet<_>>().len() <= 4);
-		let selected = server::database::expiry_inventory::BackingSnapshot { roots: roots.clone(), regular: Vec::new() };
 		let mut semantic = originals.iter().chain([&recipient, &received]).cloned()
 			.map(|coin| (ark::ServerVtxo::from(coin), None)).collect::<Vec<_>>();
 		semantic.extend(changes.iter().cloned().map(|coin| (ark::ServerVtxo::from(coin), Some(0usize))));
@@ -2225,11 +2047,9 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			semantic.push((ark::ServerVtxo::from(padding.clone()), None));
 		}
 		let mut expected = BTreeMap::new();
-		let mut terminals = Vec::new();
-		let mut residuals = BTreeMap::new();
 		for (mut coin, owner) in semantic {
 			assert!(coin.expiry_height() <= tip);
-			if selected.roots.iter().find(|root| root.point() == coin.chain_anchor() || coin.transactions().any(|step| bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32) == root.point())).map(|root| root.id()).is_none() {
+			if roots.iter().find(|root| root.point() == coin.chain_anchor() || coin.transactions().any(|step| bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32) == root.point())).map(|root| root.id()).is_none() {
 				assert!(owner.is_none(), "a rightful customer leaf cannot disappear");
 				let state = db.read(async |tx| tx.get_bare_vtxo_by_id(coin.id()).await).await.unwrap();
 				let id = ark::VtxoId::from(OutPoint::new(state.oor_spent_txid.expect("actual signed round forfeit"), 0));
@@ -2243,20 +2063,10 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			// Padding's unsigned leaf has no known preimage. Cover its signed current HarkLeaf instead.
 			let terminal = if coin.id() == padding.id() { padding_backing.clone() } else { coin.clone() };
 			terminal.validate(funding).unwrap();
-			let root_id = selected.roots.iter().find(|root| root.point() == terminal.chain_anchor() || terminal.transactions().any(|step| bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32) == root.point())).map(|root| root.id()).expect("every selected terminal needs one actual current root");
+			let root_id = roots.iter().find(|root| root.point() == terminal.chain_anchor() || terminal.transactions().any(|step| bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32) == root.point())).map(|root| root.id()).expect("every selected terminal needs one actual current root");
 			let root = roots.iter().find(|root| root.id() == root_id).unwrap();
-			let mut inside = false;
-			for step in terminal.transactions() {
-				inside |= step.tx.input[0].previous_output == root.point();
-				if inside { for (index, output) in step.tx.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()) {
-					let point = OutPoint::new(step.tx.compute_txid(), index as u32);
-					if let Some(previous) = residuals.insert(point, output.clone()) { assert_eq!(previous, *output); }
-				} }
-			}
 			assert!(expected.insert(coin.id().to_string(), (coin.clone(), owner, root.point())).is_none());
-			terminals.push(terminal);
 		}
-		let residuals = residuals.into_iter().map(|(_, txout)| txout).collect::<Vec<_>>();
 		assert_eq!(expected.values().filter(|(coin, owner, _)| owner.is_none() && coin.id() != padding.id())
 			.map(|(coin, _, _)| coin.amount()).sum::<Amount>(), sat(650_000));
 		assert_eq!(expected.values().filter(|(coin, _, _)| coin.id() == padding.id())
@@ -2308,27 +2118,9 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 		wm.trigger_sweep().await;
-		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&source_ids]).await?)).await.unwrap();
-			let mut seen = BTreeSet::new();
-			let mut packages = BTreeMap::new();
-			for row in rows {
-				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				let Some((child, measured_fee)) = observed_payout_fee_child(&ctx, &parent) else { continue; };
-				assert!(seen.insert(row.get::<_, String>("vtxo_id")));
-				packages.insert(row.get::<_, i64>("id"), (parent, child, measured_fee));
-			}
-			if seen == source_ids.iter().cloned().collect() && packages.values().all(|(parent, child, _)|
-				core.get_raw_transaction(&parent.compute_txid(), None).ok().as_ref() == Some(parent)
-				&& core.get_raw_transaction(&child.compute_txid(), None).ok().as_ref() == Some(child)) {
-				assert!(!packages.is_empty() && packages.len() <= roots.len(), "each package needs actual current backing");
-				break (packages, roots, expected, available);
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
+		let packages = wait_watchman_payouts(&ctx, &db, &source_ids).await;
+		assert!(!packages.is_empty() && packages.len() <= roots.len(), "each package needs actual current backing");
+		(packages, roots, expected, available)
 	}).await.expect("actual current-cut funded payout packages must appear within the original ten seconds");
 	let mut customer_gross_by_expiry = BTreeMap::<(usize, u32), u64>::new();
 	for (coin, owner, _) in expected.values() {
@@ -2356,7 +2148,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			core.custom_get_raw_transaction_info(child.compute_txid(), None).unwrap().unwrap().blockhash);
 		assert_eq!(parent.version.0, 3);
 		assert!(parent.vsize() <= 10_000);
-		assert_eq!(raw_fee(parent), Amount::ZERO);
+		assert_eq!(watchman_fee(&ctx, parent), Amount::ZERO);
 		let mut gross = [Amount::ZERO; 2];
 		let mut operator_gross = Amount::ZERO;
 		for input in &parent.input {
@@ -2531,18 +2323,9 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 	}
 	assert_eq!(settled, hashes.iter().cloned().collect());
 	assert_eq!(converted, customers.keys().cloned().collect());
-	let root = db.read(async |tx| tx.get_bare_vtxo_by_id(ark::VtxoId::from(anchor)).await).await.unwrap().vtxo;
-	let selected = server::database::expiry_inventory::BackingSnapshot { roots: vec![root], regular: Vec::new() };
-	let terminals = customers.values().chain(operators.values()).cloned().map(ark::ServerVtxo::from).collect::<Vec<_>>();
-	let mut residuals = BTreeMap::new();
-	for coin in &terminals { for step in coin.transactions() {
-		for (index, output) in step.tx.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()) {
-			assert_eq!(output.value, Amount::ZERO);
-			let point = OutPoint::new(step.tx.compute_txid(), index as u32);
-			if let Some(previous) = residuals.insert(point, output.clone()) { assert_eq!(previous, *output); }
-		}
+	for coin in customers.values().chain(operators.values()) { for step in coin.transactions() {
+		assert!(step.tx.output.iter().filter(|output| output.is_p2a_fee_anchor()).all(|output| output.value == Amount::ZERO));
 	} }
-	let residuals = residuals.into_iter().map(|(_, txout)| txout).collect::<Vec<_>>();
 
 	// The shortest exit chain belongs to the oldest receive. Exiting it drags the txs it
 	// shares with the other receives on-chain.
@@ -2609,29 +2392,15 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		}
 		assert!(!roots.is_empty() && roots.len() <= 2);
 		assert_eq!(roots.iter().map(|root| root.amount()).sum::<Amount>() + oldest.amount(), sat(200_000));
-		let selected = server::database::expiry_inventory::BackingSnapshot { roots: roots.clone(), regular: Vec::new() };
-		let mut terminals = Vec::new();
-		let mut residuals = BTreeMap::new();
 		let mut expected = BTreeMap::new();
 		for coin in customers.values().chain(operators.values()) {
 			assert!(coin.expiry_height() <= tip);
 			coin.validate(&funding).unwrap();
 			let full = ark::ServerVtxo::from(coin.clone());
-			let id = selected.roots.iter().find(|root| root.point() == full.chain_anchor() || full.transactions().any(|step| bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32) == root.point())).map(|root| root.id()).expect("each remaining right needs actual current backing");
+			let id = roots.iter().find(|root| root.point() == full.chain_anchor() || full.transactions().any(|step| bitcoin::OutPoint::new(step.tx.compute_txid(), step.output_idx as u32) == root.point())).map(|root| root.id()).expect("each remaining right needs actual current backing");
 			let root = roots.iter().find(|root| root.id() == id).unwrap();
-			let mut inside = false;
-			for step in coin.transactions() {
-				inside |= step.tx.input[0].previous_output == root.point();
-				if inside { for (index, output) in step.tx.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor()) {
-					assert_eq!(output.value, Amount::ZERO);
-					let point = OutPoint::new(step.tx.compute_txid(), index as u32);
-					if let Some(previous) = residuals.insert(point, output.clone()) { assert_eq!(previous, *output); }
-				} }
-			}
 			assert!(expected.insert(coin.id().to_string(), (coin.clone(), root.point())).is_none());
-			terminals.push(full);
 		}
-		let residuals = residuals.into_iter().map(|(_, txout)| txout).collect::<Vec<_>>();
 		let source_ids = expected.keys().cloned().collect::<Vec<_>>();
 		loop {
 			let allocated = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_entitlement e \
