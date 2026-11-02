@@ -5,7 +5,6 @@ mod fresh_store;
 mod wire;
 mod expiry_admission;
 mod expiry_attribution;
-mod expiry_conflict;
 mod expiry_dispatch;
 mod expiry_dust_later_receipt;
 mod expiry_failed_swap;
