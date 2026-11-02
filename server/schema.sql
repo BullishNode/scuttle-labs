@@ -761,9 +761,7 @@ CREATE TABLE public.cln_xpay (
     error_code integer,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    signed_invoice text,
-    dispatch_count bigint,
-    CONSTRAINT cln_xpay_dispatch_count_check CHECK ((dispatch_count >= 0))
+    signed_invoice text
 );
 
 

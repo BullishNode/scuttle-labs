@@ -9,6 +9,9 @@ service ScuttleService {
 
 message ReconcileLightningAttemptRequest {
 	int64 attempt_id = 1000;
+	// Privileged operator confirms complete same-backend CLN/plugin cessation,
+	// restart of its original persistent store and exclusion of new dispatch.
+	bool native_cold_restart_confirmed = 1001;
 }
 
 message ReconcileLightningAttemptResponse {

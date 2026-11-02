@@ -350,7 +350,7 @@ impl Server {
 			vtxos.push(vtxo);
 		}
 		// An exact retry acknowledges existing work even if its node or a new
-		// admission view is now unavailable. The monitor owns any re-drive.
+		// admission view is now unavailable. It never resubmits the recorded call.
 		if recorded { return Ok(()); }
 		if let Invoice::Bolt11(invoice) = &invoice {
 			if invoice.is_expired() {
