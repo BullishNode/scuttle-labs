@@ -20,12 +20,6 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
 use server_rpc::protos;
 
-pub(super) fn fields(balance: &bark::Balance) -> [Amount; 9] {
-	[balance.spendable, balance.needs_refresh, balance.pending_lightning_send,
-		balance.claimable_lightning_receive, balance.pending_in_round, balance.pending_exit,
-		balance.pending_board, balance.pending_arkoor_send, balance.pending_offboard]
-}
-
 pub(super) async fn rebuilt(ctx: &TestContext, srv: &Captaind, db: &Db) {
 	let height = bitcoin_ext::BlockHeight::new(u32::try_from(ctx.bitcoind().get_block_count().await).unwrap());
 	srv.wait_for_sync_height(height).await;
