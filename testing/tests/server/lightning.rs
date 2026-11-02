@@ -4754,7 +4754,7 @@ async fn stock_zero_part_and_cold_restart_orphan_refund_once() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let mut calls = srv.subscribe_log::<server_log::XpayRpcCalled>();
 	let mut replies = srv.subscribe_log::<server_log::XpayRpcReturned>();
-	let mut operator = server_rpc::admin::ScuttleServiceClient::connect(
+	let mut operator = server_rpc::admin::LightningAdminServiceClient::connect(
 		format!("http://{}", srv.config().rpc.admin_address.unwrap())).await.unwrap();
 	let (cut_tx, mut cut_rx) = tokio::sync::mpsc::unbounded_channel();
 	let (empty_tx, mut empty_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -4857,7 +4857,7 @@ async fn stock_zero_part_and_cold_restart_orphan_refund_once() {
 			// The ordinary due monitor must observe the actual empty native
 			// lookup without refunding or replaying the original request.
 			assert_eq!(empty_rx.recv().wait_millis(30_000).await.unwrap(), Some(attempt.id));
-			let mut observe = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest {
+			let mut observe = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
 				attempt_id: attempt.id, native_cold_restart_confirmed: false,
 			});
 			server_rpc::RequestExt::set_pver(&mut observe, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
@@ -4918,7 +4918,7 @@ async fn stock_zero_part_and_cold_restart_orphan_refund_once() {
 			// Existing reconnection supervision must re-admit this same node.
 			tokio::time::timeout(wait_timeout(), async {
 				loop {
-					let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest {
+					let mut request = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
 						attempt_id: attempt.id, native_cold_restart_confirmed: true,
 					});
 					server_rpc::RequestExt::set_pver(&mut request, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
@@ -4965,7 +4965,7 @@ async fn stock_zero_part_and_cold_restart_orphan_refund_once() {
 			assert_eq!(db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, *source).await)
 				.await.unwrap().unwrap().htlc.resolution(), Some(server::database::htlc_vtxo::HtlcResolution::Revoked));
 		}
-		let mut repeat = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest {
+		let mut repeat = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
 			attempt_id: attempt.id, native_cold_restart_confirmed: orphan,
 		});
 		server_rpc::RequestExt::set_pver(&mut repeat, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
