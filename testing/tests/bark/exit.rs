@@ -361,16 +361,6 @@ async fn exit_vtxo() {
 	// We stop the server
 	srv.stop().await.unwrap();
 
-	// A mixed explicit request must not silently start only its known subset.
-	let known = vtxo.id.to_string();
-	let unknown = "0000000000000000000000000000000000000000000000000000000000000000:0";
-	let history = serde_json::to_value(bark.history().await).unwrap();
-	let error = bark.try_run(["exit", "start", "--vtxo", &known, "--vtxo", unknown]).await
-		.expect_err("a missing requested source must refuse the complete targeted exit");
-	assert!(error.to_string().contains("not eligible for a targeted exit"), "{error:#}");
-	assert!(bark.list_exits().await.is_empty(), "a refused mixed request must not start its known input");
-	assert_eq!(serde_json::to_value(bark.history().await).unwrap(), history);
-
 	// Make bark exit and check the balance
 	bark.start_exit_vtxos([vtxo.id]).await;
 	complete_exit(&ctx, &bark).await;

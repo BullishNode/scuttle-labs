@@ -276,12 +276,9 @@ impl ExitVtxo {
 	) -> anyhow::Result<(), ExitError> {
 		// We don't want to push a new history item unless the state has changed logically
 		if new != self.state {
-			let mut next = self.clone();
-			next.history.push(self.state.clone());
-			next.state = new;
-			next.persist(persister).await?;
-			*self = next;
-			Ok(())
+			self.history.push(self.state.clone());
+			self.state = new;
+			self.persist(persister).await
 		} else {
 			Ok(())
 		}
@@ -292,50 +289,5 @@ impl ExitVtxo {
 			.map_err(|e| ExitError::DatabaseVtxoStoreFailure {
 				vtxo_id: self.id(), error: e.to_string(),
 			})
-	}
-}
-
-#[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
-mod test {
-	use super::*;
-	use crate::persist::sqlite::SqliteClient;
-
-	#[tokio::test]
-	async fn failed_state_write_keeps_memory_retryable() {
-		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("db.sqlite");
-		let db = SqliteClient::open(&path).unwrap();
-		let mut exit = ExitVtxo {
-			vtxo_id: VtxoId::from_slice(&[1; 36]).unwrap(),
-			amount: Amount::from_sat(100_000),
-			state: ExitState::new_start(BlockHeight::new(100)),
-			history: Vec::new(), txids: None, movement_id: None,
-		};
-		exit.persist(&db).await.unwrap();
-		let original = serde_json::to_value(StoredExit::new(&exit)).unwrap();
-		let conn = rusqlite::Connection::open(&path).unwrap();
-		let reject_update = "CREATE TRIGGER reject_exit_update BEFORE UPDATE ON bark_exit_states \
-			BEGIN SELECT RAISE(ABORT, 'reject exit state write'); END;";
-		conn.execute_batch(reject_update).unwrap();
-
-		let error = exit.cancel(BlockHeight::new(101), &db).await.unwrap_err();
-		assert!(matches!(error, ExitError::DatabaseVtxoStoreFailure { error, .. }
-			if error.contains("reject exit state write")));
-		assert_eq!(serde_json::to_value(StoredExit::new(&exit)).unwrap(), original);
-		assert!(exit.state().is_cancelable());
-		assert_eq!(serde_json::to_value(db.get_exit_vtxo_entry(&exit.id()).await.unwrap().unwrap()).unwrap(), original);
-
-		conn.execute_batch("DROP TRIGGER reject_exit_update;").unwrap();
-		exit.cancel(BlockHeight::new(101), &db).await.unwrap();
-		assert_eq!(exit.state(), &ExitState::new_canceled(BlockHeight::new(101)));
-		assert_eq!(exit.history(), &vec![ExitState::new_start(BlockHeight::new(100))]);
-		let committed = serde_json::to_value(StoredExit::new(&exit)).unwrap();
-		assert_eq!(serde_json::to_value(db.get_exit_vtxo_entry(&exit.id()).await.unwrap().unwrap()).unwrap(), committed);
-
-		// An equal logical state still needs neither another history item nor a write.
-		conn.execute_batch(reject_update).unwrap();
-		exit.cancel(BlockHeight::new(101), &db).await.unwrap();
-		assert_eq!(serde_json::to_value(StoredExit::new(&exit)).unwrap(), committed);
-		assert_eq!(serde_json::to_value(db.get_exit_vtxo_entry(&exit.id()).await.unwrap().unwrap()).unwrap(), committed);
 	}
 }

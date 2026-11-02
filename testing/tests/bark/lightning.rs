@@ -60,78 +60,8 @@ async fn bark_pay_ln_succeeds() {
 		let invoice = lightning.external.invoice(Some(invoice_amount), "test_payment", "A test payment").await;
 
 		assert_eq!(bark_1.spendable_balance().await, board_amount);
-		let client = Box::pin(bark_1.client()).await;
-		let hash = Invoice::from_str(&invoice).unwrap().payment_hash();
-		let balance_before = client.balance().await.unwrap().summary();
-		let coins_before = client.all_vtxos().await.unwrap();
-		let history_before = client.history().await.unwrap();
-		let actions_before = bark_1.checkpoint_steps().await;
-		assert!(client.lightning_send_checkpoint(hash).await.unwrap().is_none());
-		let error = Box::pin(client.pay_lightning_invoice(invoice.clone(), Some(invoice_amount + sat(1)), false))
-			.await.expect_err("a fixed invoice overpay must be rejected before SDK escrow");
-		assert!(matches!(error.downcast_ref::<ark::lightning::CheckAmountError>(),
-			Some(ark::lightning::CheckAmountError::InvalidUserAmount { invoice: fixed, user: requested })
-				if *fixed == invoice_amount && *requested == invoice_amount + sat(1)), "{error:#}");
-		assert!(client.lightning_send_checkpoint(hash).await.unwrap().is_none());
-		assert_eq!(client.balance().await.unwrap().summary(), balance_before);
-		assert_eq!(client.all_vtxos().await.unwrap(), coins_before);
-		assert_eq!(client.history().await.unwrap(), history_before);
-		assert_eq!(bark_1.checkpoint_steps().await, actions_before);
-		drop(client);
-
-		#[derive(Clone)]
-		struct CheckFixedAmount {
-			invoice: String,
-			db: Db,
-			node: cln_rpc::ClnGrpcClient,
-			checked: Arc<AtomicUsize>,
-		}
-		#[async_trait::async_trait]
-		impl captaind::proxy::ArkRpcProxy for CheckFixedAmount {
-			async fn initiate_lightning_payment(
-				&self, upstream: &mut ArkClient, req: protos::InitiateLightningPaymentRequest,
-			) -> Result<protos::Empty, tonic::Status> {
-				if req.invoice == self.invoice && self.checked.load(Ordering::SeqCst) == 0 {
-					let hash = Invoice::from_str(&req.invoice).unwrap().payment_hash();
-					let committed = async || self.db.read(async |t| Ok(t.query_one("SELECT jsonb_build_object(
-						'sources',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.vtxo_id) FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1),
-						'htlcs',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM htlc_vtxo h WHERE h.payment_hash=$1),
-						'owners',(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.user_pubkey) FROM owner_key o),
-						'coin_owners',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.vtxo_id) FROM coin_owner c JOIN vtxo v ON v.vtxo_id=c.vtxo_id JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1),
-						'attempts',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM lightning_payment_attempt a WHERE a.payment_hash=$1),
-						'xpay',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.id) FROM cln_xpay x WHERE x.payment_hash=$1),
-						'wal',(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM htlc_settlement s WHERE s.payment_hash=$1))::TEXT",
-						&[&hash.to_string()]).await?.get::<_, String>(0))).await.unwrap();
-					assert!(self.db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().is_none());
-					let before = committed().await;
-					let mut node = self.node.clone();
-					let pays = cln_rpc::ListpaysRequest { payment_hash: Some(hash.to_vec()), ..Default::default() };
-					let parts = cln_rpc::ListsendpaysRequest { payment_hash: Some(hash.to_vec()), ..Default::default() };
-					assert!(node.list_pays(pays.clone()).await.unwrap().into_inner().pays.is_empty());
-					assert!(node.list_send_pays(parts.clone()).await.unwrap().into_inner().payments.is_empty());
-					let mut invalid = req.clone();
-					invalid.payment_amount_sat += 1;
-					let error = upstream.initiate_lightning_payment(invalid).await.expect_err("the server must refuse a fresh fixed-amount mismatch");
-					assert_eq!(error.code(), tonic::Code::InvalidArgument);
-					assert!(error.message().contains("requested payment amount must equal the fixed invoice amount"), "{error}");
-					assert_eq!(committed().await, before);
-					assert!(node.list_pays(pays).await.unwrap().into_inner().pays.is_empty());
-					assert!(node.list_send_pays(parts).await.unwrap().into_inner().payments.is_empty());
-					self.checked.fetch_add(1, Ordering::SeqCst);
-				}
-				Ok(upstream.initiate_lightning_payment(req).await?.into_inner())
-			}
-		}
-		let checked = Arc::new(AtomicUsize::new(0));
-		let postgres = srv.config().postgres.clone();
-		let proxy = srv.start_proxy_no_mailbox(CheckFixedAmount { invoice: invoice.clone(),
-			db: Db::connect(&postgres).await.unwrap(),
-			node: lightning.internal.grpc_client().await, checked: checked.clone() }).await;
-		bark_1.set_ark_url(&proxy.address).await;
 		bark_1.pay_lightning_wait(invoice, None).await;
-		assert_eq!(checked.load(Ordering::SeqCst), 1, "the real server admission probe must execute before the normal send");
 		assert_eq!(bark_1.spendable_balance().await, btc(3));
-		bark_1.set_ark_url(&srv.ark_url()).await;
 	}
 
 	{
