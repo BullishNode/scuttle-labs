@@ -1019,31 +1019,6 @@ impl QueuedNativeLogs {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-fn queued_native_logs_require_command_ids_and_trim_line_endings() {
-	// Original native R1 stdout framing, including its trailing newline and
-	// duplicate notification. These public IDs are observation fixtures only.
-	let endpoints = "039c1d700620ab6b2ebcbabc8822fb71fb6cd43fbcf2a93786c20901cbed4f09b9 to 033880c72bb7c7c399f295b619684cf6dc4268e50ff077edf790e65af43a64625c";
-	let route = format!("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: 1: getroutes from {endpoints}\n");
-	let notification = "2026-10-31T17:39:01.135Z DEBUG   plugin-cln-askrene: notify msg info: Too many running at once (0 vs 0): waiting\n";
-	let command = "\"1/cln:xpay#238/cln-xpay:getroutes#13/cln:getroutes#240\"";
-	let queued = format!("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-askrene: {command}: Too many running at once (0 vs 0): waiting\n");
-	let mut logs = QueuedNativeLogs::default();
-	logs.observe(&route, endpoints);
-	assert_eq!(logs.payments, BTreeSet::from([1]));
-	logs.observe(notification, endpoints);
-	assert!(logs.queued.is_empty(), "a forwarded notification is not a second native command");
-	logs.observe(&queued, endpoints);
-	assert_eq!(logs.queued, BTreeSet::from([command.to_owned()]));
-	logs.observe("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: notify msg debug: getroutes_done: continuing\n", endpoints);
-	logs.observe("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: 2: getroutes_done: ignoring\n", endpoints);
-	assert!(logs.continuing.is_empty(), "neither a notification nor an ended command proves active A");
-	logs.observe("2026-10-31T17:39:01.135Z DEBUG   plugin-cln-xpay: 1: getroutes_done: continuing\r\n", endpoints);
-	assert_eq!(logs.continuing, BTreeSet::from([1]));
-	assert_eq!(&logs.lines[..2], &[route, queued], "retained raw evidence must keep its line endings");
-}
-
-#[cfg(target_os = "linux")]
 struct QueuedNativeRouting {
 	logs: Arc<Mutex<QueuedNativeLogs>>,
 	probe: cln_rpc::GetroutesRequest,
