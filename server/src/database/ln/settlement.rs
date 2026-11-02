@@ -36,7 +36,7 @@ impl Tx<'_> {
 	/// Settlement and refund decisions take validity, sorted sources, then the
 	/// settlement advisory lock. A real preimage is retained even during a reorg.
 	pub async fn lock_settlement_sources(&self, hash: PaymentHash) -> anyhow::Result<()> {
-		self.query_one("SELECT generation FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+		self.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR SHARE", &[]).await?;
 		self.query("SELECT v.vtxo_id FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id \
 			WHERE h.payment_hash=$1 ORDER BY v.vtxo_id FOR UPDATE OF v", &[&hash.to_string()]).await?;
 		Ok(())

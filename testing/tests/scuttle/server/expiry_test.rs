@@ -271,13 +271,13 @@ pub(super) fn canonical(ctx: &TestContext, tx: &Transaction) -> BlockRef {
 	BlockRef { height: BlockHeight::new(u32::try_from(header.height).unwrap()), hash }
 }
 
-pub(crate) async fn wait_rebuilt(db: &Db, point: BlockRef, timeout: Duration, message: &str) -> i64 {
+pub(crate) async fn wait_rebuilt(db: &Db, point: BlockRef, timeout: Duration, message: &str) -> BlockRef {
 	tokio::time::timeout(timeout, async {
 		loop {
 			let generation = db.read(async |tx| {
 				let Some(view) = tx.expiry_view().await? else { return Ok(None); };
-				if view.processed == point && tx.expiry_view_is_current(view).await? {
-					Ok(Some(view.generation))
+				if view == point && (tx.expiry_view().await? == Some(view)) {
+					Ok(Some(view))
 				} else { Ok(None) }
 			}).await.unwrap();
 			if let Some(generation) = generation { return generation; }

@@ -34,7 +34,6 @@ pub(crate) mod expiry_test;
 mod expiry_three_owner_forwarding;
 mod expiry_tiny_payout_grouping;
 mod expiry_transfer_refresh;
-mod expiry_view_service;
 mod fallback;
 mod lightning;
 mod lightning_cold_backup;

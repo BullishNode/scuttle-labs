@@ -1,13 +1,9 @@
-//! Terminal ownership proposals for a proven geometric backing partition.
-//! No proposal is an authorization: allocation revalidates its proof under
-//! coin, participation and chain-view locks before committing a spend fence.
+//! Resolve the selected current source under allocation and settlement locks.
 
 
-use anyhow::Context;
-use bitcoin::{Amount, Transaction, Txid};
+use bitcoin::{Amount, Txid};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockHeight, BlockRef};
-use chrono::{DateTime, Local};
 
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId};
 use ark::lightning::PaymentHash;
@@ -17,7 +13,7 @@ use super::expiry_inventory::BackingVtxoFact;
 use super::expiry_lightning::LightningSourceState;
 use super::ln::{LightningHtlcSubscriptionStatus, SourceSettlement};
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
-use super::{BlockTable, SpendState, Tx};
+use super::{SpendState, Tx};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipDisposition {
@@ -53,15 +49,12 @@ pub enum OwnershipEvidence {
 	/// The operator takes it back with the expiry sweep of its tree output.
 	/// Chain-derived: a later preimage spend conflicts the sweep.
 	HtlcRecvExpired { payment_hash: PaymentHash, htlc_expiry: BlockHeight },
-	HtlcChain { payment_hash: PaymentHash, resolution: HtlcResolution, block: BlockRef },
 }
 
 #[derive(Debug, Clone)]
 pub struct OwnershipProposal {
 	pub id: VtxoId,
 	pub gross: Amount,
-	pub updated_at: DateTime<Local>,
-	pub spend_state: SpendState,
 	pub disposition: OwnershipDisposition,
 	pub evidence: Option<OwnershipEvidence>,
 	/// These entire participations must be cancelled atomically at commit.
@@ -80,7 +73,6 @@ impl OwnershipProposal {
 	fn pending(fact: &BackingVtxoFact, reason: &'static str) -> Self {
 		Self {
 			id: fact.state.vtxo_id, gross: fact.state.vtxo.amount(),
-			updated_at: fact.state.updated_at, spend_state: fact.state.spend_state,
 			disposition: OwnershipDisposition::Unresolved(reason), evidence: None,
 			cancellations: Vec::new(), has_stored_preimage: false, needs_chain_progress: false,
 			settlement_integrity_hold: false,
@@ -93,18 +85,15 @@ impl Tx<'_> {
 		slog!(ExpiryHoldObserved, vtxo_id: id, reason: reason.to_owned());
 	}
 
-	/// Resolve one selected economic terminal. The caller supplies its
-	/// funding transaction and must already have proved the complete partition.
+	/// Resolve one current economic terminal under its source and settlement locks.
 	pub async fn propose_expiry_ownership(
 		&self,
 		fact: &BackingVtxoFact,
-		funding: &Transaction,
 		tip: BlockHeight,
 		watchman_tip: Option<BlockHeight>,
 	) -> anyhow::Result<OwnershipProposal> {
-		let mut proposal = OwnershipProposal::pending(fact, "missing complete source path");
-		let Some(full) = &fact.full_vtxo else { return Ok(proposal); };
-		full.validate_unsigned(funding).context("invalid expiry terminal path")?;
+		let mut proposal = OwnershipProposal::pending(fact, "unresolved source ownership");
+		let full = &fact.state.vtxo;
 		let state = &fact.state;
 
 		if let Some(txid) = state.offboarded_in {
@@ -191,7 +180,6 @@ impl Tx<'_> {
 			return Ok(proposal);
 		}
 		if matches!(state.spend_state, SpendState::RoundForfeit | SpendState::OffboardForfeit | SpendState::OffboardConnector) {
-			full.validate(funding).context("invalid expiry forfeit path")?;
 			proposal.disposition = OwnershipDisposition::Operator;
 			proposal.evidence = Some(OwnershipEvidence::Forfeit);
 			return Ok(proposal);
@@ -208,14 +196,16 @@ impl Tx<'_> {
 			return Ok(proposal);
 		}
 		if state.spend_state == SpendState::Unregistered {
+			if let Some(full) = &fact.full_vtxo {
 			if let Some(key) = self.expiry_unregistered_input_owner(full).await? {
 				proposal.disposition = OwnershipDisposition::Customer { user_pubkey: key };
 				proposal.evidence = Some(OwnershipEvidence::InputOwner);
 			}
+			}
 			return Ok(proposal);
 		}
 		if state.spend_state == SpendState::Unclaimed {
-			let Some(hash) = user.unlock_hash() else { return Ok(proposal); };
+			let Some(hash) = fact.full_vtxo.as_ref().and_then(|vtxo| vtxo.unlock_hash()) else { return Ok(proposal); };
 			let part = self.query_opt("SELECT id, forfeited_at IS NOT NULL AS forfeited FROM round_participation WHERE unlock_hash=$1", &[&hash.to_string()]).await?;
 			if let Some(part) = part {
 				let id = part.get::<_, i64>("id");
@@ -348,16 +338,8 @@ impl Tx<'_> {
 				proposal.needs_chain_progress = expired_contract;
 				return Ok(proposal);
 			}
-			proposal.evidence = if let Some(chain_resolution) = htlc.htlc.chain_resolution {
-				let height = htlc.htlc.chain_resolution_height.context("HTLC chain resolution has no height")?;
-				if watchman_tip.is_none_or(|point| height > point) || height > tip {
-					proposal.disposition = OwnershipDisposition::Unresolved("HTLC chain resolution ahead of completed sync");
-					return Ok(proposal);
-				}
-				let block = self.get_block_by_height(BlockTable::Watchmand, height).await?
-					.context("HTLC chain resolution block not in completed watchman view")?;
-				Some(OwnershipEvidence::HtlcChain { payment_hash: hash, resolution: chain_resolution, block })
-			} else { Some(OwnershipEvidence::HtlcOffchain { payment_hash: hash, resolution }) };
+			if htlc.htlc.chain_resolution.is_some() { return Ok(proposal); }
+			proposal.evidence = Some(OwnershipEvidence::HtlcOffchain { payment_hash: hash, resolution });
 			proposal.disposition = match (htlc.direction(), resolution) {
 				(HtlcDirection::Incoming, HtlcResolution::Fulfilled) | (HtlcDirection::Outgoing, HtlcResolution::Revoked) => OwnershipDisposition::Operator,
 				_ => OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() },
@@ -368,7 +350,6 @@ impl Tx<'_> {
 			proposal.disposition = OwnershipDisposition::Unresolved("nonterminal spend state without settlement evidence");
 			return Ok(proposal);
 		}
-		full.validate(funding).context("invalid customer expiry source signature")?;
 		proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
 		proposal.evidence = Some(OwnershipEvidence::Pubkey);
 		Ok(proposal)

@@ -2290,22 +2290,6 @@ CREATE TABLE scuttle.expiry_cancelled_participation (
 );
 
 
---
--- Name: expiry_chain_view; Type: TABLE; Schema: scuttle; Owner: -
---
-
-CREATE TABLE scuttle.expiry_chain_view (
-    id smallint NOT NULL,
-    generation bigint DEFAULT 0 NOT NULL,
-    invalid boolean DEFAULT true NOT NULL,
-    processed_height bigint,
-    processed_hash text,
-    CONSTRAINT expiry_chain_view_check CHECK (((processed_height IS NULL) = (processed_hash IS NULL))),
-    CONSTRAINT expiry_chain_view_generation_check CHECK ((generation >= 0)),
-    CONSTRAINT expiry_chain_view_id_check CHECK ((id = 1)),
-    CONSTRAINT expiry_chain_view_processed_height_check CHECK ((processed_height >= 0))
-);
-
 
 --
 -- Name: expiry_entitlement; Type: TABLE; Schema: scuttle; Owner: -
@@ -2920,13 +2904,6 @@ ALTER TABLE ONLY scuttle.expiry_cancelled_participation
 ALTER TABLE ONLY scuttle.expiry_cancelled_participation
     ADD CONSTRAINT expiry_cancelled_participation_unlock_hash_key UNIQUE (unlock_hash);
 
-
---
--- Name: expiry_chain_view expiry_chain_view_pkey; Type: CONSTRAINT; Schema: scuttle; Owner: -
---
-
-ALTER TABLE ONLY scuttle.expiry_chain_view
-    ADD CONSTRAINT expiry_chain_view_pkey PRIMARY KEY (id);
 
 
 --

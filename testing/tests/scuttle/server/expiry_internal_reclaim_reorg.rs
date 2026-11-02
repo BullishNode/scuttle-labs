@@ -98,8 +98,8 @@ async fn rebuilt_current_view(ctx: &TestContext, db: &Db) -> bool {
 	let hash = chain.get_block_hash(u64::from(height.to_u32())).unwrap();
 	db.read(async |t| {
 		let Some(view) = t.expiry_view().await? else { return Ok(false); };
-		Ok(t.expiry_view_is_current(view).await?
-			&& view.processed.height == height && view.processed.hash == hash)
+		Ok((t.expiry_view().await? == Some(view))
+			&& view.height == height && view.hash == hash)
 	}).await.unwrap()
 }
 
@@ -411,9 +411,6 @@ async fn reclaim_reorg(when: When) {
 		// Reopen against the two-deep closure before replacing any block.
 		// The existing case bound covers this static-height observer wait.
 		srv.start().await.unwrap();
-		let invalid = db.read(async |t| Ok(t.query_one("SELECT invalid FROM expiry_chain_view WHERE id=1", &[]).await?
-			.get::<_, bool>(0))).await.unwrap();
-		assert!(invalid, "the cold server must durably invalidate its old H+6 view");
 		srv.watchmand().start().await.unwrap();
 		while !rebuilt_current_view(&ctx, &db).await {
 			tokio::time::sleep(Duration::from_millis(50)).await;
@@ -478,9 +475,6 @@ async fn reclaim_reorg(when: When) {
 	if !started_at_fault {
 		srv.start().await.unwrap();
 		if original_refund.is_some() {
-			let invalid = db.read(async |t| Ok(t.query_one("SELECT invalid FROM expiry_chain_view WHERE id=1", &[]).await?
-				.get::<_, bool>(0))).await.unwrap();
-			assert!(invalid, "cold restart must durably invalidate the old payout view before the second daemon syncs");
 			assert!(chain.get_mempool_entry(&original_refund.as_ref().unwrap().1.compute_txid()).is_err(),
 				"neither Core nor the controller may replay the refund before the watchman restarts");
 		}

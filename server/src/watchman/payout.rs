@@ -16,7 +16,7 @@ use tracing::warn;
 
 use crate::bitcoind as bcd;
 use crate::bitcoind::BitcoindErrorExt;
-use crate::database::expiry_chain::ExpiryViewToken;
+use bitcoin_ext::BlockRef;
 use crate::database::expiry_payout::{MAX_PAYOUT_VSIZE, PendingExpiryPayout};
 
 use ark::ServerVtxo;
@@ -92,7 +92,7 @@ impl Watchman {
 
 	/// Publish only already committed groups. Parent bytes are durable before
 	/// fee funding or broadcast, and every retry keeps those exact bytes.
-	pub(crate) async fn process_expiry_payouts(&self, view: ExpiryViewToken) -> anyhow::Result<()> {
+	pub(crate) async fn process_expiry_payouts(&self, view: BlockRef) -> anyhow::Result<()> {
 		let groups = self.db.read(async |t| t.pending_expiry_payouts().await).await?;
 		for group in groups {
 			let id = group.id;
@@ -103,7 +103,7 @@ impl Watchman {
 		Ok(())
 	}
 
-	async fn process_expiry_payout(&self, view: ExpiryViewToken, group: PendingExpiryPayout) -> anyhow::Result<()> {
+	async fn process_expiry_payout(&self, view: BlockRef, group: PendingExpiryPayout) -> anyhow::Result<()> {
 		let parent = match group.parent {
 			Some(parent) => parent,
 			None => self.build_expiry_payout(&group.inputs, &group.payouts).await?,
@@ -196,9 +196,9 @@ impl Watchman {
 		// wallet/Core state. Persist address allocation, not a child ledger.
 		wallet.persist().await?;
 		drop(wallet);
-		view.verify(&self.bitcoind).await?;
+		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 		self.db.write(async |t| {
-			t.lock_valid_expiry_view(view).await?;
+			t.lock_watchman_tip(view).await?;
 			let row = t.query_one("SELECT status,sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE",
 				&[&group.id]).await?;
 			ensure!(row.get::<_, &str>("status") == "pending"

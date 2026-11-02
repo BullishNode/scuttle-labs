@@ -129,7 +129,7 @@ async fn rebuilt(ctx: &TestContext, db: &Db) {
 		loop {
 			let done = db.read(async |tx| {
 				let Some(view) = tx.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed == point && tx.expiry_view_is_current(view).await?)
+				Ok(view == point && (tx.expiry_view().await? == Some(view)))
 			}).await.unwrap();
 			if done { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;

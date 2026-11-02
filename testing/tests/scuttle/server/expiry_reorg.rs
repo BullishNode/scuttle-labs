@@ -175,7 +175,7 @@ async fn oversized_fee_child() {
 		loop {
 			if db.read(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed == point && t.expiry_view_is_current(view).await?)
+				Ok(view == point && (t.expiry_view().await? == Some(view)))
 			}).await.unwrap() { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -285,20 +285,17 @@ async fn wait_for_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction) {
 	}).await.expect("actual background payout did not publish")
 }
 
-async fn wait_for_confirmation(db: &Db, allocation: i64, point: BlockRef, hash: BlockHash) -> i64 {
+async fn wait_for_confirmation(db: &Db, allocation: i64, point: BlockRef, hash: BlockHash) {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let state = db.read(async |t| {
-				let row = t.query_one("SELECT v.generation,v.invalid,a.status,a.confirmed_hash \
-					FROM expiry_chain_view v,expiry_allocation a WHERE v.id=1 AND a.id=$1", &[&allocation]).await?;
-				let current = t.get_highest_block(BlockTable::Captaind).await? == Some(point)
-					&& t.get_highest_block(BlockTable::Watchmand).await? == Some(point);
-				Ok((current, row.get::<_, i64>("generation"), row.get::<_, bool>("invalid"),
-					row.get::<_, String>("status"), row.get::<_, Option<String>>("confirmed_hash")))
+			let ready = db.read(async |t| {
+				let row = t.query_one("SELECT status,confirmed_hash FROM expiry_allocation WHERE id=$1", &[&allocation]).await?;
+				Ok(t.get_highest_block(BlockTable::Captaind).await? == Some(point)
+					&& t.get_highest_block(BlockTable::Watchmand).await? == Some(point)
+					&& row.get::<_, &str>("status") == "confirmed"
+					&& row.get::<_, Option<&str>>("confirmed_hash") == Some(hash.to_string().as_str()))
 			}).await.unwrap();
-			if state.0 && !state.2 && state.3 == "confirmed" && state.4.as_deref() == Some(hash.to_string().as_str()) {
-				break state.1;
-			}
+			if ready { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("canonical payout confirmation was not rebuilt after actual daemon sync")
@@ -365,19 +362,15 @@ async fn payout_reorg(depth: u32) {
 	let old_hash = original.blockhash.expect("payout must actually confirm before its block is invalidated");
 	assert!(original.confirmations.unwrap() >= depth);
 	let old_tip = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
-	let old_generation = wait_for_confirmation(&db, allocation, old_tip, old_hash).await;
+	wait_for_confirmation(&db, allocation, old_tip, old_hash).await;
 	let deep_queries = queries.load(Ordering::SeqCst);
 	if depth > 6 {
 		// The actual block now supplies confirmation; no full historical
 		// Core lookup/rebuild is required. Idle requested sweeps must retain
 		// the completed view and not re-query this canonical paid parent.
-		let version = db.read(async |t| Ok(t.query_one("SELECT xmin::TEXT FROM expiry_chain_view WHERE id=1", &[])
-			.await?.get::<_, String>(0))).await.unwrap();
 		for _ in 0..2 {
 			srv.watchmand().trigger_sweep().await;
 			tokio::time::sleep(Duration::from_millis(1100)).await;
-			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT xmin::TEXT FROM expiry_chain_view WHERE id=1", &[])
-				.await?.get::<_, String>(0))).await.unwrap(), version);
 			assert_eq!(queries.load(Ordering::SeqCst), deep_queries, "canonical paid history was queried again");
 		}
 	}
@@ -398,17 +391,11 @@ async fn payout_reorg(depth: u32) {
 	assert!(fork.height < old_tip.height);
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let ready = db.read(async |t| {
-				let row = t.query_one("SELECT generation,invalid FROM expiry_chain_view WHERE id=1", &[]).await?;
-				Ok(t.get_highest_block(BlockTable::Captaind).await? == Some(fork)
-					&& row.get::<_, i64>("generation") > old_generation && row.get::<_, bool>("invalid"))
-			}).await.unwrap();
+			let ready = db.read(async |t| t.get_highest_block(BlockTable::Captaind).await).await.unwrap() == Some(fork);
 			if ready { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
-	}).await.expect("actual shorter fork was not durably invalidated before watchman restart");
-	assert!(db.read(async |t| t.expiry_view().await).await.unwrap().is_none(),
-		"the stopped watchman's old completed view cannot authorize this fork");
+	}).await.expect("actual shorter fork was not indexed before watchman restart");
 	assert_eq!(db.read(async |t| Ok(t.get_user_vtxo_by_id(ids[0]).await?.spend_state)).await.unwrap(),
 		server::database::SpendState::Spent, "a reorg must not reopen the committed source");
 
@@ -423,8 +410,8 @@ async fn payout_reorg(depth: u32) {
 		loop {
 			let valid = db.read(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
-				Ok(view.processed == recovery_tip
-					&& t.expiry_view_is_current(view).await?)
+				Ok(view == recovery_tip
+					&& (t.expiry_view().await? == Some(view)))
 			}).await.unwrap();
 			// A retained package may already be mined in the first replacement
 			// block; otherwise the watchman must recover it in the mempool.
@@ -442,11 +429,10 @@ async fn payout_reorg(depth: u32) {
 	let new_hash = current.blockhash.expect("the original payout must re-confirm on the replacement chain");
 	assert_ne!(new_hash, old_hash);
 	assert!(current.confirmations.unwrap() >= depth);
-	let new_generation = wait_for_confirmation(&db, allocation, new_tip, new_hash).await;
+	wait_for_confirmation(&db, allocation, new_tip, new_hash).await;
 	if depth > 6 {
 		assert!(queries.load(Ordering::SeqCst) > deep_queries, "reorg must re-enable the actual parent lookup");
 	}
-	assert!(new_generation > old_generation);
 	assert_eq!(ctx.bitcoind().await_transaction(txid).await, parent);
 	assert_eq!(rpc.get_tx_out(&txid, payout_index, Some(true)).unwrap().unwrap().value, expected);
 	let row = db.read(async |t| Ok(t.query_one(

@@ -40,7 +40,7 @@ impl Tx<'_> {
 	/// Persist these observations with its block-table row, before publishing
 	/// a completed view. Retrying a partial listener cycle is idempotent.
 	pub(crate) async fn observe_expiry_block(&self, block: &BlockData) -> anyhow::Result<()> {
-		self.query_one("SELECT generation FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+		self.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR SHARE", &[]).await?;
 		let mut spends = BTreeMap::<String, String>::new();
 		let transactions = block.block.txdata.iter().map(|tx| (tx.compute_txid(), tx)).collect::<BTreeMap<_, _>>();
 		for (txid, tx) in &transactions {

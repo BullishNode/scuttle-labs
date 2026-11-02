@@ -10,13 +10,11 @@ use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 
-use super::expiry_chain::ExpiryViewToken;
 use super::expiry_lightning::LightningSourceState;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
 use super::expiry_inventory::BackingSnapshot;
 use super::Tx;
-use crate::watchman::readiness::INVENTORY_LIMITS;
 
 pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
 
@@ -245,16 +243,16 @@ impl Tx<'_> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let rows = self.query("SELECT c.vtxo_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
 			c.payout_sat,c.forfeited_sat,a.sweep_txid,
-			CASE WHEN a.status='confirmed' AND NOT cv.invalid
+			CASE WHEN a.status='confirmed'
 				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
 				THEN a.confirmed_height END AS confirmed_height,
-			CASE WHEN a.status='confirmed' AND NOT cv.invalid
+			CASE WHEN a.status='confirmed'
 				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
 				THEN a.confirmed_hash END AS confirmed_hash,p.output_index,
 			EXISTS(SELECT 1 FROM expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id
-				AND NOT cv.invalid AND cv.processed_height >= t.height+5
+				 AND cv.processed_height >= t.height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=t.height AND b.hash=t.hash)
 				AND cv.processed_height=(SELECT MAX(height) FROM watchmand_block)
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=cv.processed_height AND b.hash=cv.processed_hash)) AS user_claimed
@@ -264,7 +262,7 @@ impl Tx<'_> {
 				JOIN expiry_allocation a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
 				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.active DESC,c.allocation_id DESC) c
 			JOIN expiry_allocation a ON a.id=c.allocation_id
-			CROSS JOIN expiry_chain_view cv
+			CROSS JOIN (SELECT height AS processed_height,hash AS processed_hash FROM watchmand_block ORDER BY height DESC LIMIT 1) cv
 			LEFT JOIN expiry_allocation_payout p ON p.allocation_id=c.allocation_id AND p.spk=c.spk
 			WHERE c.disposition='customer'", &[&ids]).await?;
 		let mut claims: BTreeMap<VtxoId, FallbackClaim> = rows.into_iter().map(|row| {
@@ -396,9 +394,9 @@ impl Tx<'_> {
 	/// Compare-and-set the exact signed parent before any network publication.
 	/// Once present, a restart or fee bump must use precisely the same bytes.
 	pub async fn store_expiry_parent(
-		&self, view: ExpiryViewToken, id: i64, parent: &Transaction,
+		&self, view: BlockRef, id: i64, parent: &Transaction,
 	) -> anyhow::Result<()> {
-		self.lock_valid_expiry_view(view).await?;
+		self.lock_watchman_tip(view).await?;
 		let row = self.query_one("SELECT status,sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
 		ensure!(row.get::<_, &str>("status") == "pending", "expiry allocation is no longer pending");
 		let raw = serialize(parent);
@@ -436,34 +434,17 @@ impl Tx<'_> {
 	/// Request only an one-input signed tree step. No manufactured
 	/// transaction or arbitrary txid can become a split instruction.
 	pub async fn request_expiry_split(
-		&self, view: ExpiryViewToken, root: &ServerVtxo,
+		&self, view: BlockRef, root: &ServerVtxo,
 	) -> anyhow::Result<bool> {
 		// Prepare without coin or chain-view locks. Only the short recheck below
 		// serializes against a new obligation, a key drop or a changed chain view.
-		let limits = INVENTORY_LIMITS;
-		let snapshot = self.backing_recovery_snapshot(root, limits).await?;
+		let snapshot = self.backing_recovery_snapshot(root).await?;
 		let txids = snapshot.regular.iter().filter(|f| f.state.vtxo_id == root.id() || !retained_server_recovery(&f.state.vtxo))
 			.filter_map(|f| f.state.oor_spent_txid)
 			.map(|id| id.to_string()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-		// Bound the returned bytes before loading transaction blobs. This is a
-		// single statement, so a concurrent registration cannot change its size
-		// between a metadata query and the blob query.
-		let raw = self.query("
-			WITH txs AS (
-				SELECT txid,signed_tx
-				FROM virtual_transaction
-				WHERE txid=ANY($1) AND signed_tx IS NOT NULL
-			), sized AS (
-				SELECT txid,signed_tx,SUM(octet_length(signed_tx)::bigint) OVER ()::bigint AS bytes
-				FROM txs
-			)
-			SELECT txid,bytes,CASE WHEN bytes<=$2 THEN signed_tx ELSE NULL END AS signed_tx
-			FROM sized
-		", &[&txids, &i64::try_from(limits.max_serialized_bytes)?]).await?;
+		let raw = self.query("SELECT txid,signed_tx FROM virtual_transaction WHERE txid=ANY($1) AND signed_tx IS NOT NULL", &[&txids]).await?;
 		let mut signed = BTreeMap::new();
 		for row in raw {
-			ensure!(usize::try_from(row.get::<_, i64>("bytes"))? <= limits.max_serialized_bytes,
-				"split signed paths exceed byte budget");
 			let id = row.get::<_, &str>("txid").parse()?;
 			let tx: Transaction = deserialize(row.get::<_, &[u8]>("signed_tx"))?;
 			ensure!(tx.compute_txid() == id, "stored split transaction has the wrong id");
@@ -484,7 +465,7 @@ impl Tx<'_> {
 			return Ok(false);
 		};
 
-		self.lock_valid_expiry_view(view).await?;
+		self.lock_watchman_tip(view).await?;
 		let expected = paths.rows.iter().map(|&i| {
 			let state = &snapshot.regular[i].state;
 			(state.vtxo_id.to_string(), (state.updated_at, state.spend_state.as_str().to_owned()))
@@ -513,7 +494,7 @@ impl Tx<'_> {
 		let keys = paths.keys.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let locked_keys = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1) ORDER BY pubkey FOR SHARE", &[&keys]).await?;
 		ensure!(locked_keys.len() == keys.len(), "split recovery key was dropped during preparation");
-		ensure!(root.expiry_height() <= view.processed.height,
+		ensure!(root.expiry_height() <= view.height,
 			"expiry split backing is not mature");
 		let row = self.query_one("SELECT oor_spent_txid FROM vtxo WHERE vtxo_id=$1", &[&root.id().to_string()]).await?;
 		let Some(txid) = row.get::<_, Option<&str>>("oor_spent_txid") else { return Ok(false); };

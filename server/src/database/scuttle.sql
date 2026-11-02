@@ -21,18 +21,6 @@ CREATE TABLE expiry_cancelled_participation (
 	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Only watchmand publishes a completed chain view after its listeners commit.
--- Restart and rollback invalidate it before any dependent financial decision.
-CREATE TABLE expiry_chain_view (
-	id SMALLINT PRIMARY KEY CHECK (id = 1),
-	generation BIGINT NOT NULL DEFAULT 0 CHECK (generation >= 0),
-	invalid BOOLEAN NOT NULL DEFAULT TRUE,
-	processed_height BIGINT CHECK (processed_height >= 0),
-	processed_hash TEXT,
-	CHECK ((processed_height IS NULL) = (processed_hash IS NULL))
-);
-INSERT INTO expiry_chain_view (id) VALUES (1);
-
 -- Financial decisions are immutable; active links follow canonical watchmand observations.
 CREATE TABLE expiry_allocation (
 	id BIGSERIAL PRIMARY KEY,

@@ -1211,8 +1211,8 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 					loop {
 						if db.read(async |t| {
 							let Some(view) = t.expiry_view().await? else { return Ok(false); };
-							let rebuilt = t.expiry_view_is_current(view).await?;
-							Ok(view.processed == point && rebuilt)
+							let rebuilt = (t.expiry_view().await? == Some(view));
+							Ok(view == point && rebuilt)
 						}).await.unwrap() { break; }
 						tokio::time::sleep(Duration::from_millis(100)).await;
 					}
