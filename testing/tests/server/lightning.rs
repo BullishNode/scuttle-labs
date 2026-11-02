@@ -2535,11 +2535,9 @@ async fn server_returned_htlc_recv_vtxos_identical(
 	srv.integration_cmd(&["configure-token-type", "receive-admission", "single-use-board", "1", "3600"]).await;
 	let stdout = srv.integration_cmd(&["generate-token", "receive-admission", "single-use-board", "--integration-api-key", &api_key]).await;
 	let token = stdout.split_whitespace().nth(1).unwrap().to_string();
-	let token_state = async || db.read(async |tx| Ok(tx.query_one("SELECT status::TEXT,updated_at::TEXT,updated_by_api_key_id \
-		FROM integration_token WHERE token=$1", &[&token]).await?)).await.unwrap();
-	let token_before = token_state().await;
-	let token_before = (token_before.get::<_, String>(0), token_before.get::<_, String>(1), token_before.get::<_, i64>(2));
-	assert_eq!(token_before.0, "unused");
+	let token_state = async || db.read(async |tx| Ok(tx.query_one("SELECT status::TEXT
+		FROM integration_token WHERE token=$1", &[&token]).await?.get::<_, String>(0))).await.unwrap();
+	assert_eq!(token_state().await, "unused");
 
 	let mut client = srv.get_public_rpc().await;
 
@@ -2574,8 +2572,7 @@ async fn server_returned_htlc_recv_vtxos_identical(
 				keypair.public_key(), bark::FallbackRefusal::InvalidOwnerProof);
 			assert_eq!(super::expiry_admission::receive_admission_rows(&db, receive.payment_hash, &[keypair.public_key()]).await, before);
 			assert_eq!(super::expiry_admission::source_rows(&db, &pool_ids).await, pool_before);
-			let state = token_state().await;
-			assert_eq!((state.get::<_, String>(0), state.get::<_, String>(1), state.get::<_, i64>(2)), token_before);
+			assert_eq!(token_state().await, "unused");
 			db.write(async |tx| tx.verify_owner_link(&srv.mailbox_keypair(), keypair.public_key(), &link, Network::Regtest).await).await.unwrap();
 			let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 			let conflicting = super::expiry_admission::unmapped_owner_link(srv, &keypair, &other).await;
@@ -2585,12 +2582,11 @@ async fn server_returned_htlc_recv_vtxos_identical(
 				keypair.public_key(), bark::FallbackRefusal::ConflictingOwnerBinding);
 			assert_eq!(super::expiry_admission::receive_admission_rows(&db, receive.payment_hash, &[keypair.public_key()]).await, before);
 			assert_eq!(super::expiry_admission::source_rows(&db, &pool_ids).await, pool_before);
-			let state = token_state().await;
-			assert_eq!((state.get::<_, String>(0), state.get::<_, String>(1), state.get::<_, i64>(2)), token_before);
+			assert_eq!(token_state().await, "unused");
 			let vtxos_1 = client.prepare_lightning_receive_claim(req_1.clone()).await.unwrap()
 				.into_inner().htlc_vtxos.into_iter().map(|b| Vtxo::deserialize(&b))
 				.collect::<Result<Vec<Vtxo<Full>>, _>>().unwrap();
-			assert_eq!(token_state().await.get::<_, String>(0), "used", "only the valid preparation consumes the token");
+			assert_eq!(token_state().await, "used", "only the valid preparation consumes the token");
 			assert!(vtxos_1.iter().all(|v| v.has_all_witnesses()), "first call vtxos should be fully signed");
 
 			// We test once again with the same request

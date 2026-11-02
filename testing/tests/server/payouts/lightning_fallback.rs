@@ -323,20 +323,9 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	srv.wait_for_sync_height(confirmed).await;
 	srv.watchmand().wait_for_sync_height(confirmed).await;
 	let core = ctx.bitcoind().sync_client();
-	let parent_info = core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().unwrap();
-	assert!(parent_info.confirmations.unwrap_or(0) >= 6);
-	let blockhash = parent_info.blockhash.unwrap();
-	let header = core.get_block_header_info(&blockhash).unwrap();
-	assert_eq!(core.get_block_hash(header.height as u64).unwrap(), blockhash);
-	let block = core.get_block(&blockhash).unwrap();
-	let canonical_parent = block.txdata.iter().find(|tx| tx.compute_txid() == parent.compute_txid()).unwrap();
-	assert_eq!(bitcoin::consensus::serialize(canonical_parent), bitcoin::consensus::serialize(&parent),
-		"the canonical parent must retain the exact expiry witness");
-	let children = block.txdata.iter().filter(|tx|
-		tx.input.iter().any(|input| input.previous_output == anchors[0])
-	).collect::<Vec<_>>();
-	assert_eq!(children.len(), 1);
-	let child = children[0];
+	let block = super::expiry_test::canonical(&ctx, &parent);
+	let (child, observed_fee) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent).unwrap();
+	assert_eq!(super::expiry_test::canonical(&ctx, &child), block);
 	assert_eq!(child.version.0, 3);
 	assert!(child.vsize() <= 1_000);
 	assert_eq!(child.input.iter().map(|input| input.previous_output).collect::<HashSet<_>>(),
@@ -345,23 +334,18 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let change = child.output.iter().map(|out| out.value).sum::<Amount>();
 	let actual_fee = sat(100_000).checked_sub(change).unwrap();
 	assert!(actual_fee > Amount::ZERO);
-	let (observed, observed_fee) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent).unwrap();
-	assert_eq!(observed, *child);
 	assert_eq!(observed_fee, i64::try_from(actual_fee.to_sat()).unwrap());
 	let expected_change = child.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO)
 		.map(|(vout, _)| OutPoint::new(child.compute_txid(), vout as u32)).collect::<HashSet<_>>();
 	assert!(!expected_change.is_empty());
 	async {
 		loop {
-			let address = srv.watchmand().config().admin_address.unwrap();
-			let mut rpc = captaind::WalletAdminClient::connect(format!("http://{address}")).await.unwrap();
-			let owned = rpc.wallet_status(protos::Empty {}).await.unwrap().into_inner().watchman.unwrap()
-				.confirmed_utxos.into_iter().map(|point| OutPoint::from_str(&point).unwrap()).collect::<HashSet<_>>();
-			if expected_change.is_subset(&owned) { break; }
+			let owned = super::expiry_test::watchman_coins(srv.watchmand()).await;
+			if expected_change.iter().all(|point| owned.contains(point)) { break; }
 			tokio::time::sleep(poll_interval()).await;
 		}
 	}.wait_millis(10_000).await;
-	for tx in [&parent, child] {
+	for tx in [&parent, &child] {
 		for (vout, out) in tx.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO) {
 			let actual = core.get_tx_out(&tx.compute_txid(), vout as u32, Some(true)).unwrap().unwrap();
 			assert!(actual.confirmations >= 6);

@@ -149,18 +149,14 @@ impl captaind::proxy::ArkRpcProxy for CheckClaim {
 		assert_eq!(bodies(&response.htlc_vtxos).len(), grants.len());
 		// A valid alternative M can read the original public grants; it cannot
 		// reassign their immutable owner or collect the native payment.
-		let cached = upstream.prepare_lightning_receive_claim(conflict).await.unwrap().into_inner();
-		assert_eq!(bodies(&cached.htlc_vtxos), bodies(&response.htlc_vtxos));
-		assert_eq!(cached.htlc_vtxos.len(), grants.len());
-		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
-		assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
-		assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before);
-		let replay = upstream.prepare_lightning_receive_claim(req).await.unwrap().into_inner();
-		assert_eq!(bodies(&replay.htlc_vtxos), bodies(&response.htlc_vtxos));
-		assert_eq!(replay.htlc_vtxos.len(), grants.len());
-		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
-		assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
-		assert_eq!(hold.list(native_request).await.unwrap().into_inner().invoices, native_before);
+		for request in [conflict, req] {
+			let cached = upstream.prepare_lightning_receive_claim(request).await.unwrap().into_inner();
+			assert_eq!(bodies(&cached.htlc_vtxos), bodies(&response.htlc_vtxos));
+			assert_eq!(cached.htlc_vtxos.len(), grants.len());
+			assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash, &[key]).await, before);
+			assert_eq!(super::expiry_admission::source_rows(&self.db, &source_ids).await, source_before);
+			assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before);
+		}
 		self.prepare_checked.store(true, Ordering::SeqCst);
 		Ok(response)
 	}
@@ -211,19 +207,13 @@ impl captaind::proxy::ArkRpcProxy for CheckClaim {
 			"a settled retry cannot collect a second payment or change the first binding");
 		let mut replay = req;
 		let mailbox = MailboxIdentifier::from_blinded(link.blinded_id, key, &self.server).unwrap();
-		let keys = replay.cosign_request.as_ref().unwrap().parts.iter().flat_map(|part|
-			part.outputs.iter().chain(&part.isolated_outputs)).map(|output|
-			VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey()).collect::<Vec<_>>();
-		let mut proofs = std::collections::BTreeMap::new();
-		for actual in keys {
-			let (_, pair) = self.wallet.pubkey_keypair(&actual).await.unwrap().unwrap();
-			assert_eq!(mailbox, self.wallet.mailbox_identifier());
-			proofs.insert(actual, OwnerLink::new_joint(Network::Regtest, self.server.public_key(), &self.wallet.mailbox_keypair(), &pair).unwrap());
-		}
+		assert_eq!(mailbox, self.wallet.mailbox_identifier());
 		for part in &mut replay.cosign_request.as_mut().unwrap().parts {
 			for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
 				let actual = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
-				output.owner_proof = Some(proofs[&actual].into());
+				let (_, pair) = self.wallet.pubkey_keypair(&actual).await.unwrap().unwrap();
+				output.owner_proof = Some(OwnerLink::new_joint(Network::Regtest, self.server.public_key(),
+					&self.wallet.mailbox_keypair(), &pair).unwrap().into());
 			}
 		}
 		let response = upstream.claim_lightning_receive(replay).await.unwrap().into_inner();
