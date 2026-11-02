@@ -1,4 +1,4 @@
-//! Canonical authority from the existing published watchmand block reference.
+//! Check the published watchman tip against Bitcoin Core.
 
 use bitcoin_ext::BlockRef;
 use bitcoind_async_client::traits::Reader;

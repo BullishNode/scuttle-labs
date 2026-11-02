@@ -218,9 +218,9 @@ enum VtxoSpendState {
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
 	// A committed fallback decision has unresolved relevant portions.
-	VTXO_SPEND_STATE_FALLBACK_PENDING = 1000;
+	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
 	// Terminal policy result with no Bitcoin payout.
-	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 1001;
+	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 7;
 }
 
 message GetVtxoStatusRequest {
@@ -231,8 +231,8 @@ message GetVtxoStatusRequest {
 
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
-	bytes owner_mailbox = 1000;
-	bool fallback_committed = 1002;
+	bytes owner_mailbox = 2;
+	bool fallback_committed = 3;
 }
 
 message VtxoStatusQuery {
@@ -249,8 +249,8 @@ message GetVtxosStatusByIdsRequest {
 message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
-	bytes owner_mailbox = 1000;
-	bool fallback_committed = 1002;
+	bytes owner_mailbox = 3;
+	bool fallback_committed = 4;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -284,8 +284,8 @@ message RecoveredVtxo {
 	// xpub/derivation_index.
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
-	bytes owner_mailbox = 1000;
-	bool fallback_committed = 1002;
+	bytes owner_mailbox = 4;
+	bool fallback_committed = 5;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -308,8 +308,8 @@ message RecoverVtxosByXpubResponse {
 // Coin and mailbox authorization of a server-specific link.
 message OwnerProof {
 	bytes blinded_mailbox_id = 1;
-	bytes signature = 3;
-	bytes mailbox_signature = 5;
+	bytes signature = 2;
+	bytes mailbox_signature = 3;
 }
 
 message BoardCosignRequest {
@@ -319,7 +319,7 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 7;
 }
 
 message BoardCosignResponse {
@@ -342,13 +342,13 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorCosignRequest {
@@ -397,7 +397,7 @@ message CheckLightningPaymentRequest {
 	bytes hash = 1;
 	bool wait = 2;
 	// Complete HTLC input set of the payment attempt being checked.
-	repeated bytes htlc_vtxo_ids = 1000;
+	repeated bytes htlc_vtxo_ids = 3;
 }
 
 message PaymentSuccessStatus {
@@ -413,7 +413,7 @@ message LightningPaymentStatus {
 		core.LightningPaymentFailure failed = 3;
 	};
 	// Input scope validated against the server's recorded payment attempt.
-	repeated bytes htlc_vtxo_ids = 1000;
+	repeated bytes htlc_vtxo_ids = 4;
 }
 
 message FetchBolt12InvoiceRequest {
@@ -432,7 +432,7 @@ message StartLightningReceiveRequest {
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
 	// Point-in-time check for an explicit recipient before invoice creation.
-	VtxoRequest claim_destination = 1000;
+	VtxoRequest claim_destination = 7;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
 	optional uint64 expiry_secs = 6;
@@ -455,7 +455,7 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 6;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -495,7 +495,7 @@ message CheckLightningReceiveResponse {
 	repeated bytes htlc_vtxos = 4;
 	// Aggregate expiry outcome of the actual collected receive destination.
 	// This hash-only query never returns mailbox identities or allocation data.
-	optional VtxoSpendState fallback_spend_state = 1000;
+	optional VtxoSpendState fallback_spend_state = 5;
 }
 
 // offboard
@@ -715,16 +715,16 @@ service RoundAdminService {
 }
 
 message ReconcileLightningAttemptRequest {
-	int64 attempt_id = 1000;
+	int64 attempt_id = 1;
 	// Privileged operator confirms complete same-backend CLN/plugin cessation,
 	// restart of its original persistent store and exclusion of new dispatch.
-	bool native_cold_restart_confirmed = 1001;
+	bool native_cold_restart_confirmed = 2;
 }
 
 message ReconcileLightningAttemptResponse {
-	int64 attempt_id = 1000;
-	bytes payment_hash = 1001;
-	string status = 1002;
+	int64 attempt_id = 1;
+	bytes payment_hash = 2;
+	string status = 3;
 }
 
 service LightningAdminService {

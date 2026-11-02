@@ -4722,7 +4722,7 @@ async fn stalled_hold_node_does_not_block_healthy_settlement() {
 /// privileged orphan continuation follows actual whole-backend cold cessation.
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn stock_zero_part_and_cold_restart_orphan_refund_once() {
+async fn zero_part_and_cold_restart_refund() {
 	let ctx = TestContext::new("server/stock_zero_part_cold_restart_orphan").await;
 	let LightningPaymentSetup { internal, external } = ctx.new_lightning_setup_no_channel("lightningd").await;
 	let node = Arc::new(internal);
