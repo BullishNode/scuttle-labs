@@ -123,7 +123,7 @@ async fn failed_swap_during_restart() {
 	let ctx = TestContext::new("server/expiry_failed_swap_restart").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
-		.no_vtxo_pool().funded(btc(10)).cfg(|config| {
+		.no_vtxo_pool().funded(btc(10)).cfg(|config| { config.expiry_payouts = true;
 			config.vtxo_lifetime = BlockDelta::new(24);
 			config.vtxo_exit_delta = BlockDelta::new(3);
 			config.htlc_send_expiry_delta = BlockDelta::new(40);

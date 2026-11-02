@@ -46,6 +46,7 @@ pub(crate) async fn guard_new_lightning_inputs(
 	tx: &super::Tx<'_>,
 	ids: &[VtxoId],
 ) -> anyhow::Result<()> {
+	if !tx.expiry_payouts() { return Ok(()); }
 	let view = tx.expiry_view().await?;
 	if let Some(point) = view { tx.lock_watchman_tip(point).await?; }
 	let watchman_height = view.map_or(0_i64, |point| i64::from(point.height));

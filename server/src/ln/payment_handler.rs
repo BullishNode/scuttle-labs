@@ -12,7 +12,6 @@ use crate::ln::LightningFailureKind;
 use crate::ln::settler::HtlcSettler;
 use crate::telemetry;
 
-
 /// Borrows the DB, mailbox manager, and payment update broadcast channel
 /// so that every payment-attempt status change is consistently followed by
 /// a broadcast and (for final states) a mailbox notification.
@@ -38,19 +37,6 @@ impl<'a> PaymentAttemptHandler<'a> {
 		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
 	) -> anyhow::Result<Option<DateTime<Local>>> {
 		self.fail_attempt(attempt, error, false).await
-	}
-
-	/// Mark an intra-Ark payment attempt that its receive refused as failed,
-	/// and unlink it from that receive in the same transaction.
-	///
-	/// Revoking the attempt's HTLCs must never see it failed while still
-	/// linked, or the revoke cancels a receive that this payment never paid.
-	///
-	/// Returns `None` if the optimistic-lock predicate missed.
-	pub async fn fail_refused_payment_attempt(
-		&self, attempt: &LightningPaymentAttempt, error: Option<&str>,
-	) -> anyhow::Result<Option<DateTime<Local>>> {
-		self.fail_attempt(attempt, error, true).await
 	}
 
 	async fn fail_attempt(

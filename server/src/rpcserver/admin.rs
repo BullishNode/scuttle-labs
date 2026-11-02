@@ -240,7 +240,7 @@ impl rpc::server::ScuttleService for Server {
 	async fn reconcile_lightning_attempt(
 		&self, req: tonic::Request<protos::scuttle::ReconcileLightningAttemptRequest>,
 	) -> Result<tonic::Response<protos::scuttle::ReconcileLightningAttemptResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, true)?;
 		let req = req.into_inner();
 		let id = req.attempt_id;
 		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }

@@ -3,7 +3,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
 		let ctx = TestContext::new("bark_sdk/cancelled_refresh_payout").await;
 		let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
-			.cfg(|config| { config.vtxo_lifetime = BlockDelta::new(48); config.vtxo_exit_delta = BlockDelta::new(3); })
+			.cfg(|config| { config.expiry_payouts = true; config.vtxo_lifetime = BlockDelta::new(48); config.vtxo_exit_delta = BlockDelta::new(3); })
 			.watchmand().create().await;
 		let transport = RefreshTransport::default();
 		let IssuedRefresh { wallet, proxy, database, mnemonic, source, state_id, movement, unlock_hash, sweep_at, first_height, .. } =
@@ -175,7 +175,7 @@ async fn issued_refresh_keeps_its_holder_without_exact_cancellation_metadata() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(async {
 		let ctx = TestContext::new("bark_sdk/cancelled_refresh_metadata").await;
 		let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
-			.cfg(|config| { config.vtxo_lifetime = BlockDelta::new(48); config.vtxo_exit_delta = BlockDelta::new(3); })
+			.cfg(|config| { config.expiry_payouts = true; config.vtxo_lifetime = BlockDelta::new(48); config.vtxo_exit_delta = BlockDelta::new(3); })
 			.watchmand().create().await;
 		let transport = RefreshTransport::default();
 		let fixture = Box::pin(issued_refresh(&ctx, &srv, transport.clone(), RoundWriteFault::default(), false)).await;
@@ -215,22 +215,10 @@ async fn issued_refresh_keeps_its_holder_without_exact_cancellation_metadata() {
 	})).await.expect("invalid cancellation replies must leave the principal protected");
 }
 
-
-
 #[tokio::test]
 async fn fallback_source_state_write_failure_retains_its_receipt_fence() {
 	Box::pin(retained_claim_write_failure(false)).await;
 }
-
-
-
-
-
-
-
-
-
-
 
 async fn reopen_refresh(
 	ctx: &TestContext, proxy: &captaind::proxy::ArkRpcProxyServer,
@@ -405,7 +393,7 @@ async fn retained_claim_write_failure(receipt_write: bool) {
 		let name = if receipt_write { "bark_sdk/receipt_write_failure" }
 			else { "bark_sdk/receipt_source_state_write_failure" };
 		let ctx = TestContext::new(name).await;
-		let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
+		let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
 			config.vtxo_lifetime = BlockDelta::new(24);
 			config.vtxo_exit_delta = BlockDelta::new(3);
 		}).watchmand().create().await;

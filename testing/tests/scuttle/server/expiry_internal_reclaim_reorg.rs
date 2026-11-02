@@ -148,7 +148,7 @@ async fn reclaim_reorg(when: When) {
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).bitcoind(ctx.bitcoind_arc())
-		.funded(btc(10)).cfg(|cfg| {
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxopool.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxopool.vtxo_pre_expiry = BlockDelta::new(2);
@@ -192,7 +192,7 @@ async fn reclaim_reorg(when: When) {
 		invoice: invoice.to_string(), payment_amount_sat: 90_000,
 		htlc_vtxo_ids: vec![incoming[0].id().to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,

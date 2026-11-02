@@ -73,7 +73,7 @@ async fn registered_receive_fallback() {
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let audit_start_height = ctx.bitcoind().get_block_count().await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal).funded(sat(500_000))
-		.cfg(|config| {
+		.cfg(|config| { config.expiry_payouts = true;
 			config.vtxo_lifetime = BlockDelta::new(32);
 			config.vtxopool.vtxo_lifetime = BlockDelta::new(32);
 			config.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
@@ -153,7 +153,6 @@ async fn registered_receive_fallback() {
 	).script_pubkey();
 	assert_eq!(destination, expected_fallback_script, "the native fallback must use the seed-derived BIP86 destination");
 	assert!(destination.is_p2tr());
-
 
 	// B has an independent key and no SDK wallet. Its genuine issuance is
 	// followed by deliberate attribution-evidence corruption.

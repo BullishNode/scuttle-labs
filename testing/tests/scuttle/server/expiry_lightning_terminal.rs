@@ -124,7 +124,7 @@ async fn failed_external_payout(no_channel: bool, lagging_cln: bool) {
 	} else if no_channel { ctx.new_lightning_setup_no_channel("lightningd").await }
 		else { ctx.new_lightning_setup("lightningd").await };
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).no_vtxo_pool()
-		.funded(btc(10)).cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(400)).watchmand().create().await;
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(400); }).watchmand().create().await;
 	let wallet = ctx.bark("abandoned", &srv).funded(sat(200_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = wallet.client().await;
@@ -312,6 +312,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	let builder = builder.no_vtxo_pool();
 	let srv = builder
 		.funded(btc(10)).cfg(move |cfg| {
+			cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(400);
 			cfg.receive_htlc_forward_timeout = Duration::from_secs(2);
 			cfg.invoice_check_interval = Duration::from_secs(1);
@@ -466,7 +467,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).bitcoind(ctx.bitcoind_arc())
-		.funded(btc(10)).cfg(move |cfg| {
+		.funded(btc(10)).cfg(move |cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(400);
 			cfg.vtxopool.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxopool.vtxo_pre_expiry = BlockDelta::new(2);
@@ -515,7 +516,7 @@ fn internal_safe_pool_grants(large_cover: bool, expose_small_grant: bool, past_s
 		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
@@ -790,7 +791,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 				.lightningd(&lightning.internal)
 				.no_vtxo_pool()
 				.funded(btc(10))
-				.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(400))
+				.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(400); })
 				.watchmand()
 				.create()
 				.await;

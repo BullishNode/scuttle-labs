@@ -14,11 +14,10 @@ use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::RpcApi;
 use server_rpc::protos;
 
-
 pub(super) async fn claim_server(ctx: &TestContext, node: &Lightningd) -> Arc<Captaind> {
 	let drain = ctx.bitcoind().get_new_address();
 	ctx.captaind("server").lightningd(node).bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(10))
-		.cfg(|cfg| {
+		.cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(1_000);
 			cfg.vtxopool.vtxo_lifetime = BlockDelta::new(1_000);
 			cfg.vtxo_exit_delta = BlockDelta::new(144);

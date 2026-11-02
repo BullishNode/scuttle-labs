@@ -46,13 +46,11 @@ use crate::{
 	MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
 
-
 #[cfg(all(feature = "tonic-native", feature = "tonic-web"))]
 compile_error!("features `tonic-native` and `tonic-web` are mutually exclusive");
 
 #[cfg(all(feature = "socks5-proxy", not(feature = "tonic-native")))]
 compile_error!("the `socks5-proxy` feature is only usable in conjunction with `tonic-native`");
-
 
 /// The HTTP header used for private server access tokens
 #[deprecated(
@@ -76,7 +74,6 @@ pub const NO_TRANSPORT_BACKEND_MESSAGE: &str =
 
 /// Default timeout to add on requests to the server
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
 
 #[cfg(feature = "tonic-native")]
 mod transport {
@@ -221,7 +218,6 @@ mod transport {
 		}
 	}
 }
-
 
 #[derive(Debug, thiserror::Error)]
 #[error("failed to create gRPC endpoint: {msg}")]
@@ -528,6 +524,9 @@ impl ServerConnection {
 		Ok(())
 	}
 
+	/// Protocol version selected by the existing handshake.
+	pub async fn protocol_version(&self) -> u64 { self.info.read().await.pver }
+
 	/// Returns the cached [ArkInfo].
 	pub async fn ark_info(&self) -> ArkInfo {
 		self.info.read().await.info.clone()
@@ -587,32 +586,6 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 mod tests {
 	use super::{check_handshake, ConnectError, CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
 	use crate::{protos, pver};
-
-	#[test]
-	fn scuttle_client_requires_exact_fork_protocol() {
-		for maximum in [pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES, pver::PROTOCOL_VERSION_SCUTTLE - 1] {
-			let old = protos::HandshakeResponse {
-				min_protocol_version: pver::PROTOCOL_VERSION_PPM_FEE_TOTAL,
-				max_protocol_version: maximum,
-				..Default::default()
-			};
-			assert!(matches!(check_handshake(old), Err(ConnectError::ProtocolVersionMismatchServerTooOld {
-				client_min: pver::PROTOCOL_VERSION_SCUTTLE, server_max,
-			}) if server_max == maximum));
-		}
-		let capable = protos::HandshakeResponse {
-			min_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE,
-			max_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE,
-			..Default::default()
-		};
-		assert_eq!(check_handshake(capable).unwrap(), pver::PROTOCOL_VERSION_SCUTTLE);
-		let future = protos::HandshakeResponse {
-			min_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE + 1,
-			max_protocol_version: pver::PROTOCOL_VERSION_SCUTTLE + 1,
-			..Default::default()
-		};
-		assert!(matches!(check_handshake(future), Err(ConnectError::ProtocolVersionMismatchClientTooOld { .. })));
-	}
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {

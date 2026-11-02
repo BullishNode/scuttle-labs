@@ -324,7 +324,7 @@ async fn expiry_actual_partial_conflict_reorg_restores_one_canonical_payment() {
 async fn partial_conflict_reorg() {
 	let ctx = TestContext::new("server/partial_conflict_reorg").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| {
+		.cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxo_exit_delta = BlockDelta::new(3);
 		}).watchmand().create().await;

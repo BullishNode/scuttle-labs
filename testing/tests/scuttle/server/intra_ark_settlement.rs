@@ -60,7 +60,7 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	let ctx = TestContext::new("scuttle/intra_ark_settlement_after_crash").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
-		.cfg(|cfg| cfg.htlc_settlement_poll_interval = Duration::from_millis(50)).create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.htlc_settlement_poll_interval = Duration::from_millis(50); }).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let payer = ctx.bark_sdk("payer", &srv).boarded(sat(100_000))
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
@@ -148,7 +148,6 @@ async fn intra_ark_settlement_completes_after_crash_between_transactions() {
 	}).await.unwrap().into_inner().pays.is_empty(), "intra-Ark must not dispatch an external payment");
 }
 
-
 /// Interrupt the real two-transaction settlement before either the receive
 /// status or cooperative grant spend commits. No financial row is reconstructed.
 #[tokio::test]
@@ -156,7 +155,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	let ctx = TestContext::new("scuttle/succeeded_receive_before_subscription_and_cosign_commit").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
-		.cfg(|cfg| {
+		.cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.htlc_settlement_poll_interval = Duration::from_millis(50);
 			cfg.invoice_check_interval = Duration::from_secs(1);
 		}).watchmand().create().await;

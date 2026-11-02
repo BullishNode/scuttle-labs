@@ -10,7 +10,7 @@ use ark_testing::{sat, constants::BOARD_CONFIRMATIONS};
 #[tokio::test]
 async fn mailbox_fallback_address_is_exposed_through_the_actual_native_barkd() {
 	let ctx = TestContext::new("barkd/fallback_registration_status").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let barkd = ctx.barkd("wallet", &srv).create().await;
 	let config = barkd.client_config();
 	let get = || config.client.get(format!("{}/api/v1/wallet/fallback", config.base_path));
@@ -28,7 +28,7 @@ async fn mailbox_fallback_address_is_exposed_through_the_actual_native_barkd() {
 async fn fallback_expired_lightning_refusal_has_a_stable_native_rest_code() {
 	let ctx = TestContext::new("barkd/fallback_expired_lightning_refusal").await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).create().await;
 	let barkd = ctx.barkd("wallet", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(200_000)).create().await;
 	barkd.onchain_sync().await;

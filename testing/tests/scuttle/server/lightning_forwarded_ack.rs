@@ -84,7 +84,7 @@ fn accepted_reply_loss() -> Pin<Box<dyn Future<Output = ()>>> {
 		let ctx = TestContext::new("server/lightning_forwarded_ack").await;
 		let lightning = ctx.new_lightning_setup("lightningd").await;
 		let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(sat(500_000))
-			.cfg(|config| {
+			.cfg(|config| { config.expiry_payouts = true;
 				config.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
 				config.ln_receive_anti_dos_required = false;
 			}).create().await;

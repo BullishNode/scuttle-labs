@@ -3,7 +3,7 @@
 #[tokio::test]
 async fn send_to_address_without_signed_link_is_refused() {
 	let ctx = TestContext::new("bark_sdk/send_without_signed_link_refused").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let sender = ctx.bark_sdk("sender", &srv).boarded(sat(400_000)).create().await;
 	let receiver = ctx.bark_sdk("recipient", &srv).create().await;
 	let address = receiver.new_address().await.unwrap();
@@ -22,7 +22,7 @@ async fn send_to_address_without_signed_link_is_refused() {
 #[tokio::test]
 async fn offline_signed_addresses_receive_split_and_isolated_outputs() {
 	let ctx = TestContext::new("bark_sdk/offline_signed_addresses_split_isolated").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let sender = ctx.bark_sdk("sender", &srv).boarded(sat(400_000))
 		.cfg(|cfg| { cfg.daemon_manual_sync = true; cfg.change_vtxo_split_factor = 3; }).create().await;
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
@@ -70,7 +70,7 @@ async fn offline_signed_addresses_receive_split_and_isolated_outputs() {
 #[tokio::test]
 async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 	let ctx = TestContext::new("bark_sdk/accepted_arkoor_reply_loss_reopen").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let address = recipient.new_address().await.unwrap();
 	#[derive(Clone)]
@@ -141,7 +141,7 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 	assert!(requests.len() >= 2, "the reopened client must send the accepted transaction again");
 	let first = requests.first().unwrap(); let replay = requests.last().unwrap();
 	assert_eq!(first.parts.len(), replay.parts.len());
-	let own_mailbox = reopened.properties().await.unwrap().mailbox_identity.public_key;
+	let own_mailbox = reopened.properties().await.unwrap().mailbox_identity.unwrap().public_key;
 	let mut reconstructed_own_proof = false;
 	for (a, b) in first.parts.iter().zip(&replay.parts) {
 		assert_eq!(a.input_vtxo_id, b.input_vtxo_id); assert_eq!(a.use_checkpoint, b.use_checkpoint);

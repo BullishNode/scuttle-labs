@@ -1,6 +1,5 @@
 pub(super) use super::owner_helpers::{unmapped_owner_link, assert_owner_refusal, owner_rows, source_rows, vtxo_replay_rows, receive_admission_rows};
 
-
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::lightning::{PaymentHash, Preimage};
@@ -23,7 +22,7 @@ use ark_testing::{btc, sat, TestContext};
 async fn expiry_native_rpc_refusals_have_stable_reasons() {
 	let ctx = TestContext::new("server/expiry_typed_refusals").await;
 	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).create().await;
 	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx,sat(100_000)).await;
 	let wallet = sender.client().await;
@@ -69,7 +68,7 @@ async fn expiry_native_rpc_refusals_have_stable_reasons() {
 #[tokio::test]
 async fn ownership_links_are_required_at_all_eight_admissions() {
 	let ctx = TestContext::new("server/owner_links_all_admissions").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let mut rpc = srv.get_public_rpc().await;
 	let pair = Keypair::from_seckey_slice(&SECP, &[37;32]).unwrap();
 	let mailbox = Keypair::from_seckey_slice(&SECP, &[38;32]).unwrap();
@@ -82,7 +81,7 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 	for proof in [None, Some(version_zero), Some(legacy), Some(missing_mailbox)] {
 		let policy = VtxoPolicy::new_pubkey(key).serialize();
 		let reason = if proof.is_none() { "owner_proof_required" } else { "invalid_owner_proof" };
-		let destination = protos::ArkoorDestination { retired_owner_proof: None,
+		let destination = protos::ArkoorDestination {
 			total_amount: 100_000, policy: policy.clone(), owner_proof: proof.clone(),
 		};
 		let part = protos::ArkoorCosignRequest { outputs: vec![destination], ..Default::default() };
@@ -92,7 +91,7 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 			assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(), reason);
 			assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
 		};
-		refusal(rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+		refusal(rpc.request_board_cosign(protos::BoardCosignRequest {
 			user_pubkey: key.serialize().to_vec(), owner_proof: proof.clone(), ..Default::default()
 		}).await.unwrap_err());
 		refusal(rpc.request_arkoor_cosign(package()).await.unwrap_err());
@@ -100,13 +99,13 @@ async fn ownership_links_are_required_at_all_eight_admissions() {
 			parts: vec![part.clone()],
 		}).await.unwrap_err());
 		refusal(rpc.request_lightning_pay_htlc_revocation(package()).await.unwrap_err());
-		refusal(rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+		refusal(rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 			payment_hash: vec![1; 32], user_pubkey: key.serialize().to_vec(), owner_proof: proof.clone(), ..Default::default()
 		}).await.unwrap_err());
 		refusal(rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 			payment_hash: vec![1; 32], payment_preimage: vec![2; 32], cosign_request: Some(package()),
 		}).await.unwrap_err());
-		let output = protos::VtxoRequest { retired_owner_proof: None, amount: 100_000, policy, owner_proof: proof };
+		let output = protos::VtxoRequest {  amount: 100_000, policy, owner_proof: proof };
 		refusal(rpc.submit_payment(protos::SubmitPaymentRequest {
 			vtxo_requests: vec![protos::SignedVtxoRequest { vtxo: Some(output.clone()), ..Default::default() }],
 			..Default::default()
@@ -194,7 +193,7 @@ async fn reject_package_proofs(
 #[tokio::test]
 async fn ownership_package_refusals_preserve_sources_and_isolated_prefixes() {
 	let ctx = TestContext::new("server/ownership_package_refusals").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let wallet = ctx.bark_sdk("sender", &srv).boarded(sat(400_000))
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let input = wallet.spendable_vtxos().await.unwrap().pop().unwrap();

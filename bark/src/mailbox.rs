@@ -483,6 +483,8 @@ impl Wallet {
 		raw_vtxos: Vec<Vec<u8>>,
 		owners: Vec<protos::core::VtxoOwner>,
 	) -> anyhow::Result<()> {
+		let (srv, _) = self.require_server().await?;
+		let ownership_required = srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
 		let mut owner_map = HashMap::new();
 		for owner in owners {
 			let id = VtxoId::from_slice(&owner.vtxo_id)?;
@@ -490,7 +492,7 @@ impl Wallet {
 			ensure!(owner_map.insert(id, mailbox).is_none(), "duplicate mailbox ownership metadata");
 		}
 		let vtxos = self.process_raw_vtxos(raw_vtxos).await?.into_iter().filter(|vtxo| {
-			let ours = owner_map.get(&vtxo.id()) == Some(&self.mailbox_keypair().public_key());
+			let ours = !ownership_required || owner_map.get(&vtxo.id()) == Some(&self.mailbox_keypair().public_key());
 			if !ours { warn!("Not counting mailbox coin {}: missing or foreign owner mailbox", vtxo.id()); }
 			ours
 		}).collect::<Vec<_>>();

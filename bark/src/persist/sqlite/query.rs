@@ -36,8 +36,8 @@ pub (crate) fn set_properties(
 	properties: &WalletProperties,
 ) -> anyhow::Result<()> {
 	let query =
-		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey)
-		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey)";
+		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey, server_payouts)
+		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey, :server_payouts)";
 	let mut statement = conn.prepare(query)?;
 
 	statement.execute(named_params! {
@@ -45,7 +45,8 @@ pub (crate) fn set_properties(
 		":fingerprint": properties.fingerprint.to_string(),
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
-		":mailbox_pubkey": properties.mailbox_identity.public_key.to_string(),
+		":server_payouts": properties.server_payouts,
+		":mailbox_pubkey": properties.mailbox_identity.as_ref().map(|identity| identity.public_key.to_string()),
 	})?;
 
 	Ok(())
@@ -90,7 +91,7 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT network,fingerprint,server_pubkey,server_mailbox_pubkey,mailbox_pubkey FROM bark_properties";
+	let query = "SELECT network,fingerprint,server_pubkey,server_mailbox_pubkey,mailbox_pubkey,server_payouts FROM bark_properties";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -99,11 +100,11 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
-		let mailbox_pubkey: String = row.get("mailbox_pubkey").context("missing mailbox identity")?;
-		let mailbox_identity = MailboxIdentity {
+		let mailbox_pubkey: Option<String> = row.get("mailbox_pubkey")?;
+		let mailbox_identity = mailbox_pubkey.map(|key| Ok::<_, anyhow::Error>(MailboxIdentity {
 			network: Network::from_str(&network).context("invalid network")?,
-			public_key: PublicKey::from_str(&mailbox_pubkey).context("invalid mailbox public key")?,
-		};
+			public_key: PublicKey::from_str(&key).context("invalid mailbox public key")?,
+		})).transpose()?;
 
 		let server_pubkey = server_pubkey
 			.map(|s| PublicKey::from_str(&s))
@@ -121,6 +122,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
+				server_payouts: row.get("server_payouts")?,
 				mailbox_identity,
 			}
 		))

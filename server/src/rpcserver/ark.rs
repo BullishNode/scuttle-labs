@@ -62,7 +62,6 @@ use crate::secret::Secret;
 use crate::rpcserver::macros;
 use crate::telemetry;
 
-
 /// Map an internal [`SpendState`] to the client-facing [`protos::VtxoSpendState`].
 ///
 /// Returns `None` for server-internal states (pool, forfeit, connector). A user
@@ -128,8 +127,8 @@ impl rpc::server::ArkService for Server {
 		};
 
 		let ret = protos::HandshakeResponse {
-			min_protocol_version: MIN_PROTOCOL_VERSION,
-			max_protocol_version: MAX_PROTOCOL_VERSION,
+			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MIN_PROTOCOL_VERSION },
+			max_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MAX_PROTOCOL_VERSION },
 			psa,
 		};
 		Ok(tonic::Response::new(ret))
@@ -149,7 +148,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::OffboardFeeRateResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&_req)?;
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		let feerate = self.offboard_feerate();
 		Ok(tonic::Response::new(protos::OffboardFeeRateResponse {
 			sat_vkb: feerate.to_sat_per_kwu() * 4,
@@ -161,7 +160,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
@@ -181,7 +180,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxoStatusRequest>,
 	) -> Result<tonic::Response<protos::GetVtxoStatusResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
@@ -222,7 +221,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosByIdsResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > rpc::MAX_NB_VTXO_IDS {
@@ -257,7 +256,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::GetVtxosStatusByIdsRequest>,
 	) -> Result<tonic::Response<protos::GetVtxosStatusByIdsResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > rpc::MAX_NB_VTXO_IDS {
@@ -319,13 +318,12 @@ impl rpc::server::ArkService for Server {
 		}))
 	}
 
-
 	#[tracing::instrument(skip(self, req))]
 	async fn recover_vtxos_by_xpub(
 		&self,
 		req: tonic::Request<protos::RecoverVtxosByXpubRequest>,
 	) -> Result<tonic::Response<protos::RecoverVtxosByXpubResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if self.config.recovery_xpub_nb_keys == 0 {
@@ -406,11 +404,8 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardCosignRequest>,
 	) -> Result<tonic::Response<protos::BoardCosignResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
-		if req.retired_owner_proof.is_some() {
-			return Err(tonic::Status::invalid_argument("retired owner proof field"));
-		}
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_BOARD_FUNDING_TX
 			&& self.config.require_board_funding_tx
@@ -422,7 +417,7 @@ impl rpc::server::ArkService for Server {
 		let amount = Amount::from_sat(req.amount);
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
 		let mut owner_links = OwnerLinks::default();
-		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref()).to_status()?;
+		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref(), self.config.expiry_payouts).to_status()?;
 		let expiry_height = check_block_height(req.expiry_height)
 			.map_err(|e| tonic::Status::invalid_argument(format!("expiry_height: {e}")))?;
 		let utxo = OutPoint::from_bytes(&req.utxo)?;
@@ -448,7 +443,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::BoardVtxoRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let vtxo = <Vtxo<Full>>::deserialize(&req.board_vtxo[..])
@@ -466,7 +461,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -495,7 +490,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RegisterVtxoTransactionsRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.is_empty() {
@@ -523,12 +518,12 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
 		}
-		let owner_links = OwnerLinks::from_parts(&req.parts).to_status()?;
+		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
 		let request = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
@@ -543,7 +538,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LightningPayHtlcCosignRequest>,
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -554,7 +549,7 @@ impl rpc::server::ArkService for Server {
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
 		}
-		let owner_links = OwnerLinks::from_parts(&req.parts).to_status()?;
+		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
 			.badarg("invalid cosign request")?;
 
@@ -569,7 +564,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::InitiateLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -604,7 +599,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningPaymentRequest>,
 	) -> Result<tonic::Response<protos::LightningPaymentStatus>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
@@ -619,12 +614,12 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ArkoorPackageCosignRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
 		}
-		let owner_links = OwnerLinks::from_parts(&req.parts).to_status()?;
+		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
@@ -639,7 +634,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FetchBolt12InvoiceRequest>,
 	) -> Result<tonic::Response<protos::FetchBolt12InvoiceResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let offer = match Offer::try_from(req.offer.to_vec()) {
@@ -668,7 +663,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::StartLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::StartLightningReceiveResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -702,7 +697,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CheckLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::CheckLightningReceiveResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
@@ -720,15 +715,12 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareLightningReceiveClaimRequest>
 	) -> Result<tonic::Response<protos::PrepareLightningReceiveClaimResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		// For token filters. Like the integration API, this trusts the
 		// proxy chain to set `X-Forwarded-For`, see `RemoteAddrService`.
 		let client_address = req.extensions().get::<SocketAddr>().cloned()
 			.or_else(|| req.remote_addr());
 		let req = req.into_inner();
-		if req.retired_owner_proof.is_some() {
-			return Err(tonic::Status::invalid_argument("retired owner proof field"));
-		}
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
 			macros::badarg!("Your client version is too old, you need to update \
@@ -739,7 +731,7 @@ impl rpc::server::ArkService for Server {
 
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
 		let mut owner_links = OwnerLinks::default();
-		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref()).to_status()?;
+		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref(), self.config.expiry_payouts).to_status()?;
 		let htlc_recv_expiry = BlockHeight::new(req.htlc_recv_expiry);
 
 		let (sub, htlcs) = self.prepare_lightning_claim(
@@ -758,14 +750,14 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ClaimLightningReceiveRequest>
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
 
 		let payment_preimage = Preimage::from_bytes(req.payment_preimage)?;
 		let raw_cosign = req.cosign_request.badarg("cosign request missing")?;
-		let owner_links = OwnerLinks::from_parts(&raw_cosign.parts).to_status()?;
+		let owner_links = OwnerLinks::from_parts(&raw_cosign.parts, self.config.expiry_payouts).to_status()?;
 		let cosign_request = ArkoorPackageCosignRequest::try_from(raw_cosign)
 			.badarg("invalid cosign request")?;
 
@@ -785,7 +777,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::CancelLightningReceiveRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
@@ -802,7 +794,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::NextRoundTimeResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&_req)?;
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		Ok(tonic::Response::new(protos::NextRoundTimeResponse {
 			timestamp: self.rounds.next_round_time.read()
 				.duration_since(UNIX_EPOCH).expect("we set this value beyond unix epoch")
@@ -822,7 +814,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<Self::SubscribeRoundsStream>, tonic::Status> {
-		super::validate_scuttle_pver(&_req)?;
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		let mgr = self.rtmgr.clone();
 		let stream = self.rounds.events()
 			.map(|e| Ok(e.as_ref().into()))
@@ -835,7 +827,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		_req: tonic::Request<protos::Empty>,
 	) -> Result<tonic::Response<protos::RoundEvent>, tonic::Status> {
-		super::validate_scuttle_pver(&_req)?;
+		super::validate_pver(&_req, self.config.expiry_payouts)?;
 		if let Some(event) = self.rounds.last_event() {
 			Ok(tonic::Response::new(event.as_ref().into()))
 		} else {
@@ -851,7 +843,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::SubmitPaymentRequest>,
 	) -> Result<tonic::Response<protos::SubmitPaymentResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -870,7 +862,7 @@ impl rpc::server::ArkService for Server {
 		let mut owner_links = OwnerLinks::default();
 		let mut vtxo_requests = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests.clone() {
-			owner_links.insert_request(r.vtxo.as_ref().badarg("missing vtxo request")?).to_status()?;
+			owner_links.insert_request(r.vtxo.as_ref().badarg("missing vtxo request")?, self.config.expiry_payouts).to_status()?;
 			// Make sure users provided right number of nonces.
 			if r.public_nonces.len() != self.config.nb_round_nonces {
 				macros::badarg!("need exactly {} public nonces", self.config.nb_round_nonces);
@@ -911,7 +903,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::VtxoSignaturesRequest>,
 	) -> Result<tonic::Response<protos::Empty>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -943,7 +935,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -971,7 +963,7 @@ impl rpc::server::ArkService for Server {
 		let mut owner_links = OwnerLinks::default();
 		let mut outputs = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests {
-			owner_links.insert_request(&r).to_status()?;
+			owner_links.insert_request(&r, self.config.expiry_payouts).to_status()?;
 			outputs.push(StoredRoundOutput {
 				vtxo_request: r.try_into().badarg("invalid vtxo request")?,
 				unblinded_mailbox_id,
@@ -992,7 +984,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::RoundParticipationStatusRequest>,
 	) -> Result<tonic::Response<protos::RoundParticipationStatusResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let unlock_hash = UnlockHash::from_bytes(&req.unlock_hash)?;
@@ -1072,7 +1064,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::LeafVtxoCosignRequest>,
 	) -> Result<tonic::Response<protos::LeafVtxoCosignResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1094,7 +1086,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitNoncesRequest>,
 	) -> Result<tonic::Response<protos::ForfeitNoncesResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1125,7 +1117,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::ForfeitVtxosRequest>,
 	) -> Result<tonic::Response<protos::ForfeitVtxosResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if pver < server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES {
@@ -1149,7 +1141,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::PrepareOffboardRequest>,
 	) -> Result<tonic::Response<protos::PrepareOffboardResponse>, tonic::Status> {
-		let pver = super::validate_scuttle_pver(&req)?;
+		let pver = super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let request = req.offboard.badarg("missing offboard field")?.try_into()
@@ -1189,7 +1181,7 @@ impl rpc::server::ArkService for Server {
 		&self,
 		req: tonic::Request<protos::FinishOffboardRequest>,
 	) -> Result<tonic::Response<protos::FinishOffboardResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let offboard_txid = Txid::from_bytes(req.offboard_txid)?;

@@ -65,7 +65,7 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 		else if pin { "server/mempool_pinned_root_is_fee_bumped" }
 		else { "server/expiry_requested_mixed_split" }).await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand()
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).watchmand()
 		.watchmand_cfg(|cfg| cfg.postgres.max_connections = 1).create().await;
 	let wallet = ctx.bark("abandoned", &srv).funded(sat(200_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;

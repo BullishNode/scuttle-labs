@@ -8,7 +8,7 @@ use server_rpc::protos;
 #[tokio::test]
 async fn watchman_wallet_admin_status_exposes_its_own_funding_address_and_balance() {
 	let ctx = TestContext::new("server/watchman_wallet_admin_status").await;
-	let srv = ctx.captaind("server").watchmand().create().await;
+	let srv = ctx.captaind("server").watchmand().cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let address = srv.watchmand().config().admin_address.unwrap().to_string();
 	let mut rpc = WalletAdminServiceClient::connect(format!("http://{address}")).await.unwrap();
 	let status = rpc.wallet_status(protos::Empty {}).await.unwrap().into_inner();

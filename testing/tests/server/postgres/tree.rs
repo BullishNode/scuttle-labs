@@ -19,7 +19,6 @@ async fn test_db(name: &str) -> (TestContext, Db) {
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 	Db::create(&postgres_cfg).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::super::register_vector_owners(&db).await;
 	(ctx, db)
 }
 

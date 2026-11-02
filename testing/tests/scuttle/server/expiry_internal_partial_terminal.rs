@@ -83,7 +83,7 @@ async fn partial_terminal(case: TerminalCase) {
 	let operator = ctx.bitcoind().get_new_address();
 	let operator_config = operator.clone();
 	let srv = Box::pin(ctx.captaind("server").lightningd(&lightning.internal).bitcoind(ctx.bitcoind_arc())
-		.funded(btc(10)).cfg(|cfg| {
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxopool.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxopool.vtxo_pre_expiry = BlockDelta::new(2);
@@ -132,7 +132,7 @@ async fn partial_terminal(case: TerminalCase) {
 		htlc_vtxo_ids: sources.iter().map(|source| source.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(5),
 	}).await.unwrap();
-	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(36)).to_u32(), lightning_receive_anti_dos: None,

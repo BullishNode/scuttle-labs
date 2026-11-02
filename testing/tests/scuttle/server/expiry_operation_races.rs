@@ -75,7 +75,7 @@ async fn offboard_race(offboard_wins: bool, finality: bool) {
 		else { "server/expiry_native_decision_wins" };
 	let ctx = TestContext::new(name).await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).watchmand().create().await;
 	let (send, arrived) = oneshot::channel();
 	let gate = HoldFinish {
 		arrived: Arc::new(Mutex::new(Some(send))), release: Arc::new(Notify::new()),
@@ -367,7 +367,7 @@ async fn expiry_registered_native_offboard_wins_over_waiting_decision() {
 async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 	let ctx = TestContext::new("server/expiry_post_backing_grant_revocation").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).watchmand().create().await;
 	// Abandonment means this actor runs no automatic protection task.
 	let wallet = ctx.bark_sdk("owner", &srv)
 		.cfg(|config| config.daemon_manual_sync = true).boarded(sat(100_000)).create().await;
@@ -441,7 +441,6 @@ async fn expiry_prepared_offboard_retains_principal_when_payout_reorgs() {
 	offboard_race(false, true).await;
 }
 
-
 /// One expired, never-finished two-input intent is superseded by a real
 /// ordinary spend of lower-ID B and canonical customer fallback of A.
 #[tokio::test]
@@ -449,7 +448,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	const SESSION_TIMEOUT: Duration = Duration::from_secs(5);
 	let ctx=TestContext::new("server/mixed_terminal_offboard_lower_id_ordinary_spend").await;
 	let srv=ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
-		.cfg(|cfg| { cfg.vtxo_lifetime=BlockDelta::new(24); cfg.offboard_session_timeout=SESSION_TIMEOUT; })
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime=BlockDelta::new(24); cfg.offboard_session_timeout=SESSION_TIMEOUT; })
 		.watchmand().create().await;
 	srv.watchmand().stop().await.unwrap();
 	#[derive(Clone)]

@@ -2,7 +2,6 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
@@ -696,7 +695,7 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 			let mut rpc = rpc::admin::ScuttleServiceClient::connect(endpoint)
 				.await.context("failed to connect to operator rpc")?;
 			let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id, native_cold_restart_confirmed });
-			request.set_pver(rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+			request.set_pver(rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
 			let response = rpc.reconcile_lightning_attempt(request).await?.into_inner();
 			serde_json::to_writer_pretty(std::io::stdout(), &serde_json::json!({
 				"attempt_id": response.attempt_id,

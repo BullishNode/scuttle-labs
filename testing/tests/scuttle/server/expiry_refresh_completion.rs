@@ -70,7 +70,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 		else { "server/expiry_native_refresh_decision_wins" };
 	let ctx = TestContext::new(name).await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.funded(btc(1)).cfg(|cfg| {
+		.funded(btc(1)).cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(40);
 			cfg.vtxo_exit_delta = BlockDelta::new(2);
 		})
@@ -329,7 +329,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 	Box::pin(async {
 		let ctx = TestContext::new("server/expiry_pre_persist_round_decision").await;
 		let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-			.funded(btc(1)).cfg(|cfg| {
+			.funded(btc(1)).cfg(|cfg| { cfg.expiry_payouts = true;
 				cfg.vtxo_lifetime = BlockDelta::new(40);
 				cfg.vtxo_exit_delta = BlockDelta::new(2);
 			}).watchmand().create().await;

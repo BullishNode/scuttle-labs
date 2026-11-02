@@ -77,7 +77,7 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 async fn unseen_paid_mailbox() {
 	require_bitcoind_chain_source!();
 	let ctx = TestContext::new("bark_sdk/full_sync_unseen_paid_mailbox").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| { cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(24);
 		cfg.vtxo_exit_delta = BlockDelta::new(3);
 	}).watchmand().create().await;
@@ -221,7 +221,7 @@ async fn provisional_recipient_transfer_pays_input_owner() {
 
 async fn stalled_change() {
 	let ctx = TestContext::new("bark_sdk/stalled_arkoor_change_pending").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
 		config.vtxo_lifetime = BlockDelta::new(24);
 		config.vtxo_exit_delta = BlockDelta::new(3);
 	}).watchmand().create().await;

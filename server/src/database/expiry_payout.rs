@@ -184,6 +184,7 @@ impl Tx<'_> {
 	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId], bitcoind: &bitcoind_async_client::Client)
 		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
 	{
+		if !self.expiry_payouts() { return Ok(BTreeMap::new()); }
 		let claims = self.source_fallback_claims(ids, bitcoind).await?;
 		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
 		let owners = self.coin_owner_mailboxes(ids).await?;
@@ -205,6 +206,7 @@ impl Tx<'_> {
 	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription, bitcoind: &bitcoind_async_client::Client)
 		-> anyhow::Result<Option<FallbackOutcome>>
 	{
+		if !self.expiry_payouts() { return Ok(None); }
 		let rows = self.query("SELECT v.vtxo_id,v.amount,c.output_vtxo_id,c.output_vtxo
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing'
 			JOIN lightning_htlc_subscription s ON s.id=v.lightning_htlc_subscription_id AND s.payment_hash=h.payment_hash
@@ -510,6 +512,7 @@ impl Tx<'_> {
 	/// Shared preimage knowledge cannot authorize an unpaid send's drain claim.
 	/// Keep the exact source and its outcome stable through native publication.
 	pub async fn lock_watchman_claim_inputs(&self, vtxos: &[ServerVtxo]) -> anyhow::Result<()> {
+		if !self.expiry_payouts() { return Ok(()); }
 		let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
 		self.lock_unallocated_watchman_inputs(&ids).await?;
 		for candidate in vtxos {
@@ -563,6 +566,7 @@ impl Tx<'_> {
 	/// keep these locks through broadcast, including when the root is not itself
 	/// one of the economic customer terminals.
 	pub async fn lock_unallocated_watchman_inputs(&self, ids: &[ark::VtxoId]) -> anyhow::Result<()> {
+		if !self.expiry_payouts() { return Ok(()); }
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
 		// Physical reservations survive while pending/confirmed. An operator

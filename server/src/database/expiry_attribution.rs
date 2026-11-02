@@ -32,6 +32,7 @@ impl Tx<'_> {
 	/// Every member of a delivery batch must have the same admitted mailbox.
 	/// Check this before allocating a mailbox checkpoint in the same transaction.
 	pub async fn delivery_owners_match(&self, ids: &[VtxoId], mailbox: MailboxIdentifier) -> anyhow::Result<bool> {
+		if !self.expiry_payouts() { return Ok(true); }
 		let owners = self.coin_owner_mailboxes(ids).await?;
 		let ids = ids.iter().copied().collect::<BTreeSet<_>>();
 		Ok(ids.len() == owners.len() && owners.values().all(|owner| *owner == mailbox.as_pubkey()))
@@ -94,6 +95,6 @@ mod tests {
 	fn customer_coin_owner_trigger_exempts_the_round_padding_policy() {
 		let policy = ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE));
 		let literal = format!("decode('{}', 'hex')", policy.serialize().as_hex());
-		assert!(include_str!("scuttle.sql").contains(&literal), "{literal}");
+		assert!(include_str!("migrations/V78__expiry_payouts.sql").contains(&literal), "{literal}");
 	}
 }

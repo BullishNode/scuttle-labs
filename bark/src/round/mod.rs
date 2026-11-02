@@ -1233,7 +1233,7 @@ async fn start_attempt(
 	for request in &mut requests {
 		let output = request.vtxo.as_mut().context("missing round output")?;
 		let key = VtxoPolicy::deserialize(&output.policy)?.user_pubkey();
-		output.owner_proof = Some(links[&key].into());
+		output.owner_proof = links.get(&key).copied().map(Into::into);
 	}
 	let resp = srv.client.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: input_vtxos,
@@ -2300,8 +2300,8 @@ impl Wallet {
 		// Build proto VtxoRequests
 		let vtxo_requests = participation.outputs.iter()
 			.map(|req|
-				protos::VtxoRequest { retired_owner_proof: None,
-					owner_proof: Some(links[&req.policy.user_pubkey()].into()),
+				protos::VtxoRequest {
+					owner_proof: links.get(&req.policy.user_pubkey()).copied().map(Into::into),
 					policy: req.policy.serialize(),
 					amount: req.amount.to_sat(),
 			})

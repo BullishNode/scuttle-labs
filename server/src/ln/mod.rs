@@ -48,8 +48,6 @@ use crate::error::ContextExt;
 use crate::owner_proof::OwnerLinks;
 use crate::{check_max_amount, telemetry, Server, CAPTAIND_API_KEY};
 
-
-
 /// Validate the client-requested HTLC-recv VTXO expiry leaves at
 /// least `htlc_expiry_delta` blocks of settlement margin below the
 /// inbound Lightning HTLC expiry, both for the request and the
@@ -152,7 +150,6 @@ pub(crate) fn validate_intra_ark_payment(
 
 	Ok(())
 }
-
 
 /// The margin (in blocks) the server requires between the current chain tip
 /// and the lowest incoming HTLC expiry when cosigning a lightning receive
@@ -698,7 +695,7 @@ impl Server {
 				return badarg!("claim destination amount differs from receive amount after fees");
 			}
 			let mut links = OwnerLinks::default();
-			links.insert_request(&destination)?;
+			links.insert_request(&destination, self.config.expiry_payouts)?;
 			self.db.write(async |t| links.verify(t, [policy.user_pubkey()],
 				self.mailbox_key.leak_ref(), self.config.network).await).await?;
 		}
@@ -846,7 +843,9 @@ impl Server {
 		owner_links: &crate::owner_proof::OwnerLinks,
 		client_address: Option<SocketAddr>,
 	) -> anyhow::Result<(LightningHtlcSubscription, Vec<Vtxo<Full>>)> {
-		owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		if self.config.expiry_payouts {
+			owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		}
 		// Held for the whole call. The status only becomes `htlcs-ready` after
 		// the arkoor is persisted, so without this lock concurrent calls each
 		// allocate a full HTLC set for one invoice and can each return a
@@ -1160,7 +1159,6 @@ impl Server {
 		Ok(builder.cosign_response())
 	}
 }
-
 
 #[cfg(test)]
 mod tests {

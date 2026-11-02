@@ -4,7 +4,7 @@
 async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	let ctx = TestContext::new("server/forwarded_claim_refusals").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let address = recipient.new_address().await.unwrap();
@@ -47,7 +47,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let ctx = TestContext::new("server/failed_intra_ark_promotion_other_payer").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
-		.cfg(|cfg| cfg.receive_htlc_forward_timeout = Duration::from_secs(3600)).create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.receive_htlc_forward_timeout = Duration::from_secs(3600); }).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let sender = ctx.bark("sender", &srv).funded(sat(200_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
@@ -71,7 +71,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	wait_for_subscription_status(&db, hash, "accepted").await;
 	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let tip = ctx.bitcoind().get_block_count().await as u32;
-	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(super::test_owner_link(&srv, &receiver).await.into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 		htlc_recv_expiry: tip + 32, lightning_receive_anti_dos: None,
@@ -126,7 +126,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let payer = Arc::new(lightning.external);
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
-		.funded(btc(10)).cfg(|cfg| {
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
 		}).watchmand().create().await;
 	srv.wait_for_vtxopool(&ctx).await;
@@ -154,7 +154,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		.await.unwrap().unwrap();
 	let incoming_expiry = subscription.lowest_incoming_htlc_expiry.unwrap();
 	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(super::test_owner_link(&srv, &receiver).await.into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 		htlc_recv_expiry: incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta).into(),

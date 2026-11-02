@@ -1499,7 +1499,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
+			vtxo: Some(protos::VtxoRequest {
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1548,7 +1548,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![fake_input],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
+			vtxo: Some(protos::VtxoRequest {
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1672,7 +1672,7 @@ async fn reject_overlong_board_cosign() {
 	};
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
@@ -1729,7 +1729,7 @@ async fn request_board_cosign_with_funding_tx(
 	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&user_key);
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
@@ -2243,7 +2243,6 @@ async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).create().await;
 
-
 	bark.board(sat(400_000)).await;
 	bark.board(sat(400_000)).await;
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
@@ -2527,7 +2526,6 @@ async fn should_refuse_round_input_vtxo_that_is_being_exited() {
 	);
 }
 
-
 /// Tests the register_board endpoint.
 ///
 /// This test covers:
@@ -2577,7 +2575,7 @@ async fn test_register_board() {
 		.generate_user_nonces();
 
 	// Request server to cosign the board
-	let cosign_request = protos::BoardCosignRequest { retired_owner_proof: None,
+	let cosign_request = protos::BoardCosignRequest {
 		owner_proof: Some(test_owner_link(&srv, &client_cosign_keypair).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
@@ -2894,7 +2892,6 @@ async fn board_exit_tx_prevents_registration() {
 	let balance = bark.spendable_balance_no_sync().await;
 	assert_eq!(balance, Amount::ZERO, "spendable balance should be zero since board was not registered");
 }
-
 
 #[tokio::test]
 async fn scheduled_height_must_not_poison_round_loading() {

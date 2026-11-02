@@ -184,7 +184,6 @@ message GetVtxoRequest {
 
 message GetVtxoResponse {
 	bytes vtxo = 1;
-	reserved 1000;
 }
 
 message GetVtxosByIdsRequest {
@@ -198,7 +197,6 @@ message GetVtxosByIdsResponse {
 	repeated bytes vtxos = 1;
 	// Requested ids the server does not know, each once.
 	repeated bytes missing_vtxo_ids = 2;
-	reserved 1000;
 }
 
 // Client-relevant spend state for a user-owned VTXO.
@@ -220,7 +218,6 @@ enum VtxoSpendState {
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
 	// A committed fallback decision has unresolved relevant portions.
-	reserved 6;
 	VTXO_SPEND_STATE_FALLBACK_PENDING = 1000;
 	// Terminal policy result with no Bitcoin payout.
 	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 1001;
@@ -235,7 +232,6 @@ message GetVtxoStatusRequest {
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
 	bytes owner_mailbox = 1000;
-	reserved 1001;
 	bool fallback_committed = 1002;
 }
 
@@ -254,7 +250,6 @@ message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
 	bytes owner_mailbox = 1000;
-	reserved 1001;
 	bool fallback_committed = 1002;
 }
 
@@ -290,7 +285,6 @@ message RecoveredVtxo {
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
 	bytes owner_mailbox = 1000;
-	reserved 1001;
 	bool fallback_committed = 1002;
 }
 
@@ -314,7 +308,6 @@ message RecoverVtxosByXpubResponse {
 // Versioned coin and mailbox authorization of a server-specific link.
 message OwnerProof {
 	bytes blinded_mailbox_id = 1;
-	reserved 2;
 	bytes signature = 3;
 	uint32 version = 4;
 	bytes mailbox_signature = 5;
@@ -327,8 +320,6 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 7;
 	OwnerProof owner_proof = 1000;
 }
 
@@ -352,16 +343,12 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 3;
 	OwnerProof owner_proof = 1000;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 3;
 	OwnerProof owner_proof = 1000;
 }
 
@@ -410,7 +397,6 @@ message InitiateLightningPaymentRequest {
 message CheckLightningPaymentRequest {
 	bytes hash = 1;
 	bool wait = 2;
-	reserved 3;
 	// Complete HTLC input set of the payment attempt being checked.
 	repeated bytes htlc_vtxo_ids = 1000;
 }
@@ -427,7 +413,6 @@ message LightningPaymentStatus {
 		// unchanged and an older peer still matches the `failed` arm.
 		core.LightningPaymentFailure failed = 3;
 	};
-	reserved 4;
 	// Input scope validated against the server's recorded payment attempt.
 	repeated bytes htlc_vtxo_ids = 1000;
 }
@@ -448,7 +433,6 @@ message StartLightningReceiveRequest {
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
 	// Point-in-time check for an explicit recipient before invoice creation.
-	reserved 7;
 	VtxoRequest claim_destination = 1000;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
@@ -472,8 +456,6 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 6;
 	OwnerProof owner_proof = 1000;
 }
 

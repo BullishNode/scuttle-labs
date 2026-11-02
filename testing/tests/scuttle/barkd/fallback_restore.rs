@@ -18,7 +18,7 @@ use ark_testing::constants::BOARD_CONFIRMATIONS;
 async fn fallback_payout_history_and_seed_restore() {
 	let ctx = TestContext::new("barkd/fallback_payout_history_and_seed_restore").await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); })
 		.watchmand().create().await;
 	let mnemonic = bip39::Mnemonic::from_entropy(&[43; 32]).unwrap().to_string();
 	let barkd = ctx.barkd("wallet", &srv).mnemonic(mnemonic.clone())

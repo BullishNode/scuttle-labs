@@ -471,6 +471,26 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		}
 	}
 
+	async fn set_mailbox_identity(&self, identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		let mut properties: WalletProperties = lock.get(partition::PROPERTIES, &[]).await?
+			.context("wallet not initialized")?.to_data()?;
+		ensure!(properties.network == identity.network
+			&& properties.mailbox_identity.as_ref().is_none_or(|stored| *stored == identity),
+			"mailbox identity differs from the stored wallet");
+		properties.mailbox_identity = Some(identity);
+		lock.put(Record::from_data(partition::PROPERTIES, &[], None, &properties)?).await
+	}
+
+	async fn set_server_payouts(&self, payouts: bool) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		let mut properties: WalletProperties = lock.get(partition::PROPERTIES, &[]).await?
+			.context("wallet not initialized")?.to_data()?;
+		ensure!(properties.server_payouts.is_none_or(|stored| stored == payouts), "server payout mode has changed");
+		properties.server_payouts = Some(payouts);
+		lock.put(Record::from_data(partition::PROPERTIES, &[], None, &properties)?).await
+	}
+
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
 		let mut properties = match self.read_properties().await? {
 			Some(properties) => properties,

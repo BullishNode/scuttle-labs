@@ -1,7 +1,7 @@
 #[tokio::test]
 async fn recovery_posts_do_not_create_or_change_coin_ownership() {
 	let ctx = TestContext::new("scuttle/recovery_posts_do_not_create_ownership").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let server_key = srv.mailbox_keypair();
 	let coin_key = Keypair::new(&SECP, &mut thread_rng());
@@ -78,7 +78,7 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 	let mut ctx = TestContext::new_minimal("postgresd/delivery_owner_batch").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create(&config).await.unwrap();
+	let db = Db::create_with_payouts(&config, true).await.unwrap();
 	let server = super::test_server_mailbox_key();
 	let first = Keypair::new(&SECP, &mut thread_rng());
 	let second = Keypair::new(&SECP, &mut thread_rng());
@@ -115,7 +115,7 @@ async fn delivery_owner_check_rejects_an_incomplete_or_mixed_batch() {
 #[tokio::test]
 async fn mailbox_authorization_delivery_and_commit_notifications() {
 	let ctx = TestContext::new("server/mailbox_authorization_delivery_and_commit_notifications").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let server_key = srv.mailbox_keypair();
 	let coin_key = Keypair::new(&SECP, &mut thread_rng());

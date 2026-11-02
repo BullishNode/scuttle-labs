@@ -168,7 +168,7 @@ impl Wallet {
 	pub async fn validate_arkoor_address(&self, address: &ark::Address) -> Result<(), ArkoorAddressError> {
 		let network = self.network().await
 			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?;
-		let (_, ark_info) = self.require_server().await
+		let (srv, ark_info) = self.require_server().await
 			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?;
 
 		let network_kind = NetworkKind::from(network);
@@ -191,9 +191,11 @@ impl Wallet {
 		}
 
 		check_delivery(address.delivery())?;
-		address.owner_link(network, ark_info.mailbox_pubkey)
-			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?
-			.ok_or(ArkoorAddressError::RecipientMustUpdate)?;
+		if srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS {
+			address.owner_link(network, ark_info.mailbox_pubkey)
+				.map_err(|e| ArkoorAddressError::Other(e.to_string()))?
+				.ok_or(ArkoorAddressError::RecipientMustUpdate)?;
+		}
 
 		Ok(())
 	}

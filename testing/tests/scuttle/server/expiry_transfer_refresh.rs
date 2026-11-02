@@ -18,7 +18,7 @@ use server::database::Db;
 async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 	let ctx = TestContext::new("server/expiry_transfer_refresh_recipient").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.funded(btc(1)).cfg(|cfg| {
+		.funded(btc(1)).cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(40);
 			cfg.vtxo_exit_delta = BlockDelta::new(2);
 			// Match the declared public-Signet board fee, rather than the zero-fee test default.

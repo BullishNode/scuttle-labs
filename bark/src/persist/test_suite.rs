@@ -126,7 +126,8 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
-		mailbox_identity: crate::MailboxIdentity { network: Network::Regtest, public_key: test_pubkey() },
+		server_payouts: None,
+		mailbox_identity: Some(crate::MailboxIdentity { network: Network::Regtest, public_key: test_pubkey() }),
 	}
 }
 
@@ -306,11 +307,11 @@ pub async fn test_external_mailbox_public_identity_roundtrip(db: &impl BarkPersi
 	let key = if key.serialize()[0] == 3 { key } else { key.negate(&secp) };
 	assert_eq!(key.serialize()[0], 3);
 	let mut props = test_properties();
-	props.mailbox_identity = crate::MailboxIdentity { network: props.network, public_key: key };
+	props.mailbox_identity = Some(crate::MailboxIdentity { network: props.network, public_key: key });
 	db.init_wallet(&props).await.expect("init external mailbox identity");
 	let read = db.read_properties().await.unwrap().unwrap();
 	assert_eq!(read, props);
-	assert_eq!(read.mailbox_identity.public_key.serialize(), key.serialize());
+	assert_eq!(read.mailbox_identity.unwrap().public_key.serialize(), key.serialize());
 }
 
 pub async fn test_set_server_pubkey(db: &impl BarkPersister) {

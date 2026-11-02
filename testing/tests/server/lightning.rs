@@ -43,7 +43,6 @@ use bitcoin_ext::AmountExt;
 
 use cln_rpc::plugins::hold;
 
-
 /// Asserts that every unspent entry in `vtxo_pool` (`spent_at IS NULL`)
 /// references a `vtxo` row with `spend_state = 'pool'`.
 async fn assert_vtxopool_consistency_db(db: &Db) {
@@ -165,7 +164,6 @@ async fn revoke_htlc_vtxos(
 	let mut srv_rpc = srv.get_public_rpc().await;
 	srv_rpc.request_lightning_pay_htlc_revocation(cosign_request).await.map(|_| ())
 }
-
 
 /// Verify that the server extracts preimages from on-chain HTLC spends
 /// and uses them to settle invoices.
@@ -2470,7 +2468,6 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 	assert_eq!(resp.status, protos::LightningReceiveStatus::Canceled as i32);
 }
 
-
 async fn server_claim_lightning_receive_is_idempotent(
 	ctx: &TestContext,
 	_lightning: &LightningPaymentSetup,
@@ -2531,7 +2528,6 @@ async fn server_claim_lightning_receive_is_idempotent(
 }
 lightning_test!(server_claim_lightning_receive_is_idempotent);
 
-
 async fn server_returned_htlc_recv_vtxos_identical(
 	ctx: &TestContext,
 	_lightning: &LightningPaymentSetup,
@@ -2579,7 +2575,7 @@ async fn server_returned_htlc_recv_vtxos_identical(
 
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 			let link = super::expiry_admission::unmapped_owner_link(srv, &keypair, &keypair).await;
-			let req_1 = protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+			let req_1 = protos::PrepareLightningReceiveClaimRequest {
 				owner_proof: Some(link.into()), payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(), htlc_recv_expiry: 172,
 				lightning_receive_anti_dos: Some(protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos::Token(token.clone())),
@@ -2622,7 +2618,7 @@ async fn server_returned_htlc_recv_vtxos_identical(
 
 			// we change keypair to make sure server don't use it on second request
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-			let req_2 = protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+			let req_2 = protos::PrepareLightningReceiveClaimRequest {
 				owner_proof: Some(super::expiry_admission::unmapped_owner_link(srv, &keypair, &keypair).await.into()),
 				payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -2706,7 +2702,7 @@ async fn server_concurrent_prepare_lightning_claim(
 		let payment_hash = receive.payment_hash;
 		async move {
 			let mut client = srv.get_public_rpc().await;
-			client.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+			client.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 				owner_proof: Some(proof.into()),
 				payment_hash: payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -2754,7 +2750,7 @@ async fn server_concurrent_prepare_lightning_claim(
 	// return the winner's vtxos instead of allocating a new set.
 	let retry_keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let retry = srv.get_public_rpc().await
-		.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+		.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 			owner_proof: Some(super::test_owner_link(&srv, &retry_keypair).await.into()),
 			payment_hash: receive.payment_hash.to_vec(),
 			user_pubkey: retry_keypair.public_key().serialize().to_vec(),
@@ -2816,7 +2812,7 @@ async fn refuses_htlc_recv_expiry_past_lowest_incoming_htlc_expiry(
 			// Boundary: requested + delta == lowest + 1. Server must refuse.
 			let attacker_expiry = lowest.saturating_sub(htlc_expiry_delta).to_u32() + 1;
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-			let req = protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+			let req = protos::PrepareLightningReceiveClaimRequest {
 				owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 				payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -2835,7 +2831,7 @@ async fn refuses_htlc_recv_expiry_past_lowest_incoming_htlc_expiry(
 			// Just below the boundary: requested + delta == lowest. Must accept.
 			let safe_expiry = lowest.saturating_sub(htlc_expiry_delta).to_u32();
 			let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-			let req_safe = protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+			let req_safe = protos::PrepareLightningReceiveClaimRequest {
 				owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 				payment_hash: receive.payment_hash.to_vec(),
 				user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -2933,7 +2929,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	// HTLC-recv VTXOs are now outstanding value of the server.
 	let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let granted = rpc
-		.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+		.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 			owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 			payment_hash: payment_hash.as_ref().to_vec(),
 			user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -3129,7 +3125,7 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 		.expect("Accepted subscription must record lowest incoming HTLC expiry");
 
 	let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	let err = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let err = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(super::test_owner_link(&srv, &keypair).await.into()),
 		payment_hash: payment_hash.as_ref().to_vec(),
 		user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -3159,7 +3155,6 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 
 	assert_vtxopool_consistency(&srv).await;
 }
-
 
 /// An intra-Ark payment of a receive is refused while an outgoing payment to
 /// another invoice with the same payment hash is still open.
@@ -3646,7 +3641,6 @@ async fn server_can_use_vtxo_pool_change_for_next_receive() {
 			cloned_sender.pay_bolt11(cloned_invoice_info.invoice).await
 		});
 
-
 		bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000).await;
 		// HTLC settlement on lightning side
 		res1.ready().await.unwrap();
@@ -3661,7 +3655,6 @@ async fn server_can_use_vtxo_pool_change_for_next_receive() {
 		let res1 = tokio::spawn(async move {
 			cloned_sender.pay_bolt11(cloned_invoice_info.invoice).await
 		});
-
 
 		bark.lightning_receive(&invoice_info.invoice).wait_millis(10_000).await;
 		// HTLC settlement on lightning side
@@ -3945,7 +3938,7 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 		payment_hash: old_hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
 		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None,
 	});
-	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_SCUTTLE - 1);
+	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS - 1);
 	let refusal = raw.start_lightning_receive(old_request).await.expect_err("an older protocol must not create a fresh invoice");
 	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
 	assert!(refusal.message().contains("unsupported Scuttle protocol version"), "unexpected refusal: {refusal}");
@@ -4375,7 +4368,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 		.min().unwrap();
 	let receiver_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut grants = rpc.prepare_lightning_receive_claim(
-		protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+		protos::PrepareLightningReceiveClaimRequest {
 			owner_proof: Some(super::test_owner_link(&srv, &receiver_key).await.into()),
 			payment_hash: payment_hash.to_vec(),
 			user_pubkey: receiver_key.public_key().serialize().to_vec(),
@@ -4492,8 +4485,6 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	let err = result.expect_err("claim must be refused after the sender refunded on-chain");
 	assert!(err.message().contains("too close to the current chaintip"), "unexpected error: {err:?}");
 }
-
-
 
 /// When xpay answers late, after its attempt was closed and the invoice
 /// retried, its result must not be applied to the retry.

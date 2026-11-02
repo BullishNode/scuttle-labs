@@ -29,7 +29,7 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 async fn expiry_payout_native_board_seed_restore(name: &str, board_fees: Option<BoardFees>) {
 	let ctx = TestContext::new(name).await;
 	let srv = ctx.captaind("server").no_vtxo_pool()
-		.cfg(move |cfg| {
+		.cfg(move |cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(24);
 			if let Some(fees) = board_fees { cfg.fees.board = fees; }
 		})

@@ -58,7 +58,7 @@ async fn assert_receive_start_refused(
 async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	let ctx = TestContext::new("bark_sdk/receive_binding_normal_external_claim").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let provider = ctx.bark_sdk("provider", &srv).boarded(sat(100_000))
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
@@ -77,7 +77,7 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 		expiry_secs: None,
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 18,
 		mailbox_id: Some(provider.mailbox_identifier().serialize()), description: None,
-		claim_destination: Some(protos::VtxoRequest { retired_owner_proof: None,
+		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(), owner_proof: Some(link.into()),
 		}),
 	};

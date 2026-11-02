@@ -50,7 +50,7 @@ impl Owner {
 
 async fn server_with_lifetime(ctx: &TestContext, lifetime: BlockDelta) -> Arc<Captaind> {
 	let srv = ctx.captaind("server").no_vtxo_pool()
-		.cfg(move |cfg| cfg.vtxo_lifetime = lifetime).watchmand().create().await;
+		.cfg(move |cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = lifetime; }).watchmand().create().await;
 	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
 	srv
@@ -87,7 +87,7 @@ async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair) -
 	let point = OutPoint::new(funding.compute_txid(), 0);
 	let builder = builder.set_funding_details(sat(100_000), Amount::ZERO, point).unwrap().generate_user_nonces();
 	let mut rpc = srv.get_public_rpc().await;
-	let cosign = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+	let cosign = rpc.request_board_cosign(protos::BoardCosignRequest {
 		owner_proof: Some(link.into()),
 		amount: 100_000, utxo: serialize(&point), expiry_height: expiry.into(),
 		user_pubkey: key.public_key().serialize().to_vec(), pub_nonce: builder.user_pub_nonce().serialize().to_vec(),

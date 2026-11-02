@@ -687,16 +687,24 @@ pub struct WalletProperties {
 	/// connect until the user resolves the rotation.
 	pub server_mailbox_pubkey: Option<PublicKey>,
 
+	/// Negotiated payout capability, retained for offline address generation.
+	#[serde(default)]
+	pub server_payouts: Option<bool>,
+
 	/// Full mailbox identity, checked before synchronization on every open.
-	pub mailbox_identity: MailboxIdentity,
+	#[serde(default)]
+	pub mailbox_identity: Option<MailboxIdentity>,
 }
 
 impl WalletProperties {
 	fn check_mailbox_identity(&self, network: Network, seed: &WalletSeed) -> anyhow::Result<()> {
-		ensure!(self.network == network && self.mailbox_identity.network == network,
-			"mailbox wallet is for a different network");
-		ensure!(self.mailbox_identity == seed.mailbox_identity(network),
-			"mailbox key is missing or differs from the wallet identity");
+		ensure!(self.network == network, "mailbox wallet is for a different network");
+		ensure!(self.mailbox_identity.is_some() || self.server_payouts != Some(true),
+			"payout wallet is missing its original mailbox identity");
+		if let Some(identity) = &self.mailbox_identity {
+			ensure!(*identity == seed.mailbox_identity(network),
+				"mailbox key is missing or differs from the wallet identity");
+		}
 		Ok(())
 	}
 }
@@ -1202,14 +1210,19 @@ impl Wallet {
 				(ark_info.server_pubkey, ark_info.mailbox_pubkey)
 			};
 
-		Ok(ark::Address::builder()
+		let payouts = match properties.server_payouts {
+			Some(payouts) => payouts,
+			None => self.require_server().await?.0.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
+		};
+		let builder = ark::Address::builder()
 			.testnet(network != bitcoin::Network::Bitcoin)
 			.server_pubkey(server_pubkey)
-			.pubkey_policy(keypair.public_key())
-			.mailbox_joint(network, mailbox_pubkey, &self.mailbox_keypair(), &keypair)
-			.context("failed to assign mailbox")?
-			.into_address()
-			.context("failed to build address")?)
+			.pubkey_policy(keypair.public_key());
+		let builder = if payouts {
+			builder.mailbox_joint(network, mailbox_pubkey, &self.mailbox_keypair(), &keypair)
+		} else { builder.mailbox(mailbox_pubkey, self.mailbox_identifier(), &keypair) }
+			.context("failed to assign mailbox")?;
+		Ok(builder.into_address().context("failed to build address")?)
 	}
 
 	/// Generate a new [ark::Address] and returns the index of the key used to create it.
@@ -1285,20 +1298,21 @@ impl Wallet {
 		// `allow_unreachable_server` is set, both drop to `(None, None)` so
 		// we can still produce an offline wallet and revisit the server on
 		// the next open.
-		let (server_pubkey, mailbox_pubkey) = match Self::connect_to_server(&config, network).await {
+		let (server_pubkey, mailbox_pubkey, server_payouts) = match Self::connect_to_server(&config, network).await {
 			Ok(conn) => {
 				let ark_info = conn.ark_info().await;
 				match check_ark_info_safe(&ark_info, config.vtxo_exit_margin) {
-					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey)),
+					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey),
+						Some(conn.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS)),
 					Err(err) if allow_unreachable_server => {
 						warn!("server-advertised ArkInfo is unsafe, \
 							treating as unavailable: {:#}", err);
-						(None, None)
+						(None, None, None)
 					},
 					Err(err) => return Err(err),
 				}
 			},
-			Err(_) if allow_unreachable_server => (None, None),
+			Err(_) if allow_unreachable_server => (None, None, None),
 			Err(err) => {
 				bail!("Failed to connect to provided server: {:#}", err);
 			},
@@ -1309,7 +1323,8 @@ impl Wallet {
 			fingerprint: wallet_fingerprint,
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
-			mailbox_identity: seed.mailbox_identity(network),
+			server_payouts,
+			mailbox_identity: Some(seed.mailbox_identity(network)),
 		};
 
 		// write the config to db
@@ -1391,6 +1406,9 @@ impl Wallet {
 			bail!("incorrect mnemonic")
 		}
 		properties.check_mailbox_identity(network, &seed)?;
+		if properties.mailbox_identity.is_none() {
+			db.set_mailbox_identity(seed.mailbox_identity(network)).await?;
+		}
 
 		let chain_source = if let Some(ref url) = config.esplora_address {
 			ChainSourceSpec::Esplora {
@@ -1548,7 +1566,7 @@ impl Wallet {
 
 		let ark_info = conn.ark_info().await;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-		self.check_and_store_server_keys(&ark_info).await?;
+		self.check_and_store_server_keys(&ark_info, conn.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS).await?;
 
 		Ok((conn, ark_info))
 	}
@@ -1569,7 +1587,7 @@ impl Wallet {
 		let ark_info = srv.ark_info().await;
 		ark_info.fees.validate().context("invalid fee schedule")?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-		self.check_and_store_server_keys(&ark_info).await?;
+		self.check_and_store_server_keys(&ark_info, srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS).await?;
 
 		Ok(())
 	}
@@ -1593,7 +1611,7 @@ impl Wallet {
 	/// Returns an error (via `bail!`) if either the server pubkey or mailbox
 	/// pubkey differs from the stored value; callers must not proceed with
 	/// server operations on error.
-	async fn check_and_store_server_keys(&self, ark_info: &ArkInfo) -> anyhow::Result<()> {
+	async fn check_and_store_server_keys(&self, ark_info: &ArkInfo, payouts: bool) -> anyhow::Result<()> {
 		let properties = self.properties().await?;
 
 		if let Some(stored_pubkey) = properties.server_pubkey {
@@ -1615,6 +1633,10 @@ impl Wallet {
 			self.inner.db.set_server_mailbox_pubkey(ark_info.mailbox_pubkey).await?;
 			info!("Stored server mailbox pubkey for existing wallet: {}", ark_info.mailbox_pubkey);
 		}
+
+		if let Some(stored) = properties.server_payouts {
+			ensure!(stored == payouts, "server payout mode has changed");
+		} else { self.inner.db.set_server_payouts(payouts).await?; }
 
 		Ok(())
 	}
@@ -2742,8 +2764,8 @@ mod tests {
 		let external = || seed().with_external_mailbox_keypair(key);
 		let props = super::WalletProperties {
 			network: Network::Regtest, fingerprint: seed().fingerprint(),
-			server_pubkey: None, server_mailbox_pubkey: None,
-			mailbox_identity: external().mailbox_identity(Network::Regtest),
+			server_pubkey: None, server_mailbox_pubkey: None, server_payouts: None,
+			mailbox_identity: Some(external().mailbox_identity(Network::Regtest)),
 		};
 		props.check_mailbox_identity(Network::Regtest, &external()).unwrap();
 		assert!(props.check_mailbox_identity(Network::Regtest, &seed()).is_err());
@@ -2754,14 +2776,11 @@ mod tests {
 		assert_eq!(seed().derive_vtxo_keypair(0).public_key(), external().derive_vtxo_keypair(0).public_key());
 		assert_eq!(seed().to_recovery_mailbox_keypair().public_key(), external().to_recovery_mailbox_keypair().public_key());
 		assert_eq!(external().to_mailbox_keypair().public_key(), key.public_key());
-		let derived = super::WalletProperties { mailbox_identity: seed().mailbox_identity(Network::Regtest), ..props.clone() };
+		let derived = super::WalletProperties { mailbox_identity: Some(seed().mailbox_identity(Network::Regtest)), ..props.clone() };
 		derived.check_mailbox_identity(Network::Regtest, &seed()).unwrap();
 		assert!(derived.check_mailbox_identity(Network::Regtest, &external()).is_err());
 		let restored: super::WalletProperties = serde_json::from_slice(&serde_json::to_vec(&props).unwrap()).unwrap();
 		assert_eq!(restored, props);
-		let mut old = serde_json::to_value(&props).unwrap();
-		old.as_object_mut().unwrap().remove("mailbox_identity");
-		assert!(serde_json::from_value::<super::WalletProperties>(old).is_err(), "an old store must not acquire a new mailbox silently");
 	}
 
 	#[test]

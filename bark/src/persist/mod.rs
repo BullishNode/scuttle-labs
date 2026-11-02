@@ -153,6 +153,16 @@ pub trait BarkPersister: Send + Sync + 'static {
 	///
 	/// Errors:
 	/// - Returns an error if the update fails.
+	/// Bind a migrated wallet's previously absent mailbox property once.
+	async fn set_mailbox_identity(&self, _identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		bail!("this persister cannot bind a migrated mailbox identity")
+	}
+
+	/// Retain the negotiated mode alongside the server's stored public keys.
+	async fn set_server_payouts(&self, _payouts: bool) -> anyhow::Result<()> {
+		bail!("this persister cannot store the negotiated payout mode")
+	}
+
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()>;
 
 	/// Set the server's mailbox public key in wallet properties.

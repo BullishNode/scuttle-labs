@@ -25,7 +25,7 @@ async fn pay_hold_expired_inputs_are_refused_then_refresh_succeeds() {
 		let lightning = Box::pin(ctx.new_lightning_setup("lightningd")).await;
 		// Isolate new-grant admission before a real fallback decision. These
 		// explicit scheduling settings do not qualify default-daemon behavior.
-		let srv = Box::pin(ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
+		let srv = Box::pin(ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(100);
 			cfg.round_interval = Duration::from_secs(86400);
 		}).watchmand_cfg(|cfg| {
@@ -278,7 +278,8 @@ async fn receive_claim_reply_loss_reopen(fallback: bool) {
 		"bark_sdk/receive_claim_reply_loss_reopen"
 	}).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let mut builder = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10));
+	let mut builder = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(move |cfg| cfg.expiry_payouts = fallback);
 	if fallback { builder = builder.bitcoind(ctx.bitcoind_arc()).watchmand(); }
 	let srv = builder.create().await;
 	if fallback {

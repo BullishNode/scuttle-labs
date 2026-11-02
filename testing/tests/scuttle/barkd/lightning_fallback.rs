@@ -4,7 +4,7 @@
 async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
 	let ctx = TestContext::new("barkd/forwarded_receive_to_signed_address_restart").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
 	let claimant = ctx.barkd("claimant", &srv).funded(sat(200_000))
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;

@@ -21,7 +21,7 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let builder = ctx.captaind("server").lightningd(&lightning.internal)
-		.funded(btc(10)).cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24));
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); });
 	let srv = if lagged_captain {
 		let srv = builder.create().await;
 		srv.attach_watchmand(ctx.watchmand("server-watchmand").bitcoind(ctx.bitcoind_arc())
@@ -212,7 +212,7 @@ async fn abandoned_registered_send(check_alarms: bool, lagged_captain: bool) {
 #[tokio::test]
 async fn expiry_cancelled_unclaimed_output_keeps_owner_after_participation_removed() {
 	let ctx = TestContext::new("server/expiry_cancelled_unclaimed_tombstone").await;
-	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool().create().await;
+	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool().cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let wallet = ctx.bark("wallet", &srv).funded(sat(500_000)).create().await;
 	let originals = wallet.board_and_confirm_and_register(&ctx, sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;

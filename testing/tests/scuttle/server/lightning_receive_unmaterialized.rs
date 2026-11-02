@@ -348,7 +348,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let ctx = TestContext::new("server/lightning_receive_unmaterialized").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(sat(500_000))
-		.cfg(|config| {
+		.cfg(|config| { config.expiry_payouts = true;
 			config.vtxo_lifetime = BlockDelta::new(32);
 			config.vtxopool.vtxo_lifetime = BlockDelta::new(32);
 			// Issuance requires two targets. After one receive the deficit is

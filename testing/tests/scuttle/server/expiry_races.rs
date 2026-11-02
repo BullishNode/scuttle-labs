@@ -18,7 +18,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 	let mut ctx = TestContext::new_minimal("expiry/tree_write_races").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg).await.unwrap();
+	Db::create_with_payouts(&cfg, true).await.unwrap();
 	let db = Db::connect(&cfg).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -105,7 +105,7 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 	let mut ctx = TestContext::new_minimal("expiry/pending_exchange_cancellation").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&cfg).await.unwrap();
+	Db::create_with_payouts(&cfg, true).await.unwrap();
 	let db = Db::connect(&cfg).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let old = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
@@ -160,7 +160,7 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 #[tokio::test]
 async fn expiry_cancelled_native_refresh_status_never_releases_preimage() {
 	let ctx = TestContext::new("expiry/native_refresh_status").await;
-	let srv = ctx.captaind("server").funded(ark_testing::btc(10)).no_vtxo_pool().create().await;
+	let srv = ctx.captaind("server").funded(ark_testing::btc(10)).no_vtxo_pool().cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let wallet = ctx.bark("wallet", &srv).funded(ark_testing::sat(500_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, ark_testing::sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;

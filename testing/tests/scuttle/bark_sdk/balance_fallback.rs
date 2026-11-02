@@ -6,7 +6,7 @@ use ark::ProtocolEncoding;
 async fn fallback_balance_completed_refresh_and_operator_backing_conserve_one_principal() {
 	let ctx = TestContext::new("bark_sdk/fallback_balance_refresh_operator").await;
 	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(48)).watchmand().create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(48); }).watchmand().create().await;
 	let wallet = boarded_wallet(&ctx, &srv).await;
 	let original = wallet.spendable_vtxos().await.unwrap();
 	assert_eq!(original.len(), 1);
@@ -42,12 +42,11 @@ async fn fallback_balance_completed_refresh_and_operator_backing_conserve_one_pr
 	assert_eq!(local.get_wallet_vtxo(original[0].id()).await.unwrap().unwrap().state, bark::vtxo::VtxoState::Spent);
 }
 
-
 /// A retained ordinary send checkpoint cannot hide a genuine committed exit.
 #[tokio::test]
 async fn retained_arkoor_checkpoint_keeps_exited_principal_in_balance() {
 	let ctx = TestContext::new("bark_sdk/retained_arkoor_checkpoint_exit_balance").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	#[derive(Clone)]
 	struct RefuseCosign(std::sync::Arc<tokio::sync::Notify>);
 	#[async_trait::async_trait]

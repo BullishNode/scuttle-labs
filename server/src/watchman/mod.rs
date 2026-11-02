@@ -40,7 +40,6 @@ impl WatchmanHandle {
 	}
 }
 
-
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -393,6 +392,12 @@ impl Watchman {
 	/// Sweeps have no deadline, so this runs on the much longer
 	/// [Config::sweep_interval].
 	pub async fn process_sweeps(&self) -> anyhow::Result<()> {
+		if !self.db.expiry_payouts() {
+			let work = self.scan_frontier().await;
+			for vtxo in &work.sweeps { self.update_mempool_spend(vtxo.id()).await; }
+			if !work.sweeps.is_empty() { self.process_claims(work.sweeps).await?; }
+			return Ok(());
+		}
 		// Confiscated OffboardForfeit outputs are exclusively server-owned.
 		// Their Bare encoding needs no customer genesis or payout allocation.
 		// Use the original native claim: its miner fee comes from operator
@@ -620,7 +625,7 @@ impl Watchman {
 		let txid = tx.compute_txid();
 		self.db.write(async |t| {
 			t.lock_watchman_claim_inputs(vtxos).await?;
-			for vtxo in vtxos.iter().filter(|v| *v.policy() == ServerVtxoPolicy::ServerOwned) {
+			for vtxo in vtxos.iter().filter(|v| self.db.expiry_payouts() && *v.policy() == ServerVtxoPolicy::ServerOwned) {
 				// Exclude mempool effects so our existing native RBF path can
 				// replace its own claim; canonical consumption always refuses.
 				let output = self.bitcoind.try_get_tx_out(vtxo.point(), false).await?

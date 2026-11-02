@@ -84,7 +84,7 @@ async fn payout_reorg(depth: u32) {
 	// Core invalidation is local to a node. Both daemons observe the same
 	// Core; only the watchman's HTTP route passes through the counter.
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); })
 		.watchmand_cfg(move |cfg| cfg.bitcoind.url = proxy_url).create().await;
 	let wallet = ctx.bark("abandoned", &srv).funded(sat(200_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
@@ -213,7 +213,7 @@ async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 async fn expiry_payout_fee_replacement_keeps_parent_and_counts_only_confirmed_child() {
 	let ctx = TestContext::new("server/expiry_payout_fee_replacement").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).watchmand().create().await;
 	let wallet = ctx.bark("abandoned", &srv).funded(sat(200_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
 	let client = wallet.client().await;
@@ -306,7 +306,7 @@ async fn positive_untrusted_parent_recovery(crash: bool) {
 	let ctx = TestContext::new(if crash { "scuttle/expiry_parent_commit_crash_recovery" }
 		else { "server/expiry_payout_positive_untrusted_funding" }).await;
 	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); })
 		.watchmand_cfg(|cfg| {
 			cfg.min_trusted_confs = 2;
 			cfg.watchman.sweep_interval = Duration::from_secs(1);

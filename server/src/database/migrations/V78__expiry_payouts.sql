@@ -1,5 +1,13 @@
--- Initial schema for fresh matched Scuttle stores.
-SET LOCAL search_path TO scuttle, public;
+SET LOCAL search_path TO public;
+
+-- Existing upstream stores remain payout-off. Only empty-database creation
+-- may choose the payout-on mode before issuing any coins.
+CREATE TABLE server_mode (
+	singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+	expiry_payouts BOOLEAN NOT NULL DEFAULT FALSE
+);
+INSERT INTO server_mode(singleton, expiry_payouts)
+VALUES (TRUE, COALESCE(current_setting('ark.expiry_payouts', TRUE), 'false')::BOOLEAN);
 
 -- Keep exact invoice identity for retries of an already recorded initiation.
 ALTER TABLE public.cln_xpay ADD COLUMN signed_invoice TEXT;
@@ -126,10 +134,11 @@ CREATE TABLE coin_owner (
 CREATE FUNCTION require_customer_coin_owner() RETURNS TRIGGER
 LANGUAGE plpgsql AS $$
 BEGIN
-	IF NEW.spend_state IN ('spendable', 'unregistered', 'unclaimed', 'htlc-recv-unclaimed')
+	IF (SELECT expiry_payouts FROM server_mode WHERE singleton)
+		AND NEW.spend_state IN ('spendable', 'unregistered', 'unclaimed', 'htlc-recv-unclaimed')
 		AND NOT (NEW.spend_state = 'unclaimed' AND NEW.policy =
 			decode('0002dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c', 'hex'))
-		AND NOT EXISTS (SELECT 1 FROM scuttle.coin_owner WHERE vtxo_id=NEW.vtxo_id)
+		AND NOT EXISTS (SELECT 1 FROM coin_owner WHERE vtxo_id=NEW.vtxo_id)
 	THEN
 		RAISE EXCEPTION 'customer VTXO has no coin_owner' USING ERRCODE='23514';
 	END IF;
@@ -137,7 +146,7 @@ BEGIN
 END;
 $$;
 CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo
-DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION scuttle.require_customer_coin_owner();
+DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION require_customer_coin_owner();
 
 CREATE TABLE htlc_settlement_source (
 	settlement_id BIGINT NOT NULL REFERENCES public.htlc_settlement(id),

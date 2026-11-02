@@ -8,6 +8,7 @@ impl Wallet {
 	/// Unanswered IDs retain their current state; success does not certify that
 	/// every known commitment was refreshed.
 	pub async fn sync_fallback_payouts(&self) -> anyhow::Result<()> {
+		if self.properties().await?.server_payouts == Some(false) { return Ok(()); }
 		let tip = self.chain().tip().await?;
 		let mut keyed = Vec::new();
 		for coin in self.inner.db.get_all_vtxos().await? {

@@ -17,7 +17,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 		let ctx = TestContext::new("server/lightning_rejection_refunds_only_its_source").await;
 		let lightning = ctx.new_lightning_setup("lightningd").await;
 		let srv = ctx.captaind("server").lightningd(&lightning.internal).no_vtxo_pool().funded(btc(10))
-			.cfg(|cfg| cfg.invoice_check_interval = Duration::from_secs(1)).watchmand().create().await;
+			.cfg(|cfg| { cfg.expiry_payouts = true; cfg.invoice_check_interval = Duration::from_secs(1); }).watchmand().create().await;
 		let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
 		let boards = [sender.board_and_confirm_and_register(&ctx, sat(100_000)).await[0],
 			sender.board_and_confirm_and_register(&ctx, sat(100_000)).await[0]];

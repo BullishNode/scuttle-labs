@@ -166,7 +166,7 @@ async fn restored_finish() {
 	let first_height = ctx.bitcoind().get_block_count().await;
 	let session_timeout = Duration::from_secs(5);
 	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.funded(sat(500_000)).cfg(move |config| {
+		.funded(sat(500_000)).cfg(move |config| { config.expiry_payouts = true;
 			config.vtxo_lifetime = BlockDelta::new(32);
 			config.offboard_session_timeout = session_timeout;
 		}).watchmand().create()).await;

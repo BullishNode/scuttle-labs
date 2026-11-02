@@ -7,7 +7,7 @@ use super::*;
 async fn settled_spendable_htlcs_cannot_be_revoked() {
 	let ctx = TestContext::new("server/settled_spendable_htlcs_cannot_be_revoked").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).create().await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let payer = ctx.bark("payer", &srv).funded(btc(7)).create().await;
 	payer.board(btc(5)).await;
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;

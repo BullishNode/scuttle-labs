@@ -177,7 +177,7 @@ async fn verify_return(
 async fn boundaries(family: Family) {
 	let ctx = TestContext::new(format!("server/expiry_script_dust_boundaries_{}", family.label())).await;
 	let start = ctx.bitcoind().get_block_count().await;
-	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|config| {
+	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
 		config.vtxo_lifetime = BlockDelta::new(40);
 		config.vtxo_exit_delta = BlockDelta::new(2);
 	}).watchmand().create()).await;

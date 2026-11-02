@@ -189,7 +189,7 @@ async fn bounded_round_inventory() {
 	const COUNT: usize = 4096;
 	let ctx = TestContext::new("server/expiry_bounded_round_inventory").await;
 	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| {
+		.cfg(|cfg| { cfg.expiry_payouts = true;
 			cfg.vtxo_lifetime = BlockDelta::new(4320);
 			cfg.vtxo_exit_delta = BlockDelta::new(144);
 			cfg.max_vtxo_exit_depth = 10;
@@ -427,7 +427,7 @@ async fn bounded_round_inventory() {
 
 async fn automatic_multilevel_split() {
 	let ctx = TestContext::new("server/expiry_automatic_real_limit_multilevel_split").await;
-	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|cfg| {
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|cfg| { cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(4_320);
 		cfg.vtxo_exit_delta = BlockDelta::new(144);
 		cfg.max_vtxo_exit_depth = 100;

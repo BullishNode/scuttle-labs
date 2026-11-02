@@ -93,6 +93,7 @@ pub struct LightningReceive {
 	/// budget spans restarts. `0` for checkpoints predating this field.
 	#[serde(default)]
 	pub claim_attempts: u32,
+	#[serde(default)]
 	pub grant_ids: Vec<VtxoId>,
 }
 
@@ -360,12 +361,15 @@ pub(crate) async fn start_lightning_receive(
 	let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
 	let net_amount = validate_and_subtract_fee(amount, fee)?;
 	let network = wallet.network().await?;
+	let payouts = srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
 	let destination = claim_destination.as_ref().map(|destination| -> anyhow::Result<_> {
-		let link = destination.owner_link(network, ark_info.mailbox_pubkey)?
-			.ok_or(FallbackRefusal::RecipientMustUpdate)?;
-		Ok(protos::VtxoRequest { retired_owner_proof: None,
+		let link = destination.owner_link(network, ark_info.mailbox_pubkey)?;
+		if payouts {
+			ensure!(link.is_some(), FallbackRefusal::RecipientMustUpdate);
+		}
+		Ok(protos::VtxoRequest {
 			amount: net_amount.to_sat(), policy: destination.policy().serialize(),
-			owner_proof: Some(link.into()),
+			owner_proof: link.map(Into::into),
 		})
 	}).transpose()?;
 
@@ -559,7 +563,7 @@ async fn prepare_lightning_receive_htlcs(
 
 	let htlc_recv_expiry = htlc_recv_expiry(current_height, recv.htlc_recv_cltv_delta);
 	let keypair = wallet.peek_keypair(recv.key_index).await.retry()?;
-	let req = protos::PrepareLightningReceiveClaimRequest { retired_owner_proof: None,
+	let req = protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(wallet.owner_link(keypair.public_key()).await.retry()?.into()),
 		payment_hash: payment_hash.to_vec(),
 		user_pubkey: keypair.public_key().serialize().to_vec(),
@@ -729,12 +733,14 @@ async fn prepare_lightning_receive_claim(
 		.context("arkoor nonce generation for claim failed").abort()?;
 
 	let network = wallet.network().await.retry()?;
-	let supplied = recv.claim_destination.as_ref().map(|address| {
-		let link = address.owner_link(network, info.mailbox_pubkey)?
-			.ok_or(crate::FallbackRefusal::RecipientMustUpdate)?;
-		Ok((address.policy().user_pubkey(), link))
-	}).transpose().map_err(|e: anyhow::Error| AdvanceError::Abort(e))?
-		.into_iter().collect();
+	let mut supplied = std::collections::BTreeMap::new();
+	if srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS {
+		if let Some(address) = recv.claim_destination.as_ref() {
+			let link = address.owner_link(network, info.mailbox_pubkey).context("invalid claim ownership link").abort()?
+				.ok_or_else(|| anyhow::Error::new(crate::FallbackRefusal::RecipientMustUpdate)).abort()?;
+			supplied.insert(address.policy().user_pubkey(), link);
+		}
+	}
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	wallet.attach_owner_links(&mut package, &supplied, info.mailbox_pubkey).await.abort()?;
 	Ok(PreparedClaim { srv, builder, package, keypairs })

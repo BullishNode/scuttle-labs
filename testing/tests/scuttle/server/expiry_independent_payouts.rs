@@ -54,7 +54,7 @@ async fn assert_pending_root_is_untouched(
 async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	let ctx = TestContext::new("server/expiry_ready_root_with_pending_same_expiry_root").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24)).watchmand().create().await;
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).watchmand().create().await;
 	let wallet = ctx.bark("abandoned", &srv).funded(sat(500_000))
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	// As in the native conflict test, create distinct roots before another

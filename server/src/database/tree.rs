@@ -487,7 +487,7 @@ pub async fn execute_vtxo_tree_update(
 			customer_pubkeys.push(key.to_string());
 		}
 	}
-	for key in customer_keys {
+	for key in customer_keys.into_iter().filter(|_| tx.expiry_payouts()) {
 		if !matches!(tx.expiry_owner(key).await?, Attribution::Owned { .. }) {
 			return Err(OwnershipRefusal::Required(key).into());
 		}

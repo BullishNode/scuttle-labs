@@ -31,14 +31,17 @@ impl Wallet {
 	/// Authorize with this wallet's mailbox key and an actual coin key from its keystore.
 	pub async fn owner_link(&self, key: PublicKey) -> anyhow::Result<OwnerLink> {
 		let (_, info) = self.require_server().await?;
-		let links = self.output_owner_links([key], &BTreeMap::new(), info.mailbox_pubkey).await?;
-		Ok(links[&key])
+		let (_, pair) = self.pubkey_keypair(&key).await?.ok_or(FallbackRefusal::OwnerProofRequired)?;
+		Ok(OwnerLink::new_joint(self.network().await?, info.mailbox_pubkey, &self.mailbox_keypair(), &pair)?)
 	}
 
 	pub(crate) async fn output_owner_links(
 		&self, keys: impl IntoIterator<Item = PublicKey>, supplied: &BTreeMap<PublicKey, OwnerLink>,
 		server_mailbox: PublicKey,
 	) -> anyhow::Result<BTreeMap<PublicKey, OwnerLink>> {
+		if !self.properties().await?.server_payouts.context("server payout capability is not known")? {
+			return Ok(BTreeMap::new());
+		}
 		let keys = keys.into_iter().collect::<BTreeSet<_>>();
 		for (key, link) in supplied {
 			ensure!(keys.contains(key), "ownership link names an absent output key {key}");
@@ -68,7 +71,7 @@ impl Wallet {
 		let links = self.output_owner_links(keys, supplied, server_mailbox).await?;
 		for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 			let key = VtxoPolicy::deserialize(&output.policy)?.user_pubkey();
-			output.owner_proof = Some(links[&key].into());
+			output.owner_proof = links.get(&key).copied().map(Into::into);
 		}
 		Ok(())
 	}

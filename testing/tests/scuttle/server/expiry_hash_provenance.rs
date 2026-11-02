@@ -20,7 +20,7 @@ async fn same_hash_sources(cooperative_refund: bool) {
 	let ctx = TestContext::new(name).await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).no_vtxo_pool().funded(btc(10))
-		.cfg(|cfg| cfg.vtxo_lifetime = BlockDelta::new(24))
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); })
 		.watchmand_cfg(|cfg| cfg.watchman.sweep_interval = Duration::from_secs(1)).create().await;
 	let wallet = ctx.bark("owner", &srv).funded(sat(500_000)).create().await;
 	let first = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await[0];

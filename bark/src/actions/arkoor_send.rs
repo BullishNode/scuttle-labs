@@ -360,12 +360,14 @@ async fn run_cosign(wallet: &Wallet, send: &ArkoorSend) -> Result<Progress, Adva
 	};
 	let neg_amount = -send.amount.to_signed().context("amount out-of-range").abort()?;
 
-	let (_, info) = wallet.require_server().await.retry()?;
+	let (srv, info) = wallet.require_server().await.retry()?;
 	let link = send.destination.owner_link(wallet.network().await.retry()?, info.mailbox_pubkey)
-		.context("invalid recipient ownership link").abort()?
-		.ok_or_else(|| anyhow::Error::new(crate::FallbackRefusal::RecipientMustUpdate)).abort()?;
+		.context("invalid recipient ownership link").abort()?;
+	if srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS && link.is_none() {
+		return Err(AdvanceError::Abort(crate::FallbackRefusal::RecipientMustUpdate.into()));
+	}
 	let arkoor = wallet.create_checkpointed_arkoor_with_vtxos(
-		dest, inputs, change_keypair, send.change_pieces.clone(), Some(link),
+		dest, inputs, change_keypair, send.change_pieces.clone(), link,
 	).await.retry_unless_rejected()?;
 
 	let initial_update = MovementUpdate::new()

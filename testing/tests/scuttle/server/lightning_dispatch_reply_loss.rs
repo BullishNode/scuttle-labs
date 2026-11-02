@@ -85,7 +85,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		ctx.generate_blocks(6).await;
 		lightning.internal.wait_for_gossip(2).await;
 		let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
-			.no_vtxo_pool().funded(btc(10)).cfg(|config| {
+			.no_vtxo_pool().funded(btc(10)).cfg(|config| { config.expiry_payouts = true;
 				config.vtxo_lifetime = BlockDelta::new(24);
 				config.vtxo_exit_delta = BlockDelta::new(3);
 				config.htlc_send_expiry_delta = BlockDelta::new(40);

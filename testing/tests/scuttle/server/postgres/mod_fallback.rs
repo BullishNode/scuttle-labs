@@ -7,7 +7,7 @@ async fn legacy_lightning_payment_attempt_result_update() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
+	Db::create_with_payouts(&postgres_cfg, true).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
@@ -45,7 +45,7 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
-	Db::create(&postgres_cfg).await.expect("Database created");
+	Db::create_with_payouts(&postgres_cfg, true).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
 	super::register_vector_owners(&db).await;
 
@@ -108,7 +108,7 @@ async fn mailbox_writers_need_no_registration_and_delivery_matches_the_birth_own
 	let mut ctx = TestContext::new_minimal("postgresd/mailbox_without_registration").await;
 	ctx.init_central_postgres().await;
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
-	let db = Db::create(&cfg).await.unwrap();
+	let db = Db::create_with_payouts(&cfg, true).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let foreign = Keypair::from_seckey_slice(&ark::SECP, &[249; 32]).unwrap();
 	let mailbox = MailboxIdentifier::from_pubkey(foreign.public_key());
@@ -164,7 +164,7 @@ async fn settlement_provenance_retains_all_origins_and_holds_unknown() {
 	let mut ctx = TestContext::new_minimal("postgresd/settlement_provenance_origins").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create(&config).await.unwrap();
+	Db::create_with_payouts(&config, true).await.unwrap();
 	let db = Db::connect(&config).await.unwrap();
 	super::register_vector_owners(&db).await;
 	let base = &VTXO_VECTORS.board_vtxo;

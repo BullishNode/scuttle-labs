@@ -11,7 +11,6 @@
 mod convert;
 mod migrations;
 mod query;
-mod scuttle;
 
 use std::path::{Path, PathBuf};
 
@@ -101,6 +100,23 @@ impl BarkPersister for SqliteClient {
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
 		let conn = self.connect()?;
 		Ok(query::fetch_properties(&conn)?)
+	}
+
+	async fn set_mailbox_identity(&self, identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		let changed = conn.execute("UPDATE bark_properties SET mailbox_pubkey=?1
+			WHERE id=1 AND network=?2 AND (mailbox_pubkey IS NULL OR mailbox_pubkey=?1)",
+			[identity.public_key.to_string(), identity.network.to_string()])?;
+		ensure!(changed == 1, "mailbox identity differs from the stored wallet");
+		Ok(())
+	}
+
+	async fn set_server_payouts(&self, payouts: bool) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		ensure!(conn.execute("UPDATE bark_properties SET server_payouts=?1 WHERE id=1
+			AND (server_payouts IS NULL OR server_payouts=?1)", [payouts])? == 1,
+			"server payout mode has changed");
+		Ok(())
 	}
 
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
@@ -527,33 +543,6 @@ mod test {
 	use crate::persist::test_suite::bark_persister_tests;
 
 	use super::*;
-
-	#[test]
-	fn receipt_bearing_wallet_is_refused_without_writes() {
-		let (path, conn) = in_memory_db();
-		let current = SqliteClient::open(&path).unwrap();
-		conn.execute("CREATE TABLE bark_fallback_receipt(vtxo_id TEXT PRIMARY KEY,receipt BLOB)", []).unwrap();
-		drop(current);
-		let before: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
-		assert!(SqliteClient::open(&path).unwrap_err().to_string().contains("not a fresh Scuttle store"));
-		let after: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
-		assert_eq!(before, after);
-		assert!(conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='bark_fallback_receipt')", [],
-			|row| row.get::<_, bool>(0)).unwrap());
-	}
-
-	#[test]
-	fn registration_shaped_wallet_is_refused_even_with_mailbox_identity() {
-		let (path,conn) = in_memory_db();
-		let db = SqliteClient::open(&path).unwrap();
-		drop(db);
-		conn.execute_batch("CREATE TABLE bark_fallback_record(id INTEGER PRIMARY KEY,record BLOB);
-			INSERT INTO bark_fallback_record VALUES(1,X'010203');").unwrap();
-		let changes: i64 = conn.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
-		assert!(SqliteClient::open(&path).is_err());
-		assert_eq!(conn.query_row("SELECT total_changes()", [], |row| row.get::<_,i64>(0)).unwrap(), changes);
-		assert_eq!(conn.query_row("SELECT record FROM bark_fallback_record", [], |row| row.get::<_,Vec<u8>>(0)).unwrap(), vec![1,2,3]);
-	}
 
 	#[tokio::test]
 	async fn test_add_and_retrieve_vtxos() {

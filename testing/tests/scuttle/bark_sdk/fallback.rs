@@ -8,7 +8,7 @@ use ark::ProtocolEncoding;
 #[tokio::test]
 async fn mailbox_bip86_identity_survives_seed_only_second_device_and_reopen() {
 	let ctx = TestContext::new("bark_sdk/mailbox_bip86_identity_seed_only_reopen").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let mnemonic = bip39::Mnemonic::generate(12).unwrap();
 	let first = ctx.bark_sdk("first", &srv).mnemonic(mnemonic.clone())
 		.cfg(|c| c.daemon_manual_sync = true).create().await;
@@ -41,7 +41,7 @@ async fn mailbox_bip86_identity_survives_seed_only_second_device_and_reopen() {
 #[tokio::test]
 async fn external_mailbox_identity_routes_delivery_and_refuses_wrong_reopen() {
 	let ctx = TestContext::new("bark_sdk/external_mailbox_identity_routes_delivery").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let mnemonic = bip39::Mnemonic::generate(12).unwrap();
 	let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[41; 32]).unwrap();
 	let first = ctx.bark_sdk("external", &srv).mnemonic(mnemonic.clone())
@@ -89,7 +89,7 @@ async fn external_mailbox_identity_routes_delivery_and_refuses_wrong_reopen() {
 #[tokio::test]
 async fn undecided_expired_source_can_reopen_offline_and_start_its_exit() {
 	let ctx = TestContext::new("bark_sdk/undecided_expired_source_offline_exit").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| {
+	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| { cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(24);
 		cfg.vtxo_exit_delta = BlockDelta::new(3);
 	}).watchmand().create().await;

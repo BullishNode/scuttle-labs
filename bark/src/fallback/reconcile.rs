@@ -64,6 +64,9 @@ impl Wallet {
 	pub(crate) async fn observe_server_vtxo_status(&self, id: VtxoId, owner: &[u8],
 		state: VtxoSpendState, committed: bool) -> anyhow::Result<VtxoSpendState>
 	{
+		if !self.properties().await?.server_payouts.context("server payout capability is not known")? {
+			return Ok(state);
+		}
 		ensure!(PublicKey::from_slice(owner)? == self.mailbox_keypair().public_key(),
 			"server coin ownership does not match this mailbox");
 		let stored = self.inner.db.get_wallet_vtxo(id).await?;

@@ -19,7 +19,6 @@ async fn get_bare_vtxo_by_id() {
 
 	Db::create(&postgres_cfg).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
 
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	db.write(async |t| t.upsert_vtxos([vtxo.clone()]).await).await.unwrap();
@@ -58,7 +57,6 @@ async fn fix_offboard_vtxos() {
 
 	Db::create(&postgres_cfg).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
 
 	// the user vtxo that gets offboarded
 	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());

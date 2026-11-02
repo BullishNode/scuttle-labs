@@ -8,7 +8,7 @@ async fn fallback_fresh_schema_reopens_concurrently_without_resetting_state() {
 	let mut ctx = TestContext::new_minimal("postgresd/fallback_fresh_schema_reopen").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = server::database::Db::create(&config).await.unwrap();
+	let db = server::database::Db::create_with_payouts(&config, true).await.unwrap();
 	let client = ctx.postgres_manager().database_client(Some(&config.name)).await;
 	let history = client.query("SELECT version, checksum FROM refinery_schema_history ORDER BY version", &[]).await.unwrap()
 		.into_iter().map(|r| (r.get::<_, i32>(0), r.get::<_, String>(1))).collect::<Vec<_>>();
@@ -27,7 +27,7 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	let mut ctx = TestContext::new_minimal("postgresd/fallback_links_are_authenticated_conflict_safe_and_transactional").await;
 	ctx.init_central_postgres().await;
 	let config = ctx.new_postgres(&ctx.test_name).await;
-	let db = server::database::Db::create(&config).await.unwrap();
+	let db = server::database::Db::create_with_payouts(&config, true).await.unwrap();
 	let key = |byte| Keypair::from_seckey_slice(&SECP, &[byte; 32]).unwrap();
 	let server = key(11);
 	let mailbox = key(17);
@@ -69,7 +69,6 @@ async fn fallback_links_are_authenticated_conflict_safe_and_transactional() {
 	assert_eq!(binding_rows(coin.public_key()).await, canonical_binding.unwrap());
 	assert!(binding_rows(key(5).public_key()).await.is_empty());
 	assert_eq!(binding_rows(key(7).public_key()).await.len(), 1, "a joint binding needs no registration");
-
 
 	let pending = key(9);
 	let pending_link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &pending).unwrap();
