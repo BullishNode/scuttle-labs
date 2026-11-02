@@ -1,0 +1,3 @@
+- Count committed emergency exits once in the pending exit and total balances.
+  An unfinished payment no longer hides their value.
+  [#79](https://github.com/BullishNode/scuttle/pull/79)
