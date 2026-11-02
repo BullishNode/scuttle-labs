@@ -10,7 +10,7 @@ use bitcoin::secp256k1::PublicKey;
 
 use ark::ServerVtxo;
 
-use bitcoin_ext::BlockRef;
+use bitcoin_ext::{BlockRef, TxOutExt};
 use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use super::expiry_payout::MAX_PAYOUT_VSIZE;
 use super::Tx;
@@ -162,8 +162,20 @@ impl Tx<'_> {
 				if fact.onchain_spent_height.is_some() || fact.onchain_spent_txid.is_some() { valid = false; break; }
 				if let Some(txid) = fact.state.oor_spent_txid.filter(|_| fact.state.offboarded_in.is_none() && fact.state.spent_in_round.is_none()) {
 					let mut children = snapshot.regular.iter().filter(|child| child.state.vtxo.point().txid == txid);
-					let amount = children.try_fold(Amount::ZERO, |sum, child| sum.checked_add(child.state.vtxo.amount())
+					let mut amount = children.try_fold(Amount::ZERO, |sum, child| sum.checked_add(child.state.vtxo.amount())
 						.context("expiry branch amount overflow"))?;
+					if amount != fact.state.vtxo.amount() {
+						// A board fee is a value-bearing P2A output, not a child VTXO.
+						let spend = self.get_virtual_transaction_by_txid(txid).await?
+							.context("expiry branch transaction missing")?.signed_tx
+							.context("expiry branch residual lacks signed transaction")?;
+						ensure!(spend.compute_txid() == txid && spend.input.len() == 1
+							&& spend.input[0].previous_output == fact.state.vtxo.point(),
+							"expiry branch residual is not bound to its input");
+						amount = spend.output.iter().filter(|output| output.is_p2a_fee_anchor())
+							.try_fold(amount, |sum, output| sum.checked_add(output.value)
+								.context("expiry branch fee anchor amount overflow"))?;
+					}
 					ensure!(amount == fact.state.vtxo.amount(), "expiry branch does not conserve its input");
 					continue;
 				}
