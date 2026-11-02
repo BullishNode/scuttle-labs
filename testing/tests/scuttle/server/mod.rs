@@ -10,7 +10,6 @@ mod expiry_dust_later_receipt;
 mod expiry_failed_swap;
 mod expiry_hash_provenance;
 mod expiry_independent_payouts;
-mod expiry_internal_batched_terminal;
 mod expiry_internal_partial_terminal;
 mod expiry_internal_reclaim_reorg;
 mod expiry_internal_replan;
