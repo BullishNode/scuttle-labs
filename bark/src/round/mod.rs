@@ -877,7 +877,7 @@ impl RoundState {
 				}
 
 				match progress_delegated(
-					wallet, &self.participation, unlock_hash, scheduled_height,
+					wallet, &self.participation, self.movement_id, unlock_hash, scheduled_height,
 					self.sent_forfeit_sigs, checkpoint,
 				).await {
 					Ok(HarkProgressResult::RoundPending) => Ok(RoundStatus::Pending),
@@ -1606,6 +1606,7 @@ enum HarkProgressResult {
 async fn progress_delegated(
 	wallet: &Wallet,
 	participation: &RoundParticipation,
+	movement_id: Option<MovementId>,
 	unlock_hash: UnlockHash,
 	scheduled_height: Option<BlockHeight>,
 	sent_forfeit_sigs: bool,
@@ -1654,6 +1655,16 @@ async fn progress_delegated(
 	// Check the confirmation status of the funding tx
 	let confirmed = check_funding_tx_confirmations(wallet, funding_txid, &funding_tx, !already_released).await
 		.context("checking funding tx confirmations")
+		.map_err(HarkForfeitError::Err)?;
+
+	// The server has issued the round and its funding tx is in our mempool or a
+	// block: the server no longer accepts these inputs, so hold them like the
+	// inputs of an interactive round before we forfeit them below. The lock
+	// is forced: a recovered wallet can hold the inputs in any state, even
+	// imported as Spent.
+	let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
+	wallet.inner.db.steal_lock(&input_ids, movement_id.map(|m| m.into())).await
+		.context("failed to lock inputs of issued delegated round")
 		.map_err(HarkForfeitError::Err)?;
 
 	if !confirmed {
