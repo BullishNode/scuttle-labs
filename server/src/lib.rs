@@ -991,8 +991,6 @@ impl Server {
 				.context(vtxo_id)
 				.badarg("vtxo not found in database")?;
 
-			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
-
 			// Check vtxo is fully signed
 			if !vtxo.has_all_witnesses() {
 				return badarg!("vtxo {} is not fully signed", vtxo_id);
@@ -1014,6 +1012,8 @@ impl Server {
 			vtxo.validate(&anchor_tx)
 				.context(vtxo_id)
 				.badarg("vtxo validation failed")?;
+
+			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			self.check_registration_inputs_not_exited(vtxo).await?;
 

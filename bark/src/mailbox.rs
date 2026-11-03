@@ -34,7 +34,7 @@ use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
-use crate::vtxo::VtxoState;
+use crate::vtxo::{VtxoState, VtxoValidationError};
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -341,7 +341,7 @@ impl Wallet {
 	///
 	/// This function only returns an error when it cannot process any VTXOs,
 	/// for example when the server is down or the chain tip is unknown.
-	/// No errors are returned for issues on individual VTXOs.
+	/// Invalid individual VTXOs are skipped; chain lookup errors are retried.
 	async fn process_raw_vtxos(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
@@ -365,6 +365,9 @@ impl Wallet {
 			};
 
 			if let Err(e) = self.validate_vtxo(&vtxo).await {
+				if matches!(&e, VtxoValidationError::Chain(_)) {
+					return Err(e.into());
+				}
 				error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
 				invalid_vtxos.push(bytes);
 				continue;

@@ -219,7 +219,7 @@ impl Watchman {
 		let mut completed = self.sync_height.clone();
 		loop {
 			tokio::select! {
-				Ok(()) = completed.changed() => {
+				Ok(()) = completed.changed(), if self.db.expiry_payouts() => {
 					self.process_sweeps_logged().await;
 				},
 				_ = reaction_timer.tick() => {
