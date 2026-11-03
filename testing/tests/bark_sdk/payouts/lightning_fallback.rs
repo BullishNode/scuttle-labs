@@ -449,9 +449,26 @@ async fn pay_hold_refused_while_sender_absent() {
 			reopened.sync().await;
 			let before = reopened.history().await.unwrap().into_iter().find(|entry|
 				entry.subsystem.is_subsystem(Subsystem::LIGHTNING_SEND)).unwrap();
-			assert_eq!(before.status, MovementStatus::Pending, "mempool receipt must not complete the send");
-			assert_eq!(before.effective_balance, -send.total_amount().to_signed().unwrap());
-			assert!(reopened.lightning_send_checkpoint(hash).await.unwrap().is_some());
+			assert_eq!(before.id, movement_id);
+			assert_eq!(before.status, MovementStatus::Failed);
+			assert_eq!(before.effective_balance, bitcoin::SignedAmount::ZERO);
+			assert_eq!(before.offchain_fee, bitcoin::Amount::ZERO);
+			assert!(reopened.lightning_send_checkpoint(hash).await.unwrap().is_none());
+			assert!(!reopened.is_invoice_paid(hash).await.unwrap());
+			for id in &ids {
+				let coin = reopened.get_vtxo_by_id(*id).await.unwrap();
+				assert_eq!(coin.state, bark::vtxo::VtxoState::Spent);
+				assert_eq!(coin.fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
+			}
+			assert!(reopened.spendable_vtxos().await.unwrap().is_empty());
+			let balance = assert_balance_consistent(&reopened, false).await;
+			assert_eq!(balance.total(), bitcoin::Amount::ZERO);
+			assert!(reopened.history().await.unwrap().iter().all(|entry|
+				entry.subsystem.name != "abandon.fallback_payout"));
+			let shallow: serde_json::Value = ctx.bitcoind().sync_client().call("getrawtransaction", &[
+				serde_json::json!(parent.compute_txid().to_string()), serde_json::json!(true),
+			]).unwrap();
+			assert!(shallow["confirmations"].as_u64().unwrap_or(0) < 6, "the commitment must still be pending onchain");
 			drop(reopened);
 			let confirmed = ctx.generate_blocks(6).await;
 			srv.wait_for_sync_height(confirmed).await;

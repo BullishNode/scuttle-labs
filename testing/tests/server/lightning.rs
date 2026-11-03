@@ -618,8 +618,8 @@ async fn reject_revocation_on_successful_lightning_payment() {
 
 /// Revocation must be refused whenever the invoice is settled, even if the
 /// recorded payment-attempt status has diverged from the settlement. The
-/// settler (the `htlc_settlement` table) is the source of truth, not the
-/// status: the node can settle without the status write committing.
+/// matching preimage remains in the WAL, while contradictory source terminal
+/// facts must remain Unknown and held rather than authorize a refund.
 ///
 /// This locks the fix from commit 1c1613335. With the old code, a status that
 /// on its own permits revocation (here, `failed`) would let the server sign the
@@ -669,7 +669,7 @@ async fn reject_revocation_when_settled_but_status_regressed() {
 
 	assert_eq!(status.code(), tonic::Code::InvalidArgument);
 	assert!(
-		status.message().contains("invoice has already been paid"),
+		status.message().contains("source settlement provenance is unknown"),
 		"unexpected server response: {status:?}",
 	);
 	assert!(
@@ -1007,6 +1007,7 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 	// Expire the operator pool before the payer's unchanged 432-block board.
 	// Otherwise native payer expiry can fence the cooperative refund itself.
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).watchmand().cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.invoice_check_interval = Duration::from_secs(1);
 		cfg.vtxopool.vtxo_lifetime = BlockDelta::new(128);
 	}).create().await;
@@ -1725,9 +1726,9 @@ impl ForeignReceive {
 }
 
 /// While an external payer holds the victim's invoice in `accepted`, a client
-/// pays the same invoice intra-Ark. The server fails that payment because the
-/// invoice is already being paid, and the client revokes its HTLCs. That
-/// failed attempt never funded the receive, so its revoke must not cancel it.
+/// tries the same invoice intra-Ark. The server refuses before recording an
+/// attempt, and the client revokes its HTLCs. That refused initiation never
+/// funded the receive, so its revoke must not cancel it.
 #[tokio::test]
 async fn revoke_of_refused_intra_ark_payment_leaves_accepted_receive_open() {
 	let ctx = TestContext::new(
@@ -1742,9 +1743,19 @@ async fn revoke_of_refused_intra_ark_payment_leaves_accepted_receive_open() {
 	let htlcs = RawHtlcSend::cosign(
 		&ctx, &f.srv, &attacker_client, &f.attacker_vtxos, f.payment_hash,
 	).await;
-	// The server records the refusal on the attempt, not in the response.
-	htlcs.initiate(&f.srv, &f.invoice, btc(1)).await.unwrap();
-	wait_for_attempt_status(&f.db, f.payment_hash, "failed").await;
+	let source_ids = htlcs.vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
+	let sources_before = super::expiry_admission::source_rows(&f.db, &source_ids).await;
+	let refusal = htlcs.initiate(&f.srv, &f.invoice, btc(1)).await
+		.expect_err("an already-accepted receive must refuse before recording an attempt");
+	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+	assert!(refusal.message().contains("intra-Ark payment refused before recording an attempt"));
+	assert!(refusal.message().contains("invoice is already being paid (subscription status: accepted)"));
+	assert_eq!(f.db.read(async |t| Ok(t.query_one(
+		"SELECT count(*) FROM lightning_payment_attempt WHERE payment_hash=$1",
+		&[&f.payment_hash.to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap(), 0,
+		"a pre-record refusal must not fabricate a Failed attempt");
+	assert_eq!(super::expiry_admission::source_rows(&f.db, &source_ids).await, sources_before);
 	htlcs.revoke(&f.srv).await.expect("revoke of the refused payment should be cosigned");
 
 	assert_eq!(
@@ -2009,7 +2020,9 @@ async fn refuse_htlc_send_vtxo_posted_to_arkoor_mailbox() {
 	let ctx = TestContext::new("server/refuse_htlc_send_vtxo_posted_to_arkoor_mailbox").await;
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).create().await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
+		cfg.expiry_payouts = true;
+	}).create().await;
 
 	// The victim only ever hands out an Ark address.
 	let victim = ctx.bark("victim", &srv).create().await;
@@ -2479,7 +2492,9 @@ async fn server_claim_lightning_receive_is_idempotent(
 
 	assert_vtxopool_consistency(srv).await;
 }
-lightning_test!(server_claim_lightning_receive_is_idempotent);
+lightning_test!(server_claim_lightning_receive_is_idempotent, |cfg| {
+	cfg.expiry_payouts = true;
+});
 
 async fn server_returned_htlc_recv_vtxos_identical(
 	ctx: &TestContext,
@@ -2593,7 +2608,9 @@ async fn server_returned_htlc_recv_vtxos_identical(
 
 	assert_vtxopool_consistency(srv).await;
 }
-lightning_test!(server_returned_htlc_recv_vtxos_identical);
+lightning_test!(server_returned_htlc_recv_vtxos_identical, |cfg| {
+	cfg.expiry_payouts = true;
+});
 
 /// Hammer `prepare_lightning_receive_claim` with 100 concurrent calls for the
 /// same invoice. A single invoice must only ever pay out one set of HTLC
@@ -3864,6 +3881,7 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	let ctx = TestContext::new("server/invoice_expiry_is_chosen_by_the_client").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.invoice_expiry = Duration::from_secs(3600);
 	}).create().await;
 
@@ -3890,7 +3908,7 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS - 1);
 	let refusal = raw.start_lightning_receive(old_request).await.expect_err("an older protocol must not create a fresh invoice");
 	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
-	assert!(refusal.message().contains("unsupported Scuttle protocol version"), "unexpected refusal: {refusal}");
+	assert_eq!(refusal.message(), "unsupported protocol version", "unexpected refusal: {refusal}");
 	assert_eq!(subscription_count().await, 0);
 	assert!(hold.list(native_request).await.unwrap().into_inner().invoices.is_empty());
 	// The ordinary client below uses the current protocol and keeps the original

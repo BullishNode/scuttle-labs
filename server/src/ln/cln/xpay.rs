@@ -95,7 +95,7 @@ impl ClnXpayClient {
 
 	pub(crate) async fn node_info(&self) -> anyhow::Result<cln_rpc::GetinfoResponse> {
 		let info = super::unary_rpc(self.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await?.into_inner();
-		ensure!(qualified_node(&info, self.node_pubkey, self.network), "unsupported xpay node/version/network");
+		ensure!(qualified_node(&info, self.node_pubkey, self.network), "xpay node identity or network mismatch");
 		Ok(info)
 	}
 
@@ -685,7 +685,6 @@ fn maxdelay_until(
 
 fn qualified_node(info: &cln_rpc::GetinfoResponse, pubkey: PublicKey, network: Network) -> bool {
 	info.id.as_slice() == pubkey.serialize().as_slice() && info.network == network.to_string()
-		&& info.version == "v26.06.6"
 }
 
 

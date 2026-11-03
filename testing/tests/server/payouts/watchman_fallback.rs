@@ -1676,7 +1676,7 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	let payout = ctx.bitcoind().get_new_address();
 	assert_ne!(payout.script_pubkey(), destination);
 	let offboard_txid = bark.offboard_all(payout.clone()).await.unwrap().txid;
-	let tip = ctx.generate_blocks(1).await;
+	ctx.generate_blocks(1).await;
 	let offboard = core.get_raw_transaction(&offboard_txid, None).unwrap();
 	assert_eq!(offboard.output[0].script_pubkey, payout.script_pubkey());
 	assert!(offboard.output[0].value > Amount::ZERO);
@@ -1688,7 +1688,6 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	assert_ne!(operator_script, destination);
 	let connector_expiry = max_expiry.to_u32() + 144;
 	let early_height = max_expiry.to_u32() + 72;
-	ctx.generate_blocks(early_height - tip.to_u32()).await;
 	let mut operator_total = Amount::ZERO;
 	let mut miner_total = Amount::ZERO;
 	let mut all_packages = BTreeMap::new();
@@ -1697,15 +1696,22 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	assert_eq!(all_sources.len(), 4);
 	assert!(all_sources.insert(connector_id.to_string()));
 	for late in [false, true] {
-		let height = ctx.bitcoind().get_block_count().await as u32;
-		if late {
-			assert!(height < connector_expiry);
-			ctx.generate_blocks(connector_expiry - height).await;
-		} else { assert_eq!(height, early_height); }
 		let tip = bitcoin_ext::BlockHeight::new(if late { connector_expiry } else { early_height });
 		let source_ids = if late { vec![connector_id.to_string()] } else { board_ids.clone() };
 		let roots = if late { BTreeMap::from([(connector_point, offboard.output[1].clone())]) } else { board_roots.clone() };
 		let packages = tokio::time::timeout(Duration::from_secs(15), async {
+			// Observe fee capital before this stage can publish and consume it.
+			let owned = watchman_confirmed_outpoints(wm).await;
+			assert!(available.keys().all(|point| owned.contains(point)));
+			for (point, expected) in &available {
+				let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
+				assert!(actual.confirmations >= 6);
+				assert_eq!(actual.value, expected.value);
+				assert_eq!(actual.script_pub_key.script().unwrap(), expected.script_pubkey);
+			}
+			let height = ctx.bitcoind().get_block_count().await as u32;
+			assert!(height < tip.to_u32());
+			ctx.generate_blocks(tip.to_u32() - height).await;
 			// All new attribution, completed-view checks and publication share this stage's original clock.
 			let stored = db.read(async |tx| Ok(tx.query_one("SELECT signed_tx,user_fee_sat FROM offboards WHERE txid=$1",
 				&[&offboard_txid.to_string()]).await?)).await.unwrap();
@@ -1748,14 +1754,6 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 					Ok(view.height == tip && view.hash == hash && tx.expiry_view().await? == Some(view))
 				}).await.unwrap() { break; }
 				tokio::time::sleep(Duration::from_millis(50)).await;
-			}
-			let owned = watchman_confirmed_outpoints(wm).await;
-			assert!(available.keys().all(|point| owned.contains(point)));
-			for (point, expected) in &available {
-				let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
-				assert!(actual.confirmations >= 6);
-				assert_eq!(actual.value, expected.value);
-				assert_eq!(actual.script_pub_key.script().unwrap(), expected.script_pubkey);
 			}
 			wm.trigger_sweep().await;
 			wait_watchman_payouts(&ctx, &db, &source_ids).await

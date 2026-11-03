@@ -125,7 +125,7 @@ async fn offboard_race(offboard_wins: bool) {
 			// The native offboard is first in the real row-lock queue. The
 			// completed watchman now permits a real allocation to queue too.
 			srv.watchmand().start().await.unwrap();
-			wait_for_query_lock(tx, "SELECT vtxo_id,updated_at,spend_state::TEXT,%").await?;
+			wait_for_query_lock(tx, "SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE").await?;
 			Ok(())
 		}).await.unwrap();
 		let actual = tokio::time::timeout(Duration::from_secs(20), operation).await.unwrap().unwrap().unwrap().txid;

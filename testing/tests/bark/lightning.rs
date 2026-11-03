@@ -1043,6 +1043,7 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 
 	// Keep the payer tree live after the pool grants have actually closed.
 	let srv = ctx.captaind("server").lightningd(&lightning.external).watchmand().cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.invoice_check_interval = Duration::from_secs(1);
 		cfg.vtxo_lifetime = BlockDelta::new(864);
 	}).create().await;

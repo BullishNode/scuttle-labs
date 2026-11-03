@@ -2746,6 +2746,7 @@ async fn undo_round() {
 
 	let ctx = TestContext::new("server/undo_round").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.round_interval = Duration::from_secs(3600);
 	}).create().await;
 

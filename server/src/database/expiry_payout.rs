@@ -153,7 +153,9 @@ impl Tx<'_> {
 	/// Follow only immutable registered OOR edges. The stage resolver below
 	/// still decides whether a descendant is actually this input owner's right;
 	/// sharing a transaction or a mailbox is not sufficient.
-	async fn source_fallback_claims(&self, ids: &[VtxoId], bitcoind: &bitcoind_async_client::Client) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
+	/// Reporting uses a read-only snapshot of the last completed block;
+	/// financial decisions validate the chain independently.
+	async fn source_fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
 		if ids.is_empty() { return Ok(BTreeMap::new()); }
 		let raw = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		let rows = self.query("WITH RECURSIVE branch AS (
@@ -173,18 +175,16 @@ impl Tx<'_> {
 			return Ok(BTreeMap::new());
 		}
 		let point = self.expiry_view().await?.context("fallback projection has no published watchman tip")?;
-		self.lock_watchman_tip(point).await?;
-		super::expiry_chain::verify_expiry_tip(point, bitcoind).await?;
 		self.fallback_claims(&candidates, point).await
 	}
 
 	/// Aggregate direct and stage-selected input-owner portions onto the
 	/// authenticated coin identity. Keep birth ownership separate from payee.
-	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId], bitcoind: &bitcoind_async_client::Client)
+	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
 		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
 	{
 		if !self.expiry_payouts() { return Ok(BTreeMap::new()); }
-		let claims = self.source_fallback_claims(ids, bitcoind).await?;
+		let claims = self.source_fallback_claims(ids).await?;
 		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
 		let owners = self.coin_owner_mailboxes(ids).await?;
 		let mut outcomes = BTreeMap::new();
@@ -202,7 +202,7 @@ impl Tx<'_> {
 	/// A collected receive can have no final coin row. Use its actual grants
 	/// and admitted destination bindings, not the provider's grant ownership.
 	/// The public hash-only response receives an outcome, never these keys.
-	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription, bitcoind: &bitcoind_async_client::Client)
+	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
 		-> anyhow::Result<Option<FallbackOutcome>>
 	{
 		if !self.expiry_payouts() { return Ok(None); }
@@ -236,7 +236,7 @@ impl Tx<'_> {
 			destinations.insert(id, mailbox_pk);
 			ids.push(id);
 		}
-		let claims = self.source_fallback_claims(&ids, bitcoind).await?;
+		let claims = self.source_fallback_claims(&ids).await?;
 		let matching = claims.values().filter(|claim| destinations.iter().any(|(id, owner)|
 			claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(id)));
 		fallback_outcome(principal, matching)

@@ -42,7 +42,8 @@ right reports `Forfeited`. Partial coverage remains pending.
 
 Bark retires authenticated fallback commitments to ordinary `Spent` immediately.
 An existing emergency exit keeps its `Exited` state. Optional `fallback_status`
-is the last observed display, not a separate claim or balance. A later reorg
+is the last observed display, not a separate claim or balance. Server status
+reflects its last processed block, rather than a new Bitcoin lookup. A later reorg
 can change that display to pending but does not restore Ark spendability.
 Ark consumption therefore does not by itself prove receipt of bitcoin.
 

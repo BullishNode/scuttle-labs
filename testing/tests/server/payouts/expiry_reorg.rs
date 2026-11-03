@@ -71,38 +71,34 @@ async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 	let entitlement: i64 = permanent.get("id");
 	let irreversible: String = permanent.get("facts");
 
-	// The server observes the shorter fork while the watchman is offline.
-	// Its old completed view must not authorize work for the new generation.
+	// Upstream sync rejects a lower tip. Keep both daemons offline until
+	// the real replacement branch is higher than their retained old tip.
 	srv.watchmand().stop().await.unwrap();
+	srv.stop().await.unwrap();
 	rpc.invalidate_block(&old_hash).unwrap();
 	let fork = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
 	assert!(fork.height < old_tip.height);
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let ready = db.read(async |t| t.get_highest_block(BlockTable::Captaind).await).await.unwrap() == Some(fork);
-			if ready { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("actual shorter fork was not indexed before watchman restart");
 	assert_eq!(db.read(async |t| Ok(t.get_user_vtxo_by_id(ids[0]).await?.spend_state)).await.unwrap(),
 		server::database::SpendState::Spent, "a reorg must not reopen the committed source");
 
-	srv.watchmand().start().await.unwrap();
-	// Upstream's wallet processes a reorg on the next block. Mine one of
-	// the replacement blocks before asking it to rebuild the fee child.
-	// A fresh coinbase destination prevents reproducing the invalid block.
+	// Use the same seven replacement blocks and a fresh coinbase destination.
 	let mining_address = ctx.bitcoind().get_new_address();
 	rpc.generate_to_address(1, &mining_address).unwrap();
+	rpc.generate_to_address(6, &mining_address).unwrap();
 	let recovery_tip = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
+	assert!(recovery_tip.height > old_tip.height);
+	srv.start().await.unwrap();
+	srv.watchmand().start().await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let valid = db.read(async |t| {
 				let Some(view) = t.expiry_view().await? else { return Ok(false); };
 				Ok(view == recovery_tip
+					&& t.get_highest_block(BlockTable::Captaind).await? == Some(recovery_tip)
 					&& (t.expiry_view().await? == Some(view)))
 			}).await.unwrap();
-			// A retained package may already be mined in the first replacement
-			// block; otherwise the watchman must recover it in the mempool.
+			// A retained package may already be mined on the replacement
+			// branch; otherwise the watchman must recover it in the mempool.
 			let published = rpc.get_mempool_entry(&txid).is_ok()
 				|| rpc.custom_get_raw_transaction_info(txid, None).unwrap()
 					.is_some_and(|info| info.confirmations.unwrap_or(0) > 0);
@@ -111,7 +107,6 @@ async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 		}
 	}).await.expect("watchman restart did not rebuild and recover the immutable payout package");
 
-	rpc.generate_to_address(6, &mining_address).unwrap();
 	let new_tip = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
 	let current = rpc.custom_get_raw_transaction_info(txid, None).unwrap().unwrap();
 	let new_hash = current.blockhash.expect("the original payout must re-confirm on the replacement chain");

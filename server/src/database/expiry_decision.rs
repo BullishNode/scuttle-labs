@@ -210,7 +210,7 @@ impl Tx<'_> {
 					dropped += 1;
 				}
 			} else {
-				if needs_split || coins.len() > 1 { self.request_held_expiry_split(view, &root, "output_requires_split").await?; }
+				if needs_split || !coins.is_empty() { self.request_held_expiry_split(view, &root, "output_requires_split").await?; }
 				dropped += 1;
 			}
 		}

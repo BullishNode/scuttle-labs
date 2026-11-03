@@ -186,12 +186,16 @@ impl rpc::server::ArkService for Server {
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
 
-		let (vtxo_state, fallback, owners, outcomes) = self.db.write(async |t| {
+		let (vtxo_state, fallback, owners, outcomes) = self.db.read(async |t| {
+			if t.expiry_payouts() {
+				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+			}
+
 			let state = t.get_server_vtxo_by_id(id).await?;
 			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
 			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?,
-				t.fallback_outcomes(&[id], &self.bitcoind).await?))
+				t.fallback_outcomes(&[id]).await?))
 		}).await.to_status()?;
 
 		let spend_state = vtxo_state.spend_state;
@@ -271,13 +275,17 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback, owners, outcomes) = self.db.write(async |t| {
+		let (states, fallback, owners, outcomes) = self.db.read(async |t| {
+			if t.expiry_payouts() {
+				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+			}
+
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
 			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
 				.collect::<Vec<_>>();
 			let fallback = t.fallback_customer_vtxos(&keys).await?;
 			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?,
-				t.fallback_outcomes(&ids, &self.bitcoind).await?))
+				t.fallback_outcomes(&ids).await?))
 		}).await.to_status()?;
 
 		// An id without a client-visible user vtxo is reported as missing,
@@ -371,10 +379,15 @@ impl rpc::server::ArkService for Server {
 		// not found.
 		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
 		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (fallback, owners, outcomes) = self.db.write(async |t| Ok((
-			t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
-			t.fallback_outcomes(&ids, &self.bitcoind).await?,
-		))).await.to_status()?;
+		let (fallback, owners, outcomes) = self.db.read(async |t| {
+			if t.expiry_payouts() {
+				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+			}
+			Ok((
+				t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
+				t.fallback_outcomes(&ids).await?,
+			))
+		}).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
 				spend_state: fallback_spend_state(client_spend_state(v.spend_state,
@@ -703,7 +716,12 @@ impl rpc::server::ArkService for Server {
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
 
 		let sub = self.check_lightning_receive(payment_hash, req.wait).await.to_status()?;
-		let outcome = self.db.write(async |t| t.receive_fallback_outcome(&sub, &self.bitcoind).await).await.to_status()?;
+		let outcome = self.db.read(async |t| {
+			if t.expiry_payouts() {
+				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+			}
+			t.receive_fallback_outcome(&sub).await
+		}).await.to_status()?;
 		let mut response: protos::CheckLightningReceiveResponse = sub.into();
 		response.fallback_spend_state = outcome.as_ref()
 			.map(|outcome| fallback_spend_state(protos::VtxoSpendState::Unspecified, Some(outcome)) as i32);

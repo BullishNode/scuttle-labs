@@ -149,7 +149,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 			held.release.notify_one();
 			wait_for_query_lock(tx, "SELECT vtxo_id FROM vtxo WHERE vtxo_id = ANY%").await?;
 			srv.watchmand().start().await.unwrap();
-			wait_for_query_lock(tx, "SELECT vtxo_id,updated_at,spend_state::TEXT,%").await?;
+			wait_for_query_lock(tx, "SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE").await?;
 			Ok(())
 		}).await.unwrap();
 		tokio::time::timeout(Duration::from_secs(20), syncing).await.unwrap().unwrap().unwrap();

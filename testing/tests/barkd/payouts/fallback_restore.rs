@@ -90,9 +90,9 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(refusal.status(), reqwest::StatusCode::CONFLICT);
 	let refusal: serde_json::Value = refusal.json().await.unwrap();
 	assert_eq!(refusal["code"], "decided_for_fallback");
-	assert_eq!(refusal["message"], "This coin expired and is being paid to your fallback address.");
-	assert_eq!(barkd.get_vtxo(&coin.vtxo.id.to_string()).await.state, bark_json::primitives::VtxoStateInfo::Spendable,
-		"the refused send must release its temporary input lock");
+	let refused_coin = barkd.get_vtxo(&coin.vtxo.id.to_string()).await;
+	assert_eq!(refused_coin.state, bark_json::primitives::VtxoStateInfo::Spent);
+	assert_eq!(refused_coin.fallback_status, Some(bark_json::primitives::FallbackStatusInfo::Spent));
 	assert_eq!(barkd.get_vtxo_encoded(&coin.vtxo.id.to_string()).await.encoded, original);
 	let postgres = srv.config().postgres.clone();
 	let db = Db::connect(&postgres).await.unwrap();
@@ -104,8 +104,8 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(refused.len(), 1);
 	assert_eq!(refused[0].status, MovementStatus::Failed);
 	assert_eq!(refused[0].effective_balance.to_sat(), 0);
-	// Discover the canonical output with the ordinary chain wallet, while
-	// retained Ark material is retired only after chain verification.
+	// The commitment has retired the Ark source. Discover its canonical
+	// Bitcoin output through the ordinary chain wallet.
 	tokio::time::timeout(Duration::from_secs(10), async {
 		loop {
 			barkd.sync().await;

@@ -48,7 +48,7 @@ async fn assert_swept_exit(
 	assert!(matches!(shallow, Some(ExitState::Processing(_))),
 		"one-deep customer payout must not end the exit: {:?}", shallow);
 	wallet.sync_fallback_payouts().await.unwrap();
-	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Locked { holder: None });
+	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().state, bark::vtxo::VtxoState::Spent);
 	assert_eq!(wallet.get_vtxo_by_id(vtxo).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
 	let registered = wallet.fallback_script();
 	let payout_index = parent.output.iter().position(|output| output.script_pubkey == registered).unwrap() as u32;
@@ -72,8 +72,8 @@ async fn assert_swept_exit(
 		ctx.generate_blocks(1).await;
 	}
 
-	assert!(matches!(state, Some(ExitState::VtxoSwept(_))),
-		"exit of a swept vtxo must terminate as VtxoSwept, was {:?}", state,
+	assert!(matches!(state, Some(ExitState::VtxoAlreadySpent(_))),
+		"the committed source must end its ordinary exit as already spent, was {:?}", state,
 	);
 	// A swept output can never be claimed, so the exit must never have offered it.
 	assert!(!claimable, "the exit of a swept vtxo must never become claimable");
