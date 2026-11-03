@@ -1509,9 +1509,17 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS n FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)",
 		&[&operator_ids]).await?.get::<_, i64>("n"))).await.unwrap();
 	assert_eq!(early, 0, "unexpired pool and discharged source must not receive an expiry allocation");
-	let tip = ctx.generate_blocks(150).await;
 	let backing_anchors = fundings.keys().map(ToString::to_string).collect::<Vec<_>>();
 	let (packages, roots) = tokio::time::timeout(Duration::from_secs(10), async {
+		// Observe declared fee capital before maturity can consume it.
+		loop {
+			if sponsors.keys().all(|point| core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().is_some_and(|output| output.confirmations >= 6)) {
+				let owned = watchman_confirmed_outpoints(wm).await;
+				if sponsors.keys().all(|point| owned.contains(point)) { break; }
+			}
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		let tip = ctx.generate_blocks(150).await;
 		srv.wait_for_sync_height(tip).await;
 		wm.wait_for_sync_height(tip).await;
 		let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM vtxo WHERE anchor_point=ANY($1) \
@@ -1532,13 +1540,6 @@ pub(super) async fn watchman_sweeps_vtxopool_with_exit() {
 		assert_eq!(roots.iter().map(|root| root.amount()).sum::<Amount>(), sat(300_099_000));
 		let hash = core.get_block_hash(u64::from(tip.to_u32())).unwrap();
 		wait_expiry_allocations(&db, &operator_ids, tip, hash).await;
-		loop {
-			if sponsors.keys().all(|point| core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().is_some_and(|output| output.confirmations >= 6)) {
-				let owned = watchman_confirmed_outpoints(wm).await;
-				if sponsors.keys().all(|point| owned.contains(point)) { break; }
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
 		wm.trigger_sweep().await;
 		let packages = wait_watchman_payouts(&ctx, &db, &operator_ids).await;
 		(packages, roots)
@@ -2002,12 +2003,33 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		assert!(watchman_fee(&ctx, &child) > Amount::ZERO);
 		(parent, child)
 	}).await.expect("real progress and its funded Core child must appear within the original ten seconds");
-	let tip = ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() - 2 * ROUND_CONFIRMATIONS + 3).await;
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
 	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	assert_ne!(destinations[0], destinations[1]);
-	let replacement_mature = replacement.expiry_height() <= tip;
-	let (packages, roots, expected, available) = tokio::time::timeout(Duration::from_secs(10), async {
+	let (packages, roots, expected, available, replacement_mature) = tokio::time::timeout(Duration::from_secs(10), async {
+		// Confirm the real progress change before backing can mature. The
+		// two batches mine the same original total, under the same 10s clock.
+		let maturity_blocks = srv.config().vtxo_lifetime.to_u32() - 2 * ROUND_CONFIRMATIONS + 3;
+		ctx.generate_blocks(6).await;
+		let consumed = progress_child.input.iter().filter(|input| sponsors.contains_key(&input.previous_output)).map(|input| input.previous_output).collect::<BTreeSet<_>>();
+		let mut available = sponsors.iter().filter(|(point, _)| !consumed.contains(point)).map(|(point, output)| (*point, output.clone())).collect::<BTreeMap<_, _>>();
+		for (index, output) in progress_child.output.iter().enumerate() {
+			assert!(output.value > Amount::ZERO);
+			assert!(available.insert(OutPoint::new(progress_child.compute_txid(), index as u32), output.clone()).is_none());
+		}
+		loop {
+			let owned = watchman_confirmed_outpoints(wm).await;
+			if available.keys().all(|point| owned.contains(point)) { break; }
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+		for (point, output) in &available {
+			let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
+			assert!(actual.confirmations >= 6);
+			assert_eq!(actual.value, output.value);
+			assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
+		}
+		let tip = ctx.generate_blocks(maturity_blocks - 6).await;
+		let replacement_mature = replacement.expiry_height() <= tip;
 		// All new attribution, the current view and publication share the original clock.
 		for (coin, round) in originals.iter().map(|coin| (coin, stale.chain_anchor().txid))
 			.chain([(&recipient, replacement.chain_anchor().txid), (&received, replacement.chain_anchor().txid)]) {
@@ -2079,25 +2101,8 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		assert_eq!(expected.values().filter(|(coin, _, _)| coin.id() == padding.id())
 			.map(|(coin, _, _)| coin.amount()).sum::<Amount>(), if replacement_mature { sat(330) } else { Amount::ZERO });
 		assert_eq!(roots.iter().map(|root| root.amount()).sum::<Amount>(), expected.values().map(|(coin, _, _)| coin.amount()).sum::<Amount>());
-		let consumed = progress_child.input.iter().filter(|input| sponsors.contains_key(&input.previous_output)).map(|input| input.previous_output).collect::<BTreeSet<_>>();
-		let mut available = sponsors.iter().filter(|(point, _)| !consumed.contains(point)).map(|(point, output)| (*point, output.clone())).collect::<BTreeMap<_, _>>();
-		for (index, output) in progress_child.output.iter().enumerate() {
-			assert!(output.value > Amount::ZERO);
-			assert!(available.insert(OutPoint::new(progress_child.compute_txid(), index as u32), output.clone()).is_none());
-		}
 		assert!(sponsors.keys().filter(|point| !consumed.contains(point)).count() >= roots.len(),
 			"untouched confirmed fee inputs must cover one package per actual current root");
-		loop {
-			let owned = watchman_confirmed_outpoints(wm).await;
-			if available.keys().all(|point| owned.contains(point)) { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-		for (point, output) in &available {
-			let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
-			assert!(actual.confirmations >= 6);
-			assert_eq!(actual.value, output.value);
-			assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
-		}
 		if !replacement_mature {
 			assert!(replacement.expiry_height() > tip);
 			for id in [replacement.id(), padding.id()] {
@@ -2127,7 +2132,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		wm.trigger_sweep().await;
 		let packages = wait_watchman_payouts(&ctx, &db, &source_ids).await;
 		assert!(!packages.is_empty() && packages.len() <= roots.len(), "each package needs actual current backing");
-		(packages, roots, expected, available)
+		(packages, roots, expected, available, replacement_mature)
 	}).await.expect("actual current-cut funded payout packages must appear within the original ten seconds");
 	let mut customer_gross_by_expiry = BTreeMap::<(usize, u32), u64>::new();
 	for (coin, owner, _) in expected.values() {

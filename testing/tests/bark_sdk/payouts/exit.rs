@@ -207,7 +207,11 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 			"Bitcoin settlement must not synthesize a second Ark movement");
 		assert_eq!(gross, output.value + fee, "the original Core output and fee still account for all principal");
 
-		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
+		let before_refresh_coin = owner.get_vtxo_by_id(id).await.unwrap();
+		let refusal = owner.refresh_vtxos([id]).await.expect_err("paid principal must not enter another round");
+		assert_eq!(refusal.to_string(), format!("input VTXO {id} is not spendable (state: Spent)"));
+		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap(), before_refresh_coin,
+			"a refused refresh must leave the retired coin unchanged");
 		owner.sync_fallback_payouts().await.unwrap();
 		assert_eq!(owner.history().await.unwrap(), before_refresh, "refresh and receipt replay must not debit or mint again");
 	}
@@ -420,7 +424,11 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 			"Bitcoin settlement must not synthesize a second Ark movement");
 		assert_eq!(gross, output.value + fee, "the original Core output and fee still account for all principal");
 
-		assert!(owner.refresh_vtxos([id]).await.unwrap().is_none(), "paid principal must not enter another round");
+		let before_refresh_coin = owner.get_vtxo_by_id(id).await.unwrap();
+		let refusal = owner.refresh_vtxos([id]).await.expect_err("paid principal must not enter another round");
+		assert_eq!(refusal.to_string(), format!("input VTXO {id} is not spendable (state: Spent)"));
+		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap(), before_refresh_coin,
+			"a refused refresh must leave the retired coin unchanged");
 		owner.sync_fallback_payouts().await.unwrap();
 		assert_eq!(owner.history().await.unwrap(), before_refresh, "refresh and receipt replay must not debit or mint again");
 	}
