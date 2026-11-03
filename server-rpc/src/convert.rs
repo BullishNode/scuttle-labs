@@ -27,6 +27,7 @@ use ark::vtxo::{Bare, Full, VtxoRef};
 
 use crate::protos;
 
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("rpc conversion error: {msg}")]
 pub struct ConvertError {
@@ -170,6 +171,7 @@ macro_rules! impl_try_from_bytes_bitcoin {
 	};
 }
 impl_try_from_bytes_bitcoin!(Transaction, "bitcoin transaction");
+
 
 impl From<ark::ArkInfo> for protos::ArkInfo {
 	#[allow(deprecated)] // vtxo_expiry_delta and offboard_feerate kept for old clients
@@ -511,6 +513,7 @@ impl TryFrom<protos::WalletStatus> for crate::WalletStatus {
 	}
 }
 
+
 impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
 	fn from(v: &'a VtxoRequest) -> Self {
 		protos::VtxoRequest {
@@ -544,7 +547,6 @@ impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
 impl From<ArkoorDestination> for protos::ArkoorDestination {
 	fn from(v: ArkoorDestination) -> Self {
 		Self {
-
 			owner_proof: None,
 			total_amount: v.total_amount.to_sat(),
 			policy: v.policy.serialize(),

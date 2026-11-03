@@ -1879,8 +1879,7 @@ impl Wallet {
 
 	/// Returns all spendable vtxos
 	pub async fn spendable_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
-		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
-		Ok(vtxos)
+		Ok(self.vtxos_with(&VtxoStateKind::Spendable).await?)
 	}
 
 	/// Returns all spendable vtxos matching the provided predicate

@@ -178,19 +178,15 @@ impl OnchainWallet {
 		};
 
 		let mut ret = Self { inner: wallet, db };
-		ret.reserve_fallback_address().await?;
+		ret.inner.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
+		ret.inner.mark_used(KeychainKind::External, 0);
+		ret.persist().await?;
 		Ok(ret)
 	}
 	/// The default mailbox's BIP86 external index-zero destination. External
 	/// mailbox applications must use the corresponding Bitcoin account themselves.
 	pub fn fallback_script(&self) -> ScriptBuf {
 		self.inner.peek_address(KeychainKind::External, 0).address.script_pubkey()
-	}
-
-	async fn reserve_fallback_address(&mut self) -> anyhow::Result<()> {
-		self.inner.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
-		self.inner.mark_used(KeychainKind::External, 0);
-		self.persist().await
 	}
 
 }

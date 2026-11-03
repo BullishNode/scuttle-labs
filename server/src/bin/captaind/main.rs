@@ -19,7 +19,7 @@ use ark::integration::{TokenStatus, TokenType};
 use ark::VtxoId;
 use server::{bitcoind as bcd, filters, Config, Server, CAPTAIND_CLI_API_KEY};
 use server::utils::block_duration;
-use server_rpc::{self as rpc, protos, RequestExt};
+use server_rpc::{self as rpc, protos};
 
 /// Defaults to our default port on localhost.
 const DEFAULT_ADMIN_RPC_ADDR: &str = "127.0.0.1:3536";

@@ -60,8 +60,6 @@ pub struct OwnershipProposal {
 	/// These entire participations must be cancelled atomically at commit.
 	/// A proposal never cancels anything during background readiness work.
 	pub cancellations: Vec<i64>,
-	/// Preserve newly learned preimages even when the chain conclusion rolls back.
-	pub has_stored_preimage: bool,
 	/// Only a fully validated, expired HTLC settlement can request
 	/// signed progression. Missing ownership or path proof never does.
 	pub needs_chain_progress: bool,
@@ -74,7 +72,7 @@ impl OwnershipProposal {
 		Self {
 			id: fact.state.vtxo_id, gross: fact.state.vtxo.amount(),
 			disposition: OwnershipDisposition::Unresolved(reason), evidence: None,
-			cancellations: Vec::new(), has_stored_preimage: false, needs_chain_progress: false,
+			cancellations: Vec::new(), needs_chain_progress: false,
 			settlement_integrity_hold: false,
 		}
 	}
@@ -242,7 +240,7 @@ impl Tx<'_> {
 		if let Some(hash) = payment {
 			let htlcs = htlc_vtxo::get_htlc_vtxo_states_by_payment_hash(self, hash).await?;
 			let Some(htlc) = htlcs.iter().find(|h| h.vtxo.vtxo_id == proposal.id) else { return Ok(proposal); };
-			proposal.has_stored_preimage = self.get_htlc_settlement_by_payment_hash(hash).await?.is_some();
+			let has_stored_preimage = self.get_htlc_settlement_by_payment_hash(hash).await?.is_some();
 			let source = if htlc.direction() == HtlcDirection::Incoming {
 				let source = self.lightning_source_state(state.vtxo_id, hash).await?;
 				let settlement = self.source_settlement(hash, state.vtxo_id).await?;
@@ -278,7 +276,7 @@ impl Tx<'_> {
 							proposal.disposition = OwnershipDisposition::Operator;
 							proposal.evidence = Some(OwnershipEvidence::HtlcRecvExpired);
 						},
-						LightningHtlcSubscriptionStatus::HtlcsReady if expired_contract && !proposal.has_stored_preimage => {
+						LightningHtlcSubscriptionStatus::HtlcsReady if expired_contract && !has_stored_preimage => {
 							proposal.disposition = OwnershipDisposition::Operator;
 							proposal.evidence = Some(OwnershipEvidence::HtlcRecvExpired);
 						},

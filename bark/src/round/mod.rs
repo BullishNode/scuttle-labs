@@ -877,7 +877,7 @@ impl RoundState {
 				}
 
 				match progress_delegated(
-					wallet, &self.participation, self.movement_id, unlock_hash, scheduled_height,
+					wallet, &self.participation, unlock_hash, scheduled_height,
 					self.sent_forfeit_sigs, checkpoint,
 				).await {
 					Ok(HarkProgressResult::RoundPending) => Ok(RoundStatus::Pending),
@@ -1606,7 +1606,6 @@ enum HarkProgressResult {
 async fn progress_delegated(
 	wallet: &Wallet,
 	participation: &RoundParticipation,
-	movement_id: Option<MovementId>,
 	unlock_hash: UnlockHash,
 	scheduled_height: Option<BlockHeight>,
 	sent_forfeit_sigs: bool,
@@ -2141,7 +2140,7 @@ impl Wallet {
 		movement_kind: Option<RoundMovement>,
 	) -> anyhow::Result<StoredRoundState> {
 		let (_, info) = self.require_server().await?;
-		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
+		self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		for output in &participation.outputs {
 			let key = output.policy.user_pubkey();
@@ -2204,7 +2203,7 @@ impl Wallet {
 		// the ones it holds when it stores this submission, and they notice
 		// on their next sync.
 		let (_, info) = self.require_server().await?;
-		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
+		self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
 			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		for output in &participation.outputs {
 			let key = output.policy.user_pubkey();

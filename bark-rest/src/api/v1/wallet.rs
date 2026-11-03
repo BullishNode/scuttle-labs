@@ -561,7 +561,9 @@ pub async fn vtxos(
 		wallet.vtxos().await.context("Failed to get VTXOs")?
 	};
 
-	let vtxo_infos = wallet_vtxos.iter().map(bark_json::primitives::WalletVtxoInfo::from).collect();
+	let vtxo_infos = wallet_vtxos.iter()
+		.map(bark_json::primitives::WalletVtxoInfo::from)
+		.collect();
 
 	Ok(axum::Json(vtxo_infos))
 }
@@ -593,8 +595,7 @@ pub async fn get_vtxo(
 	let wallet_vtxo = wallet.get_vtxo_by_id(vtxo_id).await
 		.not_found([vtxo_id], "VTXO not found")?;
 
-	let info = bark_json::primitives::WalletVtxoInfo::from(&wallet_vtxo);
-	Ok(axum::Json(info))
+	Ok(axum::Json((&wallet_vtxo).into()))
 }
 
 #[utoipa::path(

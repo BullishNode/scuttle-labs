@@ -46,11 +46,13 @@ use crate::{
 	MAX_PROTOCOL_VERSION, MIN_PROTOCOL_VERSION,
 };
 
+
 #[cfg(all(feature = "tonic-native", feature = "tonic-web"))]
 compile_error!("features `tonic-native` and `tonic-web` are mutually exclusive");
 
 #[cfg(all(feature = "socks5-proxy", not(feature = "tonic-native")))]
 compile_error!("the `socks5-proxy` feature is only usable in conjunction with `tonic-native`");
+
 
 /// The HTTP header used for private server access tokens
 #[deprecated(
@@ -74,6 +76,7 @@ pub const NO_TRANSPORT_BACKEND_MESSAGE: &str =
 
 /// Default timeout to add on requests to the server
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 
 #[cfg(feature = "tonic-native")]
 mod transport {
@@ -218,6 +221,7 @@ mod transport {
 		}
 	}
 }
+
 
 #[derive(Debug, thiserror::Error)]
 #[error("failed to create gRPC endpoint: {msg}")]
@@ -584,8 +588,7 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 
 #[cfg(test)]
 mod tests {
-	use super::{check_handshake, ConnectError, CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
-	use crate::{protos, pver};
+	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {

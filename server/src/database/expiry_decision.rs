@@ -239,7 +239,7 @@ impl Tx<'_> {
 			let cancellations = output.1.iter().flat_map(|c| c.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
 			ensure!(self.cancel_expiry_participations(&cancellations).await?, "selected expiry cancellation changed under its locks");
 		}
-		let policy = plan.forfeits.iter().chain(plan.recipients.iter().flat_map(|r| &r.leaves))
+		let policy = plan.iter()
 			.map(|a| (a.id,a)).collect::<BTreeMap<_, _>>();
 		let id: i64 = self.query_one("INSERT INTO expiry_allocation(expiry_height) VALUES($1) RETURNING id",
 			&[&i32::try_from(expiry.to_u32())?]).await?.get(0);

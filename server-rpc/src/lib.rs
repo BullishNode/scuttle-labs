@@ -105,12 +105,14 @@ pub mod mailbox {
 	pub use crate::protos::mailbox_server::mailbox_service_client::MailboxServiceClient;
 }
 
+
 use std::borrow::BorrowMut;
 use std::str::FromStr;
 use std::time::Duration;
 
 use bitcoin::{Address, Amount, OutPoint};
 use bitcoin::address::NetworkUnchecked;
+
 
 /// The minimum protocol version supported by the client.
 ///
@@ -153,6 +155,7 @@ pub const MAX_NB_MAILBOX_ARKOOR_VTXOS: usize = 100;
 
 /// The maximum number of inputs of a board funding tx
 pub const MAX_NB_BOARD_FUNDING_INPUTS: usize = 100;
+
 
 #[derive(Debug, Clone)]
 pub struct WalletStatus {
