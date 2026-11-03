@@ -24,7 +24,7 @@
 
 use std::str::FromStr;
 
-use anyhow::Context;
+use anyhow::{ensure, Context};
 use chrono::{DateTime, Local};
 use postgres_types::{FromSql, ToSql};
 use tokio_postgres::{GenericClient, Row};
@@ -382,4 +382,21 @@ pub async fn get_xpays_by_payment_hash<T: GenericClient>(
 		.context("failed to list xpays by payment hash")?;
 
 	rows.into_iter().map(ClnXpayRecord::try_from).collect()
+}
+
+/// Recover the original request written in the same transaction as this attempt.
+/// Never infer an absent/ambiguous label from a payment hash or native outcome.
+pub(crate) async fn get_xpay_for_payment_attempt<T: GenericClient>(
+	client: &T, attempt: &crate::database::ln::LightningPaymentAttempt,
+) -> anyhow::Result<ClnXpayRecord> {
+	let mut matching = get_xpays_by_payment_hash(client, attempt.payment_hash).await?
+		.into_iter().filter(|record| record.lightning_node_id == attempt.lightning_node_id
+			&& record.payment_hash == attempt.payment_hash
+			&& record.payment_amount_msat == attempt.amount_msat
+			&& record.created_at == attempt.created_at);
+	let record = matching.next().context("attempt has no exact original xpay request")?;
+	ensure!(matching.next().is_none(), "attempt has ambiguous original xpay requests");
+	ensure!(record.label.as_deref().is_some_and(|label| !label.is_empty()),
+		"original xpay request has no native label; attempt stays held");
+	Ok(record)
 }

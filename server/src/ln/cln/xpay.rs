@@ -339,8 +339,11 @@ impl ClnXpayClient {
 		let mut listpays_response = super::unary_rpc(self.rpc.clone().list_pays(req)).await
 			.context("Could not fetch cln payments")?
 			.into_inner();
-		let label = attempt.id.to_string();
-		let hash_pending_or_complete = retain_own_pays(&mut listpays_response.pays, payment_hash, &label)?;
+		let record = self.db.read(async |tx|
+			xpay::get_xpay_for_payment_attempt(&**tx, &attempt).await
+		).await?;
+		let label = record.label.as_deref().context("original xpay request has no native label")?;
+		let hash_pending_or_complete = retain_own_pays(&mut listpays_response.pays, payment_hash, label)?;
 		if listpays_response.pays.is_empty() {
 			if let Some((record, code)) = zero_part.filter(|_| !hash_pending_or_complete) {
 				self.payment_handler().process_native_failure(&self.settler, &attempt, error, record, Some(code)).await?;
@@ -359,9 +362,6 @@ impl ClnXpayClient {
 						"same-hash native parts are paid, pending or unknown; orphan stays held");
 				}
 				self.node_info().await?;
-				let record = self.db.read(async |tx| Ok(xpay::get_xpays_by_payment_hash(&**tx, payment_hash).await?
-					.into_iter().find(|record| record.label.as_deref() == Some(label.as_str())))).await?
-					.context("orphan has no original native request")?;
 				self.payment_handler().process_native_failure(&self.settler, &attempt,
 					Some("operator confirmed same-backend cold restart; no active or successful native payment"),
 					&record, None).await?;

@@ -160,12 +160,8 @@ impl<'a> PaymentAttemptHandler<'a> {
 					_ => ClnXpayOutcome::Fail { error_code: None },
 				};
 				if let Some((record, code)) = zero_part {
-					ensure!(record.label.as_deref() == Some(attempt.id.to_string().as_str())
-						&& record.lightning_node_id == attempt.lightning_node_id
-						&& record.payment_hash == attempt.payment_hash && !attempt.is_self_payment(),
-						"live native result belongs to another attempt");
-					let current = crate::database::xpay::get_xpay_by_id(&**t, record.id).await?
-						.context("live native result lost its original request")?;
+					ensure!(!attempt.is_self_payment(), "native result belongs to an intra-Ark attempt");
+					let current = crate::database::xpay::get_xpay_for_payment_attempt(&**t, attempt).await?;
 					ensure!(current == *record && current.status == crate::database::xpay::ClnXpayStatus::Pending
 						&& current.error_code.is_none(), "native request changed during its original call");
 					ensure!(crate::database::xpay::mark_xpay_fail(&**t, current.id, code).await?.is_some(),
