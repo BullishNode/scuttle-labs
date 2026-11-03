@@ -2006,11 +2006,12 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 	let operator_script = wm.config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
 	assert!(destinations.iter().all(|destination| destination != &operator_script));
 	assert_ne!(destinations[0], destinations[1]);
-	let (packages, roots, expected, available, replacement_mature) = tokio::time::timeout(Duration::from_secs(10), async {
-		// Confirm the real progress change before backing can mature. The
-		// two batches mine the same original total, under the same 10s clock.
-		let maturity_blocks = srv.config().vtxo_lifetime.to_u32() - 2 * ROUND_CONFIRMATIONS + 3;
-		ctx.generate_blocks(6).await;
+	// Mining is fixture setup, as in the original test. Fee readiness and
+	// publication still share the original ten-second budget.
+	let maturity_blocks = srv.config().vtxo_lifetime.to_u32() - 2 * ROUND_CONFIRMATIONS + 3;
+	ctx.generate_blocks(6).await;
+	let fee_started = std::time::Instant::now();
+	let (consumed, available) = tokio::time::timeout(Duration::from_secs(10), async {
 		let consumed = progress_child.input.iter().filter(|input| sponsors.contains_key(&input.previous_output)).map(|input| input.previous_output).collect::<BTreeSet<_>>();
 		let mut available = sponsors.iter().filter(|(point, _)| !consumed.contains(point)).map(|(point, output)| (*point, output.clone())).collect::<BTreeMap<_, _>>();
 		for (index, output) in progress_child.output.iter().enumerate() {
@@ -2028,8 +2029,13 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			assert_eq!(actual.value, output.value);
 			assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
 		}
-		let tip = ctx.generate_blocks(maturity_blocks - 6).await;
-		let replacement_mature = replacement.expiry_height() <= tip;
+		(consumed, available)
+	}).await.expect("confirmed fee capital must be ready within the original ten seconds");
+	let publication_time = Duration::from_secs(10).checked_sub(fee_started.elapsed())
+		.expect("fee readiness must leave time in the original publication budget");
+	let tip = ctx.generate_blocks(maturity_blocks - 6).await;
+	let replacement_mature = replacement.expiry_height() <= tip;
+	let (packages, roots, expected, available, replacement_mature) = tokio::time::timeout(publication_time, async {
 		// All new attribution, the current view and publication share the original clock.
 		for (coin, round) in originals.iter().map(|coin| (coin, stale.chain_anchor().txid))
 			.chain([(&recipient, replacement.chain_anchor().txid), (&received, replacement.chain_anchor().txid)]) {
