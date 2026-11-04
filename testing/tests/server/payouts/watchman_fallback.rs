@@ -1677,7 +1677,7 @@ pub(super) async fn watchman_sweeps_offboard_connectors() {
 	let payout = ctx.bitcoind().get_new_address();
 	assert_ne!(payout.script_pubkey(), destination);
 	let offboard_txid = bark.offboard_all(payout.clone()).await.unwrap().txid;
-	ctx.generate_blocks(1).await;
+	ctx.generate_blocks(2).await;
 	let offboard = core.get_raw_transaction(&offboard_txid, None).unwrap();
 	assert_eq!(offboard.output[0].script_pubkey, payout.script_pubkey());
 	assert!(offboard.output[0].value > Amount::ZERO);
