@@ -97,6 +97,17 @@ impl Tx<'_> {
 		if let Some(txid) = state.offboarded_in {
 			ensure!(self.query_opt("SELECT txid FROM offboards WHERE txid=$1", &[&txid.to_string()]).await?.is_some(),
 				"expiry offboard reference has no durable transaction");
+			// A stored offboard is still a customer liability until its payment
+			// has six confirmations on the chain seen by both workers.
+			let confirmed_before = i32::try_from(tip.to_u32().saturating_sub(5))?;
+			let paid = self.query_opt("SELECT n.txid FROM nursery_tx n \
+				JOIN captaind_block c ON c.height=n.confirmed_at_height \
+				JOIN watchmand_block w ON w.height=c.height AND w.hash=c.hash \
+				WHERE n.txid=$1 AND n.kind='offboard' AND n.confirmed_at_height BETWEEN 0 AND $2",
+				&[&txid.to_string(), &confirmed_before]).await?.is_some();
+			if !paid {
+				return Ok(OwnershipProposal::pending(fact, "offboard not confirmed"));
+			}
 			proposal.disposition = OwnershipDisposition::Operator;
 			proposal.evidence = Some(OwnershipEvidence::Offboard);
 			return Ok(proposal);

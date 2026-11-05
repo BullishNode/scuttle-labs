@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::body::Bytes;
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::routing::post;
+use axum::Router;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::lightning::Preimage;
 use ark::fees::VtxoFeeInfo;
@@ -44,6 +48,132 @@ impl captaind::proxy::ArkRpcProxy for HoldFinish {
 		self.response.lock().unwrap().get_or_insert_with( || result.clone());
 		result
 	}
+}
+
+/// An undelivered offboard must keep its backing reserved until Bitcoin
+/// confirms the customer payment, even after the client loses its reply.
+#[tokio::test]
+async fn unbroadcast_offboard_remains_customer_liability() {
+	let ctx = TestContext::new("server/unbroadcast_offboard_remains_customer_liability").await;
+	let upstream_url = ctx.bitcoind().rpc_url();
+	let http_client = reqwest::Client::builder().no_proxy().build().unwrap();
+	let reject_broadcast = Arc::new(AtomicBool::new(false));
+	let rejected = Arc::new(AtomicUsize::new(0));
+	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+	let proxy_url = format!("http://{}", listener.local_addr().unwrap());
+	let app = Router::new().route("/", post({
+		let reject_broadcast = reject_broadcast.clone();
+		let rejected = rejected.clone();
+		move |headers: HeaderMap, body: Bytes| {
+			let (reject_broadcast, rejected, upstream_url, http_client) =
+				(reject_broadcast.clone(), rejected.clone(), upstream_url.clone(), http_client.clone());
+			async move {
+				let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+				if request["method"] == "sendrawtransaction" && reject_broadcast.load(Ordering::SeqCst) {
+					rejected.fetch_add(1, Ordering::SeqCst);
+					let error = serde_json::json!({"result": null, "error": {
+						"code": -26, "message": "test: captaind broadcast unavailable"
+					}, "id": request["id"]});
+					return (StatusCode::OK, Bytes::from(serde_json::to_vec(&error).unwrap()));
+				}
+				let response = http_client.post(upstream_url)
+					.header(header::AUTHORIZATION, headers[header::AUTHORIZATION].clone())
+					.header(header::CONTENT_TYPE, "application/json")
+					.body(body).send().await.unwrap();
+				(response.status(), response.bytes().await.unwrap())
+			}
+		}
+	})).layer(axum::extract::DefaultBodyLimit::disable());
+	let _http_task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
+		.cfg(move |cfg| {
+			cfg.bitcoind.url = proxy_url;
+			cfg.expiry_payouts = true;
+			cfg.vtxo_lifetime = BlockDelta::new(24);
+		}).watchmand().funded(btc(1)).create().await;
+	#[derive(Clone)]
+	struct LoseFinishedReply(Arc<Mutex<Option<Vec<u8>>>>);
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for LoseFinishedReply {
+		async fn finish_offboard(&self, upstream: &mut ArkClient, req: protos::FinishOffboardRequest)
+			-> Result<protos::FinishOffboardResponse, tonic::Status>
+		{
+			let result = upstream.finish_offboard(req).await?.into_inner();
+			*self.0.lock().unwrap() = Some(result.signed_offboard_tx);
+			Err(tonic::Status::unavailable("test: signed offboard reply lost"))
+		}
+	}
+	let signed_reply = Arc::new(Mutex::new(None));
+	let proxy = srv.start_proxy_no_mailbox(LoseFinishedReply(signed_reply.clone())).await;
+	let owner = ctx.bark_sdk("owner", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true)
+		.boarded(sat(100_000)).create().await;
+	let coin = owner.spendable_vtxos().await.unwrap().pop().unwrap();
+	let coin_id = coin.id();
+	let destination = ctx.bitcoind().get_new_address();
+	let watchman_funding = srv.watchmand().wait_wallet_address().await;
+	ctx.bitcoind().fund_addr(watchman_funding, sat(100_000)).await;
+	ctx.generate_blocks(2).await;
+
+	reject_broadcast.store(true, Ordering::SeqCst);
+	owner.offboard_vtxos([coin_id], destination.clone()).await.expect_err("client response is lost");
+	let raw = signed_reply.lock().unwrap().clone().expect("server finished the offboard");
+	let offboard: Transaction = deserialize(&raw).unwrap();
+	let offboard_txid = offboard.compute_txid();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let persisted = db.read(async |tx| Ok(tx.query_one(
+		"SELECT wallet_commit FROM offboards WHERE txid=$1", &[&offboard_txid.to_string()],
+	).await?.get::<_, bool>(0))).await.unwrap();
+	assert!(persisted, "server committed the offboard before on-chain delivery");
+	let source = db.read(async |tx| tx.get_user_vtxos_by_id(&[coin_id]).await).await.unwrap();
+	assert_eq!(source[0].offboarded_in, Some(offboard_txid));
+	assert!(rejected.load(Ordering::SeqCst) > 0);
+	assert!(ctx.bitcoind().sync_client().custom_get_raw_transaction_info(offboard_txid, None).unwrap().is_none());
+
+	let current = ctx.bitcoind().get_block_count().await as u32;
+	let mature = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - current).await;
+	srv.wait_for_sync_height(mature).await;
+	srv.watchmand().wait_for_sync_height(mature).await;
+	for _ in 0..3 {
+		srv.watchmand().trigger_sweep().await;
+		ctx.generate_blocks(1).await;
+	}
+	let state = db.read(async |tx| Ok(tx.query_one(
+		"SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
+		&[&coin_id.to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(state, 0, "unpaid offboard must not release customer backing");
+	assert_eq!(ctx.bitcoind().get_received_by_address(&destination), sat(0));
+	assert!(ctx.bitcoind().sync_client().custom_get_raw_transaction_info(offboard_txid, None).unwrap().is_none());
+
+	// Once the signed payment is rescued, the same source may be released.
+	reject_broadcast.store(false, Ordering::SeqCst);
+	ctx.bitcoind().sync_client().send_raw_transaction(&offboard).unwrap();
+	let delivered = offboard.output.iter().find(|out| out.script_pubkey == destination.script_pubkey()).unwrap().value;
+	let tip = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(tip).await;
+	srv.watchmand().wait_for_sync_height(tip).await;
+	assert_eq!(ctx.bitcoind().get_received_by_address(&destination), delivered);
+	let confirmed = db.read(async |tx| Ok(tx.query_one(
+		"SELECT confirmed_at_height FROM nursery_tx WHERE txid=$1",
+		&[&offboard_txid.to_string()],
+	).await?.get::<_, Option<i32>>(0))).await.unwrap();
+	assert!(confirmed.is_some());
+	tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			srv.watchmand().trigger_sweep().await;
+			let owner = db.read(async |tx| Ok(tx.query_opt(
+				"SELECT c.disposition FROM expiry_allocation_coin c \
+				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+				WHERE e.vtxo_id=$1", &[&coin_id.to_string()],
+			).await?.map(|row| row.get::<_, String>(0)))).await.unwrap();
+			if let Some(owner) = owner {
+				assert_eq!(owner, "operator", "confirmed payment may release backing once");
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	}).await.expect("confirmed offboard did not release its backing");
 }
 
 async fn wait_for_query_lock(tx: &Tx<'_>, prefix: &str) -> anyhow::Result<()> {
