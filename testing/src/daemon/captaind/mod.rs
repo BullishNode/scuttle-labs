@@ -85,7 +85,7 @@ pub type MailboxClient = rpc::mailbox::MailboxServiceClient<
 >;
 pub type WalletAdminClient = rpc::admin::WalletAdminServiceClient<tonic::transport::Channel>;
 pub type RoundAdminClient = rpc::admin::RoundAdminServiceClient<tonic::transport::Channel>;
-pub type SweepAdminClient = rpc::admin::SweepAdminServiceClient<tonic::transport::Channel>;
+pub type WatchmanAdminClient = rpc::admin::WatchmanAdminServiceClient<tonic::transport::Channel>;
 pub type BanAdminClient = rpc::admin::BanAdminServiceClient<tonic::transport::Channel>;
 pub type BlocklistAdminClient = rpc::admin::BlocklistAdminServiceClient<tonic::transport::Channel>;
 pub type NurseryAdminClient = rpc::admin::NurseryAdminServiceClient<tonic::transport::Channel>;

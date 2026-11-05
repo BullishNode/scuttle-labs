@@ -827,6 +827,14 @@ async fn claim_lightning_receive_htlcs(
 	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await.retry()?;
 	wallet.store_spendable_vtxos(outputs.iter()).await.retry()?;
 
+	// Write the permanent settled record before finishing the movement:
+	// finishing dispatches the `MovementUpdated` notification, and a
+	// consumer reacting to it must already find the receive settled.
+	let amount = recv.invoice.get_payment_amount(None).unwrap_or(effective_balance);
+	wallet.inner.db.record_settled_lightning_receive(
+		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+	).await.retry()?;
+
 	wallet.inner.movements.finish_movement_with_update(
 		htlcs.movement_id,
 		MovementStatus::Successful,
@@ -836,17 +844,12 @@ async fn claim_lightning_receive_htlcs(
 			.produced_vtxos(&outputs),
 	).await.context("failed to finish lightning receive movement").retry()?;
 
-	let amount = recv.invoice.get_payment_amount(None).unwrap_or(effective_balance);
-	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
-	).await.retry()?;
-
 	Ok(None)
 }
 
 /// Delivering -> done. Forwards the locked claim outputs to the claim
-/// destination's mailbox, then finalises the movement and writes the
-/// permanent settled record. Re-driving after a crash at most posts the
+/// destination's mailbox, then writes the permanent settled record and
+/// finalises the movement. Re-driving after a crash at most posts the
 /// same vtxos to the mailbox again.
 async fn deliver_lightning_receive(
 	wallet: &Wallet,
@@ -861,6 +864,12 @@ async fn deliver_lightning_receive(
 		.retry()?;
 
 	let delivered = delivery.vtxos.iter().map(|v| v.amount()).sum();
+	// Settled record first, then the movement: see claim_lightning_receive_htlcs.
+	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
+	wallet.inner.db.record_settled_lightning_receive(
+		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+	).await.retry()?;
+
 	wallet.inner.movements.finish_movement_with_update(
 		delivery.movement_id,
 		MovementStatus::Successful,
@@ -868,11 +877,6 @@ async fn deliver_lightning_receive(
 			.effective_balance(SignedAmount::ZERO)
 			.sent_to([MovementDestination::ark(destination.clone(), delivered)]),
 	).await.context("failed to finish lightning receive movement").retry()?;
-
-	let amount = recv.invoice.get_payment_amount(None).unwrap_or(delivered);
-	wallet.inner.db.record_settled_lightning_receive(
-		recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
-	).await.retry()?;
 
 	Ok(())
 }

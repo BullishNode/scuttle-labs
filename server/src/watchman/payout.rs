@@ -6,7 +6,6 @@ use anyhow::Context;
 use bitcoin::{Amount, Transaction, TxOut, Txid, Weight};
 use bitcoin_ext::TxStatus;
 use bitcoin_ext::{fee, TransactionExt, TxOutExt};
-use bitcoin_ext::bdk::WalletExt;
 use bitcoin_ext::cpfp::MakeCpfpFees;
 use tracing::warn;
 
@@ -47,7 +46,7 @@ impl Watchman {
 		// Their Bare encoding needs no customer genesis or payout allocation.
 		// Use the original native claim: its miner fee comes from operator
 		// collateral, not from a customer payout or a new wallet subsidy.
-		let sweeps = self.scan_frontier().await.sweeps;
+		let sweeps = self.scan_frontier().await?.sweeps;
 		let ids = sweeps.iter().filter(|v| matches!(v.policy(), ServerVtxoPolicy::ServerOwned
 			| ServerVtxoPolicy::User(VtxoPolicy::Pubkey(_))))
 			.map(|v| v.id().to_string()).collect::<Vec<_>>();

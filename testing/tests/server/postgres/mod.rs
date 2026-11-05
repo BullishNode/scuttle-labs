@@ -2,10 +2,11 @@ mod pool;
 mod tree;
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bitcoin::secp256k1::PublicKey;
-use bitcoin::Transaction;
+use bitcoin::{Transaction, Txid};
 use chrono::{Local, TimeDelta};
 
 use ark::{ServerVtxo, VtxoPolicy, VtxoRequest};
@@ -33,8 +34,12 @@ use server::database::xpay::{self, ClnXpayOutcome, ClnXpayStatus, NewClnXpay};
 use server::filters;
 use server::filters::Filters;
 use server::ln::LightningFailureKind;
+use server::ln::settler::HtlcSettler;
 use server::nursery::NurseryTxKind;
 use server::secret::Secret;
+use server::sync::{BlockData, ChainEventListener};
+use server::system::RuntimeManager;
+use server::watchman::FrontierChainListener;
 use server::wallet::WalletKind;
 
 use ark_testing::{sat, TestContext};
@@ -1074,6 +1079,42 @@ async fn watchman_frontier() {
 }
 
 #[tokio::test]
+async fn watchman_frontier_spend_of_late_row() {
+	let mut ctx = TestContext::new_minimal("postgresd/watchman_frontier_spend_of_late_row").await;
+	ctx.init_central_postgres().await;
+	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
+
+	Db::create(&postgres_cfg).await.expect("Database created");
+	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
+
+	let settler = Arc::new(HtlcSettler::start(db.clone(), RuntimeManager::new(), Duration::from_secs(60)));
+	let listener = FrontierChainListener::new(db.clone(), settler);
+
+	// a row whose transaction started 5 minutes before it committed
+	let vtxo = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	db.write(async |t| t.upsert_vtxos(&[vtxo.clone()]).await).await.unwrap();
+	db.write(async |t| t.add_vtxo_to_frontier(vtxo.id()).await).await.unwrap();
+	let db_client = ctx.postgres_manager().database_client(Some(&ctx.test_name)).await;
+	db_client.execute(
+		"UPDATE vtxo SET frontier_at = NOW() - INTERVAL '5 minutes', updated_at = NOW() WHERE vtxo_id = $1",
+		&[&vtxo.id().to_string()],
+	).await.unwrap();
+
+	let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+	block.txdata.push(Transaction {
+		version: bitcoin::transaction::Version::TWO,
+		lock_time: bitcoin::absolute::LockTime::ZERO,
+		input: vec![bitcoin::TxIn { previous_output: vtxo.point(), ..Default::default() }],
+		output: vec![],
+	});
+	let block_ref = BlockRef { height: BlockHeight::new(1), hash: block.block_hash() };
+	listener.on_block_added(&BlockData { block_ref, block }).await.unwrap();
+
+	let frontier = db.read(async |t| t.get_frontier().await).await.unwrap();
+	assert!(frontier.is_empty(), "the spend leaves the frontier");
+}
+
+#[tokio::test]
 async fn watchman_reorg() {
 	let mut ctx = TestContext::new_minimal("postgresd/watchman_reorg").await;
 	ctx.init_central_postgres().await;
@@ -1113,7 +1154,17 @@ async fn watchman_get_vtxos_by_txid() {
 	let vtxo_txid = vtxo.point().txid;
 	let vtxos = db.read(async |t| t.get_vtxos_by_txid(vtxo_txid).await).await.unwrap();
 	assert_eq!(vtxos.len(), 1);
-	assert_eq!(vtxos[0].id(), vtxo.id());
+	assert_eq!(vtxos[0].0.id(), vtxo.id());
+	assert_eq!(vtxos[0].1, None, "no spend recorded yet");
+	assert_eq!(vtxos[0].2, None, "no spend recorded yet");
+
+	// A recorded spend comes back with the vtxo
+	let spent_txid = Txid::from_byte_array([7; 32]);
+	db.write(async |t| t.register_vtxo_spend(vtxo.id(), 105.into(), spent_txid).await).await.unwrap();
+	let vtxos = db.read(async |t| t.get_vtxos_by_txid(vtxo_txid).await).await.unwrap();
+	assert_eq!(vtxos.len(), 1);
+	assert_eq!(vtxos[0].1, Some(105.into()));
+	assert_eq!(vtxos[0].2, Some(spent_txid));
 
 	// Non-existent txid returns empty
 	let other_tx = Transaction {
@@ -1711,9 +1762,10 @@ async fn lightning_payment_attempt_result_update() {
 
 	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
 	let invoice = Invoice::Bolt11(bolt11.clone());
+	let sender_mailbox = MailboxIdentifier::from_pubkey(pubkey);
 
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(1000), Some(&sender_mailbox), &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
 	).await).await.unwrap();
 
 	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
@@ -1731,6 +1783,18 @@ async fn lightning_payment_attempt_result_update() {
 		(&bolt11).into()
 	).await).await.unwrap().expect("attempt still present");
 	assert_eq!(attempt2.final_amount_msat, Some(9999));
+
+	// A later attempt for the same invoice doesn't take over the finished
+	// attempt's notification.
+	let other_mailbox = MailboxIdentifier::from_pubkey(PublicKey::from_str(
+		"02c7ef7d49b365974cd219f7036753e1544a3cdd2120eb7247dd8a94ef91cf1e49",
+	).unwrap());
+	db.write(async |t| t.store_lightning_payment_start(
+		node_id, &invoice, sat(1000), Some(&other_mailbox), &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+	).await).await.unwrap();
+	let mailbox = db.read(async |t| t.get_lightning_sender_mailbox_id(attempt.id).await)
+		.await.unwrap();
+	assert_eq!(mailbox, Some(sender_mailbox));
 }
 
 /// xpay can give up while parts are still pending. Its error is stored then,
