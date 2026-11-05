@@ -522,7 +522,7 @@ impl TestContext {
 				},
 				offboard: OffboardFees {
 					base_fee: Amount::ZERO,
-					fixed_additional_vb: 100,
+				fixed_additional_vb: 221,
 					ppm_expiry_table: vec![],
 				},
 				refresh: RefreshFees {

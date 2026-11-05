@@ -391,7 +391,7 @@ async fn movement_offboard() {
 	let offb_vtxo = vtxos.first().unwrap();
 	let offboard_txid = bark.offboard_vtxo(offb_vtxo.id, &addr).await;
 
-	let offboard_fee = sat(938);
+	let offboard_fee = sat(1_785);
 
 	// With 0 required confirmations, the movement completes immediately
 	let movement = bark.history().await.last().cloned().unwrap();
@@ -490,7 +490,7 @@ async fn movement_send_onchain() {
 	bark.maintain().await;
 	let vtxos_post_send = bark.vtxo_ids().await;
 
-	let offboard_fee = sat(938);
+	let offboard_fee = sat(1_785);
 
 	let movement = bark.history().await.last().cloned().unwrap();
 	assert_eq!(movement.status, MovementStatus::Successful);

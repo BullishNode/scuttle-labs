@@ -14,6 +14,33 @@ use ark_testing::util::ToAltString;
 /// The error [AbandonOffboardProxy] fails prepare_offboard with.
 const ABANDON_ERROR: &str = "proxy: abandoning the offboard session";
 
+#[tokio::test]
+async fn fragmented_rounds_wallet_does_not_subsidize_client_offboard() {
+	let ctx = TestContext::new("server/fragmented_rounds_wallet_does_not_subsidize_client_offboard").await;
+	let srv = ctx.captaind("server").no_vtxo_pool().create().await;
+	for _ in 0..20 { ctx.fund_captaind(&srv, sat(50_000)).await; }
+	let funded = srv.wallet_status().await;
+	assert_eq!(funded.rounds.confirmed_utxos.len(), 20);
+	assert_eq!(funded.rounds.trusted_balance, sat(1_000_000));
+
+	let bark = ctx.bark("client", &srv).funded(sat(1_000_000)).create().await;
+	let [id] = bark.board_and_confirm_and_register(&ctx, sat(800_000)).await
+		.try_into().expect("board has one VTXO");
+	let destination = ctx.bitcoind().get_new_address();
+	let before = srv.wallet_status().await;
+	let client_before = bark.spendable_balance_no_sync().await;
+	let err = bark.try_run([
+		"offboard", "--vtxo", &id.to_string(), "--address", &destination.to_string(),
+	]).await.expect_err("server must refuse an offboard that it would subsidize");
+	assert!(format!("{err:#}").contains("miner fee but client pays only"),
+		"unexpected offboard refusal: {err:#}");
+	bark.assert_unchanged_after_refusal(client_before).await;
+	let after = srv.wallet_status().await;
+	assert_eq!(after.rounds.trusted_balance, before.rounds.trusted_balance);
+	assert_eq!(after.rounds.confirmed_utxos.len(), before.rounds.confirmed_utxos.len());
+	assert_eq!(ctx.bitcoind().get_received_by_address(&destination), Amount::ZERO);
+}
+
 /// Forwards prepare_offboard upstream, so the server creates its pending
 /// session, but reports [ABANDON_ERROR] to the client, which abandons the
 /// offboard. Server-side errors pass through untouched. Every forwarded

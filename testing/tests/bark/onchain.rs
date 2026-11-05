@@ -38,7 +38,7 @@ async fn list_utxos() {
 
 	let utxos = bark.utxos().await;
 
-	let offboard_fee = 938;
+	let offboard_fee = 1_785;
 
 	assert_eq!(2, utxos.len());
 	// board change utxo
