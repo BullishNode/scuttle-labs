@@ -11,6 +11,7 @@ use tracing::{error, warn};
 
 use crate::bitcoind as bcd;
 use crate::database::Db;
+use crate::database::ln::SourceSettlement;
 use super::{Action, Config};
 
 /// How many blocks before a claim's deadline we start alerting that it is
@@ -80,7 +81,7 @@ struct HtlcSendExtra {
 	/// The next transaction in the chain, if any.
 	next_tx: Option<ProgressSpec>,
 	htlc_expiry: BlockHeight,
-	has_preimage: bool,
+	source_funded: bool,
 }
 
 struct HtlcRecvExtra {
@@ -184,7 +185,8 @@ fn decide_action_pubkey(params: &ActionParams<PubkeyExtra>) -> Action {
 
 /// Determine action for ServerHtlcSend (outgoing Lightning payment).
 ///
-/// The server can claim with preimage after `exit_delta` from confirmation.
+/// The server can claim a funded source with its preimage after `exit_delta`
+/// from confirmation.
 /// The user can reclaim after `htlc_expiry` AND `2*exit_delta` from confirmation.
 ///
 /// Deadline is `min(htlc_expiry, confirmed_at + 2*exit_delta)`.
@@ -196,7 +198,7 @@ fn decide_action_server_htlc_send(params: &ActionParams<HtlcSendExtra>) -> Actio
 		return action;
 	}
 
-	if params.policy_extras.has_preimage {
+	if params.policy_extras.source_funded {
 		let claim_height = params.confirmed_at + params.exit_delta;
 		if params.chain_tip_height >= claim_height {
 			return Action::Claim { deadline };
@@ -275,7 +277,7 @@ impl ActionContextFetcher<'_> {
 				let params = params.with_policy_extras(HtlcSendExtra {
 					next_tx: self.fetch_progress(vtxo).await,
 					htlc_expiry: p.htlc_expiry,
-					has_preimage: self.check_have_payment_preimage(p.payment_hash).await,
+					source_funded: self.check_source_payment_funded(p.payment_hash, vtxo.id()).await,
 				});
 				decide_action_server_htlc_send(&params)
 			},
@@ -283,7 +285,7 @@ impl ActionContextFetcher<'_> {
 				let params = params.with_policy_extras(HtlcSendExtra {
 					next_tx: self.fetch_progress(vtxo).await,
 					htlc_expiry: p.htlc_expiry,
-					has_preimage: self.check_have_payment_preimage(p.payment_hash).await,
+					source_funded: self.check_source_payment_funded(p.payment_hash, vtxo.id()).await,
 				});
 				decide_action_server_htlc_send(&params)
 			},
@@ -415,13 +417,12 @@ impl ActionContextFetcher<'_> {
 		})
 	}
 
-	async fn check_have_payment_preimage(&self, payment_hash: PaymentHash) -> bool {
-		// Check the htlc_settlement table (populated by the settler),
-		// which is the single source of truth for preimages.
-		self.db.read(async |t| t.get_htlc_settlement_by_payment_hash(payment_hash).await).await
+	async fn check_source_payment_funded(&self, payment_hash: PaymentHash, source: VtxoId) -> bool {
+		// A preimage from another payment with the same hash does not entitle
+		// the server to claim this source.
+		self.db.read(async |t| t.source_settlement(payment_hash, source).await).await
 			.inspect_err(|e| error!("DB error: {:#}", e))
-			.ok().flatten()
-			.is_some()
+			.ok() == Some(SourceSettlement::Funded)
 	}
 
 	async fn check_server_knows_pubkey(&self, pk: PublicKey) -> bool {
@@ -726,7 +727,7 @@ mod tests {
 			policy_extras: HtlcSendExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				htlc_expiry: BlockHeight::new(500),
-				has_preimage: false,
+				source_funded: false,
 			},
 		};
 		assert_eq!(decide_action_server_htlc_send(&params), Action::Wait);
@@ -747,14 +748,14 @@ mod tests {
 			policy_extras: HtlcSendExtra {
 				next_tx: Some(ProgressSpec { next_txid: txid, is_signed: true }),
 				htlc_expiry: BlockHeight::new(500),
-				has_preimage: false,
+				source_funded: false,
 			},
 		};
 		// deadline = min(htlc_expiry, confirmed_at + 2*exit_delta) = min(500, 100 + 288) = 388
 		assert_eq!(decide_action_server_htlc_send(&params), Action::Progress { txid, deadline: BlockHeight::new(388) });
 	}
 
-	/// Server has the preimage but must wait until the claim height
+	/// A funded source must wait until the claim height
 	/// (confirmed_at + exit_delta) before it can claim.
 	#[test]
 	fn htlc_send_waits_with_preimage_before_claim_height() {
@@ -768,7 +769,7 @@ mod tests {
 			policy_extras: HtlcSendExtra {
 				next_tx: None,
 				htlc_expiry: BlockHeight::new(500),
-				has_preimage: true,
+				source_funded: true,
 			},
 		};
 		// claim_height = confirmed_at + exit_delta = 100 + 144 = 244
@@ -776,7 +777,7 @@ mod tests {
 		assert_eq!(decide_action_server_htlc_send(&params), Action::Wait);
 	}
 
-	/// Server claims using the preimage once the claim height is reached.
+	/// Server claims a funded source once the claim height is reached.
 	#[test]
 	fn htlc_send_claims_with_preimage_at_claim_height() {
 		let params = ActionParams {
@@ -789,7 +790,7 @@ mod tests {
 			policy_extras: HtlcSendExtra {
 				next_tx: None,
 				htlc_expiry: BlockHeight::new(500),
-				has_preimage: true,
+				source_funded: true,
 			},
 		};
 		// claim_height = 100 + 144 = 244, chain_tip >= claim_height
@@ -797,7 +798,7 @@ mod tests {
 		assert_eq!(decide_action_server_htlc_send(&params), Action::Claim { deadline: BlockHeight::new(388) });
 	}
 
-	/// Without a preimage or progress tx, the server can only wait.
+	/// Without source funding or a progress tx, the server can only wait.
 	#[test]
 	fn htlc_send_waits_without_preimage_and_progress() {
 		let params = ActionParams {
@@ -810,7 +811,7 @@ mod tests {
 			policy_extras: HtlcSendExtra {
 				next_tx: None,
 				htlc_expiry: BlockHeight::new(500),
-				has_preimage: false,
+				source_funded: false,
 			},
 		};
 		assert_eq!(decide_action_server_htlc_send(&params), Action::Wait);
