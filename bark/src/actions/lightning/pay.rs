@@ -38,7 +38,7 @@ use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus, PaymentMethod};
 use crate::persist::models::PaidInvoice;
 use crate::subsystem::{LightningMovement, LightningSendMovement, Subsystem};
-use crate::vtxo::{FallbackStatus, VtxoLockHolder};
+use crate::vtxo::VtxoLockHolder;
 
 const LN_PAY_NAMESPACE: &str = "ln_pay";
 
@@ -181,18 +181,9 @@ impl WalletAction for LightningSend {
 			},
 			Progress::RevocableHtlcs { htlcs, revocation } |
 			Progress::RevocationStuck { htlcs, revocation } => {
-				let mut committed = false;
-				for id in &htlcs.vtxo_ids {
-					committed |= wallet.has_fallback_commitment(*id).await.retry()?;
-				}
-				if committed {
-					return Ok(match retire_fallback_lightning_send(wallet, htlcs).await {
-						Ok(true) => Advance::Done,
-						Ok(false) => Advance::Park { state: self,
-							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: None },
-						Err(error) => Advance::Park { state: self,
-							wake_after: Some(PAYMENT_PENDING_POLL_INTERVAL), error: Some(error) },
-					});
+				if wallet.adopt_committed_inputs(&htlcs.vtxo_ids).await.retry()? {
+					retire_fallback_lightning_send(wallet, htlcs).await.retry()?;
+					return Ok(Advance::Done);
 				}
 				revoke_lightning_send_htlcs(wallet, &self, htlcs, revocation).await?;
 				return Ok(Advance::Done);
@@ -269,6 +260,9 @@ impl WalletAction for LightningSend {
 			// Nothing committed server-side: close the movement and let the
 			// executor release the input locks and remove the row.
 			Progress::Start | Progress::InputsLocked { .. } => {
+				if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback) {
+					or_retry!(self, wallet.adopt_fallback_refusal(&error, &self.input_vtxo_ids).await);
+				}
 				error!("Could not start lightning send {}: {:?}", self.id(), error);
 				or_retry!(self, fail_lightning_send_movement(wallet, &self).await);
 				Advance::Failed(error)
@@ -628,7 +622,8 @@ async fn check_lightning_send_payment_status(
 		Ok(response) => response.into_inner(),
 		Err(_) => return Ok(pending_status),
 	};
-	if !payment_status_scope_matches(&htlcs.vtxo_ids, &response.htlc_vtxo_ids) {
+	if wallet.properties().await?.server_payouts.context("server payout capability is not known")?
+		&& !payment_status_scope_matches(&htlcs.vtxo_ids, &response.htlc_vtxo_ids) {
 		warn!("Server returned an unbound payment status for {}", payment_hash);
 		return Ok(pending_status);
 	}
@@ -689,9 +684,7 @@ pub(crate) async fn settle_lightning_send_payment(
 		.context("lightning payment amount out of range").abort()?;
 	info!("Lightning payment succeeded! Payment hash: {}", payment_hash.as_hex());
 
-	// Serialize the local commitment with fallback refund adoption.
-	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await.retry()?;
-	wallet.inner.db.record_paid_invoice(payment_hash, preimage).await.retry()?;
+		wallet.inner.db.record_paid_invoice(payment_hash, preimage).await.retry()?;
 	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await.retry()?;
 	wallet.inner.movements.finish_movement_with_update(
 		htlcs.movement_id,
@@ -706,17 +699,9 @@ pub(crate) async fn settle_lightning_send_payment(
 	Ok(())
 }
 
-/// Retire this Ark send only after every original HTLC has a terminal
-/// authenticated customer fallback outcome. This does not classify CLN.
-async fn retire_fallback_lightning_send(wallet: &Wallet, htlcs: &Htlcs) -> anyhow::Result<bool> {
-	let mut terminal = wallet.fallback_inputs_terminal(&htlcs.vtxo_ids).await?;
-	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
-	for id in &htlcs.vtxo_ids {
-		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?
-			.context("fallback HTLC disappeared before action retirement")?;
-		terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited));
-	}
-	if !terminal { return Ok(false); }
+/// Retire the Ark send after every original HTLC is committed to fallback.
+/// Ordinary Spent retirement does not classify the native Lightning payment.
+async fn retire_fallback_lightning_send(wallet: &Wallet, htlcs: &Htlcs) -> anyhow::Result<()> {
 
 	let current = wallet.inner.db.get_movement_by_id(htlcs.movement_id).await?;
 	ensure!(current.status != MovementStatus::Successful, "successful Lightning send contradicts customer fallback retirement");
@@ -725,7 +710,7 @@ async fn retire_fallback_lightning_send(wallet: &Wallet, htlcs: &Htlcs) -> anyho
 		wallet.inner.movements.finish_movement_with_update(htlcs.movement_id, MovementStatus::Failed,
 			MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO)).await?;
 	}
-	Ok(true)
+	Ok(())
 }
 
 /// Cosign the revocation with the server, mark the HTLC vtxos spent

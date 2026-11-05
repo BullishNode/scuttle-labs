@@ -203,8 +203,8 @@ pub struct WalletVtxo {
 	#[serde(default)]
 	pub registered: bool,
 
-	/// Last authenticated fallback outcome. Never cleared by ordinary holder
-	/// cleanup, spending or exit progress; terminal records are rechecked too.
+	/// Last observed fallback status for display. Ordinary Spent retirement
+	/// is sticky even if this status changes after a reorg.
 	#[serde(default)]
 	pub fallback_status: Option<FallbackStatus>,
 }
@@ -219,12 +219,7 @@ impl FallbackStatus {
 	}
 
 	pub(crate) fn state_for(self, current: &VtxoState) -> VtxoState {
-		match current {
-			VtxoState::Exited => current.clone(),
-			VtxoState::Locked { .. } if self == Self::Pending => current.clone(),
-			_ if self == Self::Pending => VtxoState::Locked { holder: None },
-			_ => VtxoState::Spent,
-		}
+		if *current == VtxoState::Exited { current.clone() } else { VtxoState::Spent }
 	}
 }
 

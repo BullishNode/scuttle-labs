@@ -48,9 +48,6 @@ impl BlockIndex {
 		birthday: BlockRef,
 		block_table: BlockTable,
 	) -> anyhow::Result<Self> {
-		// Either process can roll back shared observations. A restarted sync
-		// process closes the old completed view before any listener can run.
-		db.write(async |t| t.invalidate_expiry_chain().await).await?;
 		let sync_tip = match db.read(async |t| t.get_highest_block(block_table).await).await.context("Failed to get tip from database")? {
 			Some(tip) => tip,
 			None => {
@@ -127,17 +124,14 @@ impl BlockIndex {
 		if self.chain_tip() != bitcoind_tip {
 			self.update_tip(bitcoind_tip);
 		}
-		let mut expiry_generation = if matches!(self.block_table, BlockTable::Watchmand) {
-			Some(self.db.write(async |t| t.begin_expiry_sync(self.sync_tip() != bitcoind_tip).await).await?)
-		} else { None };
 
 		if self.sync_tip() == bitcoind_tip {
-			self.notify_sync_complete(expiry_generation).await?;
 			return Ok(false);
 		}
 
-		// Height is not monotonic: a shorter branch can have more chainwork.
-		// Find the common ancestor instead of panicking on its height.
+		if bitcoind_tip.height < self.sync_tip().height {
+			panic!("bitcoind chain went backward. We probably restarted. Wait for bitcoind to sync and start again");
+		}
 
 		debug!("Discovered new tip with height={} and hash={}", bitcoind_tip.height, bitcoind_tip.hash);
 
@@ -155,11 +149,6 @@ impl BlockIndex {
 
 		if reorg_depth > 0 {
 			self.org_out_blocks_above(common).await?;
-			if expiry_generation.is_some() {
-				expiry_generation = Some(self.db.read(async |t| Ok(t.query_one(
-					"SELECT generation FROM expiry_chain_view WHERE id=1", &[],
-				).await?.get(0))).await?);
-			}
 		}
 
 
@@ -188,22 +177,7 @@ impl BlockIndex {
 			self.add_block(block_data).await?;
 		}
 
-		self.notify_sync_complete(expiry_generation).await?;
 		Ok(true)
-	}
-
-	async fn notify_sync_complete(&self, expiry_generation: Option<i64>) -> anyhow::Result<()> {
-		for listener in &self.listeners {
-			listener.on_sync_complete(self.sync_tip()).await?;
-		}
-		if let Some(generation) = expiry_generation {
-			if self.db.write(async |t| t.complete_expiry_sync(generation, self.sync_tip()).await).await? {
-				// Wake the sole expiry engine after completed publication, even
-				// when a restart completed at the same height. Idle cycles do not.
-				self.update_sync_height(self.sync_tip());
-			}
-		}
-		Ok(())
 	}
 
 	/// Handles a chain reorganization by rolling back to the given block.
@@ -224,30 +198,16 @@ impl BlockIndex {
 	/// retries. Orphaned blocks are not provided directly - listeners can look them
 	/// up by height if needed before the database is updated.
 	async fn org_out_blocks_above(&mut self, block: BlockRef) -> anyhow::Result<()> {
-		// Commit the invalid generation first. Then retain the conflicting
-		// exclusive row lock through every rollback callback and block delete.
-		// Watchmand cannot publish a completed view over a partial rollback by
-		// either process. These callbacks never acquire the validity row again.
-		loop {
-			self.db.write(async |t| t.invalidate_expiry_chain().await).await?;
-			let rolled_back = self.db.write(async |t| {
-				let row = t.query_one("SELECT invalid FROM expiry_chain_view WHERE id=1 FOR UPDATE", &[]).await?;
-				// A completed watchmand cycle may win the gap between the two
-				// transactions. Start no rollback unless invalid=TRUE is already
-				// durable: a crash must not roll the barrier back to a valid row.
-				if !row.get::<_, bool>("invalid") { return Ok(false); }
-				let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg(t, block))).await;
-				for result in results {
-					if result.is_err() { bail!("Failed to process reorg: {:#?}", result); }
-				}
-				t.remove_blocks_above(self.block_table, block.height).await?;
-				if matches!(self.block_table, BlockTable::Watchmand) {
-					t.reorg_expiry_observations(block).await?;
-				}
-				Ok(true)
-			}).await?;
-			if rolled_back { break; }
-		}
+		self.db.write(async |t| {
+			// Lock the same stable birthday row as source decisions. Appending
+			// a new tip cannot bypass a decision that still uses an older tip.
+			t.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR UPDATE", &[]).await?;
+			let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg(t, block))).await;
+			for result in results { result.context("Failed to process reorg")?; }
+			t.remove_blocks_above(self.block_table, block.height).await?;
+			if matches!(self.block_table, BlockTable::Watchmand) { t.reorg_expiry_observations(block).await?; }
+			Ok(())
+		}).await?;
 		self.reorg_cache_pending = Some(block);
 		self.refresh_reorg_caches().await
 	}
@@ -255,8 +215,7 @@ impl BlockIndex {
 	async fn refresh_reorg_caches(&mut self) -> anyhow::Result<()> {
 		let Some(block) = self.reorg_cache_pending else { return Ok(()); };
 		// Cache locks can be held by ordinary readers borrowing the same pool.
-		// Acquire them only after releasing the rollback connection. The view
-		// remains durably invalid until the full replacement cycle completes.
+		// Acquire them only after releasing the rollback connection.
 		let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg_committed(block))).await;
 		for result in results {
 			result.context("Failed to refresh listener after reorg")?;

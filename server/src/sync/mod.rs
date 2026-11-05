@@ -80,11 +80,6 @@ pub trait ChainEventListener: Send + Sync {
 	/// Financial rollback belongs in `on_reorg`, not this cache callback.
 	async fn on_reorg_committed(&self, _block_ref: BlockRef) -> anyhow::Result<()> { Ok(()) }
 
-	/// Called only after the entire block-sync cycle and its database tip
-	/// publication succeeded. Equal-tip cycles also notify after a restart.
-	/// Failure is retried on the next cycle; existing listeners need no action.
-	async fn on_sync_complete(&self, _block_ref: BlockRef) -> anyhow::Result<()> { Ok(()) }
-
 	/// Called when the mempool has been polled.
 	///
 	/// Contains a complete snapshot of all transaction IDs currently in the

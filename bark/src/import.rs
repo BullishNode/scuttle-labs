@@ -54,8 +54,8 @@ pub struct ImportVtxoArgs {
 	/// Default: none
 	pub gap_limit: Option<u32>,
 
-	/// Retired upstream bypass. Scuttle refuses true: a coin key alone cannot
-	/// establish mailbox ownership or override a committed fallback decision.
+	/// Skip the server query only when payouts are known to be disabled.
+	/// Payout servers require authenticated mailbox ownership and status.
 	///
 	/// Default: false
 	pub skip_status_check: bool,
@@ -110,8 +110,7 @@ impl Wallet {
 		let keypairs = self.find_vtxo_keypairs(user_pubkeys, gap_limit).await
 			.context("error scanning the vtxo key space")?;
 
-		let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		let mut fallback_pending = Vec::new();
+		let mut fallback_statuses = Vec::new();
 		let mut to_store = Vec::with_capacity(pending.len());
 		for vtxo in &pending {
 			let id = vtxo.id();
@@ -120,8 +119,8 @@ impl Wallet {
 				Some(keypair) => self.import_vtxo_state(vtxo, keypair, &args).await,
 			};
 			match state {
-				Ok((state, pending)) => {
-					if pending { fallback_pending.push((**vtxo).clone()); }
+				Ok((state, status)) => {
+					if let Some(status) = status { fallback_statuses.push((vtxo.id(), status)); }
 					to_store.push((*vtxo, state));
 				},
 				Err(e) => {
@@ -136,16 +135,9 @@ impl Wallet {
 			return Ok(ids);
 		}
 
-		let rows = to_store.iter().filter(|(coin, _)| !fallback_pending.iter().any(|pending| pending.id() == coin.id()))
-			.map(|(v, s)| (*v, s)).collect::<Vec<_>>();
-		self.inner.db.store_vtxos(&rows).await
-			.context("failed to store imported VTXOs")?;
-		let spent = to_store.iter().filter(|(coin, state)| *state == VtxoState::Spent
-			&& !fallback_pending.iter().any(|pending| pending.id() == coin.id()))
-			.map(|(vtxo, _)| vtxo.id()).collect::<Vec<_>>();
-		self.trust_ordinary_spends(&spent).await?;
-		drop(history_guard);
-		self.retain_fallback_pending(&fallback_pending).await?;
+		self.inner.db.store_vtxos(&to_store.iter().map(|(coin, state)| (*coin, state)).collect::<Vec<_>>())
+			.await.context("failed to store imported VTXOs")?;
+		for (id, status) in fallback_statuses { self.inner.db.set_vtxo_fallback_status(id, status).await?; }
 
 		for (vtxo, state) in &to_store {
 			info!("Successfully imported VTXO {} as {}", vtxo.id(), state.kind());
@@ -165,19 +157,22 @@ impl Wallet {
 		vtxo: &Vtxo<Full>,
 		keypair: &Keypair,
 		args: &ImportVtxoArgs,
-	) -> Result<(VtxoState, bool), ImportVtxoError> {
+	) -> Result<(VtxoState, Option<crate::vtxo::FallbackStatus>), ImportVtxoError> {
 		if args.skip_status_check {
+			if self.properties().await?.server_payouts == Some(false) {
+				return Ok((VtxoState::Spendable, None));
+			}
 			return Err(anyhow!("Scuttle imports require authenticated mailbox ownership and status").into());
 		}
 
 		let id = vtxo.id();
-		let (spend_state, committed) = self.fetch_vtxo_status_locked(id, keypair).await?;
+		let (spend_state, committed) = self.fetch_vtxo_status(id, keypair).await?;
 		let adoption = ServerStatusAdoption::from_status(spend_state, committed)
 			.with_context(|| format!("cannot decide the state of vtxo {id}"))?;
 		Ok(match adoption {
-			ServerStatusAdoption::Spendable => (VtxoState::Spendable, false),
-			ServerStatusAdoption::Spent => (VtxoState::Spent, false),
-			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited => (VtxoState::Locked { holder: None }, true),
+			ServerStatusAdoption::Spendable => (VtxoState::Spendable, None),
+			ServerStatusAdoption::Spent => (VtxoState::Spent, None),
+			ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited => (VtxoState::Spent, Some(crate::vtxo::FallbackStatus::try_from(spend_state)?)),
 			ServerStatusAdoption::InFlight(state) =>
 				return Err(ImportVtxoError::InFlight { id, state }),
 		})

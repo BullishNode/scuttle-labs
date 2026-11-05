@@ -35,14 +35,14 @@ async fn reject_arkoor_with_bad_signature() {
 
 			let response = upstream.read_mailbox(req).await?.into_inner();
 			let message = response.messages[0].message.as_ref().unwrap();
-			let (mut vtxo, owners) = match message {
+			let mut vtxo = match message {
 				Message::Arkoor(message) => {
-					(Vtxo::deserialize(&message.vtxos[0]).unwrap(), message.owners.clone())
+					Vtxo::deserialize(&message.vtxos[0]).unwrap()
 				},
 				_ => panic!("unexpected message type"),
 			};
 			vtxo.invalidate_final_sig();
-			let message = ArkoorMessage { vtxos: vec![vtxo.serialize()], owners };
+			let message = ArkoorMessage { vtxos: vec![vtxo.serialize()] };
 
 			Ok(protos::mailbox_server::MailboxMessages {
 				messages: vec![protos::mailbox_server::MailboxMessage {
@@ -165,9 +165,6 @@ async fn concurrent_mailbox_consumers_do_not_duplicate_arkoor_movement() {
 	let actual_anchor = ctx.bitcoind().sync_client().get_raw_transaction(&incoming.chain_anchor().txid, None).unwrap();
 	incoming.validate(&actual_anchor).unwrap();
 	assert_eq!(wallet.get_vtxo_key(&incoming).await.unwrap().public_key(), incoming.user_pubkey());
-	assert_eq!(package.owners.len(), 1);
-	assert_eq!(package.owners[0].vtxo_id, incoming.id().to_bytes().to_vec());
-	assert_eq!(package.owners[0].owner_mailbox, wallet.mailbox_keypair().public_key().serialize().to_vec());
 
 	// This authenticated hint for the same genuine owned coin carries no
 	// credit. Its higher checkpoint must not bury the failed payment message.

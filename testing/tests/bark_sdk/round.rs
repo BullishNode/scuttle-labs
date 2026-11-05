@@ -1,36 +1,22 @@
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::path::PathBuf;
 use std::time::Duration;
 
 use bitcoin::hashes::Hash;
 use tokio_stream::StreamExt;
 
-use ark::{ProtocolEncoding, Vtxo, VtxoId};
-use ark::attestations::RoundParticipationStatusAttestation;
-use ark::vtxo::Full;
-use ark::tree::signed::UnlockHash;
+use ark::VtxoId;
 use ark::fees::RefreshFees;
 use ark::rounds::RoundEvent;
-use bark::{OpenWalletArgs, Wallet, WalletSeed};
-use bark::movement::{MovementId, MovementStatus};
-use bark::onchain::OnchainWallet;
-use bark::persist::BarkPersister;
-use bark::persist::adaptor::{partition, Query, QueryRange, Record, StorageAdaptor, StorageAdaptorWrapper};
-use bark::persist::adaptor::filestore::FileStorageAdaptor;
-use bark::persist::models::RoundStateId;
-use bark::round::{RoundFlowKind, RoundStatus};
+use bark::movement::MovementStatus;
+use bark::round::RoundFlowKind;
 use bark::subsystem::RoundMovement;
 use bark::vtxo::{VtxoLockHolder, VtxoState};
 use bitcoin_ext::{BlockDelta, BlockHeight};
-use bitcoin::{Amount, Network, OutPoint, Transaction};
-use bitcoin_ext::TxOutExt;
-use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server_log::{NoRoundPayments, RoundFinished, RoundParticipationRejected};
 use server_rpc::protos;
 
 use ark_testing::{btc, sat, secs, TestContext};
-use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
+use ark_testing::constants::ROUND_CONFIRMATIONS;
 use ark_testing::daemon::captaind::{self, ArkClient, Captaind};
 use ark_testing::util::{FutureExt, poll_interval};
 

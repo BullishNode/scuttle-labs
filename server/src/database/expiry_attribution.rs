@@ -1,17 +1,16 @@
 //! Authenticated payout mailbox links.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use bitcoin::secp256k1::{Keypair, PublicKey};
 use bitcoin::{Network, ScriptBuf};
 
 use ark::fallback::OwnerLink;
-use ark::mailbox::MailboxIdentifier;
-use ark::{ProtocolEncoding, VtxoId};
+use ark::VtxoId;
 
 use crate::error::OwnershipRefusal;
-use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
+use super::expiry_ownership::{OwnershipDisposition, OwnershipProposal};
 use super::Tx;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,32 +28,16 @@ impl Tx<'_> {
 				row.get::<_, &str>(1).parse()?))).collect()
 	}
 
-	/// Every member of a delivery batch must have the same admitted mailbox.
-	/// Check this before allocating a mailbox checkpoint in the same transaction.
-	pub async fn delivery_owners_match(&self, ids: &[VtxoId], mailbox: MailboxIdentifier) -> anyhow::Result<bool> {
-		let owners = self.coin_owner_mailboxes(ids).await?;
-		let ids = ids.iter().copied().collect::<BTreeSet<_>>();
-		Ok(ids.len() == owners.len() && owners.values().all(|owner| *owner == mailbox.as_pubkey()))
-	}
-
 	/// Resolve the stage-selected key from admission's immutable binding.
 	/// Birth metadata constrains an ordinary coin, not a different entitled key
 	/// selected by an input-owner, receive-claim or participation rule.
 	pub async fn derived_expiry_owner(&self, ownership: &OwnershipProposal) -> anyhow::Result<Attribution> {
 		let OwnershipDisposition::Customer { user_pubkey } = &ownership.disposition
 			else { return Ok(Attribution::Unresolved); };
-		let Some(evidence) = &ownership.evidence else { return Ok(Attribution::Unresolved); };
-		let Some(row) = self.query_opt("SELECT k.mailbox_pk,c.mailbox_pk AS birth_mailbox
-			FROM owner_key k LEFT JOIN coin_owner c ON c.vtxo_id=$2
-			WHERE k.user_pubkey=$1", &[&user_pubkey.to_string(), &ownership.id.to_string()]).await?
-			else { return Ok(Attribution::Unresolved); };
-		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk"))
-			else { return Ok(Attribution::Unresolved); };
-		if matches!(evidence, OwnershipEvidence::Pubkey)
-			&& row.get::<_, Option<&str>>("birth_mailbox") != Some(mailbox.to_string().as_str())
-		{
-			return Ok(Attribution::Unresolved);
-		}
+		if ownership.evidence.is_none() { return Ok(Attribution::Unresolved); }
+		let Some(row) = self.query_opt("SELECT mailbox_pk FROM owner_key WHERE user_pubkey=$1",
+			&[&user_pubkey.to_string()]).await? else { return Ok(Attribution::Unresolved); };
+		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk")) else { return Ok(Attribution::Unresolved); };
 		Ok(Attribution::Owned { mailbox_pk: mailbox,
 			spk: ark::fallback::payout_script(mailbox) })
 	}
@@ -66,10 +49,9 @@ impl Tx<'_> {
 	) -> anyhow::Result<PublicKey> {
 		let mailbox = link.verify_joint(network, server_mailbox_key, user_pubkey)
 			.map_err(|_| OwnershipRefusal::Invalid(user_pubkey))?.as_pubkey();
-		self.execute("INSERT INTO owner_key (user_pubkey, mailbox_pk, blinded_id, joint_proof)
-			VALUES ($1, $2, $3, $4) ON CONFLICT (user_pubkey) DO NOTHING",
-			&[&user_pubkey.to_string(), &mailbox.to_string(),
-				&link.blinded_id.to_string(), &link.serialize_hex()]).await?;
+		self.execute("INSERT INTO owner_key (user_pubkey, mailbox_pk, blinded_id)
+			VALUES ($1, $2, $3) ON CONFLICT (user_pubkey) DO NOTHING",
+			&[&user_pubkey.to_string(), &mailbox.to_string(), &link.blinded_id.to_string()]).await?;
 		let canonical = self.query_one("SELECT mailbox_pk, blinded_id FROM owner_key WHERE user_pubkey=$1",
 			&[&user_pubkey.to_string()]).await?;
 		if canonical.get::<_, &str>("mailbox_pk") != mailbox.to_string()
@@ -102,6 +84,6 @@ mod tests {
 	fn customer_coin_owner_trigger_exempts_the_round_padding_policy() {
 		let policy = ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE));
 		let literal = format!("decode('{}', 'hex')", policy.serialize().as_hex());
-		assert!(include_str!("scuttle.sql").contains(&literal), "{literal}");
+		assert!(include_str!("migrations/V78__expiry_payouts.sql").contains(&literal), "{literal}");
 	}
 }

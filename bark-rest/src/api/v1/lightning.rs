@@ -101,9 +101,9 @@ pub async fn generate_invoice(
 	),
 	description = "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning \
 		receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. \
-		The address must carry a valid signed mailbox link. The server verifies the link and the recipient's \
-		immutable fallback registration before it accepts the destination output. Missing or invalid ownership \
-		evidence at expiry leaves the bitcoin held; it never makes that bitcoin the provider's or operator's. \
+		With expiry payouts enabled, the address must carry a joint owner link. The server verifies the link \
+		and preserves the recipient's immutable coin-to-mailbox binding. Missing or invalid ownership \
+		at expiry leaves that customer's bitcoin held instead of assigning it to the provider or operator. \
 		The invoice expires after `expiry_secs` if given, otherwise after the Ark server's \
 		invoice expiry, which is also the longest it accepts.",
 	tag = "lightning"

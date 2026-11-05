@@ -83,7 +83,6 @@ const DELIVERY_BUILTIN: u8 = 0x00;
 
 /// The type byte for the "server mailbox" delivery mechanism
 const DELIVERY_MAILBOX: u8 = 0x01;
-const RETIRED_DELIVERY_MAILBOX_SIGNED: u8 = 0x02;
 const DELIVERY_MAILBOX_JOINT: u8 = 0x03;
 
 impl VtxoDelivery {
@@ -107,7 +106,7 @@ impl VtxoDelivery {
 	fn encoded_length(&self) -> usize {
 		match self {
 			Self::ServerMailbox { .. } => 1 + 33,
-			Self::ServerMailboxJoint { .. } => 1 + 2 + 33 + 64 + 64,
+			Self::ServerMailboxJoint { .. } => 1 + 33 + 64 + 64,
 			Self::Unknown { data, .. } => 1usize.saturating_add(data.len()),
 		}
 	}
@@ -144,7 +143,6 @@ impl VtxoDelivery {
 					|_| ParseAddressError::Invalid("invalid blinded mailbox identifier"),
 				)?,
 			}),
-			RETIRED_DELIVERY_MAILBOX_SIGNED => Err(ParseAddressError::Invalid("coin-only mailbox delivery is retired")),
 			DELIVERY_MAILBOX_JOINT => {
 				let link = OwnerLink::deserialize(&payload[1..])
 					.map_err(|_| ParseAddressError::Invalid("invalid joint mailbox link"))?;
@@ -238,41 +236,18 @@ impl Address {
 		&self.delivery
 	}
 
-	/// Check every supplied coin signature against the actual policy key.
+	/// Check the selected coin signature against the actual policy key.
 	/// The intended server derives the mailbox verifier; a payer cannot do so.
-	/// A legacy mailbox entry alone has no signed link.
 	pub fn owner_link(&self, network: Network, server_mailbox_pubkey: PublicKey) -> Result<Option<OwnerLink>, ParseAddressError> {
-		self.check_mailbox_entries()?;
-		let mut selected = None;
-		for delivery in &self.delivery {
-			let link = match delivery {
-				VtxoDelivery::ServerMailboxJoint { blinded_id, signature, mailbox_signature } =>
-					Some(OwnerLink { blinded_id: *blinded_id, signature: *signature, mailbox_signature: *mailbox_signature }),
-				_ => None,
-			};
-			if let Some(link) = link {
-				link.verify_coin(network, server_mailbox_pubkey, self.policy.user_pubkey())
-					.map_err(|_| ParseAddressError::Invalid("invalid signed mailbox link"))?;
-				// The payer cannot derive Q. Do not mask an invalid mailbox
-				// signature by selecting a different jointly signed copy.
-				if selected.is_some_and(|known: OwnerLink| known != link) {
-					return Err(ParseAddressError::Invalid("distinct joint mailbox proofs"));
-				}
-				selected = Some(link);
-			}
-		}
-		Ok(selected)
-	}
-
-	fn check_mailbox_entries(&self) -> Result<(), ParseAddressError> {
-		let mut mailbox = None;
-		for id in self.delivery.iter().filter_map(VtxoDelivery::mailbox_id) {
-			if mailbox.is_some_and(|known| known != id) {
-				return Err(ParseAddressError::Invalid("conflicting mailbox entries"));
-			}
-			mailbox = Some(id);
-		}
-		Ok(())
+		self.delivery.iter().find_map(|delivery| match delivery {
+			VtxoDelivery::ServerMailboxJoint { blinded_id, signature, mailbox_signature } =>
+				Some(OwnerLink { blinded_id: *blinded_id, signature: *signature, mailbox_signature: *mailbox_signature }),
+			_ => None,
+		}).map(|link| {
+			link.verify_coin(network, server_mailbox_pubkey, self.policy.user_pubkey())
+				.map_err(|_| ParseAddressError::Invalid("invalid signed mailbox link"))?;
+			Ok(link)
+		}).transpose()
 	}
 
 	/// Write the address payload to the writer
@@ -334,9 +309,7 @@ impl Address {
 			delivery.push(VtxoDelivery::decode(&buf[..])?);
 		}
 
-		let address = Address::new(testnet, ark_id, policy, delivery);
-		address.check_mailbox_entries()?;
-		Ok(address)
+		Ok(Address::new(testnet, ark_id, policy, delivery))
 	}
 }
 
@@ -598,7 +571,7 @@ impl Builder {
 
 	/// Finish by building an [Address]
 	pub fn into_address(self) -> Result<Address, AddressBuilderError> {
-		let address = Address {
+		Ok(Address {
 			testnet: self.testnet,
 			ark_id: self.server_pubkey.ok_or("missing server pubkey")?.into(),
 			policy: self.policy.ok_or("missing policy")?,
@@ -616,9 +589,7 @@ impl Builder {
 
 				ret
 			}
-		};
-		address.check_mailbox_entries().map_err(|_| "conflicting mailbox entries")?;
-		Ok(address)
+		})
 	}
 }
 
@@ -652,10 +623,6 @@ mod test {
 	}
 
 	// Fixed BIP340 reference signatures, independently encoded as Bech32m.
-	const SIGNED_ADDRESS_VECTORS: &[(&str, &str, &str, &str, &str, &str)] = &[
-		("02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9", "0229757774cc6f3be1d5f1774aefa8f02e50bc64404230e7a67e8fde79bd559a9a", "20a352f4f1e0868fa74f8ff5752927ec0b05b2b554daeccdabe8fe02e3d14e7eb42941fc34d91d18ab45b8a44223377a891f39948a59a5e510b1bf4bb0160e5c", "6195d3d1220002f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f962020229757774cc6f3be1d5f1774aefa8f02e50bc64404230e7a67e8fde79bd559a9a20a352f4f1e0868fa74f8ff5752927ec0b05b2b554daeccdabe8fe02e3d14e7eb42941fc34d91d18ab45b8a44223377a891f39948a59a5e510b1bf4bb0160e5c", "ark1pvx2a85fzqqp0jvy2qxf93scsfy6ylp0cn4fzndf3epzcxmuekzrqrugnhnsrd7tzqgpzjathwnxx7wlp6hchwjh04rczu59uv3qyyv885elglhneh42e4x3q5df0fu0qs686wnu0746jjflvpvzm9d25mtkvm2lglcpw852w066zjs0uxnv36x9tgku2gs3rxaagj8eejj99nf09zzcm7jaszc89c4txngl", "tark1pvx2a85fzqqp0jvy2qxf93scsfy6ylp0cn4fzndf3epzcxmuekzrqrugnhnsrd7tzqgpzjathwnxx7wlp6hchwjh04rczu59uv3qyyv885elglhneh42e4x3q5df0fu0qs686wnu0746jjflvpvzm9d25mtkvm2lglcpw852w066zjs0uxnv36x9tgku2gs3rxaagj8eejj99nf09zzcm7jaszc89cnnrkyf"),
-		("03fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556", "02948dcadf5990e048aa3874d46abef9d701858f95de8041d2a6828c99e2262519", "0219945c78ec6a9dabec5c9fedc7fad15d49192ff2e5be05be7e935e737d918874b24c5cfd7f488e4517ad7d8999e1789691b0b748ef87bef51095ea98f4d0f0", "6195d3d1220003fff97bd5755eeea420453a14355235d382f6472f8568a18b2f057a1460297556620202948dcadf5990e048aa3874d46abef9d701858f95de8041d2a6828c99e22625190219945c78ec6a9dabec5c9fedc7fad15d49192ff2e5be05be7e935e737d918874b24c5cfd7f488e4517ad7d8999e1789691b0b748ef87bef51095ea98f4d0f0", "ark1pvx2a85fzqqpll7tm6464am4yypzn59p42g6a8qhkguhc269p3vhs27s5vq5h24nzqgpffrw2mavepczg4gu8f4r2hmuawqv9372aaqzp62ng9ryeugnz2xgzrx29c78vd2w6hmzunlku07k3t4y3jtljuklqt0n7jd08xlv33p6tynzul4l53rj9z7khmzveu9ufdydskaywlpa775gft65c7ng0ql7fn34", "tark1pvx2a85fzqqpll7tm6464am4yypzn59p42g6a8qhkguhc269p3vhs27s5vq5h24nzqgpffrw2mavepczg4gu8f4r2hmuawqv9372aaqzp62ng9ryeugnz2xgzrx29c78vd2w6hmzunlku07k3t4y3jtljuklqt0n7jd08xlv33p6tynzul4l53rj9z7khmzveu9ufdydskaywlpa775gft65c7ng0qexvkar"),
-	];
 
 	#[test]
 	fn joint_mailbox_address_recipient_forwarding_and_legacy_separation() {
@@ -675,38 +642,6 @@ mod test {
 		let mut payload = vec![DELIVERY_MAILBOX_JOINT];
 		payload.extend_from_slice(&proof.serialize()[..99]);
 		assert!(VtxoDelivery::decode(&payload).is_err());
-		let mut payload = vec![RETIRED_DELIVERY_MAILBOX_SIGNED]; payload.extend(proof.serialize());
-		assert!(VtxoDelivery::decode(&payload).is_err());
-	}
-
-	#[test]
-	fn joint_address_never_masks_distinct_mailbox_signatures() {
-		let server = signed_key(11); let mailbox = signed_key(17); let coin = signed_key(3);
-		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
-		let delivery = |proof: OwnerLink| VtxoDelivery::ServerMailboxJoint {
-			blinded_id: proof.blinded_id, signature: proof.signature,
-			mailbox_signature: proof.mailbox_signature,
-		};
-		let make = |first, second| Address::builder().testnet(true).server_pubkey(signed_key(13).public_key())
-			.pubkey_policy(coin.public_key()).delivery(delivery(first)).delivery(delivery(second)).into_address().unwrap();
-		let mut invalid = link;
-		invalid.mailbox_signature = schnorr::Signature::from_slice(&[0; 64]).unwrap();
-		// P remains authentic; only the intended server can verify sigma_M.
-		invalid.verify_coin(Network::Regtest, server.public_key(), coin.public_key()).unwrap();
-		for (first, second) in [(invalid, link), (link, invalid)] {
-			assert!(make(first, second).owner_link(Network::Regtest, server.public_key()).is_err());
-		}
-		assert_eq!(make(link, link).owner_link(Network::Regtest, server.public_key()).unwrap(), Some(link));
-	}
-
-	#[test]
-	fn retired_signed_mailbox_address_vectors_are_refused() {
-		for &(_, _, _, _, mainnet, signet) in SIGNED_ADDRESS_VECTORS {
-			for address in [mainnet, signet] {
-				assert!(Address::from_str(address).is_err());
-				assert!(Address::from_str(&address.to_uppercase()).is_err());
-			}
-		}
 	}
 
 	#[test]
@@ -740,27 +675,6 @@ mod test {
 			let mut encoded = Vec::new(); unknown.encode(&mut encoded).unwrap();
 			assert_eq!(encoded, bytes);
 		}
-	}
-
-	#[test]
-	fn joint_mailbox_checks_all_duplicate_links_and_conflicting_entries() {
-		let server = signed_key(11); let coin = signed_key(3); let mailbox = signed_key(17);
-		let first = OwnerLink::new_joint(Network::Regtest, server.public_key(), &mailbox, &coin).unwrap();
-		let make = |link: OwnerLink| VtxoDelivery::ServerMailboxJoint {
-			blinded_id: link.blinded_id, signature: link.signature, mailbox_signature: link.mailbox_signature,
-		};
-		let mut address = Address::new(true, signed_key(13).public_key(), VtxoPolicy::new_pubkey(coin.public_key()),
-			vec![make(first), make(first), VtxoDelivery::ServerMailbox { blinded_id: first.blinded_id }]);
-		assert_eq!(test_roundtrip(&address).owner_link(Network::Regtest, server.public_key()).unwrap(), Some(first));
-		address.delivery.push(make(OwnerLink { signature: schnorr::Signature::from_slice(&[0; 64]).unwrap(), ..first }));
-		assert!(address.owner_link(Network::Regtest, server.public_key()).is_err());
-		address.delivery.pop();
-		let foreign = OwnerLink::new_joint(Network::Regtest, server.public_key(), &signed_key(19), &coin).unwrap();
-		address.delivery.push(make(foreign));
-		assert!(address.owner_link(Network::Regtest, server.public_key()).is_err());
-		assert!(Address::from_str(&address.to_string()).is_err());
-		assert!(Address::builder().testnet(true).server_pubkey(signed_key(13).public_key()).pubkey_policy(coin.public_key())
-			.delivery(make(first)).delivery(make(foreign)).into_address().is_err());
 	}
 
 	#[test]

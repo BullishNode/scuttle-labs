@@ -78,11 +78,6 @@ impl PaymentGuards {
 		}
 	}
 
-	/// Take a payment lock without delaying another payment's monitor pass.
-	pub fn try_lock(&self, payment_hash: PaymentHash) -> Option<PaymentGuard> {
-		Self::try_lock_in(&self.locks, payment_hash)
-	}
-
 	/// Skip monitoring an xpay still held by any client, including one whose
 	/// node connection has since been replaced.
 	pub fn try_lock_dispatch(&self, payment_hash: PaymentHash) -> Option<PaymentGuard> {
@@ -226,8 +221,8 @@ mod tests {
 		let other_client = guards.clone();
 		let dispatch = guards.lock_dispatch(hash(1)).await;
 		assert!(other_client.try_lock_dispatch(hash(1)).is_none());
-		let decision = other_client.try_lock(hash(1)).expect("a pending xpay permits a receive decision");
-		assert!(guards.try_lock(hash(1)).is_none());
+		let decision = other_client.lock(hash(1)).await;
+		assert!(poll(&mut Box::pin(guards.lock(hash(1)))).await.is_none());
 		drop(decision);
 		assert!(other_client.try_lock_dispatch(hash(1)).is_none());
 		drop(dispatch);
@@ -244,19 +239,6 @@ mod tests {
 		-> Option<PaymentGuard>
 	{
 		tokio::time::timeout(Duration::ZERO, waiting).await.ok()
-	}
-
-	#[tokio::test]
-	async fn a_busy_payment_does_not_block_monitoring_another_payment() {
-		let guards = PaymentGuards::new();
-		let held = guards.lock(hash(1)).await;
-		assert!(guards.try_lock(hash(1)).is_none());
-		let other = guards.try_lock(hash(2)).expect("another payment remains available");
-		drop(other);
-		drop(held);
-		let first = guards.try_lock(hash(1)).expect("released payment is available");
-		drop(first);
-		assert_eq!(guards.tracked(), 0);
 	}
 
 	#[tokio::test]

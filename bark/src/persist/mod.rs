@@ -24,7 +24,6 @@ pub mod sqlite;
 #[cfg(test)]
 pub(crate) mod test_suite;
 
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -154,6 +153,16 @@ pub trait BarkPersister: Send + Sync + 'static {
 	///
 	/// Errors:
 	/// - Returns an error if the update fails.
+	/// Bind a migrated wallet's previously absent mailbox property once.
+	async fn set_mailbox_identity(&self, _identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		bail!("this persister cannot bind a migrated mailbox identity")
+	}
+
+	/// Retain the negotiated mode alongside the server's stored public keys.
+	async fn set_server_payouts(&self, _payouts: bool) -> anyhow::Result<()> {
+		bail!("this persister cannot store the negotiated payout mode")
+	}
+
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()>;
 
 	/// Set the server's mailbox public key in wallet properties.
@@ -339,16 +348,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		vtxos: &[(&Vtxo<Full>, &VtxoState)],
 	) -> anyhow::Result<()>;
-
-	/// Replace only the witness material of an existing VTXO. The caller must
-	/// first fully validate the completed body against its actual chain anchor.
-	/// Preserve the exact bare serialization, state history, holder and recovery
-	/// registration. Return false when the row does not exist; never insert it.
-	async fn update_vtxo_witnesses(&self, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
-		let Some(stored) = self.get_full_vtxo(vtxo.id()).await? else { return Ok(false); };
-		ensure!(stored.serialize() == vtxo.serialize(), "this persister does not support VTXO witness updates");
-		Ok(true)
-	}
 
 	/// Fetch a wallet [Vtxo] with its current state by ID.
 	///
@@ -565,7 +564,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		preimage: Preimage,
 		invoice: &Bolt11Invoice,
 		amount: Amount,
-		association: Option<&models::ReceiveAssociation>,
 	) -> anyhow::Result<()>;
 
 	/// Look up a settled lightning receive record by payment hash.
@@ -573,16 +571,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		&self,
 		payment_hash: PaymentHash,
 	) -> anyhow::Result<Option<SettledLightningReceive>>;
-
-	async fn fallback_lightning_receives(&self) -> anyhow::Result<Vec<SettledLightningReceive>> {
-		bail!("this persister does not support receive outcome rechecks")
-	}
-
-	async fn set_receive_fallback_status(&self, _hash: PaymentHash, _status: crate::vtxo::FallbackStatus)
-		-> anyhow::Result<()>
-	{
-		bail!("this persister does not support durable receive outcomes")
-	}
 
 	/// Store an entry indicating a [Vtxo] is being exited.
 	///
@@ -693,21 +681,12 @@ pub trait BarkPersister: Send + Sync + 'static {
 		allowed_old_states: &[VtxoStateKind],
 	) -> anyhow::Result<WalletVtxo>;
 
-	/// Persist authenticated fallback status before changing spendability.
-	/// Keep the marker on the existing coin through terminal/reorg checks;
-	/// no ordinary cleanup may clear it or release its commitment.
+	/// Retire an authenticated commitment to ordinary Spent and retain its
+	/// last observed status for display. The status does not release funds.
 	async fn set_vtxo_fallback_status(&self, _id: VtxoId, _status: crate::vtxo::FallbackStatus)
 		-> anyhow::Result<WalletVtxo>
 	{
 		bail!("this persister does not support durable fallback outcomes")
-	}
-
-	/// Atomically retain a validated newly discovered body and its commitment.
-	/// A crash must not leave a terminal body without its recheck marker.
-	async fn store_fallback_vtxo(&self, _vtxo: &Vtxo<Full>, _status: crate::vtxo::FallbackStatus)
-		-> anyhow::Result<WalletVtxo>
-	{
-		bail!("this persister does not support atomic fallback adoption")
 	}
 
 	/// Release `holder`'s lock on the given vtxo, transitioning it to
@@ -721,18 +700,6 @@ pub trait BarkPersister: Send + Sync + 'static {
 		vtxo_id: VtxoId,
 		holder: Option<&VtxoLockHolder>,
 	) -> anyhow::Result<()>;
-
-	/// Retire precisely `holder`'s lock directly to Spent, without making the
-	/// coin temporarily Spendable. Return false for any foreign holder/state;
-	/// already Spent is idempotent. Implementations must compare and write
-	/// atomically; an unsupported persister must leave the coin untouched.
-	async fn retire_vtxo_lock(
-		&self,
-		_vtxo_id: VtxoId,
-		_holder: Option<&VtxoLockHolder>,
-	) -> anyhow::Result<bool> {
-		bail!("this persister does not support atomic locked-coin retirement")
-	}
 
 	/// Transition multiple VTXOs to `new_state` atomically: either every
 	/// vtxo's state changes or none does. A failure must not affect any

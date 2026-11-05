@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{ensure, Context};
-use bitcoin::{Amount, ScriptBuf, TxOut};
+use bitcoin::{Amount, ScriptBuf};
 
 use ark::VtxoId;
 
@@ -29,7 +29,6 @@ pub(crate) struct LeafAllocation {
 }
 
 pub(crate) struct Recipient {
-	pub output: TxOut,
 	pub leaves: Vec<LeafAllocation>,
 }
 
@@ -80,7 +79,7 @@ pub(crate) fn allocate(
 		ensure!(remaining_fee == Amount::ZERO, "expiry group fee was not allocated");
 		if pays {
 			plan.recipients.push(Recipient {
-				output: TxOut { script_pubkey: script, value: net }, leaves: allocations,
+				leaves: allocations,
 			});
 		} else {
 			plan.forfeits.extend(allocations);
@@ -122,7 +121,7 @@ mod tests {
 		assert!(plan.forfeits.is_empty());
 		assert_eq!(plan.recipients.len(), 1);
 		let recipient = &plan.recipients[0];
-		assert_eq!(recipient.output.value, Amount::from_sat(1_000));
+		assert_eq!(recipient.leaves.iter().map(|leaf| leaf.payout).sum::<Amount>(), Amount::from_sat(1_000));
 		assert_eq!(recipient.leaves.iter().map(|a| a.fee.to_sat()).sum::<u64>(), 1_000);
 		assert!(recipient.leaves.iter().all(|a| a.fee <= a.gross));
 	}
@@ -140,7 +139,7 @@ mod tests {
 		] {
 			let dust = script.minimal_non_dust().to_sat();
 			let paid = allocate_first(vec![leaf(1, 1_000 + dust, &script)]).unwrap();
-			assert_eq!(paid.recipients[0].output.value.to_sat(), dust);
+			assert_eq!(paid.recipients[0].leaves.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), dust);
 			let forfeited = allocate_first(vec![leaf(1, 999 + dust, &script)]).unwrap();
 			assert!(forfeited.recipients.is_empty());
 			assert_eq!(forfeited.forfeits[0].forfeited.to_sat(), 999 + dust);
@@ -182,7 +181,7 @@ mod tests {
 		let script = wpkh();
 		let combined = allocate_first(vec![leaf(1, 1_200, &script), leaf(2, 1_200, &script)]).unwrap();
 		assert_eq!(combined.recipients.len(), 1);
-		assert_eq!(combined.recipients[0].output.value.to_sat(), 1_400);
+		assert_eq!(combined.recipients[0].leaves.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 1_400);
 		for id in [1, 2] {
 			let separate = allocate_first(vec![leaf(id, 1_200, &script)]).unwrap();
 			assert!(separate.recipients.is_empty());
@@ -194,15 +193,15 @@ mod tests {
 	fn fee_is_shared_across_allocations_at_one_height() {
 		let script = wpkh();
 		let first = allocate_first(vec![leaf(1, 50_000, &script)]).unwrap();
-		assert_eq!(first.recipients[0].output.value.to_sat(), 49_000);
+		assert_eq!(first.recipients[0].leaves.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 49_000);
 		let paid = BTreeMap::from([(script.clone(), (Amount::from_sat(50_000), Amount::from_sat(1_000)))]);
 		let second = allocate(vec![leaf(2, 50_001, &script)], &paid).unwrap();
-		assert_eq!(second.recipients[0].output.value.to_sat(), 50_000);
+		assert_eq!(second.recipients[0].leaves.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 50_000);
 		assert_eq!(second.recipients[0].leaves[0].fee.to_sat(), 1);
 		assert_eq!(49_000 + 50_000, 100_001 - 1_001);
 		let different = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([9; 20]));
 		let other = allocate(vec![leaf(3, 50_000, &different)], &paid).unwrap();
-		assert_eq!(other.recipients[0].output.value.to_sat(), 49_000);
+		assert_eq!(other.recipients[0].leaves.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 49_000);
 	}
 
 	#[test]

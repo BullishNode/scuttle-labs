@@ -28,10 +28,6 @@ pub enum DevCommand {
 	#[command(subcommand)]
 	Vtxo(VtxoCommand),
 
-	/// Show the mailbox-derived Bitcoin fallback address
-	#[command()]
-	FallbackAddress,
-
 	/// inspect the `ArkInfo` of the given server (defaults to wallet server)
 	#[command()]
 	ArkInfo {
@@ -46,18 +42,6 @@ pub async fn execute_dev_command(
 ) -> anyhow::Result<()> {
 	match command {
 		DevCommand::Vtxo(c) => execute_vtxo_command(&datadir, c).await?,
-		DevCommand::FallbackAddress => {
-			let wallet = open_wallet(&datadir, crate::USER_AGENT).await
-				.context("failed to open wallet")?.context("no wallet found")?;
-			let network = wallet.network().await?;
-			let address = bitcoin::Address::from_script(&wallet.fallback_script(), network)
-				.context("fallback script is not a supported address")?;
-			output_json(&serde_json::json!({
-				"network": network,
-				"mailbox_pk": wallet.mailbox_identifier().as_pubkey(),
-				"payout_address": address,
-			}));
-		},
 		DevCommand::ArkInfo { ark_address } => {
 			let mut srv = connect_server(ark_address).await
 				.context("failed to connect to server")?;

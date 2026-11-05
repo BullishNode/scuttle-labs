@@ -48,8 +48,6 @@ use crate::error::ContextExt;
 use crate::owner_proof::OwnerLinks;
 use crate::{check_max_amount, telemetry, Server, CAPTAIND_API_KEY};
 
-
-
 /// Validate the client-requested HTLC-recv VTXO expiry leaves at
 /// least `htlc_expiry_delta` blocks of settlement margin below the
 /// inbound Lightning HTLC expiry, both for the request and the
@@ -152,7 +150,6 @@ pub(crate) fn validate_intra_ark_payment(
 
 	Ok(())
 }
-
 
 /// The margin (in blocks) the server requires between the current chain tip
 /// and the lowest incoming HTLC expiry when cosigning a lightning receive
@@ -352,11 +349,6 @@ impl Server {
 		// An exact retry acknowledges existing work even if its node or a new
 		// admission view is now unavailable. It never resubmits the recorded call.
 		if recorded { return Ok(()); }
-		if let Invoice::Bolt11(invoice) = &invoice {
-			if invoice.is_expired() {
-				return badarg!("invoice has expired");
-			}
-		}
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
@@ -383,6 +375,11 @@ impl Server {
 		if let Some(sub) = self.db.read(async |t|
 			t.get_htlc_subscription_by_payment_hash(payment_hash).await
 		).await? {
+			if let Invoice::Bolt11(invoice) = &invoice {
+				if invoice.is_expired() {
+					return badarg!("invoice has expired");
+				}
+			}
 			validate_intra_ark_payment(&sub, &invoice, payment_amount)?;
 		}
 
@@ -548,7 +545,7 @@ impl Server {
 						t.warn_unknown_settlement(*source);
 						unknown = true;
 					},
-					crate::database::ln::SourceSettlement::NotSettled | crate::database::ln::SourceSettlement::Disjoint => {},
+					crate::database::ln::SourceSettlement::NotSettled => {},
 				}
 			}
 			// Release no funds when settlement is unknown; return the
@@ -698,7 +695,7 @@ impl Server {
 				return badarg!("claim destination amount differs from receive amount after fees");
 			}
 			let mut links = OwnerLinks::default();
-			links.insert_request(&destination)?;
+			links.insert_request(&destination, self.config.expiry_payouts)?;
 			self.db.write(async |t| links.verify(t, [policy.user_pubkey()],
 				self.mailbox_key.leak_ref(), self.config.network).await).await?;
 		}
@@ -846,7 +843,9 @@ impl Server {
 		owner_links: &crate::owner_proof::OwnerLinks,
 		client_address: Option<SocketAddr>,
 	) -> anyhow::Result<(LightningHtlcSubscription, Vec<Vtxo<Full>>)> {
-		owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		if self.config.expiry_payouts {
+			owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		}
 		// Held for the whole call. The status only becomes `htlcs-ready` after
 		// the arkoor is persisted, so without this lock concurrent calls each
 		// allocate a full HTLC set for one invoice and can each return a
@@ -1124,8 +1123,7 @@ impl Server {
 		ensure!(receive_claims.len() == htlc_ids.len(), "receive claim contains a non-receive source");
 		let checkpoint = self.db.write(async |t| {
 			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
-			let checkpoint = t.store_htlc_settlement_from(payment_preimage,
-				crate::database::ln::HtlcSettlementOrigin::Receive(sub.id)).await?;
+			let checkpoint = t.store_htlc_settlement(payment_preimage).await?;
 			t.prepare_receive_claims(&receive_claims).await?;
 			Ok(checkpoint)
 		}).await?;
@@ -1160,7 +1158,6 @@ impl Server {
 		Ok(builder.cosign_response())
 	}
 }
-
 
 #[cfg(test)]
 mod tests {

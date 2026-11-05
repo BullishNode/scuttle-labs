@@ -3,21 +3,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use bark_json::cli::{LightningReceiveStateKind, LightningSendStateKind};
+use bark_json::cli::LightningSendStateKind;
 
 use ark_testing::{btc, lightning_test, require_bark_version, sat, Captaind, TestContext};
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::context::LightningPaymentSetup;
 use ark_testing::util::{FutureExt, poll_interval};
-use ark::{ProtocolEncoding, Vtxo};
 use ark::lightning::Invoice;
-use ark::mailbox::MailboxIdentifier;
-use ark::vtxo::Full;
 use bark_rest_client::apis::{lightning_api, Error};
-use bark_rest_client::models::{LightningInvoiceForAddressRequest, LightningPayRequest};
-use bitcoin::{Amount};
+use bark_rest_client::models::LightningPayRequest;
 use server::database::Db;
-use server::database::expiry_attribution::Attribution;
 
 /// Verify that lightning receives are claimed via the mailbox path by
 /// running barkd in `daemon_manual_sync` mode and driving the claim with
@@ -81,7 +76,6 @@ async fn ln_receive_via_mailbox(
 lightning_test!(ln_receive_via_mailbox, |cfg| {
 	cfg.invoice_check_interval = Duration::from_secs(1);
 });
-
 
 /// `GET /lightning/sends/{identifier}` reports `unknown` for a payment
 /// hash the wallet has never seen and rejects invalid identifiers.

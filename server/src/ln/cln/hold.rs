@@ -655,7 +655,7 @@ impl ClnHoldProcess {
 				}
 			}
 			if let Some(attempt) = &attempt {
-				let updated = PaymentAttemptHandler::fail_attempt_in_tx(t, attempt, Some(reason), false).await?;
+				let updated = PaymentAttemptHandler::fail_attempt_in_tx(t, attempt, Some(reason)).await?;
 				ensure!(updated.is_some(), "linked payment attempt changed during subscription cancellation");
 			}
 			Ok((true, attempt))

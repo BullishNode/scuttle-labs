@@ -55,7 +55,7 @@ use crate::arkoor::split_change_amount;
 use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
 use crate::subsystem::{OffboardMovement, Subsystem};
-use crate::vtxo::{FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 /// How long to sleep between confirmation polls while a tx is in
 /// mempool or has too few confirmations.
@@ -333,6 +333,10 @@ impl WalletAction for Offboard {
 	/// The step can't be completed as-is: the server rejected the request
 	/// or our own state is inconsistent.
 	async fn on_abort(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if crate::FallbackRefusal::from_error(&error) == Some(crate::FallbackRefusal::DecidedForFallback)
+			&& matches!(&self.progress, Progress::Start | Progress::SplitWithArkoor | Progress::ReadyForOffboard { prior_txid: None, .. }) {
+			or_retry!(self, wallet.adopt_fallback_refusal(&error, &self.pending_balance_vtxo_ids()).await);
+		}
 		match &self.progress {
 			// Nothing is locked yet, so the user is better served by a fresh
 			// attempt than by a lingering checkpoint.
@@ -476,33 +480,28 @@ impl WalletAction for Offboard {
 }
 
 /// An offboard can be superseded by a mixture of fallback and ordinary spends.
-/// Keep History through the authenticated query and the durable spend adoption.
+/// Adopt ordinary Spent before releasing this operation's own holders.
 /// None preserves the original transaction's ambiguity without a fallback commitment.
 async fn offboard_inputs_terminal(wallet: &Wallet, ids: &[VtxoId]) -> anyhow::Result<Option<bool>> {
 	ensure!(!ids.is_empty(), "offboard has no retained inputs");
-	let _guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
+
 	let mut terminal = true;
 	let mut fallback = false;
 	for id in ids {
 		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input is missing")?;
 		let key = wallet.get_vtxo_key(&coin.vtxo).await?;
-		let (state, committed) = wallet.fetch_vtxo_status_locked(*id, &key).await?;
+		let (state, committed) = wallet.fetch_vtxo_status(*id, &key).await?;
 		fallback |= committed;
 		if !committed {
 			match state {
-				VtxoSpendState::Spent => wallet.trust_ordinary_spends(&[*id]).await?,
+				VtxoSpendState::Spent => wallet.mark_vtxos_as_spent(&[*id]).await?,
 				VtxoSpendState::Spendable => {},
 				_ => bail!("offboard input has an unresolved spend state"),
 			}
 		}
 		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input disappeared")?;
-		terminal &= if committed {
-			matches!(state, VtxoSpendState::Spent | VtxoSpendState::FallbackForfeited)
-				&& matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited))
-		} else {
-			state == VtxoSpendState::Spent && coin.fallback_status.is_none()
-				&& coin.state.kind() == VtxoStateKind::Spent
-		};
+		terminal &= coin.state.kind() == VtxoStateKind::Spent;
+
 	}
 	Ok(fallback.then_some(terminal))
 }

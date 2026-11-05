@@ -19,7 +19,6 @@ use futures::{FutureExt, Stream, StreamExt};
 use log::{debug, error, info, trace, warn};
 use tokio_util::sync::CancellationToken;
 
-
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::lightning::PaymentHash;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
@@ -424,7 +423,7 @@ impl Wallet {
 		// message is informational/ignored.
 		let advance = match mailbox_msg.message {
 			Some(Message::Arkoor(msg)) => {
-				match self.process_received_arkoor_package(msg.vtxos, msg.owners).await {
+				match self.process_received_arkoor_package(msg.vtxos).await {
 					Ok(()) => true,
 					Err(e) => {
 						error!("Error processing received arkoor package: {:#}", e);
@@ -482,19 +481,8 @@ impl Wallet {
 	async fn process_received_arkoor_package(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
-		owners: Vec<protos::core::VtxoOwner>,
 	) -> anyhow::Result<()> {
-		let mut owner_map = HashMap::new();
-		for owner in owners {
-			let id = VtxoId::from_slice(&owner.vtxo_id)?;
-			let mailbox = bitcoin::secp256k1::PublicKey::from_slice(&owner.owner_mailbox)?;
-			ensure!(owner_map.insert(id, mailbox).is_none(), "duplicate mailbox ownership metadata");
-		}
-		let vtxos = self.process_raw_vtxos(raw_vtxos).await?.into_iter().filter(|vtxo| {
-			let ours = owner_map.get(&vtxo.id()) == Some(&self.mailbox_keypair().public_key());
-			if !ours { warn!("Not counting mailbox coin {}: missing or foreign owner mailbox", vtxo.id()); }
-			ours
-		}).collect::<Vec<_>>();
+		let vtxos = self.process_raw_vtxos(raw_vtxos).await?;
 
 		// Serialize the receive dedup across all consumers of this wallet's
 		// mailbox so two of them can't both record a movement for the same
@@ -540,9 +528,13 @@ impl Wallet {
 		for coin in new_vtxos {
 			let key = self.get_vtxo_key(&coin).await?;
 			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
-			if state == protos::VtxoSpendState::Spent
-				&& !committed {
+			// A delivery may already have paid its recipient onchain before
+			// this wallet first sees the mailbox message. Do not credit it in Ark.
+			if committed || state == protos::VtxoSpendState::Spent {
 				self.store_vtxos([&coin], &VtxoState::Spent).await?;
+				if committed {
+					self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+				}
 				continue;
 			}
 			current.push(coin);

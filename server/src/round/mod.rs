@@ -891,8 +891,6 @@ impl CollectingPayments {
 			});
 		}
 
-		let padding_output_indices = (real_outputs.len()..self.all_outputs.len()).collect();
-
 		let mut vtxos_spec = VtxoTreeSpec::new(
 			self.all_outputs.iter().map(|p| p.req.clone()).collect(),
 			srv.server_pubkey,
@@ -985,7 +983,6 @@ impl CollectingPayments {
 			interactive_participants: self.interactive_participants,
 			delegated_participants: self.delegated_participants,
 			real_outputs,
-			padding_output_indices,
 			cosign_part_sigs: HashMap::with_capacity(unsigned_vtxo_tree.nb_leaves()),
 			unsigned_vtxo_tree,
 			funding_tx,
@@ -1035,8 +1032,6 @@ pub struct SigningVtxoTree {
 	/// tree-shape padding is added. Used to emit per-policy telemetry once
 	/// the round is known to have succeeded.
 	real_outputs: Vec<VtxoRequest>,
-	/// Output positions created only by the private padding loop.
-	padding_output_indices: Vec<usize>,
 	/// Mailbox IDs for each output VTXO (in same order as vtxo tree leaves).
 	/// Used to post VTXOs to mailboxes after round finalization for wallet recovery.
 	/// None for server-generated padding VTXOs which don't need mailbox delivery.
@@ -1303,16 +1298,13 @@ async fn persist_round(
 			);
 		}
 	}
-	let padding_ids = state.padding_output_indices.iter()
-		.map(|index| signed_vtxos.build_vtxo(*index).id()).collect::<Vec<_>>();
 	let result = srv.db.write(async |t| {
 		t.finish_round(
 			round_step.round_seq(),
 			unsigned_funding_tx,
 			state.all_inputs.keys().copied(),
 			signed_vtxos,
-			&state.interactive_participants,
-			&padding_ids).await?;
+			&state.interactive_participants).await?;
 
 		let mut notifications = Vec::new();
 		// Post VTXOs to mailboxes for wallet recovery support.

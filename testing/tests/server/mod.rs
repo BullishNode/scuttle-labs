@@ -1,4 +1,5 @@
-#[path = "../scuttle/server/owner_helpers.rs"]
+mod payouts;
+#[path = "payouts/owner_helpers.rs"]
 mod expiry_admission;
 mod ban;
 mod blocklist;
@@ -52,7 +53,7 @@ use bark_json::primitives::WalletVtxoInfo;
 use server::database::Db;
 use server::secret::Secret;
 use server_log::{FullRound, RoundError, RoundFinished, RoundStarted, RoundUserVtxoAlreadyRegistered};
-use server_rpc::protos::{self};
+use server_rpc::protos;
 
 use ark_testing::{btc, is_bark_version, require_bark_version, sat, secs, Captaind, TestContext};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
@@ -1499,7 +1500,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
+			vtxo: Some(protos::VtxoRequest {
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1548,7 +1549,7 @@ async fn bad_round_input() {
 	let err = rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![fake_input],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
-			vtxo: Some(protos::VtxoRequest { retired_owner_proof: None,
+			vtxo: Some(protos::VtxoRequest {
 				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
@@ -1672,7 +1673,7 @@ async fn reject_overlong_board_cosign() {
 	};
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
@@ -1729,7 +1730,7 @@ async fn request_board_cosign_with_funding_tx(
 	let (_sec_nonce, pub_nonce) = musig::nonce_pair(&user_key);
 
 	let mut rpc = srv.get_public_rpc().await;
-	let res = rpc.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
 		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
@@ -2243,7 +2244,6 @@ async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).create().await;
 
-
 	bark.board(sat(400_000)).await;
 	bark.board(sat(400_000)).await;
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
@@ -2527,7 +2527,6 @@ async fn should_refuse_round_input_vtxo_that_is_being_exited() {
 	);
 }
 
-
 /// Tests the register_board endpoint.
 ///
 /// This test covers:
@@ -2577,7 +2576,7 @@ async fn test_register_board() {
 		.generate_user_nonces();
 
 	// Request server to cosign the board
-	let cosign_request = protos::BoardCosignRequest { retired_owner_proof: None,
+	let cosign_request = protos::BoardCosignRequest {
 		owner_proof: Some(test_owner_link(&srv, &client_cosign_keypair).await.into()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
@@ -2810,8 +2809,8 @@ async fn undo_round() {
 	// A constructed PG fence on the actual round output exercises only the
 	// transactional refusal. It rolls back together with the attempted undo.
 	let refused = db.write(async |tx| {
-		tx.execute("INSERT INTO expiry_entitlement(vtxo_id,gross_sat) VALUES($1,$2)",
-			&[&fenced.id().to_string(), &(fenced.amount().to_sat() as i64)]).await?;
+		tx.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)",
+			&[&fenced.id().to_string()]).await?;
 		tx.undo_round(round_id).await
 	}).await.expect_err("economic references must still refuse the entire undo");
 	let error = refused.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();
@@ -2894,7 +2893,6 @@ async fn board_exit_tx_prevents_registration() {
 	let balance = bark.spendable_balance_no_sync().await;
 	assert_eq!(balance, Amount::ZERO, "spendable balance should be zero since board was not registered");
 }
-
 
 #[tokio::test]
 async fn scheduled_height_must_not_poison_round_loading() {
@@ -3042,4 +3040,4 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	assert!(next_attempt, "a participant's exit must not terminate the round coordinator");
 }
 
-include!("../scuttle/server/mod_fallback.rs");
+include!("payouts/mod_fallback.rs");

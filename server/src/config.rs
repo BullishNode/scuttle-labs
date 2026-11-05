@@ -215,6 +215,9 @@ mod defaults {
 pub struct Config {
 	pub data_dir: PathBuf,
 	pub network: bitcoin::Network,
+	/// Pay expired customer backing to its admitted owner. Fixed at database creation.
+	#[serde(default)]
+	pub expiry_payouts: bool,
 	/// The number of blocks after which a VTXO expires, by default 6*24*30 so that
 	/// a VTXO can live for up to 30 days.
 	pub vtxo_lifetime: BlockDelta,
@@ -652,6 +655,11 @@ impl Config {
 		// at zero the user's preimage path opens with the server's reclaim
 		if self.network == bitcoin::Network::Bitcoin && self.htlc_expiry_delta == BlockDelta::ZERO {
 			bail!("Cannot set htlc_expiry_delta to zero on mainnet");
+		}
+
+		// at zero the watchman has no block to answer a stale exit in
+		if self.network == bitcoin::Network::Bitcoin && self.vtxo_exit_delta == BlockDelta::ZERO {
+			bail!("Cannot set vtxo_exit_delta to zero on mainnet");
 		}
 
 		Ok(())

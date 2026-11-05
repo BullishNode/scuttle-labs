@@ -21,30 +21,26 @@ impl OwnerLinks {
 		self.0.entry(key).or_default().push(link);
 	}
 
-	pub fn insert_proto(&mut self, key: PublicKey, proof: Option<&protos::OwnerProof>) -> anyhow::Result<()> {
-		let proof = proof.ok_or(OwnershipRefusal::Required(key))?;
+	pub fn insert_proto(&mut self, key: PublicKey, proof: Option<&protos::OwnerProof>, required: bool) -> anyhow::Result<()> {
+		let Some(proof) = proof else {
+			return if required { Err(OwnershipRefusal::Required(key).into()) } else { Ok(()) };
+		};
 		let link = OwnerLink::try_from(proof.clone()).map_err(|_| OwnershipRefusal::Invalid(key))?;
 		self.insert(key, link);
 		Ok(())
 	}
 
-	pub fn insert_request(&mut self, request: &protos::VtxoRequest) -> anyhow::Result<()> {
-		if request.retired_owner_proof.is_some() {
-			return crate::error::badarg!("retired owner proof field");
-		}
+	pub fn insert_request(&mut self, request: &protos::VtxoRequest, required: bool) -> anyhow::Result<()> {
 		let key = VtxoPolicy::deserialize(&request.policy).badarg("invalid destination policy")?.user_pubkey();
-		self.insert_proto(key, request.owner_proof.as_ref())
+		self.insert_proto(key, request.owner_proof.as_ref(), required)
 	}
 
-	pub fn from_parts(parts: &[protos::ArkoorCosignRequest]) -> anyhow::Result<Self> {
+	pub fn from_parts(parts: &[protos::ArkoorCosignRequest], required: bool) -> anyhow::Result<Self> {
 		let mut links = Self::default();
 		for part in parts {
 			for output in part.outputs.iter().chain(&part.isolated_outputs) {
-				if output.retired_owner_proof.is_some() {
-					return crate::error::badarg!("retired owner proof field");
-				}
 				let key = VtxoPolicy::deserialize(&output.policy).badarg("invalid destination policy")?.user_pubkey();
-				links.insert_proto(key, output.owner_proof.as_ref())?;
+				links.insert_proto(key, output.owner_proof.as_ref(), required)?;
 			}
 		}
 		Ok(links)
@@ -78,6 +74,7 @@ impl OwnerLinks {
 		&self, tx: &Tx<'_>, keys: impl IntoIterator<Item = PublicKey>,
 		server_mailbox_key: &Keypair, network: Network,
 	) -> anyhow::Result<()> {
+		if !tx.expiry_payouts() { return Ok(()); }
 		let keys = self.check_signatures(keys, server_mailbox_key, network)?;
 		for key in keys {
 			let link = self.0.get(&key).and_then(|copies| copies.first()).ok_or(OwnershipRefusal::Required(key))?;

@@ -272,15 +272,14 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 					preimage.map(|preimage| preimage.compute_payment_hash().to_string())).collect::<Vec<_>>();
 				// Lock every touched source before the first settlement WAL write,
 				// including other sources of any hash revealed by this transaction.
-				t.query_one("SELECT generation FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+				t.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR SHARE", &[]).await?;
 				t.query("SELECT v.vtxo_id FROM vtxo v LEFT JOIN htlc_vtxo h ON h.id=v.id \
 					WHERE v.vtxo_id=ANY($1) OR h.payment_hash=ANY($2) \
 					ORDER BY v.vtxo_id FOR UPDATE OF v", &[&ids, &hashes]).await?;
 				let mut notifications = Vec::new();
 				for &(id, preimage, resolution) in &spent {
 					if let Some(preimage) = preimage {
-						let checkpoint = t.store_htlc_settlement_from(preimage,
-							crate::database::ln::HtlcSettlementOrigin::Onchain(id)).await?;
+						let checkpoint = t.store_htlc_settlement(preimage).await?;
 						notifications.push((checkpoint, preimage.compute_payment_hash()));
 					}
 					t.register_vtxo_spend(id, height, txid).await?;

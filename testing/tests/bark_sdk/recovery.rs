@@ -1,13 +1,11 @@
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::fs;
 
-use ark::{ProtocolEncoding, VtxoId, Vtxo};
-use ark::vtxo::Full;
-use bark::persist::{BarkPersister, sqlite::SqliteClient};
+use ark::VtxoId;
 use bark::vtxo::VtxoState;
 use server_rpc::protos;
 
@@ -187,9 +185,7 @@ struct VtxoRpcCounts {
 struct CountVtxoRpcs {
 	counts: Arc<VtxoRpcCounts>,
 	fail_status_batches: Arc<AtomicUsize>,
-	stall_xpub: Arc<AtomicBool>,
-	xpub_pages: Arc<AtomicUsize>,
-	first_xpub_id: Arc<Mutex<Option<VtxoId>>>,
+
 }
 
 impl CountVtxoRpcs {
@@ -197,37 +193,13 @@ impl CountVtxoRpcs {
 		Self {
 			counts: counts.clone(),
 			fail_status_batches: Arc::new(AtomicUsize::new(fail_status_batches)),
-			stall_xpub: Arc::new(AtomicBool::new(false)),
-			xpub_pages: Arc::new(AtomicUsize::new(0)),
-			first_xpub_id: Arc::new(Mutex::new(None)),
+
 		}
 	}
 }
 
 #[async_trait::async_trait]
 impl captaind::proxy::ArkRpcProxy for CountVtxoRpcs {
-	async fn recover_vtxos_by_xpub(&self, upstream: &mut ArkClient, req: protos::RecoverVtxosByXpubRequest)
-		-> Result<protos::RecoverVtxosByXpubResponse, tonic::Status>
-	{
-		if !self.stall_xpub.load(Ordering::SeqCst) {
-			return Ok(upstream.recover_vtxos_by_xpub(req).await?.into_inner());
-		}
-		if self.xpub_pages.fetch_add(1, Ordering::SeqCst) != 0 {
-			std::future::pending::<()>().await;
-		}
-		// Reuse the existing cursor fault: one authentic output per page.
-		let start = req.start_index;
-		let mut response = upstream.recover_vtxos_by_xpub(req).await?.into_inner();
-		assert!(response.vtxos.len() > 1);
-		response.vtxos.truncate(1);
-		let first = &response.vtxos[0];
-		let id = Vtxo::<Full>::deserialize(&first.vtxo).unwrap().id();
-		*self.first_xpub_id.lock().unwrap() = Some(id);
-		response.nb_keys_scanned = first.derivation_index - start;
-		response.have_more = true;
-		response.cursor_vtxo_id = Some(id.to_bytes().to_vec());
-		Ok(response)
-	}
 
 	async fn get_vtxo(
 		&self, upstream: &mut ArkClient, req: protos::GetVtxoRequest,
@@ -263,40 +235,15 @@ impl captaind::proxy::ArkRpcProxy for CountVtxoRpcs {
 	}
 }
 
-#[async_trait::async_trait]
-impl captaind::proxy::MailboxRpcProxy for CountVtxoRpcs {
-	async fn read_mailbox(&self, upstream: &mut MailboxClient, req: protos::mailbox_server::MailboxRequest)
-		-> Result<protos::mailbox_server::MailboxMessages, tonic::Status>
-	{
-		if self.stall_xpub.load(Ordering::SeqCst) {
-			// Preserve the existing xpub-only fixture boundary; the mailbox must
-			// not silently replace the page that timed out.
-			return Ok(protos::mailbox_server::MailboxMessages { messages: vec![], have_more: false });
-		}
-		Ok(upstream.read_mailbox(req).await?.into_inner())
-	}
-}
-
 /// Recovery resolves the VTXOs of a mailbox page with the batch rpcs, not
 /// with one request per VTXO.
 #[tokio::test]
 async fn recovery_uses_batch_rpcs() {
-	Box::pin(recovery_batch_reads(false)).await;
-}
-
-#[tokio::test]
-async fn recovery_keeps_first_xpub_page_after_later_read_times_out() {
-	Box::pin(recovery_batch_reads(true)).await;
-}
-
-async fn recovery_batch_reads(stall_xpub: bool) {
-	let ctx = TestContext::new(if stall_xpub { "bark_sdk/recovery_partial_xpub_read_timeout" }
-		else { "bark_sdk/recovery_uses_batch_rpcs" }).await;
+	let ctx = TestContext::new("bark_sdk/recovery_uses_batch_rpcs").await;
 	// The xpub lookup carries each VTXO's body and status itself, so it is
-	// turned off in the original case to exercise the mailbox batch path.
-	// The timeout variant preserves one actual xpub page instead.
+	// turned off to send recovery through the mailbox path under test.
 	let srv = ctx.captaind("server")
-		.cfg(move |c| c.recovery_xpub_nb_keys = if stall_xpub { 100_000 } else { 0 })
+		.cfg(|c| c.recovery_xpub_nb_keys = 0)
 		.create().await;
 
 	// The boards post their ids to the recovery mailbox; the arkoor receive
@@ -317,31 +264,12 @@ async fn recovery_batch_reads(stall_xpub: bool) {
 	assert!(expected.len() >= 4, "expected at least four vtxos, got {}", expected.len());
 
 	let counts = Arc::new(VtxoRpcCounts::default());
-	let observer = CountVtxoRpcs::new(&counts, 0);
-	observer.stall_xpub.store(stall_xpub, Ordering::SeqCst);
-	let proxy = srv.start_proxy_with_mailbox(observer.clone(), observer.clone()).await;
+	let proxy = srv.start_proxy_with_mailbox(CountVtxoRpcs::new(&counts, 0), ()).await;
 
 	let recovered = ctx.bark_sdk("recovered", &proxy)
-		.cfg(move |cfg| { if stall_xpub { cfg.daemon_manual_sync = true; } })
 		.mnemonic(read_mnemonic(&ctx, "target").await)
 		.create().await;
 
-	if stall_xpub {
-		assert_eq!(observer.xpub_pages.load(Ordering::SeqCst), 2);
-		let first = observer.first_xpub_id.lock().unwrap().unwrap();
-		let local = SqliteClient::open(ctx.datadir.join("recovered/db.sqlite")).unwrap();
-		let retained = local.get_all_vtxos().await.unwrap();
-		assert_eq!(retained.len(), 1, "a later timeout must keep the first adopted page without inventing the rest");
-		assert_eq!(retained[0].id(), first);
-		assert_eq!(retained[0].state, VtxoState::Spendable);
-		assert_eq!(recovered.get_full_vtxo(first).await.unwrap().serialize(), target.get_full_vtxo(first).await.unwrap().serialize());
-		assert!(local.get_all_wallet_action_checkpoints().await.unwrap().is_empty());
-		observer.stall_xpub.store(false, Ordering::SeqCst);
-		assert!(recovered.recover_vtxos(expected.iter().copied(), None).await.unwrap().is_complete());
-		let history = recovered.history().await.unwrap();
-		assert!(recovered.recover_vtxos(expected.iter().copied(), None).await.unwrap().is_complete());
-		assert_eq!(recovered.history().await.unwrap(), history);
-	}
 	let mut recovered_ids = recovered.spendable_vtxos().await.expect("list recovered vtxos")
 		.iter().map(|v| v.id()).collect::<Vec<_>>();
 	recovered_ids.sort();
@@ -349,13 +277,8 @@ async fn recovery_batch_reads(stall_xpub: bool) {
 
 	assert_eq!(counts.get_vtxo.load(Ordering::Relaxed), 0,
 		"recovery must not fetch vtxo bodies one by one");
-	if stall_xpub {
-		assert!(counts.get_vtxo_status.load(Ordering::Relaxed) > 0,
-			"recovered positive bodies retain their authenticated first-store recheck");
-	} else {
-		assert_eq!(counts.get_vtxo_status.load(Ordering::Relaxed), 0,
-			"recovery must not query vtxo status one by one");
-	}
+	assert_eq!(counts.get_vtxo_status.load(Ordering::Relaxed), 0,
+		"recovery must not query vtxo status one by one");
 	assert!(counts.get_vtxos_by_ids.load(Ordering::Relaxed) >= 1,
 		"recovery must fetch the boarded vtxo bodies in batch");
 	assert!(counts.get_vtxos_status_by_ids.load(Ordering::Relaxed) >= 1,
@@ -430,7 +353,6 @@ async fn recovery_tolerates_an_unknown_vtxo_id() {
 			resp.messages.push(MailboxMessage {
 				message: Some(mailbox_message::Message::RecoveryVtxoIds(RecoveryVtxoIdsMessage {
 					vtxo_ids: vec![self.unknown.to_bytes().to_vec()],
-					owners: Vec::new(),
 				})),
 				checkpoint: 0,
 			});

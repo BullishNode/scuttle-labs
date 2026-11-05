@@ -1520,7 +1520,7 @@
           "lightning"
         ],
         "summary": "Create a BOLT11 invoice for an Ark address",
-        "description": "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. The address must carry a valid signed mailbox link. The server verifies the link and the recipient's immutable fallback registration before it accepts the destination output. Missing or invalid ownership evidence at expiry leaves the bitcoin held; it never makes that bitcoin the provider's or operator's. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
+        "description": "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. With expiry payouts enabled, the address must carry a joint owner link. The server verifies the link and preserves the recipient's immutable coin-to-mailbox binding. Missing or invalid ownership at expiry leaves that customer's bitcoin held instead of assigning it to the provider or operator. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
         "operationId": "generate_invoice_for_address",
         "requestBody": {
           "content": {
@@ -2630,47 +2630,6 @@
           },
           "500": {
             "description": "Internal server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/InternalServerError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/wallet/fallback": {
-      "get": {
-        "tags": [
-          "wallet"
-        ],
-        "summary": "Get the mailbox-derived Bitcoin fallback address",
-        "operationId": "fallback_destination",
-        "responses": {
-          "200": {
-            "description": "Mailbox identity and BIP86 payout address",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FallbackInfo"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "No wallet is loaded",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NotFoundError"
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Wallet identity cannot be read",
             "content": {
               "application/json": {
                 "schema": {
@@ -5942,22 +5901,6 @@
           }
         }
       },
-      "FallbackInfo": {
-        "type": "object",
-        "description": "The app-selected fallback destination authenticated by this wallet.",
-        "required": [
-          "mailbox_public_key",
-          "payout_address"
-        ],
-        "properties": {
-          "mailbox_public_key": {
-            "type": "string"
-          },
-          "payout_address": {
-            "type": "string"
-          }
-        }
-      },
       "FallbackRefusalError": {
         "type": "object",
         "description": "Stable native SDK refusal. Consumers select the code, never diagnostic text.",
@@ -6307,16 +6250,6 @@
             "description": "The amount of the lightning receive, if known.",
             "minimum": 0
           },
-          "fallback_status": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/FallbackStatusInfo"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "finished_at": {
             "type": [
               "string",
@@ -6375,7 +6308,7 @@
           },
           "state": {
             "$ref": "#/components/schemas/LightningReceiveStateKind",
-            "description": "Lifecycle phase of the invoice; payout progress is `fallback_status`."
+            "description": "Lifecycle phase of the invoice."
           }
         }
       },

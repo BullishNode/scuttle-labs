@@ -1167,8 +1167,8 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 					a.sweep_txid,a.confirmed_height
 				FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id
 				LEFT JOIN expiry_entitlement e ON e.vtxo_id=v.vtxo_id
-				LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND c.active AND c.disposition='operator'
-				LEFT JOIN expiry_allocation a ON a.id=c.allocation_id AND a.status='confirmed'
+				LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator'
+				LEFT JOIN expiry_allocation_state a ON a.id=c.allocation_id AND a.status='confirmed'
 				WHERE v.lightning_htlc_subscription_id=$1 AND h.payment_hash=$2 AND h.direction='outgoing'
 				ORDER BY v.vtxo_id
 			", &[&subscription_id, &payment_hash.to_string()]).await?)).await.unwrap();
@@ -1211,8 +1211,8 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 					loop {
 						if db.read(async |t| {
 							let Some(view) = t.expiry_view().await? else { return Ok(false); };
-							let rebuilt = t.expiry_view_is_current(view).await?;
-							Ok(view.processed == point && rebuilt)
+							let rebuilt = (t.expiry_view().await? == Some(view));
+							Ok(view == point && rebuilt)
 						}).await.unwrap() { break; }
 						tokio::time::sleep(Duration::from_millis(100)).await;
 					}
