@@ -719,6 +719,7 @@ impl Server {
 				return badarg!("Requested amount exceeds limit of {}", max);
 			}
 		}
+		let mut claim_destination_user_pubkey = None;
 		if let Some(destination) = claim_destination {
 			let policy = VtxoPolicy::deserialize(&destination.policy).badarg("invalid claim destination policy")?;
 			if !matches!(policy, VtxoPolicy::Pubkey(_)) {
@@ -731,6 +732,7 @@ impl Server {
 			links.insert_request(&destination, self.config.expiry_payouts)?;
 			self.db.write(async |t| links.verify(t, [policy.user_pubkey()],
 				self.mailbox_key.leak_ref(), self.config.network).await).await?;
+			claim_destination_user_pubkey = Some(policy.user_pubkey());
 		}
 
 		// A payment hash carries at most one subscription.
@@ -738,6 +740,9 @@ impl Server {
 			t.get_htlc_subscription_by_payment_hash(payment_hash).await
 		).await?;
 		if let Some(subscription) = subscription {
+			if subscription.claim_destination_user_pubkey != claim_destination_user_pubkey {
+				return badarg!("invoice already exists for another claim destination");
+			}
 			match subscription.status {
 				LightningHtlcSubscriptionStatus::Created => {
 					let existing_expiry = subscription.invoice.expiry_time();
@@ -774,6 +779,7 @@ impl Server {
 
 		let invoice = self.lightning_manager.generate_invoice(
 			payment_hash, amount, ln_cltv_delta, expiry, description, mailbox_id,
+			claim_destination_user_pubkey,
 		).await?;
 		trace!("Hold invoice created. payment_hash: {}, amount: {}, {}",
 			payment_hash, amount, invoice.to_string(),
@@ -1160,6 +1166,13 @@ impl Server {
 		};
 		let builder = self.validate_cosign_request(validation, cosign_request)
 			.badarg("invalid cosign request")?;
+		if let Some(intended) = sub.claim_destination_user_pubkey {
+			for output in builder.build_unsigned_vtxos() {
+				if output.policy() != &VtxoPolicy::new_pubkey(intended) {
+					return badarg!("receive output differs from the invoice claim destination");
+				}
+			}
+		}
 
 		let receive_claims = crate::database::expiry_receive::ReceiveClaimBinding::from_package(&builder)
 			.badarg("invalid receive destination")?;
@@ -1241,6 +1254,7 @@ mod tests {
 			id: 1,
 			lightning_node_id: 1,
 			payment_hash: PaymentHash::from(&invoice),
+			claim_destination_user_pubkey: None,
 			invoice: invoice,
 			status: LightningHtlcSubscriptionStatus::Created,
 			lowest_incoming_htlc_expiry: None,

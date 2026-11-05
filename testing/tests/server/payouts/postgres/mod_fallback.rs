@@ -124,7 +124,7 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 		.min_final_cltv_expiry_delta(18).amount_milli_satoshis(10_000_000)
 		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
 	let subscription = db.write(async |t| {
-		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None).await?;
+		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None, None).await?;
 		Ok(t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id)
 	}).await.unwrap();
 	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,

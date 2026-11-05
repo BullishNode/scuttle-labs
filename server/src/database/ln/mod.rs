@@ -522,6 +522,7 @@ impl<'t> Tx<'t> {
 		invoice: &Bolt11Invoice,
 		amount_msat: u64,
 		receiver_mailbox_id: Option<&MailboxIdentifier>,
+		claim_destination_user_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
@@ -534,7 +535,8 @@ impl<'t> Tx<'t> {
 
 		self.inner_store_lightning_htlc_subscription(
 			node_id, &payment_hash.to_string(), &invoice.to_string(),
-			Some(amount_msat), mailbox_str.as_deref(), user_agent,
+			Some(amount_msat), mailbox_str.as_deref(), claim_destination_user_pubkey,
+			user_agent,
 		).await?;
 
 		Ok(())
@@ -550,6 +552,7 @@ impl<'t> Tx<'t> {
 		invoice: &str,
 		final_amount_msat: Option<u64>,
 		receiver_mailbox_id: Option<&str>,
+		claim_destination_user_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<(i64, DateTime<Local>)> {
 		let requested_status = LightningHtlcSubscriptionStatus::Created;
@@ -561,20 +564,22 @@ impl<'t> Tx<'t> {
 				invoice,
 				final_amount_msat,
 				receiver_mailbox_id,
+				claim_destination_user_pubkey,
 				status,
 				user_agent,
 				created_at,
 				updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
 			RETURNING id, updated_at;
 		").await?;
 
 		let final_amount = final_amount_msat.map(|u| u as i64);
+		let claim_key = claim_destination_user_pubkey.map(|key| key.to_string());
 		let row = self.query_one(
 			&stmt,
 			&[
 				&node_id, &payment_hash, &invoice, &final_amount, &receiver_mailbox_id,
-				&requested_status, &user_agent,
+				&claim_key, &requested_status, &user_agent,
 			],
 		).await?;
 
@@ -815,6 +820,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE status NOT IN ($1, $2) AND lightning_node_id = $3
@@ -840,6 +846,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT lhs.id, lhs.lightning_node_id, lhs.payment_hash, lhs.invoice,
 				lhs.status, lhs.lowest_incoming_htlc_expiry, lhs.accepted_at, lhs.user_agent,
+				lhs.claim_destination_user_pubkey,
 				lhs.created_at, lhs.updated_at,
 				COALESCE(array_agg(vtxo.vtxo_id::text), ARRAY[]::text[]) AS htlc_vtxos
 			FROM lightning_htlc_subscription lhs
@@ -871,6 +878,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE id = $1

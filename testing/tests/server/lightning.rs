@@ -2507,6 +2507,102 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 	assert_eq!(resp.status, protos::LightningReceiveStatus::Canceled as i32);
 }
 
+/// An invoice's signed recipient cannot be replaced after the HTLC arrives.
+#[tokio::test]
+async fn server_lightning_receive_claim_destination_is_bound() {
+	require_bark_version!(> "0.5.0");
+	let ctx = TestContext::new("lightningd/server_lightning_receive_claim_destination_bound").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.expiry_payouts = true).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+
+	let recipient = ctx.bark("intended-recipient", &srv).create().await;
+	let address: ark::Address = recipient.address().await.parse().unwrap();
+	let mailbox_key = srv.ark_info().await.mailbox_pubkey;
+	let recipient_link = address.owner_link(Network::Regtest, mailbox_key).unwrap().unwrap();
+	let recipient_client = recipient.client().await;
+	let preimage = ark::lightning::Preimage::from([23u8; 32]);
+	let hash = preimage.compute_payment_hash();
+	let amount = sat(100_000);
+	let net = amount - srv.config().fees.lightning_receive.calculate(amount).unwrap();
+	let mut rpc = srv.get_public_rpc().await;
+	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 40,
+		mailbox_id: Some(recipient_client.mailbox_identifier().serialize()),
+		description: None, expiry_secs: None,
+		claim_destination: Some(protos::VtxoRequest {
+			amount: net.to_sat(), policy: address.policy().serialize(),
+			owner_proof: Some(recipient_link.into()),
+		}),
+	}).await.unwrap().into_inner().bolt11;
+
+	let payer = lightning.external;
+	let pay_task = tokio::spawn(async move { payer.try_pay_bolt11(invoice).await });
+	rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
+		hash: hash.to_vec(), wait: true,
+	}).wait_millis(10_000).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap();
+	assert_eq!(sub.claim_destination_user_pubkey, Some(address.policy().user_pubkey()));
+	let lowest = sub.lowest_incoming_htlc_expiry.unwrap();
+
+	let grant_key = Keypair::from_seckey_slice(&SECP, &[61; 32]).unwrap();
+	let grant_link = OwnerLink::new_joint(Network::Regtest, mailbox_key,
+		&recipient_client.mailbox_keypair(), &grant_key).unwrap();
+	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(grant_link.into()),
+		payment_hash: hash.to_vec(), user_pubkey: grant_key.public_key().serialize().to_vec(),
+		htlc_recv_expiry: lowest.saturating_sub(srv.config().htlc_expiry_delta).into(),
+		lightning_receive_anti_dos: None,
+	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
+		.map(|bytes| Vtxo::<Full>::deserialize(&bytes).unwrap()).collect::<Vec<_>>();
+	assert!(!granted.is_empty());
+
+	let wrong_key = Keypair::from_seckey_slice(&SECP, &[62; 32]).unwrap();
+	let wrong_link = OwnerLink::new_joint(Network::Regtest, mailbox_key, &wrong_key, &wrong_key).unwrap();
+	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		granted.clone(), VtxoPolicy::new_pubkey(wrong_key.public_key()),
+	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.owner_proof = Some(wrong_link.clone().into());
+	}
+	let bad = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
+		cosign_request: Some(package),
+	}).await.expect_err("server redirected the invoice's recipient");
+	assert!(bad.message().contains("invoice claim destination"), "{bad}");
+	let still_ready = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap();
+	assert_eq!(still_ready.status, server::database::ln::LightningHtlcSubscriptionStatus::HtlcsReady);
+	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+
+	let valid_builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		granted, address.policy().clone(),
+	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
+	let mut valid_package = protos::ArkoorPackageCosignRequest::from(valid_builder.cosign_request());
+	for output in valid_package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.owner_proof = Some(recipient_link.into());
+	}
+	let response = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
+		cosign_request: Some(valid_package),
+	}).await.expect("the intended recipient should claim").into_inner();
+	let signed = valid_builder.user_cosign(&[grant_key], response.try_into().unwrap()).unwrap();
+	let outputs = signed.build_signed_vtxos();
+	assert!(!outputs.is_empty());
+	assert!(outputs.iter().all(|v| v.amount() == net
+		&& v.policy().user_pubkey() == address.policy().user_pubkey() && v.has_all_witnesses()));
+	rpc.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
+		vtxos: outputs.iter().map(|v| v.serialize()).collect(),
+	}).await.expect("the intended output can be registered");
+	assert_eq!(db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap().status, server::database::ln::LightningHtlcSubscriptionStatus::Settled);
+	assert!(pay_task.wait_millis(30_000).await.unwrap().is_ok());
+}
+
 async fn server_claim_lightning_receive_is_idempotent(
 	ctx: &TestContext,
 	_lightning: &LightningPaymentSetup,
