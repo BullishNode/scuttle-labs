@@ -108,7 +108,26 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {
 		tokio::join!(
 			lightning.external.try_pay_bolt11(invoice.to_string()),
-			provider.try_claim_lightning_receive(hash, true),
+			async {
+				let lowest = loop {
+					let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+						.await.unwrap().unwrap();
+					if let Some(lowest) = sub.lowest_incoming_htlc_expiry { break lowest; }
+					tokio::time::sleep(Duration::from_millis(50)).await;
+				};
+				let attacker = Keypair::from_seckey_slice(&SECP, &[74; 32]).unwrap();
+				let attacker_link = OwnerLink::new_joint(Network::Regtest,
+					server.public_key(), &attacker, &attacker).unwrap();
+				let refused = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+					payment_hash: hash.to_vec(),
+					user_pubkey: attacker.public_key().serialize().to_vec(),
+					htlc_recv_expiry: lowest.saturating_sub(srv.config().htlc_expiry_delta).into(),
+					lightning_receive_anti_dos: None,
+					owner_proof: Some(attacker_link.into()),
+				}).await.expect_err("foreign mailbox won the receive grant");
+				assert!(refused.message().contains("invoice mailbox"), "{refused}");
+				provider.try_claim_lightning_receive(hash, true).await
+			},
 		)
 	}).await.expect("normal receive did not complete");
 	paid.expect("external payment failed");
