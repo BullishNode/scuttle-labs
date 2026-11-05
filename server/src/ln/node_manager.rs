@@ -277,6 +277,7 @@ impl LightningManager {
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
 		retry_for: Duration,
+		intent_id: String,
 	) -> anyhow::Result<()> {
 		invoice.check_signature().context("invalid invoice signature")?;
 
@@ -292,6 +293,7 @@ impl LightningManager {
 			user_fee,
 			attempt_block_height,
 			retry_for,
+			&intent_id,
 		).await?;
 		debug!("Bolt11 invoice sent for payment");
 
@@ -322,6 +324,7 @@ impl LightningManager {
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
 		retry_for: Duration,
+		intent_id: &str,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let node = self.active_node().context("no active cln node").map_err(PaymentPreflightRefusal)?;
@@ -426,6 +429,7 @@ impl LightningManager {
 				// An intra-Ark payment short-circuits before xpay, so no
 				// routing budget is ever authorised for it.
 				sub.is_none().then_some(max_routing_fee),
+				Some(intent_id),
 			).await?;
 			if let Some((_, new)) = &mut new_xpay {
 				new.label = Some(attempt_id.to_string());

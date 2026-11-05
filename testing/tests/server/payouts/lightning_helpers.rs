@@ -59,7 +59,7 @@ async fn lightning_attempt_status(
 ) -> Option<String> {
 	db.read(async |t| {
 		Ok(t.query_opt(
-			"SELECT status::text FROM lightning_payment_attempt WHERE payment_hash = $1",
+			"SELECT status::text FROM lightning_payment_attempt WHERE payment_hash = $1 ORDER BY id DESC LIMIT 1",
 			&[&payment_hash.to_string()],
 		).await?.map(|r| r.get(0)))
 	}).await.unwrap()

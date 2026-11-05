@@ -92,10 +92,12 @@ async fn failed_external_payout() {
 	let mut rpc = srv.get_public_rpc().await;
 	let mut xpay_called = srv.subscribe_log::<XpayRpcCalled>();
 	let mut xpay_returned = srv.subscribe_log::<XpayRpcReturned>();
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![id.to_bytes().to_vec()],
 		mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &key).await).await.unwrap();
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (attempt, native_call) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
@@ -234,10 +236,12 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	drop(client);
 	lightning.sync().await;
 	let mut rpc = srv.get_public_rpc().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &key).await).await.unwrap();
 	drop(rpc); // No second prepare, cooperative revoke, claim or wallet return.
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let (attempt, subscription) = tokio::time::timeout(Duration::from_secs(30), async {
@@ -373,10 +377,12 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 	let source = incoming[0].id();
 	let mut rpc = srv.get_public_rpc().await;
 	lightning.sync().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
 		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &key).await).await.unwrap();
 	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
@@ -688,10 +694,12 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			min_final_cltv_expiry: Some(220), expiry: Some(3600), routing_hints: vec![],
 		}).await.unwrap().into_inner().bolt11;
 		lightning.sync().await;
-		srv.get_public_rpc().await.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+		srv.get_public_rpc().await.initiate_lightning_payment(
+			ark_testing::lightning::sign_lightning_send_request(&srv, protos::InitiateLightningPaymentRequest {
 			invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![source.id().to_bytes().to_vec()],
 			mailbox_id: None, retry_for_secs: Some(5),
-		}).await.unwrap();
+			intent_nonce: None, source_owner_signatures: Vec::new(),
+		}, &key).await).await.unwrap();
 		lightning.external.wait_for_hold_invoice_accepted(hash).await;
 		let payer = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
 		let receiver = lightning.external.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();

@@ -136,10 +136,12 @@ async fn reclaim_reorg() {
 	client.register_vtxo_transactions_with_server(&incoming).await.unwrap();
 	let source = incoming[0].id().to_string();
 	lightning.sync().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice: invoice.to_string(), payment_amount_sat: 90_000,
 		htlc_vtxo_ids: vec![incoming[0].id().to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &key).await).await.unwrap();
 	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),

@@ -79,10 +79,12 @@ async fn lightning_rejection_refunds_only_its_source() {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().pays.is_empty());
 		let mut returned = srv.subscribe_log::<server_log::XpayRpcReturned>();
-		rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+		rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+			protos::InitiateLightningPaymentRequest {
 			invoice: invoice.to_string(), payment_amount_sat: principal.to_sat(),
 			htlc_vtxo_ids: vec![sources[0].0.id().to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(1),
-		}).await.unwrap();
+			intent_nonce: None, source_owner_signatures: Vec::new(),
+		}, &sources[0].1).await).await.unwrap();
 		tokio::time::timeout(Duration::from_secs(30), async {
 			loop {
 				let result = returned.recv().await.unwrap();
@@ -135,10 +137,12 @@ async fn lightning_rejection_refunds_only_its_source() {
 			description: Some(hold::invoice_request::Description::Memo("same-hash pending source".into())),
 			min_final_cltv_expiry: Some(18), expiry: Some(3600), routing_hints: vec![],
 		}).await.unwrap().into_inner().bolt11;
-		rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+		rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+			protos::InitiateLightningPaymentRequest {
 			invoice, payment_amount_sat: principal.to_sat(),
 			htlc_vtxo_ids: vec![sources[1].0.id().to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(1),
-		}).await.unwrap();
+			intent_nonce: None, source_owner_signatures: Vec::new(),
+		}, &sources[1].1).await).await.unwrap();
 		lightning.external.wait_for_hold_invoice_accepted(hash).await;
 		let pending = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert_ne!(pending.id, rejected.id);

@@ -1660,18 +1660,91 @@ impl RawHtlcSend {
 
 	async fn initiate(&self, srv: &Captaind, invoice: &str, amount: Amount) -> Result<(), tonic::Status> {
 		let mut srv_rpc = srv.get_public_rpc().await;
-		srv_rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+		srv_rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(srv,
+			protos::InitiateLightningPaymentRequest {
 			invoice: invoice.to_string(),
 			htlc_vtxo_ids: self.vtxos.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 			payment_amount_sat: amount.to_sat(),
 			mailbox_id: None,
 			retry_for_secs: None,
-		}).await.map(|_| ())
+			intent_nonce: None, source_owner_signatures: Vec::new(),
+		}, &self.keypair).await).await.map(|_| ())
 	}
 
 	async fn revoke(&self, srv: &Captaind) -> Result<(), tonic::Status> {
 		revoke_htlc_vtxos(srv, self.vtxos.clone(), &vec![self.keypair; self.vtxos.len()]).await
 	}
+}
+
+#[tokio::test]
+async fn failed_lightning_source_needs_fresh_owner_intent() {
+	let ctx = TestContext::new("server/failed_lightning_source_needs_fresh_owner_intent").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
+	let inputs = sender.board_and_confirm_and_register(&ctx, sat(300_000)).await;
+	let hash = ark::lightning::Preimage::random().compute_payment_hash();
+	let unknown_key = bitcoin::secp256k1::SecretKey::new(&mut bip39::rand::thread_rng());
+	let invoice = InvoiceBuilder::new(Currency::Regtest)
+		.description("unroutable owner-intent test".into())
+		.payment_hash(sha256::Hash::from_byte_array(hash.to_byte_array()))
+		.payment_secret(PaymentSecret([17; 32]))
+		.current_timestamp().min_final_cltv_expiry_delta(18)
+		.amount_milli_satoshis(100_000_000)
+		.build_signed(|message| SECP.sign_ecdsa_recoverable(message, &unknown_key)).unwrap()
+		.to_string();
+	let wallet = sender.client().await;
+	let source = RawHtlcSend::cosign(&ctx, &srv, &wallet, &inputs, hash).await;
+	let request = protos::InitiateLightningPaymentRequest {
+		invoice, payment_amount_sat: 100_000,
+		htlc_vtxo_ids: source.vtxos.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
+		mailbox_id: None, retry_for_secs: Some(1),
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	};
+	let mut rpc = srv.get_public_rpc().await;
+	let foreign_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let foreign = ark_testing::lightning::sign_lightning_send_request(&srv, request.clone(), &foreign_key).await;
+	assert_eq!(rpc.initiate_lightning_payment(foreign).await.unwrap_err().code(),
+		tonic::Code::InvalidArgument);
+	let signed = ark_testing::lightning::sign_lightning_send_request(&srv, request.clone(), &source.keypair).await;
+	rpc.initiate_lightning_payment(signed.clone()).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	wait_for_attempt_status(&db, hash, "failed").await;
+
+	let missing = rpc.initiate_lightning_payment(request.clone()).await.unwrap_err();
+	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
+	let foreign = ark_testing::lightning::sign_lightning_send_request(&srv, request.clone(), &foreign_key).await;
+	let wrong_key = rpc.initiate_lightning_payment(foreign).await.unwrap_err();
+	assert_eq!(wrong_key.code(), tonic::Code::InvalidArgument);
+	let mut changed_amount = signed.clone();
+	changed_amount.payment_amount_sat += 1;
+	assert!(rpc.initiate_lightning_payment(changed_amount).await.unwrap_err()
+		.message().contains("source owner signature"));
+	let mut changed_retry = signed.clone();
+	changed_retry.retry_for_secs = Some(2);
+	assert!(rpc.initiate_lightning_payment(changed_retry).await.unwrap_err()
+		.message().contains("source owner signature"));
+	let mut changed_nonce = signed.clone();
+	changed_nonce.intent_nonce.as_mut().unwrap()[0] ^= 1;
+	assert!(rpc.initiate_lightning_payment(changed_nonce).await.unwrap_err()
+		.message().contains("source owner signature"));
+	let replay = rpc.initiate_lightning_payment(signed).await.unwrap_err();
+	assert!(replay.message().contains("already used"), "{replay}");
+	let count = db.read(async |t| Ok(t.query_one(
+		"SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1",
+		&[&hash.to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(count, 1, "rejected calls created another attempt");
+
+	let fresh = ark_testing::lightning::sign_lightning_send_request(&srv, request, &source.keypair).await;
+	rpc.initiate_lightning_payment(fresh).await.unwrap();
+	let count = db.read(async |t| Ok(t.query_one(
+		"SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1",
+		&[&hash.to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(count, 2, "the owner must still be able to retry a failed send");
+	wait_for_attempt_status(&db, hash, "failed").await;
+	source.revoke(&srv).await.expect("failed source remains refundable");
 }
 
 /// A server with a victim holding an open bolt11 receive and a funded
@@ -4312,13 +4385,15 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	).await;
 	wallet.register_vtxo_transactions_with_server(&htlcs).await.unwrap();
 
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice,
 		payment_amount_sat: 100_000,
 		htlc_vtxo_ids: htlcs.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None,
 		retry_for_secs: None,
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &sender_key).await).await.unwrap();
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	wait_for_subscription_status(&db, payment_hash, "accepted").await;
 
@@ -4487,7 +4562,7 @@ async fn late_xpay_result_does_not_finalize_a_retry() {
 	let invoice = ark::lightning::Invoice::from_str(&bolt11).unwrap();
 	let retry_id = db.write(async |t| t.store_lightning_payment_start(
 		first.lightning_node_id, &invoice, sat(10_000), None, &[], None,
-		first.block_height.unwrap(), sat(0), None, Duration::from_secs(3600), Some(sat(1_000)),
+		first.block_height.unwrap(), sat(0), None, Duration::from_secs(3600), Some(sat(1_000)), None,
 	).await).await.unwrap();
 
 	// Releasing the hold makes the first xpay call fail.

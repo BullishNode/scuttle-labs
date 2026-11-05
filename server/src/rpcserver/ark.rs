@@ -584,6 +584,9 @@ impl rpc::server::ArkService for Server {
 			macros::badarg!("Your client version is too old, you need to update \
 				in order to be able to send Lightning payments.");
 		}
+		if req.htlc_vtxo_ids.len() > rpc::MAX_NB_VTXO_IDS {
+			macros::badarg!("too many Lightning sources");
+		}
 
 		let htlc_vtxo_ids = req.htlc_vtxo_ids.iter()
 			.map(VtxoId::from_bytes)
@@ -597,9 +600,10 @@ impl rpc::server::ArkService for Server {
 			.transpose()
 			.map_err(|_| tonic::Status::invalid_argument("invalid mailbox_id"))?;
 
-		let retry_for = req.retry_for_secs.map(|s| Duration::from_secs(s as u64));
-
-		self.initiate_lightning_payment(invoice, payment_amount, htlc_vtxo_ids, mailbox_id, retry_for)
+		self.initiate_lightning_payment(
+			invoice, payment_amount, htlc_vtxo_ids, mailbox_id, req.retry_for_secs,
+			req.intent_nonce, req.source_owner_signatures,
+		)
 			.await
 			.to_status()?;
 		Ok(tonic::Response::new(protos::Empty {}))

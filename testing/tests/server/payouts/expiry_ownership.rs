@@ -43,11 +43,13 @@ async fn held_coin_is_alarmed_before_decision() {
 	assert!(input.expiry_height() < deadline);
 	let expired = ctx.generate_blocks(input.expiry_height().to_u32() + 1 - tip.to_u32()).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let response = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	let response = rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000,
 		htlc_vtxo_ids: htlcs.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: None,
-	}).await;
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &key).await).await;
 	let error = response.expect_err("offline sender cannot start an external payment after backing expiry");
 	assert!(error.message().contains("expired"), "{error}");
 	let attempts = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap();

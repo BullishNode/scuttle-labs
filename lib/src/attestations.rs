@@ -1,14 +1,16 @@
 use std::io::{self, Write as _};
 
+use bitcoin::constants::ChainHash;
 use bitcoin::consensus::WriteExt;
 use bitcoin::hashes::{sha256, Hash, HashEngine};
 use bitcoin::key::Keypair;
-use bitcoin::secp256k1::{self, schnorr, Message};
+use bitcoin::secp256k1::{self, schnorr, Message, PublicKey};
+use bitcoin::{Amount, Network};
 
 use crate::{SignedVtxoRequest, Vtxo, VtxoId, VtxoRequest, SECP};
 use crate::arkoor::ArkoorDestination;
 use crate::encode::{ProtocolEncoding, ProtocolDecodingError};
-use crate::lightning::PaymentHash;
+use crate::lightning::{Invoice, PaymentHash};
 use crate::mailbox::MailboxIdentifier;
 use crate::offboard::OffboardRequest;
 use crate::tree::signed::UnlockHash;
@@ -34,6 +36,59 @@ impl Challenge {
 impl AsRef<[u8]> for Challenge {
 	fn as_ref(&self) -> &[u8] {
 	    &self.0[..]
+	}
+}
+
+/// A replay-safe authorization for one Lightning send and its exact source set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LightningSendIntent(sha256::Hash);
+
+impl LightningSendIntent {
+	pub fn new(
+		nonce: [u8; 32], server_pubkey: PublicKey, network: Network,
+		invoice: &Invoice, amount: Amount, source_ids: &[VtxoId],
+		mailbox_id: Option<MailboxIdentifier>, retry_for_secs: Option<u32>,
+	) -> Self {
+		let mut engine = sha256::Hash::engine();
+		engine.write_all(b"Ark lightning send intent v1").unwrap();
+		engine.write_all(&server_pubkey.serialize()).unwrap();
+		engine.write_all(ChainHash::using_genesis_block_const(network).as_bytes()).unwrap();
+		engine.write_all(&nonce).unwrap();
+		let invoice = invoice.to_string();
+		engine.write_all(&(invoice.len() as u64).to_be_bytes()).unwrap();
+		engine.write_all(invoice.as_bytes()).unwrap();
+		engine.write_all(&amount.to_sat().to_be_bytes()).unwrap();
+		let mut ids = source_ids.to_vec();
+		ids.sort_unstable();
+		engine.write_all(&(ids.len() as u64).to_be_bytes()).unwrap();
+		for id in ids { engine.write_all(&id.to_bytes()).unwrap(); }
+		match mailbox_id {
+			Some(id) => {
+				engine.write_all(&[1]).unwrap();
+				engine.write_all(&id.serialize()).unwrap();
+			},
+			None => engine.write_all(&[0]).unwrap(),
+		}
+		match retry_for_secs {
+			Some(secs) => {
+				engine.write_all(&[1]).unwrap();
+				engine.write_all(&secs.to_be_bytes()).unwrap();
+			},
+			None => engine.write_all(&[0]).unwrap(),
+		}
+		Self(sha256::Hash::from_engine(engine))
+	}
+
+	pub fn id(self) -> sha256::Hash { self.0 }
+
+	pub fn sign(self, keypair: &Keypair) -> schnorr::Signature {
+		SECP.sign_schnorr_with_aux_rand(&Message::from_digest(self.0.to_byte_array()), keypair, &rand::random())
+	}
+
+	pub fn verify(self, signature: &schnorr::Signature, user_pubkey: PublicKey)
+		-> Result<(), secp256k1::Error> {
+		SECP.verify_schnorr(signature, &Message::from_digest(self.0.to_byte_array()),
+			&user_pubkey.x_only_public_key().0)
 	}
 }
 

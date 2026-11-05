@@ -108,10 +108,12 @@ async fn native_refund_status(two_sources: bool) {
 	let mut ids = sources.iter().map(|source| source.id().to_bytes().to_vec()).collect::<Vec<_>>();
 	ids.sort_unstable();
 	lightning.sync().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
 		htlc_vtxo_ids: ids.clone(), mailbox_id: Some(mailbox.serialize()), retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &keys[0]).await).await.unwrap();
 	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),

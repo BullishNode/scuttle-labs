@@ -70,11 +70,13 @@ async fn partial_terminal() {
 	assert!(sources.iter().all(|source| source.amount() == sat(100_000)));
 	sender.register_vtxo_transactions_with_server(&sources).await.unwrap();
 	lightning.sync().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice: invoice.to_string(), payment_amount_sat: 180_000,
 		htlc_vtxo_ids: sources.iter().map(|source| source.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &keys[0]).await).await.unwrap();
 	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),

@@ -150,10 +150,12 @@ async fn failed_swap_during_restart() {
 		min_final_cltv_expiry: Some(18), expiry: Some(3600), routing_hints: vec![],
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000, htlc_vtxo_ids: vec![source.to_bytes().to_vec()],
 		mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &key).await).await.unwrap();
 	lightning.external.wait_for_hold_invoice_accepted(hash).await;
 	drop(client);
 	drop(wallet);

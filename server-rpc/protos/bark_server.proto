@@ -391,6 +391,10 @@ message InitiateLightningPaymentRequest {
 	// single attempt. Values above the server's maximum are capped to it.
 	// The server picks its default when unset.
 	optional uint32 retry_for_secs = 5;
+	// Fresh sends require one owner signature for each source, in source order.
+	// Exact retries of an already open send may omit these fields.
+	optional bytes intent_nonce = 6;
+	repeated bytes source_owner_signatures = 7;
 }
 
 message CheckLightningPaymentRequest {

@@ -1680,7 +1680,7 @@ async fn lightning_payment_attempt_lifecycle() {
 
 	// Start a payment
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(2), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(2), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None, None,
 	).await).await.unwrap();
 
 	// One open attempt
@@ -1728,7 +1728,7 @@ async fn lightning_payment_attempt_with_error() {
 	let invoice = Invoice::Bolt11(bolt11);
 
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(1), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(1), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None, None,
 	).await).await.unwrap();
 
 	let attempts = db.read(async |t| t.get_open_lightning_payment_attempts(node_id).await).await.unwrap();
@@ -1765,7 +1765,7 @@ async fn lightning_payment_attempt_result_update() {
 	let sender_mailbox = MailboxIdentifier::from_pubkey(pubkey);
 
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(1000), Some(&sender_mailbox), &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(1000), Some(&sender_mailbox), &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None, None,
 	).await).await.unwrap();
 
 	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(
@@ -1790,7 +1790,7 @@ async fn lightning_payment_attempt_result_update() {
 		"02c7ef7d49b365974cd219f7036753e1544a3cdd2120eb7247dd8a94ef91cf1e49",
 	).unwrap());
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(1000), Some(&other_mailbox), &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(1000), Some(&other_mailbox), &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None, None,
 	).await).await.unwrap();
 	let mailbox = db.read(async |t| t.get_lightning_sender_mailbox_id(attempt.id).await)
 		.await.unwrap();
@@ -1818,7 +1818,7 @@ async fn lightning_payment_attempt_error_survives_until_failed() {
 	let invoice = Invoice::Bolt11(bolt11.clone());
 
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None, None,
 	).await).await.unwrap();
 
 	let read = async || db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
@@ -1871,7 +1871,7 @@ async fn lightning_payment_attempt_error_cleared_on_success() {
 	let invoice = Invoice::Bolt11(bolt11.clone());
 
 	db.write(async |t| t.store_lightning_payment_start(
-		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None,
+		node_id, &invoice, sat(1000), None, &[], None, BlockHeight::new(1), sat(1), Some("bark"), Duration::from_secs(60), None, None,
 	).await).await.unwrap();
 
 	let read = async || db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(
@@ -1928,7 +1928,7 @@ async fn lightning_payment_attempt_stores_protocol_fee() {
 	db.write(async |t| t.store_lightning_payment_start(
 		node_id, &invoice, sat(50_000), None, &[vtxo.id()],
 		None, expected_block_height, expected_user_fee, Some(expected_user_agent), expected_retry_for,
-		Some(expected_max_routing_fee),
+		Some(expected_max_routing_fee), None,
 	).await).await.unwrap();
 
 	let attempt = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(

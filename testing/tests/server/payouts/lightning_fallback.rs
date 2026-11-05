@@ -82,11 +82,13 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let owner_proof = super::test_owner_link(&srv, &owner).await;
 	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(), hash, owner_proof).await;
 	wallet.register_vtxo_transactions_with_server(&sources).await.unwrap();
-	let refusal = rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	let refusal = rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000,
 		htlc_vtxo_ids: sources.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap_err();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &owner).await).await.unwrap_err();
 	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
 	assert!(refusal.message().contains("already being paid"));
 	let records = db.read(async |t| {

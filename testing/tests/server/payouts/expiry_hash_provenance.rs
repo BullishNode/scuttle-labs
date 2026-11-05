@@ -57,10 +57,12 @@ async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
 		sources.push((input, key));
 	}
 	lightning.sync().await;
-	rpc.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+		protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000, htlc_vtxo_ids: vec![grants[0].to_bytes().to_vec()],
 		mailbox_id: None, retry_for_secs: Some(5),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	}, &sources[0].1).await).await.unwrap();
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {

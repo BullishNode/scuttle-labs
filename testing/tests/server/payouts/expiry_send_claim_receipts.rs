@@ -189,6 +189,12 @@ async fn external_payment(ctx: &TestContext, count: usize, selected: usize) -> E
 	// Two 90k sources fund precisely 180k. There is no hidden 20k surplus
 	// or synthetic routing fee in the direct-channel accounting.
 	let sources = signed_sources(ctx, &server, &sender, hash, sat(90_000), count).await;
+	let sender_client = sender.client().await;
+	let mut source_keys = Vec::new();
+	for source in &sources[..selected] {
+		source_keys.push(sender_client.pubkey_keypair(&source.user_pubkey())
+			.await.unwrap().unwrap().1);
+	}
 	let amount = sources[..selected].iter().map(Vtxo::amount).sum::<Amount>();
 	let mut receiver = lightning.external.hold_client().await;
 	let invoice = receiver.invoice(hold::InvoiceRequest {
@@ -198,11 +204,18 @@ async fn external_payment(ctx: &TestContext, count: usize, selected: usize) -> E
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
 	let admission_tip = ctx.bitcoind().get_block_count().await as u32;
-	server.get_public_rpc().await.initiate_lightning_payment(protos::InitiateLightningPaymentRequest {
+	let request = protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: amount.to_sat(),
 		htlc_vtxo_ids: sources[..selected].iter().map(|source| source.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(1),
-	}).await.unwrap();
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	};
+	let signed = ark_testing::lightning::sign_lightning_send_request_with_keys(
+		&server, request.clone(), &source_keys,
+	).await;
+	server.get_public_rpc().await.initiate_lightning_payment(signed).await.unwrap();
+	server.get_public_rpc().await.initiate_lightning_payment(request).await
+		.expect("an old client may acknowledge its already open payment");
 	lightning.external.wait_for_hold_invoice_accepted(hash).await;
 	let db = Db::connect(&server.config().postgres).await.unwrap();
 	let dispatch = external_dispatch(&db, hash, &sources[..selected]).await;
@@ -257,7 +270,7 @@ async fn completed_hash_cannot_discharge_another_queued_source() {
 			assert_eq!(first.status, server::database::ln::LightningPaymentStatus::Succeeded);
 			tx.store_lightning_payment_start(first.lightning_node_id, &invoice, omitted.amount(), None,
 				&[omitted.id()], None, BlockHeight::new(ctx.bitcoind().get_block_count().await as u32),
-				Amount::ZERO, None, Duration::from_secs(1), Some(Amount::ZERO)).await?;
+				Amount::ZERO, None, Duration::from_secs(1), Some(Amount::ZERO), None).await?;
 			Ok(tx.get_open_lightning_payment_attempt_by_payment_hash(hash).await?.unwrap().id)
 		}).await.unwrap();
 		assert_ne!(queued, payment.dispatch.id);
