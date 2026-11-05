@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use bitcoin::Amount;
-use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bitcoin_ext::BlockDelta;
 use server_log::RoundFinished;
 

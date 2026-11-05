@@ -220,8 +220,8 @@ async fn import_vtxo_partial_barkd() {
 	let theirs = stranger.vtxos(None).await;
 	let theirs_hex = stranger.get_vtxo_encoded(&theirs[0].vtxo.id.to_string()).await.encoded.0;
 
-	// A failed import can reveal keys. Keep queued mailbox delivery separate
-	// from the batch's own storage result.
+	// The failed import below reveals the key of `mine`. Without manual sync, the
+	// daemon's mailbox stream can then store `mine` from the sender's arkoor message.
 	let recovered = ctx.barkd("recovered", &srv)
 		.mnemonic(recipient.mnemonic().await)
 		.cfg(|c| {

@@ -17,7 +17,7 @@ use server_rpc::{protos, MAX_NB_MAILBOX_ARKOOR_VTXOS};
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 use ark_testing::{TestContext, btc, require_bark_version};
-use ark_testing::daemon::captaind::{self, MailboxClient};
+use ark_testing::daemon::captaind;
 
 /// Regression test for the checkpoint visibility gap in concurrent mailbox writes.
 ///
@@ -155,7 +155,7 @@ async fn mailbox_checkpoint_visibility_gap() {
 #[tokio::test]
 async fn mailbox_post_arkoor_requires_known_vtxos() {
 	let ctx = TestContext::new("server/mailbox_post_arkoor_requires_known_vtxos").await;
-	let srv = ctx.captaind("server").create().await;
+	let srv = ctx.captaind("server").cfg(|config| config.expiry_payouts = true).create().await;
 
 	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
 	let mut rpc = srv.get_mailbox_public_rpc().await;
@@ -199,6 +199,19 @@ async fn mailbox_post_arkoor_requires_known_vtxos() {
 	assert!(err.message().contains("doesn't belong to the provided vtxo pubkey"),
 		"unexpected error for pubkey mismatch: {}", err.message(),
 	);
+
+	// Equal payout scripts do not make opposite mailbox points the same recipient.
+	let other_mailbox = MailboxIdentifier::from_pubkey(mailbox_id.as_pubkey().negate(&SECP));
+	assert_ne!(other_mailbox, mailbox_id);
+	assert_eq!(ark::fallback::payout_script(other_mailbox.as_pubkey()),
+		ark::fallback::payout_script(mailbox_id.as_pubkey()));
+	let err = rpc.post_arkoor_message(protos::mailbox_server::PostArkoorMessageRequest {
+		blinded_id: other_mailbox.to_blinded(mailbox_pubkey, &owner_kp).unwrap().as_ref().to_vec(),
+		vtxos: vec![ProtocolEncoding::serialize(&vtxo).to_vec()],
+	}).await.unwrap_err();
+	assert_eq!(err.code(), tonic::Code::InvalidArgument);
+	let entries = db.read(async |t| t.get_mailbox_entries(other_mailbox, 0, 100).await).await.unwrap();
+	assert!(entries.is_empty(), "a post cannot consume another recipient's delivery slot");
 
 	// Nothing landed in the mailbox.
 	let entries = db.read(async |t| t.get_mailbox_entries(mailbox_id, 0, 100).await).await.unwrap();

@@ -33,7 +33,6 @@ pub fn router() -> Router<Arc<ServerState>> {
 		.route("/mnemonic", get(mnemonic))
 		.route("/ark-info", get(ark_info))
 		.route("/debug-info", get(debug_info))
-		.route("/fallback", get(fallback_destination))
 		.route("/next-round", get(next_round))
 		.route("/addresses/next", post(address))
 		.route("/addresses/index/{index}", get(peek_address))
@@ -68,7 +67,6 @@ pub fn router() -> Router<Arc<ServerState>> {
 		mnemonic,
 		ark_info,
 		debug_info,
-		fallback_destination,
 		next_round,
 		address,
 		peek_address,
@@ -98,7 +96,6 @@ pub fn router() -> Router<Arc<ServerState>> {
 		bark_json::web::Bip321UriQuery,
 		bark_json::web::Bip321UriResponse,
 		bark_json::web::WalletExistsResponse,
-		bark_json::web::FallbackInfo,
 		bark_json::web::WalletDeleteRequest,
 		bark_json::web::WalletDeleteResponse,
 		bark_json::web::ConnectedResponse,
@@ -362,29 +359,6 @@ pub async fn debug_info(
 
 #[utoipa::path(
 	get,
-	path = "/fallback",
-	summary = "Get the mailbox-derived Bitcoin fallback address",
-	responses(
-		(status = 200, description = "Mailbox identity and BIP86 payout address", body = bark_json::web::FallbackInfo),
-		(status = 404, description = "No wallet is loaded", body = error::NotFoundError),
-		(status = 500, description = "Wallet identity cannot be read", body = error::InternalServerError)
-	),
-	tag = "wallet"
-)]
-#[debug_handler]
-pub async fn fallback_destination(
-	State(state): State<Arc<ServerState>>,
-) -> HandlerResult<Json<bark_json::web::FallbackInfo>> {
-	let wallet = state.require_wallet()?;
-	let payout_address = bitcoin::Address::from_script(&wallet.fallback_script(), wallet.network().await?)
-		.context("invalid mailbox fallback address")?.to_string();
-	Ok(Json(bark_json::web::FallbackInfo {
-		mailbox_public_key: wallet.mailbox_identifier().as_pubkey().to_string(), payout_address,
-	}))
-}
-
-#[utoipa::path(
-	get,
 	path = "/next-round",
 	summary = "Get next round time",
 	responses(
@@ -587,7 +561,9 @@ pub async fn vtxos(
 		wallet.vtxos().await.context("Failed to get VTXOs")?
 	};
 
-	let vtxo_infos = wallet_vtxos.iter().map(bark_json::primitives::WalletVtxoInfo::from).collect();
+	let vtxo_infos = wallet_vtxos.iter()
+		.map(bark_json::primitives::WalletVtxoInfo::from)
+		.collect();
 
 	Ok(axum::Json(vtxo_infos))
 }
@@ -619,8 +595,7 @@ pub async fn get_vtxo(
 	let wallet_vtxo = wallet.get_vtxo_by_id(vtxo_id).await
 		.not_found([vtxo_id], "VTXO not found")?;
 
-	let info = bark_json::primitives::WalletVtxoInfo::from(&wallet_vtxo);
-	Ok(axum::Json(info))
+	Ok(axum::Json((&wallet_vtxo).into()))
 }
 
 #[utoipa::path(

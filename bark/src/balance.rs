@@ -146,7 +146,7 @@ impl Wallet {
 
 		let vtxos = self.inner.db.get_vtxos_by_state(&[
 			VtxoStateKind::Spendable, VtxoStateKind::Locked, VtxoStateKind::Exited,
-		]).await?.into_iter().filter(|v| v.fallback_status.is_none()).map(|v| (v.id(),v)).collect::<HashMap<_,_>>();
+		]).await?.into_iter().map(|v| (v.id(),v)).collect::<HashMap<_,_>>();
 
 		let mut balance = Balance {
 			spendable: Amount::ZERO,

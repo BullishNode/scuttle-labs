@@ -2,7 +2,7 @@
 mod model;
 pub use model::*;
 mod settlement;
-pub use settlement::{HtlcSettlementOrigin, SourceSettlement};
+pub use settlement::SourceSettlement;
 
 
 use std::str::FromStr;
@@ -208,8 +208,9 @@ impl<'t> Tx<'t> {
 		ensure!(invoice.amount_msat().is_none_or(|principal|
 			principal <= amount.to_msat() && principal >= amount.to_msat() / 2),
 			"recorded initiation amount exceeds invoice bounds");
-		ensure!(attempt.amount_msat == invoice.amount_msat().unwrap_or(amount.to_msat()),
-			"recorded payment principal differs from initiation");
+		ensure!(attempt.amount_msat == amount.to_msat()
+			|| Some(attempt.amount_msat) == invoice.amount_msat(),
+			"recorded payment amount differs from initiation");
 		let mut supplied = sources.iter().map(ToString::to_string).collect::<Vec<_>>();
 		supplied.sort_unstable();
 		let stored = self.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo \
@@ -232,7 +233,7 @@ impl<'t> Tx<'t> {
 				&& record.lightning_node_id == attempt.lightning_node_id
 				&& record.payment_hash == attempt.payment_hash
 				&& record.payment_amount_msat == amount.to_msat()
-				&& record.original_invoice()?.to_string() == invoice.to_string(),
+				&& record.signed_invoice.as_deref() == Some(invoice.to_string().as_str()),
 				"recorded xpay request differs from initiation");
 		}
 		Ok(true)
@@ -309,11 +310,10 @@ impl<'t> Tx<'t> {
 		retry_for: Duration,
 		// `None` for intra-Ark self-payments, which never reach CLN.
 		max_routing_fee: Option<Amount>,
+		// `None` for direct database test fixtures.
+		intent_id: Option<&str>,
 	) -> anyhow::Result<i64> {
 		let payment_hash = invoice.payment_hash();
-		let principal_msat = i64::try_from(invoice.amount_msat().unwrap_or(amount.to_msat()))
-			.context("Lightning payment principal exceeds database range")?;
-		super::expiry_guard::guard_new_lightning_inputs(self, htlc_vtxo_ids).await?;
 
 		let check_stmt = self.prepare("
 			SELECT id FROM lightning_payment_attempt
@@ -344,11 +344,12 @@ impl<'t> Tx<'t> {
 				user_fee_sat,
 				user_agent,
 				retry_for_secs,
+				intent_id,
 				max_routing_fee_msat,
 				created_at,
 				updated_at,
 				lightning_htlc_subscription_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW(), $11)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW(), $12)
 			RETURNING id, updated_at;
 		").await?;
 
@@ -363,10 +364,10 @@ impl<'t> Tx<'t> {
 		let row = self.query_one(
 			&stmt,
 			&[
-				&node_id, &payment_hash.to_string(), &principal_msat,
+				&node_id, &payment_hash.to_string(), &(amount.to_msat() as i64),
 				&mailbox_str, &requested_status,
 				&block_height_i32, &user_fee_sat_i64, &user_agent, &retry_for_secs_i32,
-				&max_routing_fee_msat_i64,
+				&intent_id, &max_routing_fee_msat_i64,
 				&lightning_htlc_subscription_id,
 			],
 		).await?;
@@ -521,23 +522,21 @@ impl<'t> Tx<'t> {
 		invoice: &Bolt11Invoice,
 		amount_msat: u64,
 		receiver_mailbox_id: Option<&MailboxIdentifier>,
+		claim_destination_user_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let mailbox_str = receiver_mailbox_id.map(|id| id.to_string());
 
-		// The hash can settle while the invoice is generated. Serialize with
-		// `store_htlc_settlement` so no receive opens for a known preimage.
-		self.execute(
-			&format!("SELECT pg_advisory_xact_lock({})",
-				super::AdvisoryLock::HtlcSettlementWrite as i64,
-			), &[],
-		).await?;
+		// The hash can settle while the invoice is generated. The gate
+		// serializes with `store_htlc_settlement`, so no receive opens for a
+		// known preimage.
 		self.ensure_not_settled(PaymentHash::from(*payment_hash)).await?;
 
 		self.inner_store_lightning_htlc_subscription(
 			node_id, &payment_hash.to_string(), &invoice.to_string(),
-			Some(amount_msat), mailbox_str.as_deref(), user_agent,
+			Some(amount_msat), mailbox_str.as_deref(), claim_destination_user_pubkey,
+			user_agent,
 		).await?;
 
 		Ok(())
@@ -553,6 +552,7 @@ impl<'t> Tx<'t> {
 		invoice: &str,
 		final_amount_msat: Option<u64>,
 		receiver_mailbox_id: Option<&str>,
+		claim_destination_user_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<(i64, DateTime<Local>)> {
 		let requested_status = LightningHtlcSubscriptionStatus::Created;
@@ -564,20 +564,22 @@ impl<'t> Tx<'t> {
 				invoice,
 				final_amount_msat,
 				receiver_mailbox_id,
+				claim_destination_user_pubkey,
 				status,
 				user_agent,
 				created_at,
 				updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
 			RETURNING id, updated_at;
 		").await?;
 
 		let final_amount = final_amount_msat.map(|u| u as i64);
+		let claim_key = claim_destination_user_pubkey.map(|key| key.to_string());
 		let row = self.query_one(
 			&stmt,
 			&[
 				&node_id, &payment_hash, &invoice, &final_amount, &receiver_mailbox_id,
-				&requested_status, &user_agent,
+				&claim_key, &requested_status, &user_agent,
 			],
 		).await?;
 
@@ -818,6 +820,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE status NOT IN ($1, $2) AND lightning_node_id = $3
@@ -843,6 +846,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT lhs.id, lhs.lightning_node_id, lhs.payment_hash, lhs.invoice,
 				lhs.status, lhs.lowest_incoming_htlc_expiry, lhs.accepted_at, lhs.user_agent,
+				lhs.claim_destination_user_pubkey,
 				lhs.created_at, lhs.updated_at,
 				COALESCE(array_agg(vtxo.vtxo_id::text), ARRAY[]::text[]) AS htlc_vtxos
 			FROM lightning_htlc_subscription lhs
@@ -874,6 +878,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE id = $1
@@ -983,14 +988,8 @@ impl<'t> Tx<'t> {
 		&self,
 		preimage: Preimage,
 	) -> anyhow::Result<Option<Checkpoint>> {
-		self.store_htlc_settlement_from(preimage, HtlcSettlementOrigin::Unknown).await
-	}
-
-	async fn store_htlc_settlement_wal(
-		&self,
-		preimage: Preimage,
-	) -> anyhow::Result<Option<Checkpoint>> {
 		let payment_hash = preimage.compute_payment_hash();
+		self.lock_settlement_sources(payment_hash).await?;
 
 		// ON CONFLICT DO NOTHING makes this idempotent: if an HTLC tx
 		// gets unconfirmed and re-confirmed in a reorg, the duplicate
@@ -1102,11 +1101,16 @@ impl<'t> Tx<'t> {
 	///
 	/// Hold the shared settlement lock INSIDE the write transaction so a
 	/// settlement racing between an earlier read-check and the write cannot
-	/// slip through.
+	/// slip through. It takes the `HtlcSettlementWrite` advisory lock.
 	pub async fn ensure_not_settled(
 		&self,
 		payment_hash: PaymentHash,
 	) -> anyhow::Result<()> {
+		self.execute(
+			&format!("SELECT pg_advisory_xact_lock({})",
+				super::AdvisoryLock::HtlcSettlementWrite as i64,
+			), &[],
+		).await?;
 		if self.get_htlc_settlement_by_payment_hash(payment_hash).await?.is_some() {
 			return badarg!("invoice has already been paid");
 		}

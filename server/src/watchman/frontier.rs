@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bitcoin::{OutPoint, Txid, Witness};
+use anyhow::Context;
+use bitcoin::{Amount, OutPoint, Txid, Witness};
 use bitcoin::taproot::LeafVersion;
-use tokio::sync::RwLock;
 use tracing::{error, trace};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
@@ -20,82 +20,114 @@ use crate::sync::{BlockData, ChainEventListener, RawMempool};
 ///
 /// All VTXOs consist of off-chain transactions. This structure tracks when
 /// any of these transactions got confirmed onchain.
-pub struct VtxoExitFrontier {
+///
+/// The frontier lives in the database. Each block, reorg and reindex loads
+/// it into a [Frontier] map and changes both the map and the database. The
+/// `_in_tx` methods write through a caller-provided db tx, so that several
+/// changes can be committed together.
+#[derive(Clone)]
+pub struct FrontierChainListener {
 	db: Db,
 	htlc_settler: Arc<HtlcSettler>,
-	frontier: BTreeMap<VtxoId, (Option<BlockHeight>, ServerVtxo)>,
-	/// Timestamp of the last sync from the DB frontier table.
-	/// Used to query only recently-added entries on each block.
-	last_db_sync: chrono::DateTime<chrono::Utc>,
+	/// Keeps chain events from interleaving with a frontier reindex.
+	lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-impl VtxoExitFrontier {
-	pub async fn init(db: Db, htlc_settler: Arc<HtlcSettler>) -> anyhow::Result<Self> {
-		let frontier = db.read(async |t| t.get_frontier().await).await?;
-		Ok(VtxoExitFrontier {
-			db, htlc_settler, frontier,
-			last_db_sync: chrono::Utc::now(),
-		})
+/// Set of VTXOs with their confirmation height. Confirmation can be None for
+/// funding txs that have not confirmed yet.
+pub type Frontier = BTreeMap<VtxoId, (Option<BlockHeight>, ServerVtxo)>;
+
+impl FrontierChainListener {
+	pub fn new(db: Db, htlc_settler: Arc<HtlcSettler>) -> Self {
+		FrontierChainListener { db, htlc_settler, lock: Arc::new(tokio::sync::Mutex::new(())) }
 	}
 
-	/// Sync new VTXOs recently added to the DB frontier into the in-memory frontier.
-	///
-	/// Should not be used for initial sync.
-	async fn sync_new_vtxos_from_db(&mut self) -> anyhow::Result<()> {
-		let since = self.last_db_sync - chrono::Duration::seconds(60);
-		let vtxos = self.db.read(async |t| t.get_frontier_vtxos_since(since).await).await?;
-		if !vtxos.is_empty() {
-			trace!("Syncing {} new frontier vtxos from DB", vtxos.len());
-			for (vtxo, db_confirmed_height) in vtxos {
-				self.register(vtxo, db_confirmed_height).await?;
-			}
-		}
-		self.last_db_sync = chrono::Utc::now();
-		Ok(())
+	/// Hold off chain event processing until the guard is dropped.
+	pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+		self.lock.lock().await
 	}
 
-	/// Register a vtxo in the frontier only if it is not already present in memory.
+	/// Register a vtxo in the frontier, writing through the given db tx.
 	///
-	/// The DB update in register() is idempotent, so this
-	/// is safe to call even if the vtxo was pre-inserted by finish_round.
-	pub async fn register(
-		&mut self,
+	/// Returns whether the vtxo was newly added.
+	pub async fn register_in_tx(
+		&self,
+		tx: &Tx<'_>,
+		frontier: &mut Frontier,
 		vtxo: ServerVtxo,
 		confirmed_height: Option<BlockHeight>,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<bool> {
 		let vtxo_id = vtxo.id();
-		if !self.frontier.contains_key(&vtxo_id) {
-			self.db.write(async |t| {
-				t.add_vtxo_to_frontier(vtxo_id).await?;
-				if let Some(height) = confirmed_height {
-					t.register_vtxo_confirmation(vtxo_id, height).await?;
-				}
-				Ok(())
-			}).await?;
-			self.frontier.insert(vtxo_id, (confirmed_height, vtxo));
+		if !frontier.contains_key(&vtxo_id) {
+			frontier.insert(vtxo_id, (confirmed_height, vtxo));
+			tx.add_vtxo_to_frontier(vtxo_id).await?;
+			if let Some(height) = confirmed_height {
+				tx.register_vtxo_confirmation(vtxo_id, height).await?;
+			}
 
 			slog!(WatchmanAddedVtxo, id: vtxo_id);
+			Ok(true)
+		} else {
+			// The entry can be in the map while the DB row lost its frontier
+			// marker; re-run the guarded insert so the row is repaired
+			// either way. This is a no-op UPDATE in the normal case.
+			tx.add_vtxo_to_frontier(vtxo_id).await?;
+			Ok(false)
+		}
+	}
+
+	/// Remove a vtxo from the frontier because its output was spent on-chain,
+	/// writing through the given db tx. Returns whether it was in the frontier.
+	pub async fn spend_in_tx(
+		&self,
+		tx: &Tx<'_>,
+		frontier: &mut Frontier,
+		vtxo_id: VtxoId,
+		spent_height: BlockHeight,
+		spent_txid: Txid,
+		witness: &Witness,
+	) -> anyhow::Result<bool> {
+		let Some((_height, vtxo)) = frontier.get(&vtxo_id) else {
+			return Ok(false);
+		};
+		// Try to extract a preimage from the spending witness if this is an HTLC vtxo.
+		// This must succeed before we proceed — if persisting the preimage fails,
+		// block processing will error and the sync manager will retry. On retry the
+		// frontier is read from the DB again, restoring this VTXO entry.
+		// If the HTLC tx gets unconfirmed and re-confirmed in a reorg, settle()
+		// is called again but the DB insert is idempotent (ON CONFLICT DO NOTHING).
+		if let Some(preimage) = try_extract_preimage(vtxo, witness) {
+			self.htlc_settler.settle(preimage).await
+				.context("failed to record HTLC settlement from on-chain spend")?;
 		}
 
-		Ok(())
+		let chain_resolution = classify_htlc_spend(vtxo, witness);
+		tx.register_vtxo_spend(vtxo_id, spent_height, spent_txid).await?;
+		if let Some(resolution) = chain_resolution {
+			htlc_vtxo::set_htlc_vtxo_chain_resolution(tx, vtxo_id, resolution, spent_height).await?;
+		}
+		frontier.remove(&vtxo_id);
+
+		if let Some(resolution) = chain_resolution {
+			slog!(HtlcVtxoResolvedOnChain, vtxo_id, height: spent_height,
+				resolution: resolution.as_str().to_owned(),
+			);
+		}
+		Ok(true)
 	}
 
 	/// Mark all VTXOs with the given txid in their point as confirmed on this height
-	pub async fn confirm_txid(&mut self, txid: Txid, height: BlockHeight) -> anyhow::Result<()> {
+	async fn confirm_txid(&self, frontier: &mut Frontier, txid: Txid, height: BlockHeight) -> anyhow::Result<()> {
 		// Since we use a BTreeMap, entries are ordered by VtxoId.
 		// Since a VtxoId is an outpoint, we can get all points with the
 		// same txid by iterating over a range.
 		let first = VtxoId::from(OutPoint::new(txid, 0));
 		let last = VtxoId::from(OutPoint::new(txid, u32::MAX));
-		for (id, (h, vtxo)) in self.frontier.range_mut(first..last) {
+		for (id, (h, vtxo)) in frontier.range_mut(first..last) {
 			let was_unconfirmed = h.is_none();
 			if !was_unconfirmed {
 				error!("Unexpected re-org or duplicate block from SyncManager?");
 			}
-			// Persist first, then mirror in memory and fire telemetry. If the
-			// DB write fails, leaving `*h` unchanged means the next retry will
-			// still see `h.is_none()` and re-attempt both the write and the
-			// one-time count; updating `*h` first would silently drop both.
 			self.db.write(async |t| t.register_vtxo_confirmation(*id, height).await).await?;
 			*h = Some(height);
 			if was_unconfirmed {
@@ -107,32 +139,74 @@ impl VtxoExitFrontier {
 		Ok(())
 	}
 
-	pub async fn reload(&mut self) -> anyhow::Result<()> {
-		self.frontier = self.db.read(async |t| t.get_frontier().await).await?;
-		Ok(())
-	}
-
-	/// Returns an iterator over the current frontier with confirmation heights.
+	/// Set the confirmation height of a single frontier VTXO, repairing a
+	/// missed or incorrect confirmation, writing through the given db tx.
 	///
-	/// Each item is a reference to a VTXO paired with its confirmation height
-	/// (None if unconfirmed).
-	pub fn get(&self) -> impl Iterator<Item = (&ServerVtxo, Option<BlockHeight>)> {
-		self.frontier.values().map(|(h, v)| (v, *h))
+	/// Unlike [Self::confirm_txid], this is a no-op when the stored height
+	/// already matches, so it is safe to use from a repair pass. Returns
+	/// whether anything changed.
+	///
+	/// Unlike [Self::confirm_txid], this doesn't fire the unilateral exit
+	/// telemetry; the caller should do so once the tx is committed.
+	pub async fn set_confirmed_in_tx(
+		&self,
+		tx: &Tx<'_>,
+		frontier: &mut Frontier,
+		vtxo_id: VtxoId,
+		height: BlockHeight,
+	) -> anyhow::Result<bool> {
+		let Some((h, _vtxo)) = frontier.get_mut(&vtxo_id) else {
+			return Ok(false);
+		};
+		if *h == Some(height) {
+			return Ok(false);
+		}
+		tx.register_vtxo_confirmation(vtxo_id, height).await?;
+		*h = Some(height);
+		Ok(true)
 	}
 
-	#[cfg(test)]
-	pub async fn check_frontier_matches_db(&self) -> anyhow::Result<()> {
-		let db_frontier = self.db.read(async |t| t.get_frontier().await).await?;
-
-		let mut local = self.frontier.keys().collect::<Vec<_>>();
-		let mut db = db_frontier.keys().collect::<Vec<_>>();
-		local.sort();
-		db.sort();
-
-		if local != db {
-			bail!("frontier doesn't match db");
+	/// Clear the confirmation height of all VTXOs created by a tx that is
+	/// no longer confirmed, writing through the given db tx.
+	///
+	/// This includes the tx's VTXOs outside the frontier. Returns the
+	/// cleared VTXOs with their stale height.
+	pub async fn clear_confirmed_txid_in_tx(
+		&self,
+		tx: &Tx<'_>,
+		frontier: &mut Frontier,
+		txid: Txid,
+	) -> anyhow::Result<Vec<(VtxoId, BlockHeight)>> {
+		let cleared = tx.clear_vtxo_confirmations_by_txid(txid).await?;
+		let first = VtxoId::from(OutPoint::new(txid, 0));
+		let last = VtxoId::from(OutPoint::new(txid, u32::MAX));
+		for (_id, (h, _vtxo)) in frontier.range_mut(first..=last) {
+			*h = None;
 		}
-		Ok(())
+		Ok(cleared)
+	}
+
+	/// Put the VTXOs spent by a tx that is no longer confirmed back into
+	/// the frontier, writing through the given db tx.
+	///
+	/// The reverse of [Self::spend_in_tx]. A preimage already settled from
+	/// the spend stays settled. Returns each restored VTXO with its
+	/// confirmation height and its stale spend height.
+	pub async fn restore_spent_in_tx(
+		&self,
+		tx: &Tx<'_>,
+		frontier: &mut Frontier,
+		spending_txid: Txid,
+	) -> anyhow::Result<Vec<(VtxoId, Option<BlockHeight>, Amount, BlockHeight)>> {
+		let cleared = tx.clear_vtxo_spends_by_txid(spending_txid).await?;
+		let mut restored = Vec::with_capacity(cleared.len());
+		for (vtxo, confirmed_height, spent_height) in cleared {
+			let (id, amount) = (vtxo.id(), vtxo.amount());
+			htlc_vtxo::clear_htlc_vtxo_chain_resolution(tx, id).await?;
+			self.register_in_tx(tx, frontier, vtxo, confirmed_height).await?;
+			restored.push((id, confirmed_height, amount, spent_height));
+		}
+		Ok(restored)
 	}
 }
 
@@ -238,49 +312,45 @@ fn try_extract_preimage(vtxo: &ServerVtxo, witness: &Witness) -> Option<ark::lig
 }
 
 #[async_trait::async_trait]
-impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
+impl ChainEventListener for FrontierChainListener {
 	async fn on_block_added(&self, block: &BlockData) -> anyhow::Result<()> {
+		let _guard = self.lock().await;
 		let height = block.block_ref.height;
-		let mut frontier = self.write().await;
-
-		// Sync any vtxos added to the DB frontier since the last block
-		// (e.g. by finish_round, register_board, vtxopool) so that spend
-		// detection below works correctly for all frontier entries.
-		frontier.sync_new_vtxos_from_db().await?;
+		let mut frontier = self.db.read(async |t| t.get_frontier().await).await?;
 
 		for tx in &block.block.txdata {
 			let txid = tx.compute_txid();
 
 			// Check if any unconfirmed VTXOs in frontier have this txid as their funding tx
-			frontier.confirm_txid(txid, height).await?;
+			self.confirm_txid(&mut frontier, txid, height).await?;
 
 			let spent = tx.input.iter().filter_map(|input| {
 				let id = VtxoId::from(input.previous_output);
-				let (_, vtxo) = frontier.frontier.get(&id)?;
+				let (_, vtxo) = frontier.get(&id)?;
 				Some((id, try_extract_preimage(vtxo, &input.witness),
 					classify_htlc_spend(vtxo, &input.witness)))
 			}).collect::<Vec<_>>();
 			if spent.is_empty() { continue; }
 
-			// Commit each source-to-successor transition together. A restart
-			// before commit reloads the inputs; after commit it reloads successors.
-			let (new_vtxos, notifications) = frontier.db.write(async |t| {
+			// A block transition must commit its spent sources, newly reachable
+			// children and preimages together. The map is local to this block,
+			// so a failed write is discarded and the next pass reads the DB.
+			let (new_vtxos, notifications) = self.db.write(async |t| {
 				let new_vtxos = t.get_vtxos_by_txid(txid).await?;
 				let ids = spent.iter().map(|(id, _, _)| id.to_string())
-					.chain(new_vtxos.iter().map(|vtxo| vtxo.id().to_string())).collect::<Vec<_>>();
+					.chain(new_vtxos.iter().map(|(vtxo, _, _)| vtxo.id().to_string()))
+					.collect::<Vec<_>>();
 				let hashes = spent.iter().filter_map(|(_, preimage, _)|
-					preimage.map(|preimage| preimage.compute_payment_hash().to_string())).collect::<Vec<_>>();
-				// Lock every touched source before the first settlement WAL write,
-				// including other sources of any hash revealed by this transaction.
-				t.query_one("SELECT generation FROM expiry_chain_view WHERE id=1 FOR SHARE", &[]).await?;
+					preimage.map(|preimage| preimage.compute_payment_hash().to_string()))
+					.collect::<Vec<_>>();
+				t.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR SHARE", &[]).await?;
 				t.query("SELECT v.vtxo_id FROM vtxo v LEFT JOIN htlc_vtxo h ON h.id=v.id \
 					WHERE v.vtxo_id=ANY($1) OR h.payment_hash=ANY($2) \
 					ORDER BY v.vtxo_id FOR UPDATE OF v", &[&ids, &hashes]).await?;
 				let mut notifications = Vec::new();
 				for &(id, preimage, resolution) in &spent {
 					if let Some(preimage) = preimage {
-						let checkpoint = t.store_htlc_settlement_from(preimage,
-							crate::database::ln::HtlcSettlementOrigin::Onchain(id)).await?;
+						let checkpoint = t.store_htlc_settlement(preimage).await?;
 						notifications.push((checkpoint, preimage.compute_payment_hash()));
 					}
 					t.register_vtxo_spend(id, height, txid).await?;
@@ -288,8 +358,8 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 						htlc_vtxo::set_htlc_vtxo_chain_resolution(t, id, resolution, height).await?;
 					}
 				}
-				for vtxo in &new_vtxos {
-					if !frontier.frontier.contains_key(&vtxo.id()) {
+				for (vtxo, spent_height, _) in &new_vtxos {
+					if spent_height.is_none() && !frontier.contains_key(&vtxo.id()) {
 						t.add_vtxo_to_frontier(vtxo.id()).await?;
 						t.register_vtxo_confirmation(vtxo.id(), height).await?;
 					}
@@ -297,43 +367,34 @@ impl ChainEventListener for Arc<RwLock<VtxoExitFrontier>> {
 				Ok((new_vtxos, notifications))
 			}).await?;
 			for (id, _, resolution) in spent {
-				frontier.frontier.remove(&id);
+				frontier.remove(&id);
 				if let Some(resolution) = resolution {
 					slog!(HtlcVtxoResolvedOnChain, vtxo_id: id, height,
-						resolution: resolution.as_str().to_owned(),
-					);
+						resolution: resolution.as_str().to_owned());
 				}
 			}
-			for vtxo in new_vtxos {
+			for (vtxo, spent_height, _) in new_vtxos {
 				let id = vtxo.id();
-				if !frontier.frontier.contains_key(&id) {
-					frontier.frontier.insert(id, (Some(height), vtxo));
+				if spent_height.is_none() && !frontier.contains_key(&id) {
+					frontier.insert(id, (Some(height), vtxo));
 					slog!(WatchmanAddedVtxo, id);
 				}
 			}
 			for (checkpoint, hash) in notifications {
-				frontier.htlc_settler.notify_stored(checkpoint, hash);
+				self.htlc_settler.notify_stored(checkpoint, hash);
 			}
 		}
-
-		#[cfg(test)]
-		frontier.check_frontier_matches_db().await?;
 
 		Ok(())
 	}
 
 	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+		// The rollback tx already holds the validity barrier. If a reindex has
+		// the frontier lock, retry the reorg after it completes instead of
+		// waiting while holding that barrier.
+		let _guard = self.lock.try_lock().context("frontier busy during reorg")?;
 		tx.reorg_frontier(block_ref.height).await?;
 		htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(tx, block_ref.height).await?;
-		Ok(())
-	}
-
-	async fn on_reorg_committed(&self, _block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
-		// No connection is retained while waiting for the cache lock. A full
-		// reload includes newly registered entries as well as restored spends.
-		let mut frontier = self.write().await;
-		frontier.reload().await?;
-		frontier.last_db_sync = chrono::Utc::now();
 		Ok(())
 	}
 

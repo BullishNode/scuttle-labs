@@ -5,7 +5,7 @@ use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use bitcoin_ext::BlockHeight;
 use bitcoin_ext::rpc::RpcApi;
 use server::database::{Db, SpendState};
-use server_rpc::{protos, RequestExt};
+use server_rpc::protos;
 
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::constants::ROUND_CONFIRMATIONS;
@@ -210,7 +210,6 @@ fn reanchored_vtxo(vtxo: &Vtxo<Full>, expiry: BlockHeight) -> Vtxo<Full> {
 		.expect("a bare encoding re-anchors as an empty-genesis full vtxo")
 }
 
-
 /// A registration may only add witnesses to a stored vtxo. Re-anchoring a
 /// pubkey vtxo at its own point with an empty chain and a forged expiry
 /// passes validation against the anchor, so the server has to compare it
@@ -359,7 +358,7 @@ async fn board_output_is_bound_to_one_exit_tx() {
 		let builder = BoardBuilder::new(
 			user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
 		).set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
-		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest { retired_owner_proof: None,
+		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest {
 			owner_proof: Some(owner_proof.into()),
 			amount: amount.to_sat(),
 			utxo: utxo.serialize(),

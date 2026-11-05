@@ -39,27 +39,42 @@ pub type Captaind = Daemon<CaptaindHelper>;
 /// Real bark clients attach this header via their own interceptor once the
 /// handshake has negotiated a version. We need this for certain RPCs like
 /// when we claim a lightning receive.
-type PverInterceptor = fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>;
+#[derive(Clone)]
+pub struct PverInterceptor(u64);
 
-fn inject_pver(mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-	rpc::RequestExt::set_pver(&mut req, rpc::MAX_PROTOCOL_VERSION);
-	Ok(req)
+impl tonic::service::Interceptor for PverInterceptor {
+	fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+		rpc::RequestExt::set_pver(&mut req, self.0);
+		Ok(req)
+	}
 }
 
-/// Connect an [ArkClient] to `url` with the [inject_pver] interceptor attached.
+async fn negotiated_pver(channel: tonic::transport::Channel) -> anyhow::Result<PverInterceptor> {
+	let response = rpc::ArkServiceClient::new(channel).handshake(protos::HandshakeRequest {
+		bark_version: Some(rpc::BARK_CRATE_VERSION.into()),
+	}).await?.into_inner();
+	let version = rpc::MAX_PROTOCOL_VERSION.min(response.max_protocol_version);
+	anyhow::ensure!(version >= rpc::MIN_PROTOCOL_VERSION && version >= response.min_protocol_version,
+		"no supported Ark protocol version");
+	Ok(PverInterceptor(version))
+}
+
+/// Connect an [ArkClient] to `url` with the advertised protocol version attached.
 async fn connect_ark_client(url: &str) -> anyhow::Result<ArkClient> {
 	let channel = tonic::transport::Endpoint::from_shared(url.to_owned())
 		.context("invalid ark url")?
 		.connect().await
 		.context("connecting ark rpc")?;
-	Ok(rpc::ArkServiceClient::with_interceptor(channel, inject_pver as PverInterceptor))
+	let interceptor = negotiated_pver(channel.clone()).await?;
+	Ok(rpc::ArkServiceClient::with_interceptor(channel, interceptor))
 }
 
-/// Connect the native mailbox fixture with the same fork epoch as its Ark client.
+/// Connect the native mailbox fixture with the same negotiated version as its Ark client.
 pub async fn connect_mailbox_client(url: &str) -> anyhow::Result<MailboxClient> {
 	let channel = tonic::transport::Endpoint::from_shared(url.to_owned())
 		.context("invalid mailbox url")?.connect().await.context("connecting mailbox rpc")?;
-	Ok(rpc::mailbox::MailboxServiceClient::with_interceptor(channel, inject_pver as PverInterceptor))
+	let interceptor = negotiated_pver(channel.clone()).await?;
+	Ok(rpc::mailbox::MailboxServiceClient::with_interceptor(channel, interceptor))
 }
 
 pub type ArkClient = rpc::ArkServiceClient<
@@ -70,16 +85,14 @@ pub type MailboxClient = rpc::mailbox::MailboxServiceClient<
 >;
 pub type WalletAdminClient = rpc::admin::WalletAdminServiceClient<tonic::transport::Channel>;
 pub type RoundAdminClient = rpc::admin::RoundAdminServiceClient<tonic::transport::Channel>;
-pub type SweepAdminClient = rpc::admin::SweepAdminServiceClient<tonic::transport::Channel>;
+pub type WatchmanAdminClient = rpc::admin::WatchmanAdminServiceClient<tonic::transport::Channel>;
 pub type BanAdminClient = rpc::admin::BanAdminServiceClient<tonic::transport::Channel>;
 pub type BlocklistAdminClient = rpc::admin::BlocklistAdminServiceClient<tonic::transport::Channel>;
 pub type NurseryAdminClient = rpc::admin::NurseryAdminServiceClient<tonic::transport::Channel>;
 pub type HealthClient = tonic_health::pb::health_client::HealthClient<tonic::transport::Channel>;
 
-
 pub const CAPTAIND_CONFIG_FILE: &str = "config.toml";
 pub const HUMAN_READABLE_LOGFILE: &str = "stdout.hr.log";
-
 
 pub trait SlogHandler: Send + Sync + 'static {
 	/// Process a log line. Return true when you're done.

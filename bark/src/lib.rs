@@ -436,7 +436,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context};
-use bark_runtime::Instant;
 use bip39::Mnemonic;
 use bitcoin::{Amount, Network, OutPoint};
 use bitcoin::bip32::{self, ChildNumber, Fingerprint};
@@ -485,9 +484,10 @@ compile_error!("`wasm-web` does not support the `bitcoind-rpc` feature");
 const BARK_PURPOSE_INDEX: u32 = 350;
 /// Derivation index used to generate keypairs to sign VTXOs
 const VTXO_KEYS_INDEX: u32 = 0;
+/// Derivation index used to generate keypair for the server mailbox
+const MAILBOX_KEY_INDEX: u32 = 1;
 /// Derivation index used to generate keypair for the recovery mailbox
 const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
-const SERVER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const MISSING_SERVER_TRANSPORT_HELP: &str =
 	"This build of bark-wallet does not include an Ark server transport backend. Enable feature `bark-wallet/native` or `bark-wallet/wasm-web` to use server-backed wallet functionality.";
 
@@ -689,16 +689,28 @@ pub struct WalletProperties {
 	/// connect until the user resolves the rotation.
 	pub server_mailbox_pubkey: Option<PublicKey>,
 
+	/// Negotiated payout capability, retained for offline address generation.
+	#[serde(default)]
+	pub server_payouts: Option<bool>,
+
 	/// Full mailbox identity, checked before synchronization on every open.
-	pub mailbox_identity: MailboxIdentity,
+	#[serde(default)]
+	pub mailbox_identity: Option<MailboxIdentity>,
 }
 
 impl WalletProperties {
 	fn check_mailbox_identity(&self, network: Network, seed: &WalletSeed) -> anyhow::Result<()> {
-		ensure!(self.network == network && self.mailbox_identity.network == network,
-			"mailbox wallet is for a different network");
-		ensure!(self.mailbox_identity == seed.mailbox_identity(network),
-			"mailbox key is missing or differs from the wallet identity");
+		ensure!(self.network == network, "mailbox wallet is for a different network");
+		ensure!(self.mailbox_identity.is_some() || self.server_payouts != Some(true),
+			"payout wallet is missing its original mailbox identity");
+		if self.mailbox_identity.is_none() {
+			ensure!(seed.to_mailbox_keypair().public_key() == seed.legacy_mailbox_keypair().public_key(),
+				"legacy wallet mailbox key differs from its seed");
+		}
+		if let Some(identity) = &self.mailbox_identity {
+			ensure!(*identity == seed.mailbox_identity(network),
+				"mailbox key is missing or differs from the wallet identity");
+		}
 		Ok(())
 	}
 }
@@ -765,6 +777,19 @@ impl WalletSeed {
 	fn to_mailbox_keypair(&self) -> Keypair {
 		if let Some(keypair) = self.external_mailbox { return keypair; }
 		self.mailbox
+	}
+
+	fn legacy_mailbox_keypair(&self) -> Keypair {
+		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
+		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
+	}
+
+	fn mailbox_keypair_for_mode(&self, payouts: bool, identity: Option<&MailboxIdentity>) -> Keypair {
+		if !payouts && self.external_mailbox.is_none() {
+			let legacy = self.legacy_mailbox_keypair();
+			if identity.is_none_or(|stored| stored.public_key == legacy.public_key()) { return legacy; }
+		}
+		self.to_mailbox_keypair()
 	}
 
 	fn to_recovery_mailbox_keypair(&self) -> Keypair {
@@ -882,10 +907,11 @@ struct WalletInner {
 
 	/// Live connection to an Ark server for round participation and synchronization.
 	///
-	/// Lazily initialized by [`Wallet::require_server`]. Concurrent cold callers
-	/// share a connection only after its stored server keys match.
-	/// An explicit refresh removes it until those checks succeed again.
-	server: tokio::sync::RwLock<Option<ServerConnection>>,
+	/// Lazily initialised on first use via [`Wallet::require_server`]. A
+	/// [`OnceCell`] is the right primitive here: concurrent callers on a
+	/// cold cell all await the same in-flight `connect_to_server` future
+	/// instead of each opening a fresh gRPC channel.
+	server: tokio::sync::OnceCell<ServerConnection>,
 
 	/// Onchain wallet used for boarding, exit fee-bumping, and onchain syncing.
 	///
@@ -1195,7 +1221,6 @@ impl Wallet {
 		let network = properties.network;
 		let keypair = self.peek_keypair(index).await?;
 
-
 		let (server_pubkey, mailbox_pubkey) =
 			if let (Some(spk), Some(mpk)) = (properties.server_pubkey, properties.server_mailbox_pubkey) {
 				(spk, mpk)
@@ -1204,14 +1229,19 @@ impl Wallet {
 				(ark_info.server_pubkey, ark_info.mailbox_pubkey)
 			};
 
-		Ok(ark::Address::builder()
+		let payouts = match properties.server_payouts {
+			Some(payouts) => payouts,
+			None => self.require_server().await?.0.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
+		};
+		let builder = ark::Address::builder()
 			.testnet(network != bitcoin::Network::Bitcoin)
 			.server_pubkey(server_pubkey)
-			.pubkey_policy(keypair.public_key())
-			.mailbox_joint(network, mailbox_pubkey, &self.mailbox_keypair(), &keypair)
-			.context("failed to assign mailbox")?
-			.into_address()
-			.context("failed to build address")?)
+			.pubkey_policy(keypair.public_key());
+		let builder = if payouts {
+			builder.mailbox_joint(network, mailbox_pubkey, &self.mailbox_keypair(), &keypair)
+		} else { builder.mailbox(mailbox_pubkey, self.mailbox_identifier(), &keypair) }
+			.context("failed to assign mailbox")?;
+		Ok(builder.into_address().context("failed to build address")?)
 	}
 
 	/// Generate a new [ark::Address] and returns the index of the key used to create it.
@@ -1287,20 +1317,21 @@ impl Wallet {
 		// `allow_unreachable_server` is set, both drop to `(None, None)` so
 		// we can still produce an offline wallet and revisit the server on
 		// the next open.
-		let (server_pubkey, mailbox_pubkey) = match Self::connect_to_server(&config, network).await {
+		let (server_pubkey, mailbox_pubkey, server_payouts) = match Self::connect_to_server(&config, network).await {
 			Ok(conn) => {
 				let ark_info = conn.ark_info().await;
 				match check_ark_info_safe(&ark_info, config.vtxo_exit_margin) {
-					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey)),
+					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey),
+						Some(conn.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS)),
 					Err(err) if allow_unreachable_server => {
 						warn!("server-advertised ArkInfo is unsafe, \
 							treating as unavailable: {:#}", err);
-						(None, None)
+						(None, None, None)
 					},
 					Err(err) => return Err(err),
 				}
 			},
-			Err(_) if allow_unreachable_server => (None, None),
+			Err(_) if allow_unreachable_server => (None, None, None),
 			Err(err) => {
 				bail!("Failed to connect to provided server: {:#}", err);
 			},
@@ -1311,7 +1342,9 @@ impl Wallet {
 			fingerprint: wallet_fingerprint,
 			server_pubkey,
 			server_mailbox_pubkey: mailbox_pubkey,
-			mailbox_identity: seed.mailbox_identity(network),
+			server_payouts,
+			mailbox_identity: Some(MailboxIdentity { network,
+				public_key: seed.mailbox_keypair_for_mode(server_payouts.unwrap_or(true), None).public_key() }),
 		};
 
 		// write the config to db
@@ -1367,14 +1400,16 @@ impl Wallet {
 		// Decode the current coin/operation formats once at open, before any
 		// property or server-key write. Do not put this full-record read on
 		// read_properties, which is also used in ordinary payment processing.
-		let coins = db.get_all_vtxos().await?.len();
+		let coins = db.get_all_vtxos().await?;
+		ensure!(coins.iter().all(|coin| coin.fallback_status.is_none()
+			|| matches!(coin.state, crate::vtxo::VtxoState::Spent | crate::vtxo::VtxoState::Exited)),
+			"legacy fallback reservations require a fresh wallet store");
 		let actions = db.get_all_wallet_action_checkpoints().await?.len();
-		let receives = db.fallback_lightning_receives().await?.len();
 		let mut created_now = false;
 		let properties = if let Some(p) = db.read_properties().await? {
 			p
 		} else if args.create_if_not_exists {
-			ensure!(coins == 0 && actions == 0 && receives == 0,
+			ensure!(coins.is_empty() && actions == 0,
 				"partial wallet state requires a fresh store");
 			Self::create(
 				network, &seed, &config, &*db, &*lock_manager, args.create_without_server,
@@ -1390,7 +1425,16 @@ impl Wallet {
 		if properties.fingerprint != fingerprint {
 			bail!("incorrect mnemonic")
 		}
+		// V42 SQLite and old adaptor properties used the upstream mailbox.
+		// A wallet created offline already has an identity; preserve that key.
+		let mut seed = seed;
+		seed.mailbox = seed.mailbox_keypair_for_mode(properties.server_payouts.unwrap_or(false),
+			properties.mailbox_identity.as_ref());
 		properties.check_mailbox_identity(network, &seed)?;
+		if properties.mailbox_identity.is_none() {
+			if properties.server_payouts.is_none() { db.set_server_payouts(false).await?; }
+			db.set_mailbox_identity(seed.mailbox_identity(network)).await?;
+		}
 
 		let chain_source = if let Some(ref url) = config.esplora_address {
 			ChainSourceSpec::Esplora {
@@ -1415,15 +1459,17 @@ impl Wallet {
 			bail!("Need to either provide esplora or bitcoind info");
 		};
 
+		#[cfg(feature = "socks5-proxy")]
+		let chain_proxy = proxy_for_url(&config.socks5_proxy, chain_source.url())?;
 		let chain_source_client = ChainSource::new(
 			chain_source, properties.network, config.fallback_fee_rate,
-			#[cfg(feature = "socks5-proxy")] config.socks5_proxy.as_deref(),
+			#[cfg(feature = "socks5-proxy")] chain_proxy.as_deref(),
 		).await?;
 		let chain = Arc::new(chain_source_client);
 		chain.require_version().await
 			.context("provided chain source doesn't meet version requirement")?;
 
-		let server = tokio::sync::RwLock::new(None);
+		let server = tokio::sync::OnceCell::new();
 
 		let notifications = NotificationDispatch::new();
 		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
@@ -1534,68 +1580,40 @@ impl Wallet {
 			.context("Failed to connect to Ark server")
 	}
 
-	/// Only the remote/transport read awaits use this deadline. Callers must
-	/// keep validation, local persistence and adoption outside this future.
-	async fn server_read<T>(deadline: Option<Instant>, read: impl Future<Output = T>) -> anyhow::Result<T> {
-		if let Some(deadline) = deadline {
-			let remaining = deadline.saturating_duration_since(Instant::now());
-			ensure!(!remaining.is_zero(), "Ark server read deadline elapsed");
-			bark_runtime::timeout(remaining, read).await.context("Ark server read deadline elapsed")
-		} else {
-			Ok(read.await)
-		}
-	}
-
 	async fn require_server(&self) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		Box::pin(self.require_server_with_deadline(None)).await
-	}
+		// Connect lazily if not yet connected. `get_or_try_init` ensures
+		// concurrent callers on a cold cell all await the same in-flight
+		// connect future instead of each opening a fresh gRPC channel.
+		let conn = self.inner.server.get_or_try_init(|| async {
+			let network = self.properties().await?.network;
+			Self::connect_to_server(&self.inner.config, network).await
+				.context("You should be connected to Ark server to perform this action")
+		}).await?.clone();
 
-	async fn require_server_with_deadline(&self, deadline: Option<Instant>) -> anyhow::Result<(ServerConnection, ArkInfo)> {
-		let existing = { Self::server_read(deadline, self.inner.server.read()).await?.clone() };
-		let conn = if let Some(connection) = existing {
-			connection
-		} else {
-			let mut server = Self::server_read(deadline, self.inner.server.write()).await?;
-			if let Some(connection) = server.as_ref() {
-				connection.clone()
-			} else {
-				let network = self.properties().await?.network;
-				let mut connection = Self::server_read(deadline,
-					Self::connect_to_server(&self.inner.config, network)).await?
-					.context("You should be connected to Ark server to perform this action")?;
-				let ark_info = Self::server_read(deadline, connection.ark_info()).await?;
-				check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-				self.check_and_store_server_keys(&ark_info).await?;
-				*server = Some(connection.clone());
-				connection
-			}
-		};
-
-		let ark_info = Self::server_read(deadline, conn.ark_info()).await?;
+		let ark_info = conn.ark_info().await;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-		self.check_and_store_server_keys(&ark_info).await?;
+		self.check_and_store_server_keys(&ark_info, conn.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS).await?;
 
 		Ok((conn, ark_info))
 	}
 
 	pub async fn refresh_server(&self) -> anyhow::Result<()> {
-		let deadline = Some(Instant::now() + SERVER_READ_TIMEOUT);
-		// Remove the cached connection before refreshing it. On failure or
-		// cancellation, future callers must connect and authenticate again.
-		let mut server = Self::server_read(deadline, self.inner.server.write()).await?;
-		let mut connection = if let Some(connection) = server.take() {
-			connection
-		} else {
+		// If the cell is still cold, initialise it with a fresh connection.
+		// If it is already initialised, run a heartbeat against the existing
+		// one — `OnceCell` does not support replacing a stored value, but
+		// `ServerConnection` is built around a tonic `Channel` which
+		// transparently reconnects, so we don't need to swap it.
+		let srv = self.inner.server.get_or_try_init(|| async {
 			let properties = self.properties().await?;
-			Self::server_read(deadline, Self::connect_to_server(&self.inner.config, properties.network)).await??
-		};
+			Self::connect_to_server(&self.inner.config, properties.network).await
+				.map_err(anyhow::Error::from)
+		}).await?;
 
-		Self::server_read(deadline, connection.check_connection()).await??;
-		let ark_info = Self::server_read(deadline, connection.ark_info()).await?;
+		srv.check_connection().await?;
+		let ark_info = srv.ark_info().await;
 		ark_info.fees.validate().context("invalid fee schedule")?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-		self.check_and_store_server_keys(&ark_info).await?;
-		*server = Some(connection);
+		self.check_and_store_server_keys(&ark_info, srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS).await?;
 
 		Ok(())
 	}
@@ -1619,7 +1637,7 @@ impl Wallet {
 	/// Returns an error (via `bail!`) if either the server pubkey or mailbox
 	/// pubkey differs from the stored value; callers must not proceed with
 	/// server operations on error.
-	async fn check_and_store_server_keys(&self, ark_info: &ArkInfo) -> anyhow::Result<()> {
+	async fn check_and_store_server_keys(&self, ark_info: &ArkInfo, payouts: bool) -> anyhow::Result<()> {
 		let properties = self.properties().await?;
 
 		if let Some(stored_pubkey) = properties.server_pubkey {
@@ -1642,13 +1660,16 @@ impl Wallet {
 			info!("Stored server mailbox pubkey for existing wallet: {}", ark_info.mailbox_pubkey);
 		}
 
+		if let Some(stored) = properties.server_payouts {
+			ensure!(stored == payouts, "server payout mode has changed");
+		} else { self.inner.db.set_server_payouts(payouts).await?; }
+
 		Ok(())
 	}
 
 	/// Return [ArkInfo] fetched on last handshake with the Ark server
 	pub async fn ark_info(&self) -> anyhow::Result<Option<ArkInfo>> {
-		let server = { self.inner.server.read().await.clone() };
-		match server {
+		match self.inner.server.get() {
 			Some(srv) => Ok(Some(srv.ark_info().await)),
 			None => Ok(None),
 		}
@@ -1673,35 +1694,16 @@ impl Wallet {
 		vtxo.validate(&tx).map_err(VtxoValidationError::Invalid)
 	}
 
-	/// Ask the server for `vtxo_id`'s spend state.
-	///
-	/// `keypair` must be the VTXO's private key so we can prove ownership.
-	pub(crate) async fn fetch_vtxo_spend_state(
-		&self,
-		vtxo_id: VtxoId,
-		keypair: &Keypair,
-	) -> anyhow::Result<VtxoSpendState> {
-		Ok(self.fetch_vtxo_status(vtxo_id, keypair).await?.0)
-	}
-
+	/// Adopt authenticated commitments as Spent; retain the status only for display.
 	pub(crate) async fn fetch_vtxo_status(&self, vtxo_id: VtxoId, keypair: &Keypair)
 		-> anyhow::Result<(VtxoSpendState, bool)>
 	{
-		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-		self.fetch_vtxo_status_locked(vtxo_id, keypair).await
-	}
-
-	/// Caller retains FallbackHistory from before the request through adoption
-	/// and any first-seen body/marker write using the returned status.
-	pub(crate) async fn fetch_vtxo_status_locked(&self, vtxo_id: VtxoId, keypair: &Keypair)
-		-> anyhow::Result<(VtxoSpendState, bool)>
-	{
-		let (mut srv, _) = self.require_server_with_deadline(Some(Instant::now() + SERVER_READ_TIMEOUT)).await?;
+		let (mut srv, _) = self.require_server().await?;
 		let attestation = VtxoStatusAttestation::new(vtxo_id, keypair);
-		let resp = Self::server_read(Some(Instant::now() + SERVER_READ_TIMEOUT), srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+		let resp = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
 			vtxo_id: vtxo_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
-		})).await?.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
+		}).await.with_context(|| format!("error fetching status for vtxo {vtxo_id}"))?.into_inner();
 
 		let state = VtxoSpendState::try_from(resp.spend_state).map_err(|_| anyhow::anyhow!(
 			"server returned unknown spend state {} for vtxo {vtxo_id}; this wallet may need updating", resp.spend_state,
@@ -1716,27 +1718,19 @@ impl Wallet {
 	/// Each keypair must be its VTXO's private key so we can prove ownership.
 	///
 	/// Unknown IDs, failed RPC batches, undecodable IDs and unknown spend states
-	/// are absent from the result. A read timeout stops later chunks and returns
-	/// answers already processed; `Ok` does not imply complete coverage.
-	/// History acquisition, server admission, integrity checks and local adoption
+	/// are absent from the result; `Ok` does not imply complete coverage.
+	/// Server admission, integrity checks and local adoption
 	/// or storage can return errors. Earlier adopted updates remain durable.
-	pub(crate) async fn fetch_vtxo_spend_states(
-		&self,
-		queries: &[(VtxoId, &Keypair)],
-	) -> anyhow::Result<HashMap<VtxoId, VtxoSpendState>> {
-		Ok(self.fetch_vtxo_statuses(queries).await?.into_iter().map(|(id,(state,_))| (id,state)).collect())
-	}
-
 	pub(crate) async fn fetch_vtxo_statuses(&self, queries: &[(VtxoId, &Keypair)])
 		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
 	{
-		let _guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
+
 		let mut ret = HashMap::with_capacity(queries.len());
 		if queries.is_empty() {
 			return Ok(ret);
 		}
 
-		let (mut srv, _) = self.require_server_with_deadline(Some(Instant::now() + SERVER_READ_TIMEOUT)).await?;
+		let (mut srv, _) = self.require_server().await?;
 		for chunk in queries.chunks(MAX_NB_VTXO_IDS) {
 			let req = protos::GetVtxosStatusByIdsRequest {
 				vtxos: chunk.iter().map(|(id, keypair)| protos::VtxoStatusQuery {
@@ -1744,13 +1738,9 @@ impl Wallet {
 					attestation: VtxoStatusAttestation::new(*id, keypair).serialize(),
 				}).collect(),
 			};
-			let resp = match Self::server_read(Some(Instant::now() + SERVER_READ_TIMEOUT), srv.client.get_vtxos_status_by_ids(req)).await {
-				Err(error) => {
-					warn!("Stopping status reads with {} answers retained: {:#}", ret.len(), error);
-					break;
-				},
-				Ok(Ok(resp)) => resp.into_inner(),
-				Ok(Err(e)) => {
+			let resp = match srv.client.get_vtxos_status_by_ids(req).await {
+				Ok(resp) => resp.into_inner(),
+				Err(e) => {
 					warn!("Could not fetch the status of {} vtxos from server: {:#}", chunk.len(), e);
 					continue;
 				},
@@ -1889,9 +1879,7 @@ impl Wallet {
 
 	/// Returns all spendable vtxos
 	pub async fn spendable_vtxos(&self) -> anyhow::Result<Vec<WalletVtxo>> {
-		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
-		vtxos.retain(|vtxo| vtxo.fallback_status.is_none());
-		Ok(vtxos)
+		Ok(self.vtxos_with(&VtxoStateKind::Spendable).await?)
 	}
 
 	/// Returns all spendable vtxos matching the provided predicate
@@ -2368,9 +2356,8 @@ impl Wallet {
 		vtxos: impl IntoIterator<Item = V>,
 		height: Option<BlockHeight>,
 	) -> anyhow::Result<Option<RoundParticipation>> {
-		let selected = self.filter_expired_refresh_inputs(vtxos.into_iter().collect()).await?;
 		let (vtxos, total_amount) = {
-			let iter = selected.into_iter();
+			let iter = vtxos.into_iter();
 			let size_hint = iter.size_hint();
 			let mut vtxos = Vec::<Vtxo<Full>>::with_capacity(size_hint.1.unwrap_or(size_hint.0));
 			let mut amount = Amount::ZERO;
@@ -2497,7 +2484,7 @@ impl Wallet {
 		let mut vtxos = self.vtxos_with(&VtxoStateKind::Spendable).await?;
 		RefreshStrategy::should_refresh_if_must(self, self.inner.chain.tip().await?,
 			self.inner.chain.fee_rates().await.fast).filter_vtxos(&mut vtxos).await?;
-		self.filter_expired_refresh_inputs(vtxos).await
+		Ok(vtxos)
 	}
 
 	/// Similar to [Wallet::get_vtxos_to_refresh] but it allows VTXOs to be excluded from the
@@ -2783,8 +2770,8 @@ mod tests {
 		let external = || seed().with_external_mailbox_keypair(key);
 		let props = super::WalletProperties {
 			network: Network::Regtest, fingerprint: seed().fingerprint(),
-			server_pubkey: None, server_mailbox_pubkey: None,
-			mailbox_identity: external().mailbox_identity(Network::Regtest),
+			server_pubkey: None, server_mailbox_pubkey: None, server_payouts: None,
+			mailbox_identity: Some(external().mailbox_identity(Network::Regtest)),
 		};
 		props.check_mailbox_identity(Network::Regtest, &external()).unwrap();
 		assert!(props.check_mailbox_identity(Network::Regtest, &seed()).is_err());
@@ -2795,14 +2782,41 @@ mod tests {
 		assert_eq!(seed().derive_vtxo_keypair(0).public_key(), external().derive_vtxo_keypair(0).public_key());
 		assert_eq!(seed().to_recovery_mailbox_keypair().public_key(), external().to_recovery_mailbox_keypair().public_key());
 		assert_eq!(external().to_mailbox_keypair().public_key(), key.public_key());
-		let derived = super::WalletProperties { mailbox_identity: seed().mailbox_identity(Network::Regtest), ..props.clone() };
+		let derived = super::WalletProperties { mailbox_identity: Some(seed().mailbox_identity(Network::Regtest)), ..props.clone() };
 		derived.check_mailbox_identity(Network::Regtest, &seed()).unwrap();
 		assert!(derived.check_mailbox_identity(Network::Regtest, &external()).is_err());
 		let restored: super::WalletProperties = serde_json::from_slice(&serde_json::to_vec(&props).unwrap()).unwrap();
 		assert_eq!(restored, props);
-		let mut old = serde_json::to_value(&props).unwrap();
-		old.as_object_mut().unwrap().remove("mailbox_identity");
-		assert!(serde_json::from_value::<super::WalletProperties>(old).is_err(), "an old store must not acquire a new mailbox silently");
+	}
+
+	#[test]
+	fn payout_off_preserves_upstream_and_already_bound_mailbox_keys() {
+		let seed = || super::WalletSeed::new_from_seed(Network::Regtest, &[17; 64]);
+		let root = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[17; 64]).unwrap();
+		let path = [bitcoin::bip32::ChildNumber::from_hardened_idx(350).unwrap(),
+			bitcoin::bip32::ChildNumber::from_hardened_idx(1).unwrap()];
+		let upstream = root.derive_priv(&super::SECP, &path).unwrap().to_keypair(&super::SECP);
+		let props = super::WalletProperties {
+			network: Network::Regtest, fingerprint: seed().fingerprint(),
+			server_pubkey: None, server_mailbox_pubkey: None,
+			server_payouts: Some(false), mailbox_identity: None,
+		};
+		let mut reopened = seed();
+		reopened.mailbox = reopened.mailbox_keypair_for_mode(false, None);
+		props.check_mailbox_identity(Network::Regtest, &reopened).unwrap();
+		assert_eq!(reopened.to_mailbox_keypair().public_key(), upstream.public_key());
+		let bound = reopened.mailbox_identity(Network::Regtest);
+		assert_eq!(seed().mailbox_keypair_for_mode(false, Some(&bound)).public_key(), upstream.public_key());
+		assert_eq!(reopened.to_recovery_mailbox_keypair().public_key(), seed().to_recovery_mailbox_keypair().public_key());
+		assert_eq!(reopened.derive_vtxo_keypair(0).public_key(), seed().derive_vtxo_keypair(0).public_key());
+		let bip86 = seed().mailbox_identity(Network::Regtest);
+		assert_ne!(bip86.public_key, upstream.public_key());
+		assert_eq!(seed().mailbox_keypair_for_mode(true, None).public_key(), bip86.public_key);
+		// An offline-created wallet bound its BIP86 identity before knowing
+		// the server's mode; an OFF handshake must not change it on reopen.
+		assert_eq!(seed().mailbox_keypair_for_mode(false, Some(&bip86)).public_key(), bip86.public_key);
+		let other = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[1; 32]).unwrap();
+		assert!(props.check_mailbox_identity(Network::Regtest, &seed().with_external_mailbox_keypair(other)).is_err());
 	}
 
 	#[test]

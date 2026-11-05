@@ -84,3 +84,41 @@ macro_rules! lightning_test {
 		}
 	};
 }
+
+/// Sign a raw send request in tests that exercise a fresh payment attempt.
+pub async fn sign_lightning_send_request(
+	srv: &crate::Captaind,
+	req: server_rpc::protos::InitiateLightningPaymentRequest,
+	keypair: &bitcoin::secp256k1::Keypair,
+) -> server_rpc::protos::InitiateLightningPaymentRequest {
+	let keys = vec![*keypair; req.htlc_vtxo_ids.len()];
+	sign_lightning_send_request_with_keys(srv, req, &keys).await
+}
+
+pub async fn sign_lightning_send_request_with_keys(
+	srv: &crate::Captaind,
+	mut req: server_rpc::protos::InitiateLightningPaymentRequest,
+	keys: &[bitcoin::secp256k1::Keypair],
+) -> server_rpc::protos::InitiateLightningPaymentRequest {
+	use std::str::FromStr;
+	use ark::attestations::LightningSendIntent;
+	use ark::lightning::Invoice;
+	use ark::mailbox::MailboxIdentifier;
+	use ark::{ProtocolEncoding, VtxoId};
+	let info = srv.ark_info().await;
+	let invoice = Invoice::from_str(&req.invoice).unwrap();
+	let ids = req.htlc_vtxo_ids.iter().map(|bytes| VtxoId::from_slice(bytes).unwrap())
+		.collect::<Vec<_>>();
+	assert_eq!(ids.len(), keys.len());
+	let mailbox = req.mailbox_id.as_deref()
+		.map(MailboxIdentifier::deserialize).transpose().unwrap();
+	let nonce = rand::random();
+	let intent = LightningSendIntent::new(
+		nonce, info.server_pubkey, info.network, &invoice,
+		bitcoin::Amount::from_sat(req.payment_amount_sat), &ids, mailbox, req.retry_for_secs,
+	);
+	req.intent_nonce = Some(nonce.to_vec());
+	req.source_owner_signatures = keys.iter().map(|keypair|
+		intent.sign(keypair).serialize().to_vec()).collect();
+	req
+}

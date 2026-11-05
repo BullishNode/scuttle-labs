@@ -18,14 +18,13 @@
 //!
 //! Note that recovery is a trusted process. The server can withhold VTXOs
 //! or may falsely represent spendable VTXOs as spent. Its word on the spend
-//! state is authoritative for ordinary spends. Fallback allocations remain
-//! pending until independently verified on chain. An ordinary spent VTXO is
-//! stored without validation. Spendable and fallback-pending bodies are
-//! validated before contributing to the balance. Prefer to maintain back-ups and use recovery from the
+//! state is final for ordinary spends, whose history is stored without
+//! validation. Spendable bodies are validated and checked against the chain.
+//! Authenticated fallback bodies are validated and stored Spent; their last
+//! observed payout status is display-only. Prefer to maintain back-ups and use recovery from the
 //! mnemonic as a last resort.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;
@@ -480,9 +479,8 @@ impl Wallet {
 
 	/// Store owned VTXOs in the state the server reported for them.
 	///
-	/// Ordinary spent history follows upstream trust. Validate spendable and
-	/// fallback-pending bodies before admitting positive principal; a fallback
-	/// allocation is not evidence of payment.
+	/// Ordinary spent history follows upstream trust. Validate recovered bodies;
+	/// fallback commitments are stored Spent and reported as skipped.
 	async fn store_recovered_vtxos(
 		&self,
 		report: &mut RecoveryReport,
@@ -493,38 +491,27 @@ impl Wallet {
 		let mut spent = Vec::new();
 		let mut unclaimed = Vec::new();
 		let mut locked = Vec::new();
-		for (mut vtxo, mut adoption) in vtxos {
+		for (vtxo, adoption) in vtxos {
 			let id = vtxo.id();
-			if matches!(&adoption, Ok(ServerStatusAdoption::Spendable | ServerStatusAdoption::FallbackPending))
-				&& vtxo.unlock_hash().is_some() {
-				match self.recover_released_round_output(&vtxo).await {
-					Ok(completed) => {
-						vtxo = completed;
-						let (_, key) = self.pubkey_keypair(&vtxo.user_pubkey()).await?
-							.context("recovered round key disappeared")?;
-						adoption = self.fetch_vtxo_status(id, &key).await
-							.and_then(|(state, committed)| ServerStatusAdoption::from_status(state, committed));
-					},
-					Err(error) => {
-						warn!("Could not complete released recovery source {id}: {error:#}");
-						report.push_failed(id, Some(vtxo.amount()));
-						continue;
-					},
-				}
-			}
+
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),
-				Ok(ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited) => fallback_pending.push(vtxo),
+				Ok(adoption @ (ServerStatusAdoption::FallbackPending | ServerStatusAdoption::FallbackSpent | ServerStatusAdoption::Forfeited)) => {
+					let status = match adoption { ServerStatusAdoption::FallbackPending => crate::vtxo::FallbackStatus::Pending,
+						ServerStatusAdoption::FallbackSpent => crate::vtxo::FallbackStatus::Spent, _ => crate::vtxo::FallbackStatus::Forfeited };
+					fallback_pending.push((vtxo, status));
+				},
 				Ok(ServerStatusAdoption::InFlight(VtxoSpendState::Unclaimed))
 					if vtxo.unlock_hash().is_some() => unclaimed.push(vtxo),
-				// Keep bodies held by an existing flow so it can finish. Only an
-				// ordinary Spendable row is locked; the checked write cannot steal
-				// a concurrent holder. Fresh in-flight candidates remain absent.
+				// Finishing the flow the VTXO is stuck in is what decides where it
+				// belongs, so nothing is stored. Arkoor mailbox messages only carry
+				// final Pubkey-policy VTXOs, so the replay cannot bring an in-flight
+				// one back.
 				Ok(ServerStatusAdoption::InFlight(state)) => {
 					debug!("Recovery vtxo {id} not spendable ({state:?}), skipping");
-					self.lock_available_vtxos(std::slice::from_ref(&vtxo), None).await
-						.context("Failed to lock in-flight recovery vtxo")?;
+					self.inner.db.remove_vtxo(id).await
+						.context("Failed to drop in-flight recovery vtxo")?;
 					report.push_skipped(&vtxo);
 				},
 				Err(e) => {
@@ -538,25 +525,24 @@ impl Wallet {
 		// vtxo as spendable again. A row from an earlier, failed attempt is
 		// forced along.
 		if !spent.is_empty() {
-			self.store_vtxos_with_server_status(spent.iter()).await?;
-			self.trust_ordinary_spends(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
+			self.store_spent_vtxos(spent.iter()).await?;
+			self.mark_vtxos_as_spent(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
 			for vtxo in &spent {
 				debug!("Recovery vtxo {} already spent, skipping", vtxo.id());
 				report.push_skipped(vtxo);
 			}
 		}
 
-		let mut pending = Vec::new();
-		for vtxo in fallback_pending {
+		for (vtxo, status) in fallback_pending {
 			if let Err(error) = self.validate_vtxo(&vtxo).await {
 				warn!("Invalid fallback recovery source {}: {error:#}", vtxo.id());
 				report.push_failed(vtxo.id(), Some(vtxo.amount()));
 			} else {
 				report.push_skipped(&vtxo);
-				pending.push(vtxo);
+				self.store_spent_vtxos([&vtxo]).await?;
+				self.inner.db.set_vtxo_fallback_status(vtxo.id(), status).await?;
 			}
 		}
-		self.retain_fallback_pending(&pending).await?;
 
 		// An unclaimed output of a delegated round participation lacks its
 		// unlock preimage, so it can't validate yet. The participation is
@@ -593,7 +579,7 @@ impl Wallet {
 		}
 		// NB we don't use store_spendable_vtxos to avoid posting the vtxos again
 		if !recovered.is_empty() {
-			self.store_vtxos_with_server_status(recovered.iter()).await?;
+			self.store_vtxos(recovered.iter(), &VtxoState::Spendable).await?;
 			// A locked row from an earlier attempt without an answer is released.
 			self.unlock_vtxos(recovered.iter(), None).await?;
 			for vtxo in &recovered {
@@ -650,9 +636,9 @@ impl Wallet {
 	///
 	/// Returns `Ok(false)` when the server doesn't offer the rpc.
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
-		let (mut srv, ark_info) = self.require_server_with_deadline(
-			Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT)).await?;
+		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
+		let payouts = self.properties().await?.server_payouts.context("server payout capability is not known")?;
 
 		let mut start_index = 0u32;
 		let mut cursor_vtxo_id = None;
@@ -669,9 +655,8 @@ impl Wallet {
 				authorization: auth.serialize(),
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
-			let history_guard = self.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
-			let deadline = Some(bark_runtime::Instant::now() + crate::SERVER_READ_TIMEOUT);
-			let resp = match Self::server_read(deadline, srv.client.recover_vtxos_by_xpub(req)).await? {
+
+			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {
 					info!("Server doesn't support VTXO recovery by xpub: {}", status.message());
@@ -708,7 +693,7 @@ impl Wallet {
 				}
 				max_index = max_index.max(Some(index));
 
-				if bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
+				if payouts && bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
 					!= Some(self.mailbox_keypair().public_key()) {
 					warn!("Recovery coin {} belongs to another or unknown mailbox", vtxo.id());
 					report.push_foreign(&vtxo);
@@ -728,7 +713,6 @@ impl Wallet {
 				self.reveal_vtxo_keys_up_to(max_index).await
 					.context("failed to store recovered vtxo keys")?;
 			}
-			drop(history_guard);
 			self.store_recovered_vtxos(report, vtxos).await?;
 
 			// A server that moved neither past a key nor within one would have
@@ -767,18 +751,9 @@ impl Wallet {
 	/// mailboxes are then read from checkpoint 0, and every VTXO they reference
 	/// that the lookup didn't settle is resolved against the server, and against the chain when the server
 	/// reports it spendable, one mailbox page at a time and stored accordingly.
-	/// This can be called explicitly on an existing wallet after a failed
-	/// discovery at creation or a later interrupted scan. It starts from the
-	/// beginning using the same store and seed; no known VTXO IDs are needed.
-	/// Previously stored results are handled idempotently. Normal open and
-	/// sync do not automatically repeat this scan. This is an explicit Rust SDK
-	/// operation; no CLI, REST or NWC entry point is supplied.
-	///
-	/// Returns the existing [`RecoveryReport`]; inspect [`RecoveryReport::is_complete`]
-	/// and its categories rather than assuming every discovered coin is spendable.
-	/// An error can follow partial durable recovery. Retry after the underlying
-	/// service recovers; existing held coins and uncertain outcomes remain fenced.
-	pub async fn recover_from_seed(&self) -> anyhow::Result<RecoveryReport> {
+	/// Returns a [`RecoveryReport`] (see it for why recovered/skipped/failed
+	/// matters).
+	pub(crate) async fn recover_from_seed(&self) -> anyhow::Result<RecoveryReport> {
 		let mut report = RecoveryReport::default();
 		let gap_limit = self.inner.config.vtxo_key_gap_limit;
 

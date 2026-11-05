@@ -21,20 +21,20 @@ use std::sync::atomic::{self, AtomicBool};
 use tokio::sync::oneshot;
 use tracing::{trace, warn};
 
-use server_rpc::{pver, RequestExt};
+use ::ark::VtxoId;
+use server_rpc::{pver, RequestExt, IN_FLIGHT_INPUTS_METADATA_KEY};
 
-use crate::error::{BadArgument, FallbackRefusal, OwnershipRefusal, NotFound, RoundCancelledBeforeForfeit, Unavailable, UnusableInputs};
-
+use crate::error::{BadArgument, FallbackRefusal, InFlightInputs, OwnershipRefusal, NotFound, RoundCancelledBeforeForfeit, Unavailable, UnusableInputs};
 
 /// The minimum protocol version supported by the server.
 ///
 /// For info on protocol versions, see [server_rpc::pver] module documentation.
-pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_SCUTTLE;
+pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
 
 /// The maximum protocol version supported by the server.
 ///
 /// For info on protocol versions, see [server_rpc::pver] module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_SCUTTLE;
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
 
 /// Default maximum number of remotely-reset HTTP/2 streams that may sit in a
 /// connection's accept queue before h2 closes the connection.
@@ -59,6 +59,18 @@ pub(crate) const DEFAULT_HTTP2_MAX_PENDING_ACCEPT_RESET_STREAMS: usize = 1000;
 /// We keep this static because it's hard to propagate the config
 /// into all error conversions.
 pub(crate) static RPC_RICH_ERRORS: AtomicBool = AtomicBool::new(false);
+
+/// Join vtxo ids into a comma-separated gRPC metadata value.
+fn vtxo_ids_metadata(ids: &[VtxoId]) -> tonic::metadata::MetadataValue<tonic::metadata::Ascii> {
+	let mut buf = String::with_capacity(ids.len() * 65);
+	for (i, id) in ids.iter().enumerate() {
+		if i > 0 {
+			buf.push_str(",");
+		}
+		write!(&mut buf, "{}", id).unwrap();
+	}
+	buf.parse().expect("non-ascii identifier")
+}
 
 /// A trait to easily convert some errors to [tonic::Status].
 trait ToStatus {
@@ -102,19 +114,15 @@ impl ToStatus for anyhow::Error {
 		} else if let Some(ui) = self.downcast_ref::<UnusableInputs>() {
 			// Like a bad argument, but we attach the offending VTXO ids so the
 			// client can drop exactly those inputs and retry without them.
-			let ids = {
-				let ids = ui.identifiers();
-				let mut buf = String::with_capacity(ids.len() * 65);
-				for (i, id) in ids.iter().enumerate() {
-					if i > 0 {
-						buf.push_str(",");
-					}
-					write!(&mut buf, "{}", id).unwrap();
-				}
-				buf.parse().expect("non-ascii identifier")
-			};
 			let mut metadata = tonic::metadata::MetadataMap::new();
-			metadata.insert("identifiers", ids);
+			metadata.insert("identifiers", vtxo_ids_metadata(ui.identifiers()));
+			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
+		} else if let Some(ifi) = self.downcast_ref::<InFlightInputs>() {
+			// Also a bad argument, but under a key of its own: these inputs
+			// are still the client's, it should wait for them rather than
+			// drop them the way it would with `identifiers`.
+			let mut metadata = tonic::metadata::MetadataMap::new();
+			metadata.insert(IN_FLIGHT_INPUTS_METADATA_KEY, vtxo_ids_metadata(ifi.identifiers()));
 			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
 		} else if let Some(_) = self.downcast_ref::<Unavailable>() {
 			tonic::Status::unavailable(format!("{:#}", self))
@@ -207,7 +215,6 @@ where
 	}
 }
 
-
 #[async_trait]
 trait ReceiverExt {
 	async fn wait_for_status(self) -> Result<(), tonic::Status>;
@@ -228,24 +235,15 @@ impl ReceiverExt for oneshot::Receiver<anyhow::Error> {
 	}
 }
 
-/// Require the negotiated Scuttle epoch before reading or mutating fork state.
-fn validate_scuttle_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
+/// Validate the ordinary range, or require joint ownership in payout-on mode.
+fn validate_pver<T>(req: &tonic::Request<T>, expiry_payouts: bool) -> Result<u64, tonic::Status> {
 	let pver = req.pver()?;
-	if pver != pver::PROTOCOL_VERSION_SCUTTLE {
-		return Err(tonic::Status::invalid_argument("unsupported Scuttle protocol version"));
-	}
-	Ok(pver)
-}
-
-/// Get the protocol version sent by the user and check if it's supported.
-#[allow(unused)]
-fn validate_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
-	let pver = req.pver()?;
-
-	if !(MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver) {
+	let range = if expiry_payouts {
+		pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS..=pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS
+	} else { MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION };
+	if !range.contains(&pver) {
 		return Err(tonic::Status::invalid_argument("unsupported protocol version"));
 	}
-
 	Ok(pver)
 }
 
@@ -255,18 +253,6 @@ mod fallback_tests {
 	use ::ark::test_util::VTXO_VECTORS;
 	use ::ark::tree::signed::UnlockHash;
 	use bitcoin::hashes::Hash;
-
-	#[test]
-	fn scuttle_version_is_required_before_public_operations() {
-		let mut request = tonic::Request::new(server_rpc::protos::Empty {});
-		assert_eq!(validate_scuttle_pver(&request).unwrap_err().code(), tonic::Code::InvalidArgument);
-		for version in [0, 4, 5, 6, 7, pver::PROTOCOL_VERSION_SCUTTLE - 1, pver::PROTOCOL_VERSION_SCUTTLE + 1] {
-			request.set_pver(version);
-			assert_eq!(validate_scuttle_pver(&request).unwrap_err().code(), tonic::Code::InvalidArgument);
-		}
-		request.set_pver(pver::PROTOCOL_VERSION_SCUTTLE);
-		assert_eq!(validate_scuttle_pver(&request).unwrap(), pver::PROTOCOL_VERSION_SCUTTLE);
-	}
 
 	#[test]
 	fn cancelled_round_metadata_binds_requested_hash_through_error_context() {

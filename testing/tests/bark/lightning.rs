@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use bitcoin::Amount;
 use bitcoincore_rpc::RpcApi;
+use futures::StreamExt;
 
 use ark::VtxoId;
 use ark::lightning::{Invoice, Offer, OfferAmountExt, PaymentHash};
@@ -60,78 +61,8 @@ async fn bark_pay_ln_succeeds() {
 		let invoice = lightning.external.invoice(Some(invoice_amount), "test_payment", "A test payment").await;
 
 		assert_eq!(bark_1.spendable_balance().await, board_amount);
-		let client = Box::pin(bark_1.client()).await;
-		let hash = Invoice::from_str(&invoice).unwrap().payment_hash();
-		let balance_before = client.balance().await.unwrap().summary();
-		let coins_before = client.all_vtxos().await.unwrap();
-		let history_before = client.history().await.unwrap();
-		let actions_before = bark_1.checkpoint_steps().await;
-		assert!(client.lightning_send_checkpoint(hash).await.unwrap().is_none());
-		let error = Box::pin(client.pay_lightning_invoice(invoice.clone(), Some(invoice_amount + sat(1)), false))
-			.await.expect_err("a fixed invoice overpay must be rejected before SDK escrow");
-		assert!(matches!(error.downcast_ref::<ark::lightning::CheckAmountError>(),
-			Some(ark::lightning::CheckAmountError::InvalidUserAmount { invoice: fixed, user: requested })
-				if *fixed == invoice_amount && *requested == invoice_amount + sat(1)), "{error:#}");
-		assert!(client.lightning_send_checkpoint(hash).await.unwrap().is_none());
-		assert_eq!(client.balance().await.unwrap().summary(), balance_before);
-		assert_eq!(client.all_vtxos().await.unwrap(), coins_before);
-		assert_eq!(client.history().await.unwrap(), history_before);
-		assert_eq!(bark_1.checkpoint_steps().await, actions_before);
-		drop(client);
-
-		#[derive(Clone)]
-		struct CheckFixedAmount {
-			invoice: String,
-			db: Db,
-			node: cln_rpc::ClnGrpcClient,
-			checked: Arc<AtomicUsize>,
-		}
-		#[async_trait::async_trait]
-		impl captaind::proxy::ArkRpcProxy for CheckFixedAmount {
-			async fn initiate_lightning_payment(
-				&self, upstream: &mut ArkClient, req: protos::InitiateLightningPaymentRequest,
-			) -> Result<protos::Empty, tonic::Status> {
-				if req.invoice == self.invoice && self.checked.load(Ordering::SeqCst) == 0 {
-					let hash = Invoice::from_str(&req.invoice).unwrap().payment_hash();
-					let committed = async || self.db.read(async |t| Ok(t.query_one("SELECT jsonb_build_object(
-						'sources',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.vtxo_id) FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1),
-						'htlcs',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM htlc_vtxo h WHERE h.payment_hash=$1),
-						'owners',(SELECT jsonb_agg(to_jsonb(o) ORDER BY o.user_pubkey) FROM owner_key o),
-						'coin_owners',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.vtxo_id) FROM coin_owner c JOIN vtxo v ON v.vtxo_id=c.vtxo_id JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1),
-						'attempts',(SELECT jsonb_agg(to_jsonb(a) ORDER BY a.id) FROM lightning_payment_attempt a WHERE a.payment_hash=$1),
-						'xpay',(SELECT jsonb_agg(to_jsonb(x) ORDER BY x.id) FROM cln_xpay x WHERE x.payment_hash=$1),
-						'wal',(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM htlc_settlement s WHERE s.payment_hash=$1))::TEXT",
-						&[&hash.to_string()]).await?.get::<_, String>(0))).await.unwrap();
-					assert!(self.db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().is_none());
-					let before = committed().await;
-					let mut node = self.node.clone();
-					let pays = cln_rpc::ListpaysRequest { payment_hash: Some(hash.to_vec()), ..Default::default() };
-					let parts = cln_rpc::ListsendpaysRequest { payment_hash: Some(hash.to_vec()), ..Default::default() };
-					assert!(node.list_pays(pays.clone()).await.unwrap().into_inner().pays.is_empty());
-					assert!(node.list_send_pays(parts.clone()).await.unwrap().into_inner().payments.is_empty());
-					let mut invalid = req.clone();
-					invalid.payment_amount_sat += 1;
-					let error = upstream.initiate_lightning_payment(invalid).await.expect_err("the server must refuse a fresh fixed-amount mismatch");
-					assert_eq!(error.code(), tonic::Code::InvalidArgument);
-					assert!(error.message().contains("requested payment amount must equal the fixed invoice amount"), "{error}");
-					assert_eq!(committed().await, before);
-					assert!(node.list_pays(pays).await.unwrap().into_inner().pays.is_empty());
-					assert!(node.list_send_pays(parts).await.unwrap().into_inner().payments.is_empty());
-					self.checked.fetch_add(1, Ordering::SeqCst);
-				}
-				Ok(upstream.initiate_lightning_payment(req).await?.into_inner())
-			}
-		}
-		let checked = Arc::new(AtomicUsize::new(0));
-		let postgres = srv.config().postgres.clone();
-		let proxy = srv.start_proxy_no_mailbox(CheckFixedAmount { invoice: invoice.clone(),
-			db: Db::connect(&postgres).await.unwrap(),
-			node: lightning.internal.grpc_client().await, checked: checked.clone() }).await;
-		bark_1.set_ark_url(&proxy.address).await;
 		bark_1.pay_lightning_wait(invoice, None).await;
-		assert_eq!(checked.load(Ordering::SeqCst), 1, "the real server admission probe must execute before the normal send");
 		assert_eq!(bark_1.spendable_balance().await, btc(3));
-		bark_1.set_ark_url(&srv.ark_url()).await;
 	}
 
 	{
@@ -1113,6 +1044,7 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 
 	// Keep the payer tree live after the pool grants have actually closed.
 	let srv = ctx.captaind("server").lightningd(&lightning.external).watchmand().cfg(|cfg| {
+		cfg.expiry_payouts = true;
 		cfg.invoice_check_interval = Duration::from_secs(1);
 		cfg.vtxo_lifetime = BlockDelta::new(864);
 	}).create().await;
@@ -1237,8 +1169,8 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 					a.sweep_txid,a.confirmed_height
 				FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id
 				LEFT JOIN expiry_entitlement e ON e.vtxo_id=v.vtxo_id
-				LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND c.active AND c.disposition='operator'
-				LEFT JOIN expiry_allocation a ON a.id=c.allocation_id AND a.status='confirmed'
+				LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator'
+				LEFT JOIN expiry_allocation_state a ON a.id=c.allocation_id AND a.status='confirmed'
 				WHERE v.lightning_htlc_subscription_id=$1 AND h.payment_hash=$2 AND h.direction='outgoing'
 				ORDER BY v.vtxo_id
 			", &[&subscription_id, &payment_hash.to_string()]).await?)).await.unwrap();
@@ -1281,8 +1213,8 @@ async fn intra_ark_revoke_then_claim_does_not_drain_server() {
 					loop {
 						if db.read(async |t| {
 							let Some(view) = t.expiry_view().await? else { return Ok(false); };
-							let rebuilt = t.expiry_view_is_current(view).await?;
-							Ok(view.processed == point && rebuilt)
+							let rebuilt = (t.expiry_view().await? == Some(view));
+							Ok(view == point && rebuilt)
 						}).await.unwrap() { break; }
 						tokio::time::sleep(Duration::from_millis(100)).await;
 					}
@@ -2503,6 +2435,70 @@ async fn bark_cannot_cancel_lightning_receive_after_preimage_revealed() {
 	let err = bark.try_cancel_lightning_receive(&invoice_info.invoice).await.unwrap_err();
 	assert!(err.to_string().contains("cannot cancel: preimage has already been revealed"),
 		"expected preimage-revealed error, got: {err}");
+}
+
+// Multi-threaded on purpose: the sqlite persister runs synchronously inside
+// the wallet's async calls, so on a single-threaded runtime the notification
+// consumer could never run while the claim is between its two writes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bark_lightning_receive_is_settled_when_movement_notification_arrives() {
+	require_bark_version!(== "DIRTY");
+
+	let ctx = TestContext::new("lightningd/bark_lightning_receive_settled_on_notification").await;
+
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+
+	let srv = ctx.captaind("srv").lightningd(&lightning.internal).funded(btc(10)).create().await;
+
+	let bark = ctx.bark("bark", &srv).funded(btc(3)).create().await;
+	bark.board(btc(2)).await;
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+
+	// Open a wallet client and subscribe before the receive starts.
+	// NB: only use `wallet` from now since we can't have 2 wallets on same persistence yet
+	let wallet = bark.client().await;
+	let notifications = wallet.subscribe_notifications();
+
+	let invoice = wallet.bolt11_invoice(btc(1), None, None).await.unwrap();
+	let payment_hash = PaymentHash::from(&invoice);
+
+	let cloned_invoice = invoice.to_string();
+	tokio::spawn(async move {
+		lightning.external.pay_bolt11(cloned_invoice).await;
+	});
+
+	// A consumer of the successful lightning receive movement must be able to
+	// look up the settled receive the moment the notification arrives, not a
+	// bit later: the settled record is written before the movement finishes.
+	// The consumer runs on its own task so it races the claim like an
+	// external notification handler would.
+	let consumer_wallet = wallet.clone();
+	let lookup_on_notification = tokio::spawn(async move {
+		let mut movements = notifications.movements();
+		loop {
+			let movement = movements.next().await.expect("notification stream ended");
+			if movement.subsystem.name != "bark.lightning_receive" {
+				continue;
+			}
+			if movement.status != bark::movement::MovementStatus::Successful {
+				continue;
+			}
+			break consumer_wallet.lightning_receive_state(payment_hash).await;
+		}
+	});
+
+	let claimed = wallet.try_claim_lightning_receive(payment_hash, true).wait_millis(60_000).await;
+	assert!(matches!(claimed.unwrap(), LightningReceiveState::Settled(_)));
+
+	let looked_up = lookup_on_notification.wait_millis(60_000).await.unwrap();
+	let settled = match looked_up.expect("lookup on notification failed") {
+		LightningReceiveState::Settled(settled) => settled,
+		LightningReceiveState::InProgress(recv) => {
+			panic!("receive still in progress when the movement was reported successful: {:?}", recv.progress);
+		},
+	};
+	assert_eq!(settled.preimage.compute_payment_hash(), payment_hash);
+	assert_eq!(settled.amount, btc(1));
 }
 
 /// Test bolt11 receive over a 5-hop lightning route.

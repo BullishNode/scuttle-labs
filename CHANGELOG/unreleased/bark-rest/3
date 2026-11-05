@@ -1,3 +1,0 @@
-- Return the mailbox identity and derived payout address from `/wallet/fallback`.
-  [#3](https://github.com/BullishNode/scuttle/pull/3)
-  - **BREAKING:** The response no longer reports a registered destination.

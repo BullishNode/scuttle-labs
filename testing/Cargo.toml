@@ -9,10 +9,6 @@ name = "lock-holder"
 path = "tests/core/lock-holder.rs"
 
 [[test]]
-name = "scuttle"
-path = "tests/scuttle/mod.rs"
-
-[[test]]
 name = "server"
 path = "tests/server/mod.rs"
 
@@ -97,9 +93,3 @@ parking_lot.workspace = true
 
 axum = { version = "0.8.4", features = ["macros", "tokio", "query", "http1"], default-features = false }
 tower-http = { version = "0.5", features = ["cors", "set-header"] }
-
-[dev-dependencies]
-rusqlite = { version = "0.31.0", features = ["chrono"] }
-lightning.workspace = true
-prost.workspace = true
-tonic-prost.workspace = true

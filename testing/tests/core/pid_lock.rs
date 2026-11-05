@@ -7,7 +7,6 @@ use std::process::{Child, Command, Stdio};
 use nix::sys::signal::Signal;
 
 use ark_testing::TestContext;
-use bark::lock_manager::PidLockError;
 use bark::lock_manager::pid_fcntl::FcntlPidLockManager;
 use bark::lock_manager::pid_flock::{FlockPidLockManager, LOCK_FILE};
 
@@ -38,42 +37,6 @@ fn pid_backends() -> [PidBackend; 2] {
 		PidBackend { name: "flock", kind: "pid-flock", try_acquire: try_flock },
 		PidBackend { name: "fcntl", kind: "pid-fcntl", try_acquire: try_fcntl },
 	]
-}
-
-#[tokio::test]
-async fn fcntl_alias_refusal_preserves_process_exclusion() {
-	let ctx = TestContext::new_minimal("pid/fcntl/alias").await;
-	let held = FcntlPidLockManager::new(&ctx.datadir).unwrap();
-	let alias = ctx.datadir.join("alias");
-	let canonical = fs::canonicalize(&ctx.datadir).unwrap();
-	std::os::unix::fs::symlink(&canonical, &alias).unwrap();
-	assert_eq!(fs::canonicalize(&alias).unwrap(), canonical);
-	match FcntlPidLockManager::new(&alias) {
-		Err(PidLockError::AlreadyHeld { pid, .. }) => assert_eq!(pid, Some(std::process::id())),
-		other => panic!("alias must be refused before opening another lock descriptor: {other:?}"),
-	}
-
-	let mut child = Command::new(lock_holder_bin())
-		.env("LOCK_TEST_KIND", "pid-fcntl")
-		.env("LOCK_TEST_DIR", &ctx.datadir)
-		.stdout(Stdio::piped()).stderr(Stdio::piped())
-		.spawn().expect("failed to spawn lock-holder");
-	let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-	loop {
-		if child.try_wait().unwrap().is_some() { break; }
-		if tokio::time::Instant::now() >= deadline {
-			kill_and_wait(child, Signal::SIGKILL);
-			panic!("child acquired the lock while the original manager was still alive");
-		}
-		tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-	}
-	let output = child.wait_with_output().unwrap();
-	assert!(!output.status.success());
-	assert!(String::from_utf8_lossy(&output.stderr).contains("AlreadyHeld"));
-
-	drop(held);
-	let child = spawn_holder("pid-fcntl", &alias, None);
-	kill_and_wait(child, Signal::SIGTERM);
 }
 
 #[tokio::test]

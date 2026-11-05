@@ -29,7 +29,7 @@ use crate::actions::lightning::pay::LightningSend;
 use crate::actions::lightning::receive::LightningReceive;
 use crate::actions::offboard::Offboard;
 use crate::lock_manager::LockGuard;
-use crate::vtxo::{FallbackStatus, VtxoState, VtxoStateKind, VtxoValidationError};
+use crate::vtxo::{VtxoState, VtxoStateKind, VtxoValidationError};
 
 pub(crate) const BASE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -529,62 +529,13 @@ where
 	/// a step. Calling this directly is for actions that end outside of a
 	/// step, like a cancel.
 	pub async fn finish(self, wallet: &Wallet) -> anyhow::Result<()> {
-		self.finish_or_remove(wallet, true).await
+		wallet.release_action_locks(&self.id).await?;
+		self.remove(wallet).await
 	}
 
 	/// Remove the checkpoint of the action, and keep the vtxos it locked
 	/// locked.
 	pub async fn remove(self, wallet: &Wallet) -> anyhow::Result<()> {
-		self.finish_or_remove(wallet, false).await
-	}
-
-	async fn finish_or_remove(self, wallet: &Wallet, release_locks: bool) -> anyhow::Result<()> {
-		// The driver consumes its in-memory action before advancing it. Read
-		// the original durable state under the action lock, not that empty slot.
-		let checkpoint = wallet.inner.db.get_wallet_action_checkpoint(&self.id).await?;
-		let offboard = matches!(&checkpoint, Some(WalletActionCheckpoint::Offboard(_)));
-		let ids = match checkpoint {
-			Some(WalletActionCheckpoint::LightningSend(send)) => match send.progress {
-				lightning::pay::Progress::RevocableHtlcs { htlcs, .. } |
-				lightning::pay::Progress::RevocationStuck { htlcs, .. } => Some(htlcs.vtxo_ids),
-				_ => None,
-			},
-			Some(WalletActionCheckpoint::ArkoorSend(send)) => match &send.progress {
-				arkoor_send::Progress::Registration { signed_change_vtxos, .. } => Some(
-					send.input_vtxo_ids.iter().copied().chain(signed_change_vtxos.iter().map(|coin| coin.id())).collect::<Vec<_>>()),
-				_ => None,
-			},
-			Some(WalletActionCheckpoint::Offboard(offboard)) => match offboard.progress {
-				offboard::Progress::OffboardTxPrepared { offboard_vtxo_ids, .. } |
-				offboard::Progress::ReadyForOffboard { offboard_vtxo_ids, prior_txid: Some(_), .. } => Some(offboard_vtxo_ids),
-				_ => None,
-			},
-			_ => None,
-		};
-		let history_guard = if let Some(ids) = ids {
-			let guard = wallet.lock_fallback_history(Duration::from_secs(30)).await?;
-			ensure!(!ids.is_empty(), "protected action has no retained inputs");
-			let mut committed = false;
-			let mut terminal = true;
-			for id in ids {
-				let coin = wallet.inner.db.get_wallet_vtxo(id).await?
-					.context("protected action input or signed change is missing")?;
-				committed |= coin.fallback_status.is_some();
-				terminal &= matches!(coin.fallback_status, Some(FallbackStatus::Spent | FallbackStatus::Forfeited))
-					|| (offboard && coin.fallback_status.is_none() && coin.state.kind() == VtxoStateKind::Spent);
-			}
-			ensure!(!committed || terminal, "fallback input or signed change is unresolved; retaining its checkpoint");
-			Some(guard)
-		} else { None };
-		if release_locks {
-			if history_guard.is_some() {
-				wallet.release_action_locks_locked(&self.id).await?;
-			} else {
-				wallet.release_action_locks(&self.id).await?;
-			}
-		}
-		// Keep History through removal: a later status adoption must not race
-		// the assessment above or forget the signed Registration checkpoint.
 		wallet.inner.db.remove_wallet_action_checkpoint(&self.id).await?;
 		Ok(())
 	}
@@ -634,23 +585,14 @@ impl Wallet {
 	/// Cheap when nothing is held (no-op). Used as the cleanup hook by
 	/// [`GuardedCheckpoint::finish`].
 	pub async fn release_action_locks(&self, action_id: &WalletActionId) -> anyhow::Result<()> {
-		let _guard = self.lock_fallback_history(Duration::from_secs(30)).await?;
-		self.release_action_locks_locked(action_id).await
-	}
-
-	/// Caller holds History through holder release and checkpoint removal.
-	async fn release_action_locks_locked(&self, action_id: &WalletActionId) -> anyhow::Result<()> {
 		let vtxos = self.get_vtxos_locked_by_action(action_id).await?;
 		if vtxos.is_empty() {
 			return Ok(());
 		}
 		debug!("releasing {} vtxo lock(s) held by action {}", vtxos.len(), action_id);
-		let holder = crate::vtxo::VtxoLockHolder::Action { id: action_id.clone() };
-		for coin in vtxos {
-			if self.has_fallback_commitment(coin.id()).await? { continue; }
-			self.inner.db.release_vtxo_lock(coin.id(), Some(&holder)).await?;
-		}
-		Ok(())
+		self.unlock_vtxos(
+			vtxos, Some(crate::vtxo::VtxoLockHolder::Action { id: action_id.clone() }),
+		).await
 	}
 
 	/// Take the lock of a wallet action without waiting, and read its

@@ -184,7 +184,6 @@ message GetVtxoRequest {
 
 message GetVtxoResponse {
 	bytes vtxo = 1;
-	reserved 1000;
 }
 
 message GetVtxosByIdsRequest {
@@ -198,7 +197,6 @@ message GetVtxosByIdsResponse {
 	repeated bytes vtxos = 1;
 	// Requested ids the server does not know, each once.
 	repeated bytes missing_vtxo_ids = 2;
-	reserved 1000;
 }
 
 // Client-relevant spend state for a user-owned VTXO.
@@ -220,10 +218,9 @@ enum VtxoSpendState {
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
 	// A committed fallback decision has unresolved relevant portions.
-	reserved 6;
-	VTXO_SPEND_STATE_FALLBACK_PENDING = 1000;
+	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
 	// Terminal policy result with no Bitcoin payout.
-	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 1001;
+	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 7;
 }
 
 message GetVtxoStatusRequest {
@@ -234,9 +231,8 @@ message GetVtxoStatusRequest {
 
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
-	bytes owner_mailbox = 1000;
-	reserved 1001;
-	bool fallback_committed = 1002;
+	bytes owner_mailbox = 2;
+	bool fallback_committed = 3;
 }
 
 message VtxoStatusQuery {
@@ -253,9 +249,8 @@ message GetVtxosStatusByIdsRequest {
 message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
-	bytes owner_mailbox = 1000;
-	reserved 1001;
-	bool fallback_committed = 1002;
+	bytes owner_mailbox = 3;
+	bool fallback_committed = 4;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -289,9 +284,8 @@ message RecoveredVtxo {
 	// xpub/derivation_index.
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
-	bytes owner_mailbox = 1000;
-	reserved 1001;
-	bool fallback_committed = 1002;
+	bytes owner_mailbox = 4;
+	bool fallback_committed = 5;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -311,13 +305,11 @@ message RecoverVtxosByXpubResponse {
 
 // boarding
 
-// Versioned coin and mailbox authorization of a server-specific link.
+// Coin and mailbox authorization of a server-specific link.
 message OwnerProof {
 	bytes blinded_mailbox_id = 1;
-	reserved 2;
-	bytes signature = 3;
-	uint32 version = 4;
-	bytes mailbox_signature = 5;
+	bytes signature = 2;
+	bytes mailbox_signature = 3;
 }
 
 message BoardCosignRequest {
@@ -327,9 +319,7 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 7;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 7;
 }
 
 message BoardCosignResponse {
@@ -352,17 +342,13 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 3;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 3;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 3;
 }
 
 message ArkoorCosignRequest {
@@ -405,14 +391,17 @@ message InitiateLightningPaymentRequest {
 	// single attempt. Values above the server's maximum are capped to it.
 	// The server picks its default when unset.
 	optional uint32 retry_for_secs = 5;
+	// Fresh sends require one owner signature for each source, in source order.
+	// Exact retries of an already open send may omit these fields.
+	optional bytes intent_nonce = 6;
+	repeated bytes source_owner_signatures = 7;
 }
 
 message CheckLightningPaymentRequest {
 	bytes hash = 1;
 	bool wait = 2;
-	reserved 3;
 	// Complete HTLC input set of the payment attempt being checked.
-	repeated bytes htlc_vtxo_ids = 1000;
+	repeated bytes htlc_vtxo_ids = 3;
 }
 
 message PaymentSuccessStatus {
@@ -427,9 +416,8 @@ message LightningPaymentStatus {
 		// unchanged and an older peer still matches the `failed` arm.
 		core.LightningPaymentFailure failed = 3;
 	};
-	reserved 4;
 	// Input scope validated against the server's recorded payment attempt.
-	repeated bytes htlc_vtxo_ids = 1000;
+	repeated bytes htlc_vtxo_ids = 4;
 }
 
 message FetchBolt12InvoiceRequest {
@@ -448,8 +436,7 @@ message StartLightningReceiveRequest {
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
 	// Point-in-time check for an explicit recipient before invoice creation.
-	reserved 7;
-	VtxoRequest claim_destination = 1000;
+	VtxoRequest claim_destination = 7;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
 	optional uint64 expiry_secs = 6;
@@ -472,9 +459,7 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
-	// Decode-only tombstone: presence is refused, including an empty payload.
-	optional bytes retired_owner_proof = 6;
-	OwnerProof owner_proof = 1000;
+	OwnerProof owner_proof = 6;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -514,7 +499,7 @@ message CheckLightningReceiveResponse {
 	repeated bytes htlc_vtxos = 4;
 	// Aggregate expiry outcome of the actual collected receive destination.
 	// This hash-only query never returns mailbox identities or allocation data.
-	optional VtxoSpendState fallback_spend_state = 1000;
+	optional VtxoSpendState fallback_spend_state = 5;
 }
 
 // offboard
@@ -733,13 +718,28 @@ service RoundAdminService {
 	rpc TriggerRound(core.Empty) returns (core.Empty) {}
 }
 
+message ReconcileLightningAttemptRequest {
+	int64 attempt_id = 1;
+	// Privileged operator confirms complete same-backend CLN/plugin cessation,
+	// restart of its original persistent store and exclusion of new dispatch.
+	bool native_cold_restart_confirmed = 2;
+}
+
+message ReconcileLightningAttemptResponse {
+	int64 attempt_id = 1;
+	bytes payment_hash = 2;
+	string status = 3;
+}
+
 service LightningAdminService {
+	rpc ReconcileLightningAttempt(ReconcileLightningAttemptRequest) returns (ReconcileLightningAttemptResponse) {}
 	rpc StartLightningNode(LightningNodeUri) returns (core.Empty) {}
 	rpc StopLightningNode(LightningNodeUri) returns (core.Empty) {}
 }
 
-service SweepAdminService {
+service WatchmanAdminService {
 	rpc TriggerSweep(core.Empty) returns (core.Empty) {}
+	rpc ReindexFrontier(core.Empty) returns (ReindexFrontierResponse) {}
 }
 
 service BlocklistAdminService {
@@ -799,6 +799,31 @@ message ReloadBlocklistResponse {
 	uint64 total = 1;
 	uint64 added = 2;
 	uint64 removed = 3;
+}
+
+message ReindexFrontierResponse {
+	// Number of frontier entries verified against the chain.
+	uint64 entries_checked = 1;
+	// Entries whose missed or incorrect confirmation height was repaired.
+	uint64 confirmations_repaired = 2;
+	// Entries whose missed on-chain spend was registered.
+	uint64 spends_repaired = 3;
+	// VTXOs newly added to the frontier as children of repaired spends.
+	uint64 vtxos_added = 4;
+	// Funding txs with unfrontiered VTXOs that were processed.
+	uint64 funding_txs_added = 5;
+	// VTXOs newly registered from unfrontiered funding txs.
+	uint64 funding_vtxos_added = 6;
+	// Entries spent on-chain whose spending tx was not found.
+	uint64 unresolved_spends = 7;
+	// Number of blocks scanned looking for missed spends.
+	uint64 blocks_scanned = 8;
+	// Entries whose stored confirmation height was cleared because their
+	// tx is no longer confirmed.
+	uint64 confirmations_cleared = 9;
+	// VTXOs whose stored on-chain spend was cleared because the spending
+	// tx is no longer confirmed.
+	uint64 spends_cleared = 10;
 }
 
 message BanVtxoRequest {

@@ -5,7 +5,6 @@
 //! so all that matters is that the code can compile. It doesn't have to run.
 //!
 
-
 #[cfg(feature = "onchain-bdk")]
 use bdk_wallet::ChangeSet;
 use bitcoin::consensus::deserialize;
@@ -36,7 +35,6 @@ use bark::persist::models::{
 use bark::round::RoundState;
 use bark::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
-
 struct Dummy;
 
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -62,7 +60,8 @@ impl BarkPersister for Dummy {
 			fingerprint: Fingerprint::default(),
 			server_pubkey: None,
 			server_mailbox_pubkey: None,
-			mailbox_identity: bark::MailboxIdentity { network: Network::Bitcoin, public_key: "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9".parse().unwrap() },
+			server_payouts: None,
+			mailbox_identity: Some(bark::MailboxIdentity { network: Network::Bitcoin, public_key: "02f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9".parse().unwrap() }),
 		}))
 	}
 
@@ -198,7 +197,6 @@ impl BarkPersister for Dummy {
 		_preimage: Preimage,
 		_invoice: &Bolt11Invoice,
 		_amount: bitcoin::Amount,
-		_association: Option<&bark::persist::models::ReceiveAssociation>,
 	) -> anyhow::Result<()> {
 		Ok(())
 	}

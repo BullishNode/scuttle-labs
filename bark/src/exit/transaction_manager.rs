@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use bitcoin::{Network, OutPoint, Transaction, Txid};
@@ -164,9 +164,9 @@ impl ExitTransactionManager {
 		}
 	}
 
-	pub async fn sync(&mut self, no_rebroadcast: &HashSet<Txid>) -> anyhow::Result<(), ExitError> {
+	pub async fn sync(&mut self) -> anyhow::Result<(), ExitError> {
 		trace!("Syncing exit transaction manager");
-		self.update_tx_statuses(no_rebroadcast).await
+		self.update_tx_statuses().await
 	}
 
 	/// Refreshes the chain status of a single exit transaction and returns it.
@@ -177,7 +177,7 @@ impl ExitTransactionManager {
 		self.tx_status(txid).await
 	}
 
-	async fn update_tx_statuses(&mut self, no_rebroadcast: &HashSet<Txid>) -> anyhow::Result<(), ExitError> {
+	async fn update_tx_statuses(&mut self) -> anyhow::Result<(), ExitError> {
 		let tip = self.tip().await?;
 		let keys = self.status.keys().cloned().collect::<Vec<_>>();
 		for txid in keys {
@@ -195,7 +195,7 @@ impl ExitTransactionManager {
 			// reports a tx as mempool while bitcoind's mempool has already evicted or
 			// confirmed it). Log and move on — the next sync tick will retry. Each exit's
 			// own `progress()` call surfaces fatal problems via its per-VTXO error field.
-			if let Err(e) = self.update_one_tx_status(txid, tip, !no_rebroadcast.contains(&txid)).await {
+			if let Err(e) = self.update_one_tx_status(txid, tip, true).await {
 				warn!("Failed to update status for exit tx {}: {:#}", txid, e);
 			}
 		}
@@ -393,10 +393,6 @@ impl ExitTransactionManager {
 		let mut deeply_spent = Vec::with_capacity(to_scan.len());
 		for input in to_scan {
 			match spends.get(&input) {
-				// Esplora can also return a spender older than the requested window.
-				Some((_, TxStatus::Confirmed(block))) if block.height < scan_start => {
-					deeply_spent.push(input);
-				},
 				Some((txid, TxStatus::Confirmed(_) | TxStatus::Mempool)) => {
 					warn!("Exit tx {} has a spend of input {} by {} within the last {} blocks, \
 						too recent to end the exit on", exit_txid, input, txid, SPEND_CONFIRMATIONS,

@@ -1,30 +1,23 @@
-//! Immutable zero-fee sweep parents. Fee replacements affect only their child.
+//! Pays expired coins to their owners. Fee bumps keep the payout transaction unchanged.
 
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::HashMap;
 
 use anyhow::Context;
-use bdk_wallet::coin_selection::LargestFirstCoinSelection;
-use bitcoin::{Amount, OutPoint, Transaction, TxOut, Txid, Weight};
+use bitcoin::{Amount, Transaction, TxOut, Txid, Weight};
 use bitcoin_ext::TxStatus;
 use bitcoin_ext::{fee, TransactionExt, TxOutExt};
-use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
-use bitcoind_async_client::traits::Reader;
-use bitcoin_ext::bdk::WalletExt;
 use bitcoin_ext::cpfp::MakeCpfpFees;
 use tracing::warn;
 
 use crate::bitcoind as bcd;
 use crate::bitcoind::BitcoindErrorExt;
-use crate::database::expiry_chain::ExpiryViewToken;
+use crate::wallet::BdkWalletExt;
+use bitcoin_ext::BlockRef;
 use crate::database::expiry_payout::{MAX_PAYOUT_VSIZE, PendingExpiryPayout};
 
-use ark::ServerVtxo;
+use ark::{ServerVtxo, ServerVtxoPolicy, VtxoPolicy};
 
-use super::Watchman;
-
-/// Core's version-3 child limit for a package with an unconfirmed parent.
-const MAX_FEE_CHILD_VSIZE: usize = 1_000;
+use super::{saturating_add_feerates, Watchman};
 
 /// The current anchor spender supplies only Core's replacement fee and inputs.
 /// Customer settlement depends on the immutable parent, not its fee sponsor.
@@ -47,6 +40,100 @@ pub(super) async fn mempool_child_fee(
 }
 
 impl Watchman {
+	/// Sweep server coins, pay expired customer coins, and advance pending splits.
+	pub(super) async fn process_expiry_sweeps(&self) -> anyhow::Result<()> {
+		// Confiscated OffboardForfeit outputs are exclusively server-owned.
+		// Their Bare encoding needs no customer genesis or payout allocation.
+		// Use the original native claim: its miner fee comes from operator
+		// collateral, not from a customer payout or a new wallet subsidy.
+		let sweeps = self.scan_frontier().await?.sweeps;
+		let ids = sweeps.iter().filter(|v| matches!(v.policy(), ServerVtxoPolicy::ServerOwned
+			| ServerVtxoPolicy::User(VtxoPolicy::Pubkey(_))))
+			.map(|v| v.id().to_string()).collect::<Vec<_>>();
+		let eligible = self.db.read(async |t| Ok(t.query(
+			"SELECT vtxo_id,spend_state::TEXT FROM vtxo WHERE vtxo_id=ANY($1) AND spend_state IN ('offboard-forfeit','pool')",
+			&[&ids]).await?.into_iter().map(|r| (r.get::<_, String>(0),r.get::<_, String>(1))).collect::<HashMap<_, _>>()
+		)).await?;
+		let mut claims = Vec::new();
+		for vtxo in &sweeps {
+			let state = eligible.get(&vtxo.id().to_string()).map(String::as_str);
+			let owned = match (vtxo.policy(), state) {
+				(ServerVtxoPolicy::ServerOwned, Some("offboard-forfeit")) => true,
+				(ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)), Some("pool")) => {
+					policy.user_pubkey == vtxo.server_pubkey() || self.db.read(async |t|
+						t.fetch_ephemeral_tweak(policy.user_pubkey).await
+					).await?.is_some()
+				},
+				_ => false,
+			};
+			if owned {
+				self.update_mempool_spend(vtxo.id()).await;
+				claims.push(vtxo.clone());
+			}
+		}
+		if !claims.is_empty() { self.process_claims(claims).await?; }
+		// Operator-only claims above do not depend on customer view readiness.
+		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
+		self.expiry_readiness_pass(view, sweeps).await?;
+		// Expired customer backing never reaches upstream's drain-only builder.
+		self.process_expiry_payouts(view).await?;
+		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
+		for (txid, root) in splits {
+			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+			let ids = [root.id()];
+			let mut fee_rate = self.fee_estimator.regular();
+			self.update_mempool_spend(root.id()).await;
+			if let Some(spend) = self.get_mempool_spend(root.id()) {
+				if spend.txid != txid {
+					warn!(vtxo_id = %root.id(), expected = %txid, actual = %spend.txid,
+						"Expiry progress is pinned by a different spender; retaining its hold");
+					continue;
+				}
+				if spend.fee_rate >= fee_rate { continue; }
+				fee_rate = fee_rate.max(saturating_add_feerates(
+					spend.fee_rate, self.config.incremental_relay_fee
+				));
+			}
+			let committed_wallet = self.db.write(async |t| {
+				t.lock_watchman_tip(view).await?;
+				// Wallet sync may hold the wallet while waiting for this connection.
+				let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(None); };
+				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
+					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
+					return Ok(None);
+				}
+				// A request may outlive a later refresh, offboard or key drop.
+				// Reprove preservation and retain its sorted path locks through
+				// publication, rather than trusting the old request's txid alone.
+				if !t.request_expiry_split(view, &root).await
+					.context("expiry split request revalidation")? { return Ok(None); }
+				let current = t.query_one("
+					SELECT progress_txid FROM expiry_split_request
+					WHERE vtxo_id=$1
+				", &[&root.id().to_string()]).await.context("expiry split instruction lookup")?;
+				ensure!(
+					current.get::<_, &str>("progress_txid") == txid.to_string(),
+					"expiry split instruction changed"
+				);
+				t.lock_unallocated_watchman_inputs(&ids).await.context("expiry split input locks")?;
+				if self.process_progress_tx(t, &mut wallet, txid, &root, fee_rate).await
+					.context("expiry split progress publication")? {
+					Ok(Some(wallet))
+				} else { Ok(None) }
+			}).await;
+			match committed_wallet {
+				Ok(Some(mut wallet)) => {
+					let _ = wallet.take_staged();
+					crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
+				},
+				Ok(None) => {},
+				Err(error) => warn!(vtxo_id = %ids[0], progress_txid = %txid, error = %format!("{error:#}"),
+					"Expiry split remains pending"),
+			}
+		}
+		Ok(())
+	}
+
 	/// Build the complete group as one transaction; callers must never feed a
 	/// committed group through process_claims, which retries individual inputs.
 	pub(crate) async fn build_expiry_payout(
@@ -55,15 +142,6 @@ impl Watchman {
 		payouts: &[TxOut],
 	) -> anyhow::Result<Transaction> {
 		ensure!(!vtxos.is_empty(), "expiry payout has no backing inputs");
-		ensure!(vtxos.iter().map(|v| v.id()).collect::<BTreeSet<_>>().len() == vtxos.len(),
-			"expiry payout repeats a backing input");
-		for vtxo in vtxos {
-			let output = self.bitcoind.try_get_tx_out(vtxo.point(), true).await?
-				.context("expiry payout input is already consumed")?;
-			ensure!(output.confirmations > 0 && output.value == vtxo.amount()
-				&& output.script_pub_key.script().context("invalid backing script")? == vtxo.txout().script_pubkey,
-				"expiry payout backing is not the exact confirmed output");
-		}
 		ensure!(payouts.iter().all(|out| out.is_standard()), "expiry payout contains nonstandard or dust payee output");
 		let input_amount = vtxos.iter().try_fold(Amount::ZERO, |sum, vtxo|
 			sum.checked_add(vtxo.amount()).context("claim input amount overflow"),
@@ -92,7 +170,7 @@ impl Watchman {
 
 	/// Publish only already committed groups. Parent bytes are durable before
 	/// fee funding or broadcast, and every retry keeps those exact bytes.
-	pub(crate) async fn process_expiry_payouts(&self, view: ExpiryViewToken) -> anyhow::Result<()> {
+	pub(crate) async fn process_expiry_payouts(&self, view: BlockRef) -> anyhow::Result<()> {
 		let groups = self.db.read(async |t| t.pending_expiry_payouts().await).await?;
 		for group in groups {
 			let id = group.id;
@@ -103,7 +181,7 @@ impl Watchman {
 		Ok(())
 	}
 
-	async fn process_expiry_payout(&self, view: ExpiryViewToken, group: PendingExpiryPayout) -> anyhow::Result<()> {
+	async fn process_expiry_payout(&self, view: BlockRef, group: PendingExpiryPayout) -> anyhow::Result<()> {
 		let parent = match group.parent {
 			Some(parent) => parent,
 			None => self.build_expiry_payout(&group.inputs, &group.payouts).await?,
@@ -115,101 +193,46 @@ impl Watchman {
 		let target = self.fee_estimator.regular();
 		let (anchor, _) = parent.fee_anchor().context("expiry parent has no fee anchor")?;
 		let active = bcd::get_mempool_spending_tx(&self.bitcoind, anchor).await?;
-		let mut replacing_inputs = BTreeSet::new();
-		let mut fees = if let Some(txid) = active {
+		let fees = if let Some(txid) = active {
 			let (current_package_fee, weight) = mempool_child_fee(&self.bitcoind, txid).await?
 				.context("expiry fee child left the mempool")?;
 			if current_package_fee >= (parent.weight() + weight) * target {
 				return Ok(());
 			}
-			let child = self.bitcoind.get_raw_transaction_verbosity_zero(&txid).await?.0;
-			ensure!(child.compute_txid() == txid && child.input.iter().any(|input| input.previous_output == anchor),
-				"expiry anchor spender changed");
-			replacing_inputs.extend(child.input.iter().map(|input| input.previous_output));
 			MakeCpfpFees::Rbf { min_effective_fee_rate: target, current_package_fee }
 		} else {
 			MakeCpfpFees::Effective(target)
 		};
-		let mut wallet = self.watchman_wallet.lock().await;
-		let mut replacement = None;
-		if active.is_none() {
-			// BDK can retain an orphaned child's spend after eviction. Recover
-			// only its own confirmed inputs, independently checked against Core.
-			let children = wallet.tx_graph().outspends(anchor).iter().copied().collect::<Vec<_>>();
-			for id in children {
-				if !wallet.get_tx(id).is_some_and(|tx| tx.chain_position.is_unconfirmed()) { continue }
-				let Some(child) = wallet.tx_graph().get_tx(id) else { continue };
-				if child.output.len() != 1 || !wallet.is_mine(child.output[0].script_pubkey.clone())
-					|| mempool_child_fee(&self.bitcoind, id).await?.is_some()
-					|| matches!(bcd::tx_status(&self.bitcoind, id).await?, TxStatus::Confirmed(_)) {
-					continue;
-				}
-				let mut funding = Amount::ZERO;
-				let mut available = true;
-				for input in child.input.iter().filter(|i| i.previous_output != anchor) {
-					let point = input.previous_output;
-					let Some(known) = wallet.tx_graph().get_txout(point) else { available = false; break };
-					let Some(output) = self.bitcoind.try_get_tx_out(point, true).await? else { available = false; break };
-					if !wallet.is_mine(known.script_pubkey.clone())
-						|| output.confirmations == 0 || output.confirmations < wallet.min_trusted_confs()
-						|| output.value != known.value
-						|| output.script_pub_key.script()? != known.script_pubkey {
-						available = false;
-						break;
-					}
-					funding = funding.checked_add(output.value).context("fee funding overflow")?;
-				}
-				if !available || funding < self.config.min_cpfp_amount { continue }
-				let mut update = bdk_wallet::Update::default();
-				update.tx_update.txs.push(Arc::new(parent.clone()));
-				wallet.apply_update(update)?;
-				fees = MakeCpfpFees::Rbf { min_effective_fee_rate: target,
-					current_package_fee: wallet.calculate_fee(&child)? };
-				replacement = Some(id);
-				break;
-			}
-		}
-		if replacement.is_none() && !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
-			warn!(allocation_id = group.id, "Expiry payouts need confirmed usable watchman funds");
-			return Ok(());
-		}
-		// A confirmed input spent only by the child being replaced remains usable
-		// for RBF. Unrelated mempool spends must not be selected as fee funding.
-		let candidates = wallet.list_unspent().map(|utxo| utxo.outpoint).collect::<Vec<OutPoint>>();
-		let mut excluded = Vec::new();
-		for point in candidates {
-			let confirmed = self.bitcoind.try_get_tx_out(point, false).await?
-				.is_some_and(|output| output.confirmations > 0);
-			let available = replacing_inputs.contains(&point)
-				|| self.bitcoind.try_get_tx_out(point, true).await?.is_some();
-			if !confirmed || !available { excluded.push(point); }
-		}
-		let child = wallet.make_signed_p2a_cpfp_replacing(
-			&parent, fees, &excluded, LargestFirstCoinSelection, replacement,
-		).context("funding expiry payout fee child")?;
-		if child.vsize() > MAX_FEE_CHILD_VSIZE {
-			wallet.mark_output_keys_unused(&child);
-			wallet.persist().await?;
-			bail!("expiry fee child exceeds {} vbytes: {}", MAX_FEE_CHILD_VSIZE, child.vsize());
-		}
-		// As with upstream's progress CPFP, the child is rebuilt from current
-		// wallet/Core state. Persist address allocation, not a child ledger.
-		wallet.persist().await?;
-		drop(wallet);
-		view.verify(&self.bitcoind).await?;
-		self.db.write(async |t| {
-			t.lock_valid_expiry_view(view).await?;
-			let row = t.query_one("SELECT status,sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE",
-				&[&group.id]).await?;
-			ensure!(row.get::<_, &str>("status") == "pending"
-				&& row.get::<_, Option<&[u8]>>("sweep_tx") == Some(bitcoin::consensus::serialize(&parent).as_slice()),
+		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+		let committed_wallet = self.db.write(async |t| {
+			t.lock_watchman_tip(view).await?;
+			t.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&group.id]).await?;
+			ensure!(t.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&group.id]).await?.get::<_, &str>(0) == "pending",
 				"expiry allocation changed before package publication");
+			// Wallet sync may hold the wallet while waiting for this connection.
+			// Defer if busy; never wait for it while holding the publication tx.
+			let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(None); };
+			if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
+				warn!(allocation_id = group.id, "Expiry payouts need confirmed usable watchman funds");
+				return Ok(None);
+			}
+			let child = wallet.make_signed_p2a_cpfp(&parent, fees)
+				.context("funding expiry payout fee child")?;
 			let result = bcd::submit_package(&self.bitcoind, &[parent.clone(), child.clone()]).await?;
 			bcd::require_package_acceptance(&result, &[&parent, &child])?;
+			wallet.commit_tx(&child);
+			if let Some(change) = wallet.staged() {
+				t.store_changeset(wallet.kind(), change).await?;
+			}
 			t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) WHERE id=$1",
 				&[&group.id]).await?;
-			Ok(())
+			Ok(Some(wallet))
 		}).await?;
+		if let Some(mut wallet) = committed_wallet {
+			// Keep staged changes on any database failure, as persist() does.
+			let _ = wallet.take_staged();
+			crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
+		}
 		Ok(())
 	}
 

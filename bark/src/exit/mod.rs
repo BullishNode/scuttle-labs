@@ -152,7 +152,7 @@ use crate::chain::ChainSource;
 use crate::exit::bdk::should_rbf;
 use crate::exit::transaction_manager::ExitTransactionManager;
 use crate::onchain::MakeCpfpFees;
-use crate::movement::{MovementDestination, MovementId, MovementStatus, PaymentMethod};
+use crate::movement::{MovementDestination, MovementStatus, PaymentMethod};
 use crate::movement::manager::MovementManager;
 use crate::movement::update::MovementUpdate;
 
@@ -161,17 +161,6 @@ use crate::persist::models::StoredExit;
 use crate::psbtext::PsbtInputExt;
 use crate::subsystem::{ExitMovement, Subsystem};
 use crate::vtxo::VtxoStateKind;
-
-/// A known commitment prevents new publication while the exit is still abortable.
-/// It does not cancel, discard, or reinterpret an already exposed exit.
-pub(crate) fn fallback_blocks_abortable_exit(state: &ExitState, id: VtxoId, commitments: &HashSet<VtxoId>) -> bool {
-	(state.is_cancelable() || matches!(state, ExitState::Canceled(_)))
-		&& commitments.contains(&id)
-}
-
-async fn fallback_commitments(db: &dyn BarkPersister) -> anyhow::Result<HashSet<VtxoId>> {
-	Ok(db.get_all_vtxos().await?.into_iter().filter(|coin| coin.fallback_status.is_some()).map(|coin| coin.id()).collect())
-}
 
 /// What is known about the CPFP child of a pending exit transaction.
 pub(crate) enum ChildState {
@@ -227,9 +216,6 @@ impl ExitInner {
 		if vtxos.is_empty() {
 			return Ok(());
 		}
-		let commitments = fallback_commitments(&*self.persister).await?;
-		ensure!(!vtxos.iter().any(|coin| commitments.contains(&coin.borrow().id())),
-			"a committed fallback source cannot be exited");
 		let tip = self.chain_source.tip().await?;
 		let params = Params::new(self.chain_source.network());
 		for vtxo in vtxos {
@@ -264,12 +250,6 @@ impl ExitInner {
 				if let Err(error) = full_vtxo.check_standard() {
 					return Err(ExitError::NonStandardVtxo { vtxo: vtxo_id, error }.into());
 				}
-			}
-
-			// Finish the old history before replacing its only stored movement link.
-			if let Some(entry) = self.persister.get_exit_vtxo_entry(&vtxo_id).await? {
-				Exit::finish_exit_movement(&self.movement_manager, &entry.state, entry.movement_id).await
-					.context("failed to finalize the previous exit movement")?;
 			}
 
 			// Create the movement in a Pending state. It transitions to Successful once the
@@ -308,7 +288,8 @@ impl ExitInner {
 
 	/// Initializes pending exits and refreshes the chain view of their transaction packages.
 	async fn refresh_tx_state(&mut self) -> anyhow::Result<()> {
-		for exit in &mut self.exit_vtxos {
+		let mut exit_vtxos = std::mem::take(&mut self.exit_vtxos);
+		for exit in &mut exit_vtxos {
 			if !exit.is_initialized() {
 				match exit.initialize(&mut self.tx_manager, &*self.persister).await {
 					Ok(()) => continue,
@@ -318,18 +299,8 @@ impl ExitInner {
 				}
 			}
 		}
-		let commitments = fallback_commitments(&*self.persister).await?;
-		let mut blocked = HashSet::new();
-		let mut allowed = HashSet::new();
-		for exit in &self.exit_vtxos {
-			let target = if fallback_blocks_abortable_exit(exit.state(), exit.id(), &commitments) {
-				&mut blocked
-			} else { &mut allowed };
-			if let Some(txids) = exit.txids() { target.extend(txids.iter().copied()); }
-		}
-		// A shared ancestor can still be needed by a different, unfenced exit.
-		blocked.retain(|txid| !allowed.contains(txid));
-		self.tx_manager.sync(&blocked).await?;
+		self.exit_vtxos = exit_vtxos;
+		self.tx_manager.sync().await?;
 		Ok(())
 	}
 
@@ -455,9 +426,6 @@ impl Exit {
 	pub(crate) async fn load(&self) -> anyhow::Result<()> {
 		let mut guard = self.inner.write().await;
 		let inner = &mut *guard;
-
-		// Repair history left pending after the exit state was durably finished.
-		Self::reconcile_finished_movements(&*inner.persister, &inner.movement_manager).await?;
 
 		// Finished exits never progress again, so don't track them.
 		let exit_vtxo_entries = inner.persister
@@ -685,12 +653,9 @@ impl Exit {
 				// Only live exits are in memory; check the store for a finished one.
 				let entry = inner.persister.get_exit_vtxo_entry(&vtxo_id).await
 					.map_err(|e| ExitError::InternalError { error: e.to_string() })?;
-				return match entry {
-					Some(entry) if entry.state.kind() == ExitStateKind::Canceled => {
-						Self::finish_exit_movement(&inner.movement_manager, &entry.state, entry.movement_id).await
-							.map_err(|e| ExitError::InternalError { error: format!("{e:#}") })
-					},
-					Some(entry) => Err(ExitError::CannotCancelExit { vtxo: vtxo_id, state: entry.state.kind() }),
+				return match entry.map(|e| e.state.kind()) {
+					Some(ExitStateKind::Canceled) => Ok(()),
+					Some(kind) => Err(ExitError::CannotCancelExit { vtxo: vtxo_id, state: kind }),
 					None => Err(ExitError::NotExiting { vtxo: vtxo_id }),
 				};
 			},
@@ -766,22 +731,22 @@ impl Exit {
 		&self,
 		wallet: &Wallet,
 	) -> anyhow::Result<Option<Vec<ExitProgressStatus>>> {
-		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut guard = self.inner.write().await;
 		guard.refresh_tx_state().await?;
-		let inner = &mut *guard;
-		let mut exit_statuses = Vec::with_capacity(inner.exit_vtxos.len());
+		let mut exit_vtxos = std::mem::take(&mut guard.exit_vtxos);
+		let mut exit_statuses = Vec::with_capacity(exit_vtxos.len());
 
-		for ev in inner.exit_vtxos.iter_mut() {
+		for ev in exit_vtxos.iter_mut() {
 			if !ev.is_initialized() {
 				warn!("Skipping progress of uninitialized unilateral exit {}", ev.id());
 				continue;
 			}
 
 			info!("Progressing exit for VTXO {}", ev.id());
+			let pre_state = ev.state().clone();
 			let error = match ev.progress(
 				wallet,
-				&mut inner.tx_manager,
+				&mut guard.tx_manager,
 				true,
 			).await {
 				Ok(_) => None,
@@ -798,8 +763,9 @@ impl Exit {
 				}
 			};
 
+			let state_changed = ev.state() != &pre_state;
 			Self::reconcile_vtxo_and_movement(
-				wallet, &inner.movement_manager, ev,
+				wallet, &guard.movement_manager, ev, state_changed,
 			).await;
 
 			if !matches!(ev.state(), ExitState::Claimed(..)) {
@@ -811,6 +777,7 @@ impl Exit {
 			}
 		}
 
+		guard.exit_vtxos = exit_vtxos;
 		Ok(Some(exit_statuses))
 	}
 
@@ -821,56 +788,35 @@ impl Exit {
 	/// - finish the movement as `Canceled` when we detect the VTXO was already spent.
 	///
 	/// All updates are best-effort: failures are logged and don't abort progress. The VTXO
-	/// transition and movement completion are idempotent, so an earlier failure can retry
-	/// without changing a completed movement or emitting another notification.
+	/// transition is idempotent; the movement transitions only fire on a fresh state change
+	/// to avoid notification spam.
 	async fn reconcile_vtxo_and_movement(
 		wallet: &Wallet,
 		movements: &MovementManager,
 		ev: &ExitVtxo,
+		state_changed: bool,
 	) {
-		let paid_fallback = match wallet.inner.db.get_wallet_vtxo(ev.id()).await {
-			Ok(coin) => coin.is_some_and(|coin| matches!(coin.fallback_status,
-				Some(crate::vtxo::FallbackStatus::Spent | crate::vtxo::FallbackStatus::Forfeited))),
-			Err(error) => {
-				error!("Could not check fallback retirement for exit {}: {error:#}", ev.id());
-				return;
-			},
-		};
-		if ev.state().warrants_exited_vtxo() && !paid_fallback {
+		if ev.state().warrants_exited_vtxo() {
 			if let Err(e) = wallet.mark_vtxos_as_exited([ev.id()]).await {
 				error!("Failed to mark VTXO {} as Exited: {:#}", ev.id(), e);
 			}
 		}
 
-		if let Err(e) = Self::finish_exit_movement(movements, ev.state(), ev.movement_id()).await {
-			error!("Failed to finalize movement for exit {}: {e:#}", ev.id());
+		if !state_changed {
+			return;
 		}
-	}
-
-	async fn finish_exit_movement(
-		movements: &MovementManager,
-		state: &ExitState,
-		movement_id: Option<MovementId>,
-	) -> anyhow::Result<()> {
-		let Some(movement_id) = movement_id else { return Ok(()) };
-		let status = match state {
+		let Some(movement_id) = ev.movement_id() else { return };
+		let new_status = match ev.state() {
 			ExitState::Claimed(_) => MovementStatus::Successful,
-			ExitState::VtxoAlreadySpent(_) | ExitState::Canceled(_) => MovementStatus::Canceled,
-			_ => return Ok(()),
+			ExitState::VtxoAlreadySpent(_) => MovementStatus::Canceled,
+			_ => return,
 		};
-		movements.finish_movement(movement_id, status).await?;
-		Ok(())
-	}
-
-	async fn reconcile_finished_movements(
-		persister: &dyn BarkPersister,
-		movements: &MovementManager,
-	) -> anyhow::Result<()> {
-		for entry in persister.get_exit_vtxo_entries_with_states(ExitStateKind::FINISHED_STATES).await? {
-			Self::finish_exit_movement(movements, &entry.state, entry.movement_id).await
-				.with_context(|| format!("failed to finalize movement for exit {}", entry.vtxo_id))?;
+		if let Err(e) = movements.finish_movement(movement_id, new_status).await {
+			error!(
+				"Failed to finalize exit movement {} as {:?}: {:#}",
+				movement_id, new_status, e,
+			);
 		}
-		Ok(())
 	}
 
 	/// For use when syncing. Pending exits will be initialized, the network status of each
@@ -880,25 +826,27 @@ impl Exit {
 		&self,
 		wallet: &Wallet,
 	) -> anyhow::Result<()> {
-		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await?;
 		let mut guard = self.inner.write().await;
 		guard.refresh_tx_state().await?;
-		let inner = &mut *guard;
-		for exit in &mut inner.exit_vtxos {
+		let mut exit_vtxos = std::mem::take(&mut guard.exit_vtxos);
+		for exit in &mut exit_vtxos {
 			if !exit.is_initialized() {
 				warn!("Skipping progress of uninitialized unilateral exit {}", exit.id());
 				continue;
 			}
 
+			let pre_state = exit.state().clone();
 			if let Err(e) = exit.progress(
-				wallet, &mut inner.tx_manager, true,
+				wallet, &mut guard.tx_manager, true,
 			).await {
 				error!("Error syncing exit for VTXO {}: {}", exit.id(), e);
 			}
+			let state_changed = exit.state() != &pre_state;
 			Self::reconcile_vtxo_and_movement(
-				wallet, &inner.movement_manager, exit,
+				wallet, &guard.movement_manager, exit, state_changed,
 			).await;
 		}
+		guard.exit_vtxos = exit_vtxos;
 		Ok(())
 	}
 
@@ -910,13 +858,8 @@ impl Exit {
 	/// Call [Exit::provide_cpfp_tx] to submit the child.
 	pub async fn exits_needing_cpfp(&self) -> Vec<ExitCpfpRequest> {
 		let guard = self.inner.read().await;
-		let commitments = match fallback_commitments(&*guard.persister).await {
-			Ok(commitments) => commitments,
-			Err(error) => { error!("Could not check fallback commitments for CPFP selection: {error:#}"); return Vec::new(); },
-		};
 		let mut requests = Vec::new();
 		for ev in &guard.exit_vtxos {
-			if fallback_blocks_abortable_exit(ev.state(), ev.id(), &commitments) { continue; }
 			let ExitState::Processing(s) = ev.state() else { continue };
 			for tx in &s.transactions {
 				let rbf_requirement = match &tx.status {
@@ -973,17 +916,8 @@ impl Exit {
 		child_tx: Transaction,
 	) -> anyhow::Result<(), ExitError> {
 		let origin = ExitTxOrigin::Wallet { confirmed_in: None };
-		let _receipt_guard = wallet.lock_fallback_history(std::time::Duration::from_secs(30)).await
-			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
 		let mut guard = self.inner.write().await;
 		let inner = &mut *guard;
-		let commitments = fallback_commitments(&*inner.persister).await
-			.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
-		let matching = inner.exit_vtxos.iter().filter(|exit| exit.txids().is_some_and(|txids| txids.contains(&exit_txid)))
-			.collect::<Vec<_>>();
-		if matching.is_empty() || matching.iter().all(|exit| fallback_blocks_abortable_exit(exit.state(), exit.id(), &commitments)) {
-			return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot publish another abortable exit".into() });
-		}
 
 		// Broadcast the package first and only commit the child if it's accepted
 		if !inner.tx_manager.broadcast_and_set_child(exit_txid, child_tx, origin).await? {
@@ -1163,13 +1097,6 @@ impl Exit {
 
 			{
 				let guard = self.inner.read().await;
-				let commitments = fallback_commitments(&*guard.persister).await
-					.map_err(|error| ExitError::InvalidWalletState { error: error.to_string() })?;
-				let state = guard.exit_vtxos.iter().find(|exit| exit.id() == vtxo_id).map(|exit| exit.state());
-				if commitments.contains(&vtxo_id) && state.is_none_or(|state|
-					fallback_blocks_abortable_exit(state, vtxo_id, &commitments)) {
-					return Err(ExitError::InvalidWalletState { error: "a committed fallback source cannot be exited".into() });
-				}
 				match guard.exit_vtxos.iter().find(|ev| ev.id() == vtxo_id).map(|ev| ev.state()) {
 					Some(ExitState::Claimed(_)) => {
 						return Err(ExitError::VtxoAlreadyExited { vtxo: vtxo_id });
@@ -1276,124 +1203,5 @@ impl Exit {
 			groups.push(UnconfirmedExitParents { vtxo, parents });
 		}
 		Ok(groups)
-	}
-}
-
-#[cfg(all(test, feature = "sqlite", not(target_arch = "wasm32")))]
-mod test {
-	use bitcoin::{BlockHash, SignedAmount};
-	use bitcoin::hashes::Hash;
-	use bitcoin_ext::BlockRef;
-	use futures::{FutureExt, StreamExt};
-
-	use crate::notification::{NotificationDispatch, WalletNotification};
-	use crate::persist::sqlite::SqliteClient;
-
-	use super::*;
-
-	#[tokio::test]
-	async fn terminal_exit_history_retries_and_reloads() {
-		let dir = tempfile::tempdir().unwrap();
-		let path = dir.path().join("db.sqlite");
-		let db = Arc::new(SqliteClient::open(&path).unwrap());
-		let dispatch = NotificationDispatch::new();
-		let movements = MovementManager::new(db.clone(), dispatch.clone());
-		movements.register_subsystem(Subsystem::EXIT).await.unwrap();
-		let tip = BlockHeight::new(100);
-		// Persisted-state units: these literals do not establish onchain finality.
-		let states = [
-			(ExitState::new_claimed(tip, Txid::all_zeros(),
-				BlockRef { height: tip, hash: BlockHash::all_zeros() }), Some(MovementStatus::Successful)),
-			(ExitState::new_vtxo_already_spent(tip), Some(MovementStatus::Canceled)),
-			(ExitState::new_canceled(tip), Some(MovementStatus::Canceled)),
-			(ExitState::new_vtxo_swept(tip, vec![]), None),
-			(ExitState::new_start(tip), None),
-		];
-		let mut records = Vec::new();
-		for (index, (state, status)) in states.into_iter().enumerate() {
-			let id = movements.new_movement_with_update(Subsystem::EXIT, "start",
-				MovementUpdate::new().intended_and_effective_balance(SignedAmount::from_sat(-100_000))
-					.fee(Amount::from_sat(1_000))).await.unwrap();
-			let entry = StoredExit {
-				vtxo_id: VtxoId::from_slice(&[index as u8 + 1; 36]).unwrap(), state,
-				history: vec![ExitState::new_start(BlockHeight::new(99))], movement_id: Some(id),
-			};
-			db.store_exit_vtxo_entry(&entry).await.unwrap();
-			records.push((entry, db.get_movement_by_id(id).await.unwrap(), status));
-		}
-		let mut notifications = dispatch.subscribe();
-		let conn = rusqlite::Connection::open(&path).unwrap();
-		conn.execute_batch("CREATE TRIGGER reject_exit_history_completion BEFORE UPDATE ON bark_movements \
-			WHEN OLD.status = 'pending' AND NEW.status != 'pending' \
-			BEGIN SELECT RAISE(ABORT, 'exit movement write rejected'); END;").unwrap();
-
-		// The same terminal-state caller must propagate the actual failed write,
-		// and the one-time load must not silently drop that unfinished history.
-		let entry = &records[0].0;
-		let error = Exit::finish_exit_movement(&movements, &entry.state, entry.movement_id).await.unwrap_err();
-		assert!(format!("{error:#}").contains("exit movement write rejected"));
-		let error = Exit::reconcile_finished_movements(&*db, &movements).await.unwrap_err();
-		assert!(format!("{error:#}").contains("exit movement write rejected"));
-		// Cancellation retries and new-exit preflight use this same finalizer.
-		// A failed write must keep the canceled row's original Pending movement link.
-		let canceled = &records[2].0;
-		let error = Exit::finish_exit_movement(&movements, &canceled.state, canceled.movement_id).await.unwrap_err();
-		assert!(format!("{error:#}").contains("exit movement write rejected"));
-		for (entry, pending, _) in &records {
-			assert_eq!(db.get_movement_by_id(pending.id).await.unwrap(), *pending);
-			assert_eq!(db.get_exit_vtxo_entry(&entry.vtxo_id).await.unwrap().unwrap(), *entry);
-		}
-		assert!(notifications.next().now_or_never().is_none());
-		conn.execute_batch("DROP TRIGGER reject_exit_history_completion;").unwrap();
-
-		// Retry with the identical terminal state, without another state transition.
-		Exit::finish_exit_movement(&movements, &entry.state, entry.movement_id).await.unwrap();
-		let finished_live = db.get_movement_by_id(entry.movement_id.unwrap()).await.unwrap();
-		drop(movements);
-		drop(db);
-
-		// The remaining terminal records still have Pending movements across reopen.
-		let db = Arc::new(SqliteClient::open(&path).unwrap());
-		let movements = MovementManager::new(db.clone(), dispatch);
-		movements.register_subsystem(Subsystem::EXIT).await.unwrap();
-		Exit::reconcile_finished_movements(&*db, &movements).await.unwrap();
-		for (entry, pending, status) in &records {
-			let actual = db.get_movement_by_id(pending.id).await.unwrap();
-			let mut expected = pending.clone();
-			if let Some(status) = status {
-				assert!(actual.time.completed_at.is_some());
-				expected.status = *status;
-				expected.time.completed_at = actual.time.completed_at;
-			}
-			assert_eq!(actual, expected, "only the terminal status/completion time can change");
-			assert_eq!(db.get_exit_vtxo_entry(&entry.vtxo_id).await.unwrap().unwrap(), *entry);
-		}
-		assert_eq!(db.get_movement_by_id(finished_live.id).await.unwrap(), finished_live);
-		let mut updated = Vec::new();
-		while let Some(Some(notification)) = notifications.next().now_or_never() {
-			let WalletNotification::MovementUpdated { movement } = notification else {
-				panic!("unexpected notification: {notification:?}");
-			};
-			updated.push(movement.id);
-		}
-		let expected = records.iter().filter(|(_, _, status)| status.is_some())
-			.map(|(_, movement, _)| movement.id).collect::<HashSet<_>>();
-		assert_eq!(updated.len(), expected.len());
-		assert_eq!(updated.into_iter().collect::<HashSet<_>>(), expected);
-		Exit::reconcile_finished_movements(&*db, &movements).await.unwrap();
-		assert_eq!(db.get_movement_by_id(finished_live.id).await.unwrap(), finished_live);
-		assert!(notifications.next().now_or_never().is_none(), "completed history must stay idempotent");
-		// Only after finalizing the prior link can a new exit replace that row.
-		Exit::finish_exit_movement(&movements, &canceled.state, canceled.movement_id).await.unwrap();
-		let completed = db.get_movement_by_id(canceled.movement_id.unwrap()).await.unwrap();
-		assert_eq!(completed.status, MovementStatus::Canceled);
-		let replacement_id = movements.new_movement(Subsystem::EXIT, "start").await.unwrap();
-		let replacement = StoredExit {
-			vtxo_id: canceled.vtxo_id, state: ExitState::new_start(tip),
-			history: vec![], movement_id: Some(replacement_id),
-		};
-		db.store_exit_vtxo_entry(&replacement).await.unwrap();
-		assert_eq!(db.get_exit_vtxo_entry(&replacement.vtxo_id).await.unwrap().unwrap(), replacement);
-		assert_eq!(db.get_movement_by_id(completed.id).await.unwrap(), completed);
 	}
 }

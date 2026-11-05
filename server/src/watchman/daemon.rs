@@ -30,7 +30,7 @@ use crate::system::RuntimeManager;
 use crate::utils::InstrumentedLock;
 use crate::wallet::{PersistedWallet, WalletKind, MNEMONIC_FILE};
 use crate::ln::settler::HtlcSettler;
-use crate::watchman::{VtxoExitFrontier, Watchman, WatchmanHandle, WatchmanSigner};
+use crate::watchman::{FrontierChainListener, Watchman, WatchmanHandle, WatchmanSigner};
 
 
 /// The HD keypath to use for the server key.
@@ -44,8 +44,6 @@ pub struct Daemon {
 	sync_manager: SyncManager,
 	#[allow(unused)]
 	watchman_wallet: InstrumentedLock<PersistedWallet>,
-	#[allow(unused)]
-	frontier: Arc<tokio::sync::RwLock<VtxoExitFrontier>>,
 	watchman_handle: WatchmanHandle,
 	bitcoin_address_blocklist: Option<BitcoinAddressBlocklist>,
 }
@@ -133,7 +131,9 @@ impl Daemon {
 				network, cfg.network,
 			);
 		}
-		bitcoind.require_txindex().await?;
+		if db.expiry_payouts() {
+			bitcoind.require_txindex().await?;
+		}
 
 		let deep_tip = bcd::deep_tip(&bitcoind).await
 			.context("failed to query node for deep tip")?;
@@ -178,9 +178,7 @@ impl Daemon {
 			db.clone(), rtmgr.clone(), cfg.htlc_settlement_poll_interval,
 		));
 
-		let frontier = Arc::new(tokio::sync::RwLock::new(
-			VtxoExitFrontier::init(db.clone(), htlc_settler.clone()).await?,
-		));
+		let frontier = FrontierChainListener::new(db.clone(), htlc_settler.clone());
 
 		let listeners: Vec<Box<dyn ChainEventListener>> = vec![
 			Box::new(watchman_wallet.clone()),
@@ -231,14 +229,14 @@ impl Daemon {
 			fee_estimator,
 			drain_address,
 			watchman_wallet.clone(),
-			frontier.clone(),
+			frontier,
 			sync_height_watcher,
 		);
 
 		let watchman_handle = watchman.start(rtmgr.clone());
 
 		Ok(Self {
-			rtmgr, sync_manager, watchman_wallet, frontier, watchman_handle,
+			rtmgr, sync_manager, watchman_wallet, watchman_handle,
 			bitcoin_address_blocklist,
 		})
 	}

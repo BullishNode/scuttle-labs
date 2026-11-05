@@ -237,8 +237,9 @@ impl LightningManager {
 
 	/// Reconcile only this existing external attempt on its recorded online
 	/// node. Missing/offline nodes require re-adding the same node; an operator
-	/// supplies no outcome and cannot cause a new dispatch here.
-	pub async fn reconcile_lightning_attempt(&self, attempt_id: i64)
+	/// supplies no native outcome and cannot cause a new dispatch here. The
+	/// optional cold-restart assertion is a privileged external lifecycle fact.
+	pub async fn reconcile_lightning_attempt(&self, attempt_id: i64, native_cold_restart_confirmed: bool)
 		-> anyhow::Result<Option<LightningPaymentAttempt>>
 	{
 		let Some(attempt) = self.db.read(async |tx|
@@ -248,7 +249,7 @@ impl LightningManager {
 		if !attempt.status.is_final() {
 			let node = self.node_by_id(attempt.lightning_node_id)
 				.context("recorded Lightning node is not online; attempt stays held")?;
-			node.xpay.reconcile_existing_payment_attempt(attempt).await?;
+			node.xpay.reconcile_existing_payment_attempt(attempt, native_cold_restart_confirmed).await?;
 		}
 		self.db.read(async |tx| tx.get_lightning_payment_attempt_by_id(attempt_id).await).await
 	}
@@ -276,6 +277,7 @@ impl LightningManager {
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
 		retry_for: Duration,
+		intent_id: String,
 	) -> anyhow::Result<()> {
 		invoice.check_signature().context("invalid invoice signature")?;
 
@@ -291,6 +293,7 @@ impl LightningManager {
 			user_fee,
 			attempt_block_height,
 			retry_for,
+			&intent_id,
 		).await?;
 		debug!("Bolt11 invoice sent for payment");
 
@@ -321,6 +324,7 @@ impl LightningManager {
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
 		retry_for: Duration,
+		intent_id: &str,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let node = self.active_node().context("no active cln node").map_err(PaymentPreflightRefusal)?;
@@ -333,7 +337,7 @@ impl LightningManager {
 		// Refuse an unqualified external endpoint before committing an attempt.
 		// Dispatch still rechecks it: endpoint changes after commit stay unknown.
 		let info = if sub.is_none() {
-			node.xpay.qualify_before_attempt().await.map_err(PaymentPreflightRefusal)?
+			node.xpay.node_info().await.map_err(PaymentPreflightRefusal)?
 		} else {
 			unary_rpc(node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await
 				.context("failed to get info from rpc")?.into_inner()
@@ -425,6 +429,7 @@ impl LightningManager {
 				// An intra-Ark payment short-circuits before xpay, so no
 				// routing budget is ever authorised for it.
 				sub.is_none().then_some(max_routing_fee),
+				Some(intent_id),
 			).await?;
 			if let Some((_, new)) = &mut new_xpay {
 				new.label = Some(attempt_id.to_string());
@@ -440,24 +445,7 @@ impl LightningManager {
 
 			// Only a validated sender and an actual subscription promotion can
 			// reach these post-commit notifications and backend cancellation.
-			let res = async {
-				let res = self.finish_intra_ark_payment(sub).await;
-				if let Err(e) = res {
-					trace!("Failed to update subscription status: {e:#}");
-					let attempt = self.db.read(async |t|
-						t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await
-					).await?.filter(|attempt| attempt.id == attempt_id)
-						.context("internal payment attempt disappeared")?;
-					self.payment_handler().fail_payment_attempt(&attempt, Some(&e.to_string())).await?;
-					return Err(e);
-				}
-				Ok::<_, anyhow::Error>(())
-			}.await;
-			if let Err(e) = res {
-				// The creation COMMIT above succeeded. An error here must not
-				// claim the recorded payment was refused before initiation.
-				error!(attempt_id, error = %format!("{e:#}"), "Recorded intra-Ark payment needs reconciliation");
-			}
+			self.finish_intra_ark_payment(sub).await;
 
 			return Ok(());
 		}
@@ -493,7 +481,7 @@ impl LightningManager {
 	async fn finish_intra_ark_payment(
 		&self,
 		subscription: LightningHtlcSubscription,
-	) -> anyhow::Result<()> {
+	) {
 		let payment_hash = PaymentHash::from(&subscription.invoice);
 		// Wake check_lightning_receive so the client sees Accepted.
 		let _ = self.payment_update_tx.send(payment_hash);
@@ -546,7 +534,6 @@ impl LightningManager {
 			},
 		}
 
-		Ok(())
 	}
 
 	/// Gets the outcome of a complete, recorded payment input set.
@@ -622,6 +609,7 @@ impl LightningManager {
 		expiry: Duration,
 		description: Option<String>,
 		receiver_mailbox_id: Option<MailboxIdentifier>,
+		claim_destination_user_pubkey: Option<bitcoin::secp256k1::PublicKey>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let node = self.hold_active_node().context("no active hold-compatible cln node")?;
 		let mut hold_client = node.hold_rpc.clone().expect("hold-active node has hold_rpc");
@@ -659,6 +647,7 @@ impl LightningManager {
 		let stored = self.db.write(async |t| {
 			t.store_generated_lightning_receive(
 				node.id, &invoice, amount.to_msat(), receiver_mailbox_id.as_ref(),
+				claim_destination_user_pubkey,
 				user_agent.as_deref(),
 			).await?;
 			hold_db::create_hold(&**t, &new_hold).await

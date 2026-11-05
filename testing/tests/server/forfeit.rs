@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::{Keypair, rand::thread_rng};
-use futures::future::join_all;
 use parking_lot::Mutex;
 
 use ark::{musig, ProtocolEncoding, SECP};
@@ -24,7 +23,6 @@ use ark_testing::exit::complete_exit;
 struct RecordForfeit {
 	nonces: Arc<Mutex<Option<Result<(), String>>>>,
 	forfeit: Arc<Mutex<Option<Result<(), String>>>>,
-	concurrent_nonces: bool,
 }
 
 #[async_trait::async_trait]
@@ -32,21 +30,6 @@ impl captaind::proxy::ArkRpcProxy for RecordForfeit {
 	async fn request_forfeit_nonces(
 		&self, upstream: &mut ArkClient, req: protos::ForfeitNoncesRequest,
 	) -> Result<protos::ForfeitNoncesResponse, tonic::Status> {
-		if self.concurrent_nonces {
-			let requests = (0..8).map(|_| {
-				let mut client = upstream.clone();
-				let request = req.clone();
-				tokio::spawn(async move { client.request_forfeit_nonces(request).await })
-			}).collect::<Vec<_>>();
-			let mut responses = join_all(requests).await.into_iter().map(|result|
-				result.expect("concurrent owner nonce task panicked")
-					.expect("genuine owner nonce request was refused").into_inner()).collect::<Vec<_>>();
-			let response = responses.remove(0);
-			assert_eq!(response.public_nonces.len(), req.vtxo_ids.len());
-			for replay in responses { assert_eq!(replay.public_nonces, response.public_nonces); }
-			*self.nonces.lock() = Some(Ok(()));
-			return Ok(response);
-		}
 		let res = upstream.request_forfeit_nonces(req).await;
 		*self.nonces.lock() = Some(res.as_ref().map(|_| ()).map_err(|e| e.message().to_owned()));
 		Ok(res?.into_inner())
@@ -186,14 +169,9 @@ async fn forfeit_calls_do_not_reveal_participation_membership() {
 	}
 
 	// the owners still forfeit, sending their attestations
-	let record = RecordForfeit { concurrent_nonces: true, ..RecordForfeit::default() };
-	let proxy = srv.start_proxy_no_mailbox(record.clone()).await;
-	victim.set_ark_url(&proxy.address).await;
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	victim.sync().await;
 	other.sync().await;
-	assert_eq!(*record.nonces.lock(), Some(Ok(())), "the real owner must reach the concurrent nonce requests");
-	assert_eq!(*record.forfeit.lock(), Some(Ok(())), "the original owner must complete its signed forfeit with those nonces");
 	let unforfeited = db.read(async |t| {
 		let row = t.query_one(
 			"SELECT count(*) FROM round_participation \

@@ -39,7 +39,6 @@ mod round;
 pub mod telemetry;
 pub mod utils;
 
-
 use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::database::BlockTable;
 use crate::database::htlc_vtxo::{self, HtlcDirection};
@@ -127,7 +126,6 @@ pub(crate) fn check_max_amount(
 		_ => Ok(()),
 	}
 }
-
 
 /// Return type for the round event RPC stream.
 ///
@@ -259,7 +257,7 @@ impl Server {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres).await?;
+		let db = database::Db::create_with_payouts(&cfg.postgres, cfg.expiry_payouts).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -356,6 +354,11 @@ impl Server {
 			server_key.public_key(),
 		);
 		info!("Running with config: {:#?}", cfg);
+		if cfg.ln_max_fee_ppm > 1_000_000 {
+			warn!("ln_max_fee_ppm is {}, above 100%: lightning sends may pay more routing \
+				fee than the user's fee covers", cfg.ln_max_fee_ppm,
+			);
+		}
 
 		info!("Starting server at {}", cfg.data_dir.display());
 
@@ -363,6 +366,8 @@ impl Server {
 		let db = database::Db::connect(&cfg.postgres)
 			.await
 			.context("failed to connect to db")?;
+		ensure!(db.expiry_payouts() == cfg.expiry_payouts,
+			"expiry_payouts differs from the mode fixed at database creation");
 
 		let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
 		bcd::require_network(&bitcoind, cfg.network).await?;
@@ -610,7 +615,6 @@ impl Server {
 	fn nursery_confirm_target(&self) -> BlockHeight {
 		self.chain_tip().height + self.config.nursery_confirm_target_blocks
 	}
-
 
 	pub async fn new_onchain_address(&self) -> anyhow::Result<Address> {
 		let mut wallet = self.rounds_wallet.lock().await;

@@ -454,7 +454,7 @@ async fn try_create_wallet(
 	// chain source client
 	let chain_spec = config.chain_source()
 		.context("failed to create a chain source client with the config")?;
-	let chain = ChainSource::new(chain_spec, net.as_bitcoin(), None, config.socks5_proxy.as_deref()).await
+	let chain = ChainSource::new(chain_spec, net.as_bitcoin(), None, None).await
 		.context("failed to create a chain source client with the config")?;
 	chain.require_version().await.context("chain source version check failed")?;
 
@@ -505,7 +505,6 @@ async fn try_create_wallet(
 			lock_manager: Some(lock_manager),
 			create_if_not_exists: true,
 			create_without_server: opts.force,
-
 			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
 			run_daemon: false,
 			..Default::default()
@@ -579,7 +578,6 @@ pub async fn open_wallet(datadir: &Path, user_agent: &str) -> anyhow::Result<Opt
 			persister: Some(db),
 			lock_manager: Some(lock_manager),
 			onchain: Some(onchain.clone()),
-
 			run_daemon: false,
 			..Default::default()
 		},

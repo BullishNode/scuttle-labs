@@ -33,14 +33,12 @@ fn check_auth_not_expired(auth: &MailboxAuthorization) -> Result<(), tonic::Stat
 
 #[allow(deprecated)]
 fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessage {
-	let owners = super::convert::owner_mailboxes(&entry.owner_mailboxes);
 	match entry.payload {
 		MailboxPayload::Arkoor { vtxos } => {
 			protos::mailbox_server::MailboxMessage {
 				message: Some(protos::mailbox_server::mailbox_message::Message::Arkoor(
 					protos::mailbox_server::ArkoorMessage {
 						vtxos: vtxos.into_iter().map(|v| v.serialize()).collect(),
-						owners,
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -74,8 +72,6 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 				message: Some(protos::mailbox_server::mailbox_message::Message::RecoveryVtxoIds(
 					protos::mailbox_server::RecoveryVtxoIdsMessage {
 						vtxo_ids: vtxo_ids.into_iter().map(|v| v.to_bytes().to_vec()).collect(),
-						// Locator posting authenticates the mailbox, not these coins.
-						owners: Vec::new(),
 					}
 				)),
 				checkpoint: entry.checkpoint.into(),
@@ -98,29 +94,6 @@ fn new_mailbox_msg(entry: MailboxEntry) -> protos::mailbox_server::MailboxMessag
 	}
 }
 
-#[cfg(test)]
-mod tests {
-	use std::collections::BTreeMap;
-
-	use super::*;
-
-	#[test]
-	fn recovery_locator_does_not_serialize_owner_metadata() {
-		let id = VtxoId::from_slice(&[1; 36]).unwrap();
-		let owner = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798".parse().unwrap();
-		let message = new_mailbox_msg(MailboxEntry {
-			checkpoint: Checkpoint::from(1_u64),
-			payload: MailboxPayload::RecoveryVtxoIds { vtxo_ids: vec![id] },
-			owner_mailboxes: BTreeMap::from([(id, owner)]),
-		});
-		assert_eq!(message.checkpoint, 1);
-		let Some(protos::mailbox_server::mailbox_message::Message::RecoveryVtxoIds(hint)) = message.message
-			else { panic!("expected recovery locator"); };
-		assert_eq!(hint.vtxo_ids, vec![id.to_bytes().to_vec()]);
-		assert!(hint.owners.is_empty(), "even an enriched internal hint must not expose coin ownership");
-	}
-}
-
 #[async_trait]
 impl rpc::server::MailboxService for crate::Server {
 	#[tracing::instrument(skip(self, req))]
@@ -128,7 +101,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostArkoorMessageRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > MAX_NB_MAILBOX_ARKOOR_VTXOS {
@@ -215,7 +188,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<protos::mailbox_server::MailboxMessages>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -257,7 +230,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<Self::SubscribeMailboxStream>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -336,7 +309,7 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostRecoveryVtxoIdsRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
+		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > MAX_NB_MAILBOX_RECOVERY_IDS {

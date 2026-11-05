@@ -43,15 +43,14 @@ impl Tx<'_> {
 	pub(crate) async fn internal_grants_reclaimed(
 		&self, source: VtxoId, hash: PaymentHash, tip: BlockHeight,
 		watchman_tip: BlockHeight,
-	) -> anyhow::Result<Option<(Vec<(i64, i64)>, BlockRef)>> {
-		let attempts = self.query("SELECT a.id,a.lightning_htlc_subscription_id,a.status::TEXT, \
+	) -> anyhow::Result<Option<BlockRef>> {
+		let attempts = self.query("SELECT a.lightning_htlc_subscription_id,a.status::TEXT, \
 			s.payment_hash,s.status::TEXT AS subscription_status FROM lightning_payment_attempt a \
 			JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
 			JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id \
 			WHERE l.vtxo_id=$1 AND a.payment_hash=$2 ORDER BY a.id",
 			&[&source.to_string(), &hash.to_string()]).await?;
 		if attempts.is_empty() { return Ok(None); }
-		let mut scope = Vec::with_capacity(attempts.len());
 		let mut last = 0u32;
 		for attempt in attempts {
 			if attempt.get::<_, &str>("status") != "failed"
@@ -60,14 +59,13 @@ impl Tx<'_> {
 				return Ok(None);
 			}
 			let subscription: i64 = attempt.get("lightning_htlc_subscription_id");
-			scope.push((attempt.get("id"), subscription));
 			let grants = self.query("
 				SELECT h.payment_hash,h.direction::TEXT,h.offchain_resolution::TEXT,
 					h.chain_resolution::TEXT,h.chain_resolution_height,
-					(SELECT MIN(a.confirmed_height) FROM expiry_allocation a
+					(SELECT MIN(a.confirmed_height) FROM expiry_allocation_state a
 						JOIN expiry_allocation_coin c ON c.allocation_id=a.id
 						JOIN expiry_entitlement e ON e.id=c.entitlement_id
-						WHERE e.vtxo_id=v.vtxo_id AND c.active
+						WHERE e.vtxo_id=v.vtxo_id
 						AND c.disposition='operator' AND a.status='confirmed') AS swept_height
 				FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id
 				WHERE v.lightning_htlc_subscription_id=$1 ORDER BY v.vtxo_id
@@ -94,7 +92,7 @@ impl Tx<'_> {
 		}
 		let block = self.get_block_by_height(BlockTable::Watchmand, BlockHeight::new(last)).await?
 			.context("grant reclaim block is not in the completed watchman view")?;
-		Ok(Some((scope, block)))
+		Ok(Some(block))
 	}
 
 	pub(crate) async fn lightning_source_state(
@@ -143,7 +141,7 @@ impl Tx<'_> {
 		for source in &requested {
 			match self.source_settlement(hash, *source).await? {
 				SourceSettlement::Funded => any_funded = true,
-				SourceSettlement::NotSettled | SourceSettlement::Disjoint => all_funded = false,
+				SourceSettlement::NotSettled => all_funded = false,
 				SourceSettlement::Unknown => {
 					self.warn_unknown_settlement(*source);
 					unknown = true;

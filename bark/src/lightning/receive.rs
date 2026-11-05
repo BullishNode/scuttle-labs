@@ -389,7 +389,7 @@ impl Wallet {
 		// on-chain HTLC-recv spend, possibly after this checkpoint is gone.
 		let amount = recv.invoice.get_payment_amount(None).unwrap_or(Amount::ZERO);
 		self.inner.db.record_settled_lightning_receive(
-			recv.payment_hash, recv.payment_preimage, &recv.invoice, amount, Some(&recv.association()),
+			recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
 		).await?;
 
 		Ok(())

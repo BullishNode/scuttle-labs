@@ -68,12 +68,10 @@ impl PostgresDatabaseManager {
 
 	/// Returns a client for a specific database.
 	pub async fn database_client(&self, db_name: Option<&str>) -> Client {
-		let client = match self {
+		match self {
 			Self::ExternallyHosted(p) => p.database_client(db_name).await,
 			Self::TestManaged(p) => p.database_client(db_name).await,
-		};
-		client.batch_execute("SET search_path TO public, scuttle").await.unwrap();
-		client
+		}
 	}
 
 	/// Returns a client for the global database, can be used to create test databases.

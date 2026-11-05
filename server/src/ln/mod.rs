@@ -18,16 +18,15 @@ use std::time::Duration;
 use anyhow::{bail, Context};
 use tokio::sync::broadcast;
 use bitcoin::Amount;
-use bitcoin::amount::CheckedSum;
 use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::secp256k1::{schnorr, PublicKey};
 use tracing::{error, info, trace, warn};
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy, VtxoRequest, ServerVtxo};
 use ark::arkoor::ArkoorDestination;
 use ark::vtxo::Full;
 use ark::arkoor::package::{ArkoorPackageCosignRequest, ArkoorPackageCosignResponse};
-use ark::attestations::LightningReceiveAttestation;
+use ark::attestations::{LightningReceiveAttestation, LightningSendIntent};
 use ark::fees::{validate_and_subtract_fee, VtxoFeeInfo};
 use ark::integration::{TokenStatus, TokenType};
 use ark::lightning::{Bolt12Invoice, Invoice, Offer, PaymentHash, PaymentStatus, Preimage};
@@ -48,8 +47,6 @@ use crate::database::ln::{
 use crate::error::ContextExt;
 use crate::owner_proof::OwnerLinks;
 use crate::{check_max_amount, telemetry, Server, CAPTAIND_API_KEY};
-
-
 
 /// Validate the client-requested HTLC-recv VTXO expiry leaves at
 /// least `htlc_expiry_delta` blocks of settlement margin below the
@@ -154,7 +151,6 @@ pub(crate) fn validate_intra_ark_payment(
 	Ok(())
 }
 
-
 /// The margin (in blocks) the server requires between the current chain tip
 /// and the lowest incoming HTLC expiry when cosigning a lightning receive
 /// claim backed by an external Lightning payment.
@@ -230,8 +226,7 @@ impl Server {
 
 		let payment_hash = requested_policy.payment_hash;
 
-		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount)
-			.checked_sum().badarg("HTLC amount overflow")?;
+		let htlc_amount = htlc_vtxos.iter().map(|v| v.total_amount).sum::<Amount>();
 		check_max_amount("lightning send", htlc_amount, self.config.max_ln_send_amount)?;
 
 		// Held for the whole call, so no other call decides on this payment
@@ -303,10 +298,13 @@ impl Server {
 		payment_amount: Amount,
 		htlc_vtxo_ids: Vec<VtxoId>,
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
-		retry_for: Option<Duration>,
+		retry_for_secs: Option<u32>,
+		intent_nonce: Option<Vec<u8>>,
+		source_owner_signatures: Vec<Vec<u8>>,
 	) -> anyhow::Result<()> {
 		//TODO(stevenroose) validate vtxo generally (based on input)
 		check_max_amount("lightning send", payment_amount, self.config.max_ln_send_amount)?;
+		let retry_for = retry_for_secs.map(|secs| Duration::from_secs(secs.into()));
 
 		let retry_for = match retry_for {
 			None => self.config.cln_xpay_timeout,
@@ -352,13 +350,37 @@ impl Server {
 			vtxos.push(vtxo);
 		}
 		// An exact retry acknowledges existing work even if its node or a new
-		// admission view is now unavailable. The monitor owns any re-drive.
+		// admission view is now unavailable. It never resubmits the recorded call.
 		if recorded { return Ok(()); }
-		if let Invoice::Bolt11(invoice) = &invoice {
-			if invoice.is_expired() {
-				return badarg!("invoice has expired");
-			}
+		if htlc_vtxo_ids.is_empty() || source_owner_signatures.len() != htlc_vtxo_ids.len() {
+			return badarg!("each Lightning source needs an owner signature");
 		}
+		let mut unique_ids = htlc_vtxo_ids.clone();
+		unique_ids.sort_unstable();
+		unique_ids.dedup();
+		if unique_ids.len() != htlc_vtxo_ids.len() {
+			return badarg!("duplicate Lightning source");
+		}
+		let nonce: [u8; 32] = intent_nonce
+			.ok_or_else(|| badarg_err!("missing Lightning send intent nonce"))?
+			.try_into().map_err(|_| badarg_err!("Lightning send intent nonce must be 32 bytes"))?;
+		let intent = LightningSendIntent::new(
+			nonce, self.server_pubkey, self.config.network, &invoice, payment_amount,
+			&htlc_vtxo_ids, mailbox_id, retry_for_secs,
+		);
+		for (source_id, signature) in htlc_vtxo_ids.iter().zip(&source_owner_signatures) {
+			let vtxo = vtxos.iter().find(|vtxo| vtxo.id() == *source_id)
+				.context("Lightning source is missing")?;
+			let signature = schnorr::Signature::from_slice(signature)
+				.badarg("invalid Lightning source owner signature")?;
+			intent.verify(&signature, vtxo.user_pubkey())
+				.badarg("Lightning source owner signature does not match payment intent")?;
+		}
+		let intent_id = intent.id().to_string();
+		let used = self.db.read(async |t| Ok(t.query_opt(
+			"SELECT 1 FROM lightning_payment_attempt WHERE intent_id=$1", &[&intent_id],
+		).await?.is_some())).await?;
+		if used { return badarg!("Lightning send intent was already used"); }
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
@@ -372,17 +394,24 @@ impl Server {
 			htlc_vtxo_sum += htlc_vtxo.amount();
 		}
 
-		// New admissions must match the fixed invoice's rounded satoshi quote.
-		// Recorded retries above retain their original payment parameters.
+		// Verify against the invoice amount if applicable, disallowing underpayments.
 		if let Some(invoice_msat) = invoice.amount_msat() {
-			if payment_amount != Amount::from_msat_ceil(invoice_msat) {
-				return badarg!("requested payment amount must equal the fixed invoice amount");
+			if invoice_msat > payment_amount.to_msat() {
+				return badarg!("requested payment amount too low for invoice");
+			}
+			if invoice_msat < payment_amount.to_msat() / 2 {
+				return badarg!("requested payment amount more than double invoice amount");
 			}
 		}
 
 		if let Some(sub) = self.db.read(async |t|
 			t.get_htlc_subscription_by_payment_hash(payment_hash).await
 		).await? {
+			if let Invoice::Bolt11(invoice) = &invoice {
+				if invoice.is_expired() {
+					return badarg!("invoice has expired");
+				}
+			}
 			validate_intra_ark_payment(&sub, &invoice, payment_amount)?;
 		}
 
@@ -427,6 +456,7 @@ impl Server {
 			user_fee,
 			attempt_block_height,
 			retry_for,
+			intent_id,
 		).await?;
 
 		Ok(())
@@ -548,7 +578,7 @@ impl Server {
 						t.warn_unknown_settlement(*source);
 						unknown = true;
 					},
-					crate::database::ln::SourceSettlement::NotSettled | crate::database::ln::SourceSettlement::Disjoint => {},
+					crate::database::ln::SourceSettlement::NotSettled => {},
 				}
 			}
 			// Release no funds when settlement is unknown; return the
@@ -689,6 +719,7 @@ impl Server {
 				return badarg!("Requested amount exceeds limit of {}", max);
 			}
 		}
+		let mut claim_destination_user_pubkey = None;
 		if let Some(destination) = claim_destination {
 			let policy = VtxoPolicy::deserialize(&destination.policy).badarg("invalid claim destination policy")?;
 			if !matches!(policy, VtxoPolicy::Pubkey(_)) {
@@ -698,9 +729,10 @@ impl Server {
 				return badarg!("claim destination amount differs from receive amount after fees");
 			}
 			let mut links = OwnerLinks::default();
-			links.insert_request(&destination)?;
+			links.insert_request(&destination, self.config.expiry_payouts)?;
 			self.db.write(async |t| links.verify(t, [policy.user_pubkey()],
 				self.mailbox_key.leak_ref(), self.config.network).await).await?;
+			claim_destination_user_pubkey = Some(policy.user_pubkey());
 		}
 
 		// A payment hash carries at most one subscription.
@@ -708,6 +740,9 @@ impl Server {
 			t.get_htlc_subscription_by_payment_hash(payment_hash).await
 		).await?;
 		if let Some(subscription) = subscription {
+			if subscription.claim_destination_user_pubkey != claim_destination_user_pubkey {
+				return badarg!("invoice already exists for another claim destination");
+			}
 			match subscription.status {
 				LightningHtlcSubscriptionStatus::Created => {
 					let existing_expiry = subscription.invoice.expiry_time();
@@ -744,6 +779,7 @@ impl Server {
 
 		let invoice = self.lightning_manager.generate_invoice(
 			payment_hash, amount, ln_cltv_delta, expiry, description, mailbox_id,
+			claim_destination_user_pubkey,
 		).await?;
 		trace!("Hold invoice created. payment_hash: {}, amount: {}, {}",
 			payment_hash, amount, invoice.to_string(),
@@ -846,7 +882,9 @@ impl Server {
 		owner_links: &crate::owner_proof::OwnerLinks,
 		client_address: Option<SocketAddr>,
 	) -> anyhow::Result<(LightningHtlcSubscription, Vec<Vtxo<Full>>)> {
-		owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		if self.config.expiry_payouts {
+			owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
+		}
 		// Held for the whole call. The status only becomes `htlcs-ready` after
 		// the arkoor is persisted, so without this lock concurrent calls each
 		// allocate a full HTLC set for one invoice and can each return a
@@ -855,6 +893,16 @@ impl Server {
 
 		let mut sub = self.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await?
 			.not_found([payment_hash], "no pending payment with this payment hash")?;
+		if let Some(invoice_mailbox) = self.db.read(async |t|
+			t.get_lightning_receiver_mailbox_id(payment_hash).await
+		).await? {
+			let claimant_mailbox = owner_links.verified_mailbox(
+				user_pubkey, self.mailbox_key.leak_ref(), self.config.network,
+			)?;
+			if claimant_mailbox != invoice_mailbox {
+				return badarg!("receive claimant does not own the invoice mailbox");
+			}
+		}
 
 		slog!(LightningReceivePrepareRequested, payment_hash, user_pubkey, htlc_recv_expiry);
 
@@ -1118,14 +1166,20 @@ impl Server {
 		};
 		let builder = self.validate_cosign_request(validation, cosign_request)
 			.badarg("invalid cosign request")?;
+		if let Some(intended) = sub.claim_destination_user_pubkey {
+			for output in builder.build_unsigned_vtxos() {
+				if output.policy() != &VtxoPolicy::new_pubkey(intended) {
+					return badarg!("receive output differs from the invoice claim destination");
+				}
+			}
+		}
 
 		let receive_claims = crate::database::expiry_receive::ReceiveClaimBinding::from_package(&builder)
 			.badarg("invalid receive destination")?;
 		ensure!(receive_claims.len() == htlc_ids.len(), "receive claim contains a non-receive source");
 		let checkpoint = self.db.write(async |t| {
 			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
-			let checkpoint = t.store_htlc_settlement_from(payment_preimage,
-				crate::database::ln::HtlcSettlementOrigin::Receive(sub.id)).await?;
+			let checkpoint = t.store_htlc_settlement(payment_preimage).await?;
 			t.prepare_receive_claims(&receive_claims).await?;
 			Ok(checkpoint)
 		}).await?;
@@ -1160,7 +1214,6 @@ impl Server {
 		Ok(builder.cosign_response())
 	}
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1201,6 +1254,7 @@ mod tests {
 			id: 1,
 			lightning_node_id: 1,
 			payment_hash: PaymentHash::from(&invoice),
+			claim_destination_user_pubkey: None,
 			invoice: invoice,
 			status: LightningHtlcSubscriptionStatus::Created,
 			lowest_incoming_htlc_expiry: None,

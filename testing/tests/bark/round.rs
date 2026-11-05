@@ -7,7 +7,8 @@ use futures::future::join_all;
 use log::{debug, info, trace};
 use tokio_stream::StreamExt;
 
-use ark::{VtxoPolicy, VtxoRequest};
+use ark::{ProtocolEncoding, VtxoPolicy, VtxoRequest};
+use ark::attestations::RoundParticipationStatusAttestation;
 use ark::rounds::RoundEvent;
 use ark::tree::signed::HashlockVersion;
 use ark::vtxo::policy::PubkeyVtxoPolicy;
@@ -15,7 +16,7 @@ use bark::persist::models::{StoredRoundState, Unlocked};
 use bark::round::{RoundFlowKind, RoundParticipation};
 use bark::subsystem::RoundMovement;
 use bark::vtxo::{VtxoLockHolder, VtxoState};
-use server::database::Db;
+use server::database::{Db, MailboxPayload};
 use server_log::{AttemptingRound, NoRoundPayments, RestartMissingVtxoSigs, RoundFinished, RoundUserVtxoNotAllowed};
 use server_rpc::protos;
 
@@ -23,6 +24,178 @@ use ark_testing::{TestContext, btc, is_bark_version, require_bark_version, sat, 
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::daemon::captaind::{self, ArkClient};
 use ark_testing::util::FutureExt;
+
+#[tokio::test]
+async fn delegated_round_equal_outputs_in_separate_participations_keep_their_hashes() {
+	// Two participations may request the same policy and amount. Each wallet
+	// result must select the leaf locked to that participation's unlock hash.
+
+	require_bark_version!(> "0.6.2");
+
+	let ctx = TestContext::new("bark/delegated_round_equal_outputs_in_separate_participations_keep_their_hashes").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv)
+		.cfg(|cfg| cfg.daemon_manual_sync = true)
+		.funded(sat(1_000_000)).create().await;
+
+	let [first_id] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("first board has one output");
+	let [second_id] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("second board has one output");
+
+	let expected_hashes = {
+		let wallet = bark.client().await;
+		let first = wallet.build_refresh_participation(vec![first_id]).await.unwrap()
+			.expect("first input can refresh");
+		let mut second = wallet.build_refresh_participation(vec![second_id]).await.unwrap()
+			.expect("second input can refresh");
+		assert_eq!(first.outputs.len(), 1);
+		assert_eq!(second.outputs.len(), 1);
+		second.outputs = first.outputs.clone();
+		wallet.join_next_round_delegated(first, Some(RoundMovement::Refresh)).await.unwrap();
+		wallet.join_next_round_delegated(second, Some(RoundMovement::Refresh)).await.unwrap();
+		let pending = wallet.pending_round_states().await.unwrap();
+		assert_eq!(pending.len(), 2);
+		assert_ne!(pending[0].state().unlock_hash(), pending[1].state().unlock_hash());
+		pending.iter().map(|state| state.state().unlock_hash().unwrap()).collect::<HashSet<_>>()
+	};
+
+	let mut finished = srv.subscribe_log::<RoundFinished>();
+	srv.trigger_round().await;
+	finished.recv().wait(secs(30)).await.expect("round with two participants should finish");
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+
+	let wallet = bark.client().await;
+	for _ in 0..10 {
+		wallet.sync().await;
+		if wallet.pending_round_states().await.unwrap().is_empty() { break; }
+		ctx.generate_blocks(1).await;
+	}
+	assert!(wallet.pending_round_states().await.unwrap().is_empty(), "round states should complete");
+	let vtxos = wallet.spendable_vtxos().await.unwrap();
+	assert_eq!(vtxos.len(), 2, "each forfeited input must produce a spendable output");
+	assert_ne!(vtxos[0].vtxo.id(), vtxos[1].vtxo.id(), "outputs must be distinct leaves");
+	let full_vtxos = wallet.get_full_vtxos(vtxos.iter().map(|v| v.vtxo.id())).await.unwrap();
+	assert_eq!(full_vtxos.iter().map(|v| v.unlock_hash().unwrap()).collect::<HashSet<_>>(), expected_hashes);
+}
+
+#[tokio::test]
+async fn interactive_round_equal_outputs_in_separate_participations_keep_their_hashes() {
+	// Completing an interactive round must bind each equal output request to
+	// the participation that will forfeit its input for that output.
+
+	require_bark_version!(> "0.6.2");
+
+	let ctx = TestContext::new("bark/interactive_round_equal_outputs_in_separate_participations_keep_their_hashes").await;
+	let srv = ctx.captaind("server").cfg(|cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+	}).funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv)
+		.cfg(|cfg| cfg.daemon_manual_sync = true)
+		.funded(sat(1_000_000)).create().await;
+
+	let [first_id] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("first board has one output");
+	let [second_id] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("second board has one output");
+
+	let wallet = Arc::new(bark.client().await);
+	let first = wallet.build_refresh_participation(vec![first_id]).await.unwrap()
+		.expect("first input can refresh");
+	let mut second = wallet.build_refresh_participation(vec![second_id]).await.unwrap()
+		.expect("second input can refresh");
+	assert_eq!(first.outputs.len(), 1);
+	assert_eq!(second.outputs.len(), 1);
+	second.outputs = first.outputs.clone();
+
+	let first_state = wallet.join_next_round(first, Some(RoundMovement::Refresh)).await.unwrap();
+	let second_state = wallet.join_next_round(second, Some(RoundMovement::Refresh)).await.unwrap();
+	drop(first_state);
+	drop(second_state);
+	assert_eq!(wallet.pending_round_states().await.unwrap().len(), 2);
+
+	let mut finished = srv.subscribe_log::<RoundFinished>();
+	let (driven, ()) = tokio::join!(wallet.participate_ongoing_rounds(), srv.trigger_round());
+	driven.expect("wallet should process the round event stream");
+	let result = finished.recv().wait(secs(30)).await.expect("round should finish");
+	assert_eq!(result.nb_input_vtxos, 2, "both input coins must enter the round");
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	wallet.sync().await;
+
+	let vtxos = wallet.spendable_vtxos().await.unwrap();
+	assert_eq!(vtxos.len(), 2, "each forfeited input must produce a spendable output");
+	assert_ne!(vtxos[0].vtxo.id(), vtxos[1].vtxo.id(), "outputs must be distinct leaves");
+	let full_vtxos = wallet.get_full_vtxos(vtxos.iter().map(|v| v.vtxo.id())).await.unwrap();
+	assert_ne!(full_vtxos[0].unlock_hash(), full_vtxos[1].unlock_hash());
+}
+
+#[tokio::test]
+async fn interactive_round_posts_recovery_notice() {
+	interactive_round_recovery_notice(false).await;
+}
+
+#[tokio::test]
+async fn payout_interactive_round_posts_recovery_notice() {
+	interactive_round_recovery_notice(true).await;
+}
+
+async fn interactive_round_recovery_notice(payout: bool) {
+	require_bark_version!(> "0.6.2");
+	let ctx = TestContext::new(if payout {
+		"bark/payout_interactive_round_posts_recovery_notice"
+	} else { "bark/interactive_round_posts_recovery_notice" }).await;
+	let srv = ctx.captaind("server").cfg(move |cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+		cfg.round_status_attestation_required = true;
+		cfg.expiry_payouts = payout;
+	}).funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv)
+		.cfg(|cfg| cfg.daemon_manual_sync = true)
+		.funded(sat(500_000)).create().await;
+	let [input] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("one board output");
+	let wallet = bark.client().await;
+	let participation = wallet.build_refresh_participation(vec![input]).await.unwrap()
+		.expect("board coin can refresh");
+	let round = wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
+	drop(round);
+	let mut finished = srv.subscribe_log::<RoundFinished>();
+	let (driven, ()) = tokio::join!(wallet.participate_ongoing_rounds(), srv.trigger_round());
+	driven.expect("interactive round should finish");
+	let finished = finished.recv().wait(secs(30)).await.expect("server should finish the round");
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let expected_hash = db.read(async |t| {
+		let rows = t.query("SELECT vtxo FROM vtxo WHERE anchor_point=$1",
+			&[&format!("{}:0", finished.txid)]).await?;
+		Ok(rows.into_iter().find_map(|row| {
+			let coin = ark::ServerVtxo::<ark::vtxo::Full>::deserialize(row.get("vtxo")).ok()?;
+			coin.unlock_hash()
+		}))
+	}).await.unwrap().expect("the finished round has a hash-locked output");
+	let mailbox = wallet.mailbox_identifier();
+	let entries = db.read(async |t| t.get_mailbox_messages(mailbox, 0, 100).await).await.unwrap();
+	let matches = entries.iter().filter(|entry| matches!(&entry.payload,
+		MailboxPayload::RoundParticipationCompleted { unlock_hash } if *unlock_hash == expected_hash
+	)).count();
+	assert_eq!(matches, 1, "the output must have one matching recovery notice");
+	let mut rpc = srv.get_public_rpc().await;
+	let status = rpc.round_participation_status(protos::RoundParticipationStatusRequest {
+		unlock_hash: expected_hash.serialize(),
+		attestation: RoundParticipationStatusAttestation::new(
+			expected_hash, &wallet.mailbox_keypair(),
+		).serialize(),
+	}).await.expect("owner can authenticate the completed round status").into_inner();
+	assert_eq!(status.output_vtxos.len(), 1);
+	let denied = rpc.round_participation_status(protos::RoundParticipationStatusRequest {
+		unlock_hash: expected_hash.serialize(), attestation: vec![],
+	}).await.expect_err("unauthenticated round status must be hidden");
+	assert_eq!(denied.code(), tonic::Code::NotFound);
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	wallet.sync().await;
+	assert_eq!(wallet.spendable_vtxos().await.unwrap().len(), 1);
+}
 
 #[tokio::test]
 async fn large_round() {

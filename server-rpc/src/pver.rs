@@ -38,6 +38,6 @@ pub const PROTOCOL_VERSION_BOARD_FUNDING_TX: u64 = 4;
 /// participations from clients below this version with an upgrade error.
 pub const PROTOCOL_VERSION_HASHLOCK_CLAUSES: u64 = 5;
 
-/// Scuttle's fixed fork wire epoch. Upstream and older fork clients must not
-/// interpret joint-owner fields, scoped status or fork spend states as upstream.
-pub const PROTOCOL_VERSION_SCUTTLE: u64 = 1001;
+/// Joint ownership and automatic expired-backing payouts. Payout-on servers
+/// require this version; payout-off servers retain the ordinary range.
+pub const PROTOCOL_VERSION_EXPIRY_PAYOUTS: u64 = 6;

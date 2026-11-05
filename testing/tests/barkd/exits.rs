@@ -1,24 +1,14 @@
 
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use ark::ProtocolEncoding;
 use bitcoin::Txid;
-
-use bark::persist::BarkPersister;
-use bark::persist::sqlite::{SqliteClient, DEFAULT_DB_FILE};
-use bark::vtxo::{VtxoLockHolder, VtxoState};
 
 use bark_json::exit::ExitState;
 use bark_json::movements::MovementStatus;
 use bark_json::primitives::VtxoStateInfo;
 
 use ark_testing::{btc, require_bark_version, sat, TestContext};
-use bark_rest_client::apis::{exits_api, wallet_api, Error};
-use bark_rest_client::models::{ExitStartRequest, OffboardVtxosRequest};
-use ark_testing::daemon::captaind::{self, ArkClient};
-use server_rpc::protos;
+use bark_rest_client::apis::exits_api;
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 
 use super::helpers::{
@@ -38,7 +28,8 @@ async fn exit_start_all_and_progress_barkd() {
 	// Board into a VTXO, then refresh into a round so it's fully in-round.
 	let barkd = ctx.barkd("barkd1", &srv).boarded(sat(500_000)).create().await;
 
-	tokio::join!(barkd.refresh_all(), srv.trigger_round());
+	barkd.refresh_all().await;
+	srv.trigger_round().await;
 	wait_for_rounds_complete(&ctx, &barkd).await;
 
 	let balance_before = barkd.bark_balance().await;
@@ -92,7 +83,8 @@ async fn exit_claim_all_barkd() {
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 	let barkd = ctx.barkd("barkd1", &srv).boarded(sat(500_000)).create().await;
 
-	tokio::join!(barkd.refresh_all(), srv.trigger_round());
+	barkd.refresh_all().await;
+	srv.trigger_round().await;
 	wait_for_rounds_complete(&ctx, &barkd).await;
 
 	srv.stop().await.unwrap();
@@ -116,31 +108,13 @@ async fn exit_claim_all_barkd() {
 	);
 }
 
-#[derive(Clone)]
-struct HoldTargetedExitInput(Arc<AtomicUsize>);
-
-#[async_trait::async_trait]
-impl captaind::proxy::ArkRpcProxy for HoldTargetedExitInput {
-	async fn prepare_offboard(
-		&self, _upstream: &mut ArkClient, _request: protos::PrepareOffboardRequest,
-	) -> Result<protos::PrepareOffboardResponse, tonic::Status> {
-		self.0.fetch_add(1, Ordering::SeqCst);
-		// No server preparation, signed forfeit or financial effect is forwarded.
-		Err(tonic::Status::unavailable("declared offboard preparation outage"))
-	}
-}
-
 /// Verify `POST /exits/start/vtxos` exits only the specified VTXO.
 #[tokio::test]
 async fn exit_start_vtxos_barkd() {
 	let ctx = TestContext::new("barkd/exit_start_vtxos_barkd").await;
 
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
-	let prepare_calls = Arc::new(AtomicUsize::new(0));
-	let proxy = srv.start_proxy_no_mailbox(HoldTargetedExitInput(prepare_calls.clone())).await;
-	let proxy_url = proxy.address.clone();
-	let barkd = ctx.barkd("barkd1", &srv).funded(sat(300_000))
-		.cfg(move |cfg| cfg.server_address = proxy_url).create().await;
+	let barkd = ctx.barkd("barkd1", &srv).funded(sat(300_000)).create().await;
 
 	// Create two VTXOs.
 	wait_for_onchain_balance(&barkd, sat(300_000)).await;
@@ -155,45 +129,7 @@ async fn exit_start_vtxos_barkd() {
 	let target_id = vtxos[0].id.to_string();
 	let other_id = vtxos[1].id.to_string();
 
-	// The normal public offboard path reserves the other source. Its only
-	// declared fault is Unavailable before prepare is forwarded upstream.
-	let config = barkd.client_config();
-	wallet_api::offboard_vtxos(&config, OffboardVtxosRequest {
-		address: Some(ctx.bitcoind().get_new_address().to_string()),
-		vtxos: vec![other_id.clone()],
-	}).await.expect_err("offboard must remain pending during the preparation outage");
-	assert!(prepare_calls.load(Ordering::SeqCst) > 0);
-	let database_path = barkd.datadir().join(DEFAULT_DB_FILE);
-	assert!(database_path.exists(), "the real daemon wallet database must already exist");
-	let local = SqliteClient::open(database_path).unwrap();
-	let held_id = vtxos[1].id;
-	let held = local.get_wallet_vtxo(held_id).await.unwrap().unwrap();
-	assert!(held.fallback_status.is_none(), "this is an ordinary action-held source");
-	let action_id = match &held.state {
-		VtxoState::Locked { holder: Some(VtxoLockHolder::Action { id }) } => id.clone(),
-		state => panic!("offboard did not retain its exact action holder: {state:?}"),
-	};
-	let checkpoint = local.get_wallet_action_checkpoint(&action_id).await.unwrap().unwrap();
-	assert!(matches!(&checkpoint, bark::actions::WalletActionCheckpoint::Offboard(_)));
-	let signed = local.get_full_vtxo(held_id).await.unwrap().unwrap();
-	assert!(signed.has_all_witnesses());
-	let history = serde_json::to_value(barkd.history(None, None).await).unwrap();
 	srv.stop().await.unwrap();
-
-	for requested in [vec![other_id.clone()], vec![target_id.clone(), other_id.clone()]] {
-		match exits_api::exit_start_vtxos(&config, ExitStartRequest { vtxos: requested }).await {
-			Err(Error::ResponseError(response)) => {
-				assert_eq!(response.status, 400);
-				assert!(response.content.contains("not eligible for a targeted exit"), "{}", response.content);
-			},
-			_ => panic!("targeted exit must return an HTTP refusal"),
-		}
-		assert!(local.get_exit_vtxo_entries().await.unwrap().is_empty(), "no partial exit can start");
-		assert_eq!(local.get_wallet_vtxo(held_id).await.unwrap().unwrap(), held);
-		assert_eq!(local.get_full_vtxo(held_id).await.unwrap().unwrap().serialize(), signed.serialize());
-		assert_eq!(local.get_wallet_action_checkpoint(&action_id).await.unwrap().unwrap(), checkpoint);
-		assert_eq!(serde_json::to_value(barkd.history(None, None).await).unwrap(), history);
-	}
 
 	// Exit only one VTXO.
 	barkd.exit_start_vtxos(vec![target_id.clone()]).await;
@@ -262,7 +198,8 @@ async fn exit_auto_progress_disconnected_barkd() {
 	// Setup: board and refresh into round.
 	let barkd = ctx.barkd("barkd1", &srv).boarded(sat(500_000)).create().await;
 
-	tokio::join!(barkd.refresh_all(), srv.trigger_round());
+	barkd.refresh_all().await;
+	srv.trigger_round().await;
 	wait_for_rounds_complete(&ctx, &barkd).await;
 
 	// Stop server — barkd becomes disconnected.

@@ -2,7 +2,6 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-
 use std::path::PathBuf;
 use std::process;
 use std::str::FromStr;
@@ -20,7 +19,7 @@ use ark::integration::{TokenStatus, TokenType};
 use ark::VtxoId;
 use server::{bitcoind as bcd, filters, Config, Server, CAPTAIND_CLI_API_KEY};
 use server::utils::block_duration;
-use server_rpc::{self as rpc, protos, RequestExt};
+use server_rpc::{self as rpc, protos};
 
 /// Defaults to our default port on localhost.
 const DEFAULT_ADMIN_RPC_ADDR: &str = "127.0.0.1:3536";
@@ -117,7 +116,13 @@ enum Command {
 enum RpcCommand {
 	/// Observe an existing Lightning attempt on its recorded online node.
 	#[command()]
-	ReconcileLightningAttempt { attempt_id: i64 },
+	ReconcileLightningAttempt {
+		attempt_id: i64,
+		/// Confirm the whole original CLN/plugin process group was stopped/reaped,
+		/// its same persistent backend restarted, and new dispatch excluded.
+		#[arg(long)]
+		native_cold_restart_confirmed: bool,
+	},
 	/// Report server wallet status
 	#[command()]
 	Wallet,
@@ -686,11 +691,10 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 	debug!("Query admin rpc-endpoint at {}", endpoint);
 
 	match cmd {
-		RpcCommand::ReconcileLightningAttempt { attempt_id } => {
-			let mut rpc = rpc::admin::ScuttleServiceClient::connect(endpoint)
+		RpcCommand::ReconcileLightningAttempt { attempt_id, native_cold_restart_confirmed } => {
+			let mut rpc = rpc::admin::LightningAdminServiceClient::connect(endpoint)
 				.await.context("failed to connect to operator rpc")?;
-			let mut request = tonic::Request::new(protos::scuttle::ReconcileLightningAttemptRequest { attempt_id });
-			request.set_pver(rpc::pver::PROTOCOL_VERSION_SCUTTLE);
+			let request = protos::ReconcileLightningAttemptRequest { attempt_id, native_cold_restart_confirmed };
 			let response = rpc.reconcile_lightning_attempt(request).await?.into_inner();
 			serde_json::to_writer_pretty(std::io::stdout(), &serde_json::json!({
 				"attempt_id": response.attempt_id,

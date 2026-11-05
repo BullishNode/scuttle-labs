@@ -200,6 +200,9 @@ fn validate_payment_amounts(
 	let mut in_set = HashSet::with_capacity(inputs.len());
 	let mut in_sum = Amount::ZERO;
 	for input in inputs {
+		input.check_standard().map_err(|e| badarg_err!(
+			"input VTXO {} cannot be enforced onchain: {}", input.id(), e,
+		))?;
 		// checked_add: bitcoin::Amount addition panics on overflow, so never feed it
 		// an untrusted running total. See the output loop below for the client-facing case.
 		in_sum = in_sum.checked_add(input.amount())
@@ -508,7 +511,9 @@ impl CollectingPayments {
 				"should be checked before",
 			);
 
-			self.all_outputs.push(VtxoParticipant::new_signed(req.clone(), unlock_hash, unblinded_mailbox_id));
+			self.all_outputs.push(VtxoParticipant::new_signed(
+				req.clone(), unlock_hash, unblinded_mailbox_id,
+			));
 		}
 
 		assert!(self.interactive_participants.insert(unlock_hash, InteractiveParticipation {
@@ -660,7 +665,8 @@ impl CollectingPayments {
 
 		// Finally, we are done
 		self.register_interactive_participation(
-			flux_guard, input_vtxos, vtxo_requests, unblinded_mailbox_id, unlock_preimage, user_agent_name,
+			flux_guard, input_vtxos, vtxo_requests, unblinded_mailbox_id,
+			unlock_preimage, user_agent_name,
 			actual_fee.to_sat(),
 		);
 
@@ -737,6 +743,19 @@ impl CollectingPayments {
 				));
 			},
 		};
+
+		// A resubmission over these inputs takes the same flux lock while it
+		// replaces the stored participation, so now that we hold the lock the
+		// row is either still there or gone for good. Using a row that is gone
+		// would spend its inputs for a leaf nobody holds the preimage of.
+		let exists = srv.db.read(async |t| t.unlock_hash_exists(participation.unlock_hash).await).await;
+		match exists {
+			Ok(true) => {},
+			Ok(false) => return Err(ProcessHarkParticipationError::Superseded),
+			Err(e) => return Err(ProcessHarkParticipationError::CheckFailed(
+				e.context("failed to check the participation still exists")
+			)),
+		}
 
 		for input in &participation.inputs {
 			if self.all_inputs.contains_key(&input.vtxo_id) {
@@ -822,6 +841,18 @@ impl CollectingPayments {
 				Ok(()) => {},
 				// NB we already slog this when producing an error
 				Err(ProcessHarkParticipationError::RoundFull) => continue,
+				Err(ProcessHarkParticipationError::Superseded) => {
+					debug!("Skipping hArk round participation for unlock hash {}: \
+						superseded by a newer submission", unlock_hash,
+					);
+					continue;
+				},
+				Err(ProcessHarkParticipationError::CheckFailed(e)) => {
+					warn!("Skipping hArk round participation for unlock hash {} \
+						this round: {:#}", unlock_hash, e,
+					);
+					continue;
+				},
 				Err(ProcessHarkParticipationError::BadParticipation(e)) => {
 					slog!(RoundParticipationRejected, unlock_hash, reason: format!("{:#}", e));
 
@@ -897,8 +928,6 @@ impl CollectingPayments {
 				unblinded_mailbox_id: None,
 			});
 		}
-
-		let padding_output_indices = (real_outputs.len()..self.all_outputs.len()).collect();
 
 		let mut vtxos_spec = VtxoTreeSpec::new(
 			self.all_outputs.iter().map(|p| p.req.clone()).collect(),
@@ -992,7 +1021,6 @@ impl CollectingPayments {
 			interactive_participants: self.interactive_participants,
 			delegated_participants: self.delegated_participants,
 			real_outputs,
-			padding_output_indices,
 			cosign_part_sigs: HashMap::with_capacity(unsigned_vtxo_tree.nb_leaves()),
 			unsigned_vtxo_tree,
 			funding_tx,
@@ -1014,6 +1042,12 @@ impl CollectingPayments {
 enum ProcessHarkParticipationError {
 	RoundFull,
 	BadParticipation(anyhow::Error),
+	/// The participation was replaced by a newer submission over its inputs
+	/// between the round reading it and locking its inputs.
+	Superseded,
+	/// The round could not verify the participation; it stays stored for a
+	/// later round.
+	CheckFailed(anyhow::Error),
 }
 
 pub struct SigningVtxoTree {
@@ -1042,8 +1076,6 @@ pub struct SigningVtxoTree {
 	/// tree-shape padding is added. Used to emit per-policy telemetry once
 	/// the round is known to have succeeded.
 	real_outputs: Vec<VtxoRequest>,
-	/// Output positions created only by the private padding loop.
-	padding_output_indices: Vec<usize>,
 	/// Mailbox IDs for each output VTXO (in same order as vtxo tree leaves).
 	/// Used to post VTXOs to mailboxes after round finalization for wallet recovery.
 	/// None for server-generated padding VTXOs which don't need mailbox delivery.
@@ -1310,16 +1342,13 @@ async fn persist_round(
 			);
 		}
 	}
-	let padding_ids = state.padding_output_indices.iter()
-		.map(|index| signed_vtxos.build_vtxo(*index).id()).collect::<Vec<_>>();
 	let result = srv.db.write(async |t| {
 		t.finish_round(
 			round_step.round_seq(),
 			unsigned_funding_tx,
 			state.all_inputs.keys().copied(),
 			signed_vtxos,
-			&state.interactive_participants,
-			&padding_ids).await?;
+			&state.interactive_participants).await?;
 
 		let mut notifications = Vec::new();
 		// Post VTXOs to mailboxes for wallet recovery support.
@@ -1332,12 +1361,18 @@ async fn persist_round(
 			let Some(unlock_hash) = vtxo.unlock_hash() else {
 				continue; // Skip VTXOs without unlock hash
 			};
-			let checkpoint = t.store_round_participation_in_mailbox(*mailbox_id, unlock_hash)
-				.await.with_context(|| format!("error posting round VTXO {} to mailbox", vtxo.id()))?;
-			if let Some(cp) = checkpoint {
-				notifications.push((*mailbox_id, cp));
+			match t.store_round_participation_in_mailbox(*mailbox_id, unlock_hash).await {
+				Ok(checkpoint) => {
+					if let Some(cp) = checkpoint {
+						notifications.push((*mailbox_id, cp));
+					}
+					trace!("Posted round VTXO {} to mailbox", vtxo.id());
+				},
+				Err(e) => {
+					// Log but don't fail the round - mailbox delivery is best-effort
+					warn!("Failed to post round VTXO {} to mailbox: {:#}", vtxo.id(), e);
+				},
 			}
-			trace!("Posted round VTXO {} to mailbox", vtxo.id());
 		}
 
 		Ok(notifications)
@@ -1611,11 +1646,13 @@ async fn receive_payments(
 
 				let res = match input {
 					RoundInput::RegisterPayment {
-						inputs, vtxo_requests, unblinded_mailbox_id, unlock_preimage, user_agent_name, owner_links
+						inputs, vtxo_requests, unblinded_mailbox_id, unlock_preimage,
+						user_agent_name, owner_links,
 					} => {
 						state
 							.process_self_signed_participation(
-								srv, inputs, vtxo_requests, unblinded_mailbox_id, unlock_preimage.leak_owned(), user_agent_name,
+								srv, inputs, vtxo_requests, unblinded_mailbox_id,
+								unlock_preimage.leak_owned(), user_agent_name,
 								&owner_links,
 							).await
 							.map_err(|e| {
@@ -2018,6 +2055,27 @@ impl Server {
 				.unusable_inputs(unusable);
 		}
 
+		// Storing replaces any pending participation over these inputs. A
+		// round attempt that already picked one up holds them in flux until
+		// it finishes or restarts and builds its leaf from that row, so the
+		// store runs under the same lock: either the round has the inputs and
+		// this is refused, or the store completes first and the round finds
+		// the old row gone before registering it (see
+		// process_delegated_participation). In-flight inputs are the client's
+		// to wait on, not to drop, so they come back under their own key.
+		let _flux_guard = match self.vtxos_in_flux.try_lock(&input_ids) {
+			Ok(guard) => guard,
+			Err(e) => {
+				let mut in_flight = self.vtxos_in_flux.in_flux(&input_ids);
+				if !in_flight.contains(&e.id) {
+					in_flight.push(e.id);
+				}
+				debug!("delegated round inputs {:?} are in flight", in_flight);
+				return badarg!("input vtxo(s) in flight in another operation")
+					.in_flight_inputs(in_flight);
+			},
+		};
+
 		self.db.write(async |t| {
 			owner_links.verify(t, outputs.iter().map(|o| o.vtxo_request.policy.user_pubkey()),
 				self.mailbox_key.leak_ref(), self.config.network).await?;
@@ -2131,13 +2189,9 @@ mod tests {
 		state.locked_inputs = flux.empty_guard().into_owned();
 		let ids = inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 		let guard = flux.try_lock(&ids).unwrap();
-		let mailbox = ark::mailbox::MailboxIdentifier::from_pubkey(generate_pubkey());
-		state.register_interactive_participation(guard, inputs, outputs.clone(), Some(mailbox), pre, "test", 0);
+		state.register_interactive_participation(guard, inputs, outputs.clone(), None, pre, "test", 0);
 		assert_eq!(state.all_inputs.len(), 1);
 		assert_eq!(state.all_outputs.len(), 1);
-		assert_eq!(state.all_outputs[0].unblinded_mailbox_id, Some(mailbox));
-		assert_eq!(state.interactive_participants[&UnlockHash::hash(&pre)].outputs[0].unblinded_mailbox_id,
-			Some(mailbox));
 		assert_eq!(state.inputs_per_cosigner.len(), 1);
 		assert_eq!(1, state.inputs_per_cosigner.get(&outputs[0].cosign_pubkey).unwrap().len());
 		// Readiness uses this same lock while preparing and committing. A

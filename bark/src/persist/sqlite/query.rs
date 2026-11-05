@@ -36,8 +36,8 @@ pub (crate) fn set_properties(
 	properties: &WalletProperties,
 ) -> anyhow::Result<()> {
 	let query =
-		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey)
-		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey)";
+		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey, server_payouts)
+		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey, :server_payouts)";
 	let mut statement = conn.prepare(query)?;
 
 	statement.execute(named_params! {
@@ -45,9 +45,9 @@ pub (crate) fn set_properties(
 		":fingerprint": properties.fingerprint.to_string(),
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
+		":server_payouts": properties.server_payouts,
+		":mailbox_pubkey": properties.mailbox_identity.as_ref().map(|identity| identity.public_key.to_string()),
 	})?;
-	conn.execute("INSERT INTO bark_mailbox_identity (id, public_key, network) VALUES (1, ?1, ?2)",
-		params![properties.mailbox_identity.public_key.to_string(), properties.mailbox_identity.network.to_string()])?;
 
 	Ok(())
 }
@@ -91,8 +91,7 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT p.*, m.public_key AS mailbox_pubkey, m.network AS mailbox_network
-		FROM bark_properties p LEFT JOIN bark_mailbox_identity m ON m.id = p.id";
+	let query = "SELECT network,fingerprint,server_pubkey,server_mailbox_pubkey,mailbox_pubkey,server_payouts FROM bark_properties";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -101,12 +100,11 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
-		let mailbox_pubkey: String = row.get("mailbox_pubkey").context("missing mailbox identity")?;
-		let mailbox_network: String = row.get("mailbox_network").context("missing mailbox network")?;
-		let mailbox_identity = MailboxIdentity {
-			network: Network::from_str(&mailbox_network).context("invalid mailbox network")?,
-			public_key: PublicKey::from_str(&mailbox_pubkey).context("invalid mailbox public key")?,
-		};
+		let mailbox_pubkey: Option<String> = row.get("mailbox_pubkey")?;
+		let mailbox_identity = mailbox_pubkey.map(|key| Ok::<_, anyhow::Error>(MailboxIdentity {
+			network: Network::from_str(&network).context("invalid network")?,
+			public_key: PublicKey::from_str(&key).context("invalid mailbox public key")?,
+		})).transpose()?;
 
 		let server_pubkey = server_pubkey
 			.map(|s| PublicKey::from_str(&s))
@@ -124,6 +122,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
+				server_payouts: row.get("server_payouts")?,
 				mailbox_identity,
 			}
 		))
@@ -332,19 +331,6 @@ pub fn store_vtxo_with_initial_state(
 	}
 
 	Ok(())
-}
-
-/// Update material without changing identity, ownership or state history.
-pub fn update_vtxo_witnesses(tx: &Transaction, vtxo: &Vtxo<Full>) -> anyhow::Result<bool> {
-	ensure!(vtxo.has_all_witnesses(), "replacement VTXO witnesses are incomplete");
-	let Some(stored) = get_full_vtxo_by_id(tx, vtxo.id())? else { return Ok(false); };
-	ensure!(stored.to_bare().serialize() == vtxo.to_bare().serialize(), "replacement VTXO changes its bare identity");
-	let weight = vtxo.transactions().try_fold(0_u64, |sum, step|
-		sum.checked_add(step.tx.weight().to_wu()).context("VTXO exit weight overflow"))?;
-	let changed = tx.execute("UPDATE bark_vtxo SET raw_genesis=?1,exit_depth=?2,exit_tx_weight=?3 WHERE id=?4",
-		rusqlite::params![vtxo.serialize_genesis(), i64::from(vtxo.exit_depth()), i64::try_from(weight)?, vtxo.id().to_string()])?;
-	ensure!(changed == 1, "VTXO disappeared during witness update");
-	Ok(true)
 }
 
 pub fn store_round_state(
@@ -582,8 +568,6 @@ pub fn delete_vtxo(
 	tx: &rusqlite::Transaction,
 	id: VtxoId
 ) -> anyhow::Result<Option<Vtxo<Full>>> {
-	ensure!(get_wallet_vtxo_by_id(tx, id)?.is_none_or(|coin| coin.fallback_status.is_none()),
-		"fallback identity must be retained for status rechecks");
 	// Delete all vtxo-states
 	let query = "DELETE FROM bark_vtxo_state WHERE vtxo_id = ?1";
 	tx.execute(query, [id.to_string()])?;
@@ -650,9 +634,6 @@ pub fn update_vtxo_state_checked(
 		WHERE
 			vtxo_id = :vtxo_id AND
 			state_kind IN (SELECT atom FROM json_each(:old_states)) AND
-			EXISTS(SELECT 1 FROM bark_vtxo b WHERE b.id=:vtxo_id AND
-				(b.fallback_status IS NULL OR :state_kind='Exited'
-				 OR (b.fallback_status!='pending' AND :state_kind='Spent'))) AND
 			state != :state";
 
 	let new_state_blob = serde_json::to_vec(&new_state)?;
@@ -698,7 +679,6 @@ pub fn release_vtxo_lock(
 		SELECT :vtxo_id, :spendable_kind, :spendable FROM most_recent_vtxo_state
 		WHERE
 			vtxo_id = :vtxo_id AND
-			EXISTS(SELECT 1 FROM bark_vtxo b WHERE b.id=:vtxo_id AND b.fallback_status IS NULL) AND
 			state = :expected_state";
 
 	let expected = VtxoState::Locked { holder: holder.cloned() };
@@ -728,23 +708,6 @@ pub fn set_vtxo_fallback_status(
 		SELECT ?1,?2,?3 FROM most_recent_vtxo_state WHERE vtxo_id=?1 AND state!=?3",
 		params![id.to_string(), state.kind().as_str(), serde_json::to_vec(&state)?])?;
 	get_wallet_vtxo_by_id(tx, id)?.context("fallback source disappeared")
-}
-
-/// Holder-scoped retirement, with no intermediate Spendable state.
-pub fn retire_vtxo_lock(
-	conn: &Connection, vtxo_id: VtxoId, holder: Option<&VtxoLockHolder>,
-) -> anyhow::Result<bool> {
-	let changed = conn.execute("INSERT INTO bark_vtxo_state (vtxo_id,state_kind,state) \
-		SELECT :id,:kind,:next FROM most_recent_vtxo_state \
-		WHERE vtxo_id=:id AND state=:expected AND EXISTS(SELECT 1 FROM bark_vtxo b
-			WHERE b.id=:id AND (b.fallback_status IS NULL OR b.fallback_status!='pending'))", named_params! {
-		":id": vtxo_id.to_string(),
-		":kind": VtxoStateKind::Spent.as_str(),
-		":next": serde_json::to_vec(&VtxoState::Spent)?,
-		":expected": serde_json::to_vec(&VtxoState::Locked { holder: holder.cloned() })?,
-	})?;
-	ensure!(changed <= 1, "corrupted database: multiple locked-coin retirements");
-	Ok(changed == 1 || get_wallet_vtxo_by_id(conn, vtxo_id)?.is_some_and(|coin| coin.state == VtxoState::Spent))
 }
 
 /// Set the `registered` flag on the given vtxos, recording that their
@@ -1116,7 +1079,6 @@ pub fn remove_wallet_action_checkpoint(
 	Ok(())
 }
 
-
 pub fn record_paid_invoice(
 	conn: &Connection,
 	payment_hash: PaymentHash,
@@ -1153,18 +1115,16 @@ pub fn get_paid_invoice(
 	Ok(Some(PaidInvoice { payment_hash, preimage, paid_at }))
 }
 
-
 pub fn record_settled_lightning_receive(
 	conn: &Connection,
 	payment_hash: PaymentHash,
 	preimage: Preimage,
 	invoice: &Bolt11Invoice,
 	amount: Amount,
-	association: Option<&crate::persist::models::ReceiveAssociation>,
 ) -> anyhow::Result<()> {
 	let query = "
-		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat, association)
-		VALUES (:payment_hash, :preimage, :invoice, :amount_sat, :association)
+		INSERT INTO bark_settled_lightning_receive (payment_hash, preimage, invoice, amount_sat)
+		VALUES (:payment_hash, :preimage, :invoice, :amount_sat)
 		ON CONFLICT(payment_hash) DO NOTHING";
 	let mut statement = conn.prepare(query)?;
 	statement.execute(named_params! {
@@ -1172,15 +1132,7 @@ pub fn record_settled_lightning_receive(
 		":preimage": preimage.as_hex().to_string(),
 		":invoice": invoice.to_string(),
 		":amount_sat": amount.to_sat() as i64,
-		":association": association.map(serde_json::to_vec).transpose()?,
 	})?;
-	if let Some(expected) = association {
-		let stored = get_settled_lightning_receive(conn, payment_hash)?.context("settled receive disappeared")?
-			.association.context("settled receive has no original claim association")?;
-		ensure!((stored.key_index, &stored.claim_destination, &stored.grant_ids)
-			== (expected.key_index, &expected.claim_destination, &expected.grant_ids),
-			"settled receive claim association differs");
-	}
 	Ok(())
 }
 
@@ -1188,7 +1140,7 @@ pub fn get_settled_lightning_receive(
 	conn: &Connection,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<Option<SettledLightningReceive>> {
-	let query = "SELECT preimage, invoice, amount_sat, settled_at, association
+	let query = "SELECT preimage, invoice, amount_sat, settled_at
 		FROM bark_settled_lightning_receive WHERE payment_hash = :payment_hash";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query(named_params! { ":payment_hash": payment_hash.as_hex().to_string() })?;
@@ -1205,35 +1157,8 @@ pub fn get_settled_lightning_receive(
 		.context("invalid invoice in bark_settled_lightning_receive")?;
 	let amount = Amount::from_sat(row.get::<_, i64>("amount_sat")? as u64);
 	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
-	let association = row.get::<_, Option<Vec<u8>>>("association")?
-		.map(|raw| serde_json::from_slice(&raw)).transpose()?;
-	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at, association }))
+	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
 }
-
-pub fn fallback_lightning_receives(conn: &Connection) -> anyhow::Result<Vec<SettledLightningReceive>> {
-	let mut statement = conn.prepare("SELECT payment_hash FROM bark_settled_lightning_receive WHERE association IS NOT NULL ORDER BY payment_hash")?;
-	let hashes = statement.query_map([], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-	let mut ret = Vec::new();
-	for hash in hashes {
-		let recv = get_settled_lightning_receive(conn, hash.parse()?)?.context("known receive disappeared")?;
-		if recv.association.as_ref().is_some_and(|claim| claim.fallback_status.is_some()) { ret.push(recv); }
-	}
-	Ok(ret)
-}
-
-pub fn set_receive_fallback_status(conn: &mut Connection, hash: PaymentHash, status: crate::vtxo::FallbackStatus)
-	-> anyhow::Result<()>
-{
-	let tx = conn.transaction()?;
-	let mut association = get_settled_lightning_receive(&tx, hash)?.context("receive is not stored")?
-		.association.context("receive has no original claim association")?;
-	association.fallback_status = Some(status);
-	tx.execute("UPDATE bark_settled_lightning_receive SET association=?2 WHERE payment_hash=?1",
-		params![hash.to_string(), serde_json::to_vec(&association)?])?;
-	tx.commit()?;
-	Ok(())
-}
-
 
 #[cfg(test)]
 mod test {
@@ -1396,27 +1321,6 @@ mod test {
 		release_vtxo_lock(&tx, vtxo.id(), None).unwrap();
 		let wv = get_wallet_vtxo_by_id(&tx, vtxo.id()).unwrap().unwrap();
 		assert_eq!(wv.state, theirs_state, "None holder must not release a Some lock");
-	}
-
-	#[test]
-	fn retirement_never_releases_a_foreign_holder_or_passes_through_spendable() {
-		let (_, mut conn) = in_memory_db();
-		MigrationContext{}.do_all_migrations(&mut conn).unwrap();
-		let tx = conn.transaction().unwrap();
-		let coin = &VTXO_VECTORS.board_vtxo;
-		store_vtxo_with_initial_state(&tx, coin, &VtxoState::Locked { holder: None }).unwrap();
-		assert!(retire_vtxo_lock(&tx, coin.id(), None).unwrap());
-		assert_eq!(get_wallet_vtxo_by_id(&tx, coin.id()).unwrap().unwrap().state, VtxoState::Spent);
-		let available: i64 = tx.query_row("SELECT COUNT(*) FROM bark_vtxo_state \
-			WHERE vtxo_id=?1 AND state_kind='spendable'", [coin.id().to_string()], |row| row.get(0)).unwrap();
-		assert_eq!(available, 0, "retirement cannot expose an available state");
-		let holder = VtxoLockHolder::Movement { id: MovementId::new(7) };
-		let foreign = VtxoState::Locked { holder: Some(holder.clone()) };
-		update_vtxo_state_checked(&tx, coin.id(), foreign.clone(), &[VtxoStateKind::Spent]).unwrap();
-		assert!(!retire_vtxo_lock(&tx, coin.id(), None).unwrap());
-		assert_eq!(get_wallet_vtxo_by_id(&tx, coin.id()).unwrap().unwrap().state, foreign);
-		assert!(retire_vtxo_lock(&tx, coin.id(), Some(&holder)).unwrap());
-		assert!(retire_vtxo_lock(&tx, coin.id(), None).unwrap(), "already Spent is idempotent");
 	}
 
 	#[test]

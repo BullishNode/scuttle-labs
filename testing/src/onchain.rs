@@ -9,6 +9,7 @@ use bark::chain::ChainSource;
 use bark::onchain::{CpfpError, LocalUtxo, MakeCpfpFees, OnchainWalletTrait, Utxo};
 use bark::persist::BarkPersister;
 use bdk_wallet::chain::ChainPosition;
+use bdk_wallet::signer::SignersContainer;
 use bdk_wallet::{KeychainKind, LocalOutput, TxOrdering};
 use bitcoin::{Address, Amount, FeeRate, Network, Psbt, Script, ScriptBuf, Transaction, Txid};
 use bitcoin_ext::{BlockHeight, TransactionExt};
@@ -26,6 +27,7 @@ fn timestamp() -> u64 {
 /// Keeps its own descriptor, keys and persistence; the SDK sees a trait object.
 pub struct AppBip86Wallet {
 	inner: bdk_wallet::Wallet,
+	signers: SignersContainer,
 	db: Arc<dyn BarkPersister>,
 	rpc: BitcoinRpcClient,
 }
@@ -47,14 +49,14 @@ impl AppBip86Wallet {
 		let changeset = db.initialize_bdk_wallet().await?;
 		let inner = bdk_wallet::Wallet::load()
 			.descriptor(KeychainKind::External, Some(descriptor.clone()))
-			.extract_keys()
 			.check_network(network)
 			.load_wallet_no_persist(changeset)?;
 		let inner = match inner {
 			Some(wallet) => wallet,
-			None => bdk_wallet::Wallet::create_single(descriptor).network(network).create_wallet_no_persist()?,
+			None => bdk_wallet::Wallet::create_single(descriptor.clone()).network(network).create_wallet_no_persist()?,
 		};
-		let mut wallet = Self { inner, db, rpc };
+		let signers = inner.build_signers(descriptor).context("error building application wallet signers")?;
+		let mut wallet = Self { inner, signers, db, rpc };
 		wallet.inner.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
 		wallet.inner.mark_used(KeychainKind::External, 0);
 		wallet.persist().await?;
@@ -173,7 +175,8 @@ impl OnchainWalletTrait for AppBip86Wallet {
 	async fn sign_psbt(&mut self, mut psbt: Psbt) -> anyhow::Result<Psbt> {
 		#[allow(deprecated)]
 		let options = bdk_wallet::SignOptions { trust_witness_utxo: true, ..Default::default() };
-		ensure!(self.inner.sign(&mut psbt, options)?, "application wallet could not finalize PSBT");
+		ensure!(self.inner.sign_with_signers(&mut psbt, &[&self.signers], options)?,
+			"application wallet could not finalize PSBT");
 		Ok(psbt)
 	}
 
@@ -184,7 +187,7 @@ impl OnchainWalletTrait for AppBip86Wallet {
 	}
 
 	async fn make_signed_p2a_cpfp(&mut self, tx: &Transaction, fees: MakeCpfpFees) -> Result<Transaction, CpfpError> {
-		WalletExt::make_signed_p2a_cpfp(&mut self.inner, tx, fees).map_err(|error| match error {
+		WalletExt::make_signed_p2a_cpfp(&mut self.inner, tx, fees, &self.signers).map_err(|error| match error {
 			CpfpInternalError::General(message) => CpfpError::InternalError(message),
 			CpfpInternalError::Create(error) => CpfpError::CreateError(error.to_string()),
 			CpfpInternalError::Extract(error) => CpfpError::FinalizeError(error.to_string()),

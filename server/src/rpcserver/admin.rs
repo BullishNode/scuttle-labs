@@ -76,6 +76,19 @@ impl rpc::server::RoundAdminService for Server {
 
 #[async_trait]
 impl rpc::server::LightningAdminService for Server {
+	async fn reconcile_lightning_attempt(
+		&self, req: tonic::Request<protos::ReconcileLightningAttemptRequest>,
+	) -> Result<tonic::Response<protos::ReconcileLightningAttemptResponse>, tonic::Status> {
+		let req = req.into_inner();
+		let id = req.attempt_id;
+		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }
+		let attempt = self.lightning_manager.reconcile_lightning_attempt(id, req.native_cold_restart_confirmed).await.to_status()?
+			.ok_or_else(|| tonic::Status::not_found("unknown Lightning payment attempt"))?;
+		Ok(tonic::Response::new(protos::ReconcileLightningAttemptResponse {
+			attempt_id: attempt.id, payment_hash: attempt.payment_hash.to_vec(), status: attempt.status.to_string(),
+		}))
+	}
+
 	#[tracing::instrument(skip(self, req))]
 	async fn start_lightning_node(
 		&self,
@@ -100,7 +113,7 @@ impl rpc::server::LightningAdminService for Server {
 }
 
 #[async_trait]
-impl rpc::server::SweepAdminService for crate::watchman::Daemon {
+impl rpc::server::WatchmanAdminService for crate::watchman::Daemon {
 	#[tracing::instrument(skip(self, _req))]
 	async fn trigger_sweep(
 		&self,
@@ -109,6 +122,26 @@ impl rpc::server::SweepAdminService for crate::watchman::Daemon {
 
 		self.watchman_handle().trigger_sweep();
 		Ok(tonic::Response::new(protos::Empty {}))
+	}
+
+	#[tracing::instrument(skip(self, _req))]
+	async fn reindex_frontier(
+		&self,
+		_req: tonic::Request<protos::Empty>,
+	) -> Result<tonic::Response<protos::ReindexFrontierResponse>, tonic::Status> {
+		let stats = self.watchman_handle().reindex_frontier().await.to_status()?;
+		Ok(tonic::Response::new(protos::ReindexFrontierResponse {
+			entries_checked: stats.entries_checked as u64,
+			confirmations_repaired: stats.confirmations_repaired as u64,
+			spends_repaired: stats.spends_repaired as u64,
+			vtxos_added: stats.vtxos_added as u64,
+			funding_txs_added: stats.funding_txs_added as u64,
+			funding_vtxos_added: stats.funding_vtxos_added as u64,
+			unresolved_spends: stats.unresolved_spends as u64,
+			blocks_scanned: stats.blocks_scanned as u64,
+			confirmations_cleared: stats.confirmations_cleared as u64,
+			spends_cleared: stats.spends_cleared as u64,
+		}))
 	}
 }
 
@@ -235,22 +268,6 @@ impl rpc::server::BanAdminService for Server {
 	}
 }
 
-#[async_trait]
-impl rpc::server::ScuttleService for Server {
-	async fn reconcile_lightning_attempt(
-		&self, req: tonic::Request<protos::scuttle::ReconcileLightningAttemptRequest>,
-	) -> Result<tonic::Response<protos::scuttle::ReconcileLightningAttemptResponse>, tonic::Status> {
-		super::validate_scuttle_pver(&req)?;
-		let id = req.into_inner().attempt_id;
-		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }
-		let attempt = self.lightning_manager.reconcile_lightning_attempt(id).await.to_status()?
-			.ok_or_else(|| tonic::Status::not_found("unknown Lightning payment attempt"))?;
-		Ok(tonic::Response::new(protos::scuttle::ReconcileLightningAttemptResponse {
-			attempt_id: attempt.id, payment_hash: attempt.payment_hash.to_vec(), status: attempt.status.to_string(),
-		}))
-	}
-
-}
 
 /// Run the captaind admin gRPC endpoint.
 pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
@@ -262,7 +279,6 @@ pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {
 	info!("Starting admin gRPC service on address {}", addr);
 
 	let routes = tonic::service::Routes::default()
-		.add_service(rpc::server::ScuttleServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::WalletAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::RoundAdminServiceServer::from_arc(srv.clone()))
 		.add_service(rpc::server::LightningAdminServiceServer::from_arc(srv.clone()))
@@ -292,7 +308,7 @@ pub async fn run_watchmand_admin_rpc_server(
 
 	let routes = tonic::service::Routes::default()
 		.add_service(rpc::server::WalletAdminServiceServer::from_arc(daemon.clone()))
-		.add_service(rpc::server::SweepAdminServiceServer::from_arc(daemon.clone()))
+		.add_service(rpc::server::WatchmanAdminServiceServer::from_arc(daemon.clone()))
 		.add_service(rpc::server::BlocklistAdminServiceServer::from_arc(daemon));
 
 	tonic::transport::Server::builder()

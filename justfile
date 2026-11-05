@@ -73,8 +73,6 @@ check-use-bark-as-dependency:
 
 checks: prechecks check-lib-arithmetic check-wasm-tests check
 
-final-series-checks: checks fork-canary
-
 check-commits:
 	bash contrib/check-commits.sh
 
@@ -166,12 +164,6 @@ test-integration TEST="": ensure-build-bins docker-pull
 	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
 		-E 'not binary(tor) and not binary(server-migrations) and not binary(upgrade)' {{TEST}}
 alias int := test-integration
-
-# Scuttle-only financial, ownership, wire and recovery regressions.
-test-integration-scuttle TEST="": ensure-build-bins docker-pull
-	cargo nextest run --no-fail-fast --profile {{NEXTEST_PROFILE}} --package ark-testing \
-		--test scuttle {{TEST}}
-alias int-scuttle := test-integration-scuttle
 
 # Run the server upgrade/migration tests. Requires OLD_CAPTAIND_EXEC to
 # point at a previous captaind release binary, e.g.:
@@ -638,7 +630,3 @@ _nix-build-checksums:
 	rm -f SHA256SUMS
 	LC_ALL=C sha256sum * > SHA256SUMS
 	cat SHA256SUMS
-
-# Read-only Git maintenance canary; no application or native test is started.
-fork-canary:
-	python3 -B contrib/check-scuttle-delta.py
