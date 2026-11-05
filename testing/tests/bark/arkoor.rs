@@ -4,6 +4,7 @@ use ark_testing::util::{FutureExt, ToAltString};
 use bitcoin::Amount;
 use bark::movement::{MovementDestination, PaymentMethod};
 use futures::StreamExt;
+use server_rpc::MAX_NB_MAILBOX_ARKOOR_VTXOS;
 
 #[tokio::test]
 async fn send_simple_arkoor() {
@@ -121,6 +122,34 @@ async fn send_arkoor_package() {
 	assert_eq!(vtxo1.amount, sat(10_000));
 	assert_eq!(vtxo2.amount, sat(20_000));
 	assert_eq!(vtxo3.amount, sat(20_000));
+}
+
+/// A send can produce more destination coins than one mailbox post accepts.
+/// Every coin must reach the recipient before the sender finalizes the send.
+#[tokio::test]
+async fn send_arkoor_package_larger_than_mailbox_post() {
+	let ctx = TestContext::new("bark/send_arkoor_package_larger_than_mailbox_post").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let sender = ctx.bark("sender", &srv).funded(sat(3_000_000)).create().await;
+	let recipient = ctx.bark("recipient", &srv).create().await;
+
+	for i in 0..=MAX_NB_MAILBOX_ARKOOR_VTXOS {
+		sender.board(sat(20_000)).await;
+		if i % 10 == 9 {
+			ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+			sender.sync().await;
+		}
+	}
+	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
+	sender.sync().await;
+	assert_eq!(sender.vtxos().await.len(), MAX_NB_MAILBOX_ARKOOR_VTXOS + 1);
+
+	let amount = sender.spendable_balance().await;
+	sender.send_oor(recipient.address().await, amount).await;
+	recipient.sync().await;
+	assert_eq!(recipient.spendable_balance().await, amount);
+	assert_eq!(recipient.vtxos().await.len(), MAX_NB_MAILBOX_ARKOOR_VTXOS + 1);
+	assert_eq!(sender.spendable_balance().await, Amount::ZERO);
 }
 
 #[tokio::test]
