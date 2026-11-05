@@ -52,6 +52,8 @@ pub enum VtxoLockHolder {
 	/// A pre-action subsystem (round, offboard, board, lightning
 	/// receive). The movement is used as a stable handle.
 	Movement { id: MovementId },
+	/// An arkoor mailbox payment awaiting server registration.
+	MailboxReceive,
 }
 
 impl From<MovementId> for VtxoLockHolder {

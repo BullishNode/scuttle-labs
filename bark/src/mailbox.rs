@@ -34,7 +34,7 @@ use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
-use crate::vtxo::{VtxoState, VtxoValidationError};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, VtxoValidationError};
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -333,6 +333,7 @@ impl Wallet {
 				break;
 			}
 		}
+		self.reconcile_pending_arkoor_receives().await?;
 
 		Ok(())
 	}
@@ -519,10 +520,9 @@ impl Wallet {
 		// Redundantly re-register the received vtxos with the server. An
 		// up-to-date sender already does this after cosign, but older
 		// senders may not, so we do it on receive too to make sure the
-		// server has signed_tx rows for our spendable vtxos. Any failure
-		// is logged and swallowed: the receive must still proceed so we
-		// don't lose track of the vtxos locally, and later spends will
-		// retry registration if still needed.
+		// server has signed_tx rows for our spendable vtxos. A failure
+		// does not discard the signed chain, but the server status below
+		// must confirm spendability before the wallet credits it.
 		if let Err(e) = self.register_vtxo_transactions_with_server(&new_vtxos).await {
 			warn!("Failed to register received arkoor vtxo transactions with server: {:#}", e);
 		}
@@ -540,22 +540,74 @@ impl Wallet {
 				}
 				continue;
 			}
+			if state != protos::VtxoSpendState::Spendable {
+				warn!("Received arkoor VTXO {} is not spendable on the server ({state:?}); \
+					keeping its signed chain locked", coin.id());
+				self.store_vtxos([&coin], &VtxoState::Locked {
+					holder: Some(VtxoLockHolder::MailboxReceive),
+				}).await?;
+				continue;
+			}
 			current.push(coin);
 		}
 		let new_vtxos = current;
 		if new_vtxos.is_empty() { return Ok(()); }
+		self.credit_received_arkoor_vtxos(&new_vtxos).await
+	}
 
+	/// Recheck only mailbox receives held for registration. Other locked VTXOs
+	/// belong to in-flight wallet actions and must not be released by sync.
+	async fn reconcile_pending_arkoor_receives(&self) -> anyhow::Result<()> {
+		let _guard = self.inner.lock_manager.lock(
+			MAILBOX_PROCESSING_LOCK_KEY, MAILBOX_PROCESSING_LOCK_TIMEOUT,
+		).await.context("failed to acquire mailbox processing lock")?;
+		let ids = self.inner.db.get_vtxos_by_state(&[VtxoStateKind::Locked]).await?
+			.into_iter()
+			.filter(|v| matches!(v.state, VtxoState::Locked {
+				holder: Some(VtxoLockHolder::MailboxReceive),
+			}))
+			.map(|v| v.vtxo.id())
+			.collect::<Vec<_>>();
+		if ids.is_empty() { return Ok(()); }
+
+		let pending = self.inner.db.get_full_vtxos(&ids).await?;
+		let mut ready = Vec::new();
+		for coin in pending {
+			if let Err(e) = self.register_vtxo_transactions_with_server(&[coin.clone()]).await {
+				debug!("Pending arkoor VTXO {} still cannot register: {e:#}", coin.id());
+			}
+			let key = self.get_vtxo_key(&coin).await?;
+			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
+			if committed || state == protos::VtxoSpendState::Spent {
+				self.mark_vtxos_as_spent([coin.id()]).await?;
+				if committed {
+					self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+				}
+			} else if state == protos::VtxoSpendState::Spendable {
+				ready.push(coin);
+			}
+		}
+		if !ready.is_empty() {
+			let ready_ids = ready.iter().map(|v| v.id()).collect::<Vec<_>>();
+			self.unlock_vtxos(ready_ids,
+				Some(VtxoLockHolder::MailboxReceive)).await?;
+			self.credit_received_arkoor_vtxos(&ready).await?;
+		}
+		Ok(())
+	}
+
+	async fn credit_received_arkoor_vtxos(&self, new_vtxos: &[Vtxo<Full>]) -> anyhow::Result<()> {
 		// TODO: Make sure we don't effectively skip the entire package if the movement fails to
 		//       be recorded due to bark getting killed after this point.
 		let balance = new_vtxos
 			.iter()
 			.map(|vtxo| vtxo.amount()).sum::<Amount>()
 			.to_signed()?;
-		self.store_spendable_vtxos(&new_vtxos).await?;
+		self.store_spendable_vtxos(new_vtxos.iter()).await?;
 
 		// Build received_on destinations from received VTXOs, aggregated by address
 		let mut received_by_address = HashMap::<ark::Address, Amount>::new();
-		for vtxo in &new_vtxos {
+		for vtxo in new_vtxos {
 			if let Ok(Some((index, _))) = self.pubkey_keypair(&vtxo.user_pubkey()).await {
 				if let Ok(address) = self.peek_address(index).await {
 					*received_by_address.entry(address).or_default() += vtxo.amount();
@@ -572,7 +624,7 @@ impl Wallet {
 			ArkoorMovement::Receive.to_string(),
 			MovementStatus::Successful,
 			MovementUpdate::new()
-				.produced_vtxos(&new_vtxos)
+				.produced_vtxos(new_vtxos)
 				.intended_and_effective_balance(balance)
 				.received_on(received_on),
 		).await?;
