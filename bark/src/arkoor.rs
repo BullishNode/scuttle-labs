@@ -11,7 +11,7 @@ use ark::fallback::OwnerLink;
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::vtxo::{Full, Vtxo, VtxoId};
-use server_rpc::{protos, ServerConnection};
+use server_rpc::{protos, ServerConnection, MAX_NB_MAILBOX_ARKOOR_VTXOS};
 
 use crate::{VtxoDelivery, Wallet, WalletVtxo};
 use crate::actions::DriveMode;
@@ -92,8 +92,7 @@ pub(crate) enum DeliveryOutcome {
 /// using the common blinded-id accessor. Mailbox posts
 /// are idempotent on the server.
 ///
-/// Any-success semantics: one accepted post is enough, since the recipient
-/// only needs the signed chain to arrive once.
+/// One delivery method must accept every chunk before the send completes.
 pub(crate) async fn post_arkoor_to_mailboxes(
 	srv: &mut ServerConnection,
 	delivery: &[VtxoDelivery],
@@ -107,18 +106,21 @@ pub(crate) async fn post_arkoor_to_mailboxes(
 	let mut failures: Vec<String> = Vec::new();
 	for method in delivery {
 		let Some(blinded_id) = method.mailbox_id() else { continue };
-		let req = protos::mailbox_server::PostArkoorMessageRequest {
-			blinded_id: blinded_id.as_ref().to_vec(),
-			vtxos: serialized.clone(),
-		};
-		match srv.mailbox_client.post_arkoor_message(req).await {
-			Ok(_) => any_succeeded = true,
-			Err(e) => {
+		let mut delivered_all = !serialized.is_empty();
+		for chunk in serialized.chunks(MAX_NB_MAILBOX_ARKOOR_VTXOS) {
+			let req = protos::mailbox_server::PostArkoorMessageRequest {
+				blinded_id: blinded_id.as_ref().to_vec(),
+				vtxos: chunk.to_vec(),
+			};
+			if let Err(e) = srv.mailbox_client.post_arkoor_message(req).await {
 				let reason = format!("{:#}", e);
 				error!("failed to post arkoor vtxos to mailbox: {}", reason);
 				failures.push(reason);
-			},
+				delivered_all = false;
+				break;
+			}
 		}
+		any_succeeded |= delivered_all;
 	}
 
 	if any_succeeded {
