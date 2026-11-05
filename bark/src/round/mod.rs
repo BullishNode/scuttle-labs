@@ -1303,6 +1303,14 @@ async fn hark_vtxo_swap(
 	sent_forfeit_sigs: bool,
 	checkpoint: &RoundCheckpoint,
 ) -> Result<(), HarkForfeitError> {
+	if let Some(output) = output_vtxos.iter().find(|v| v.unlock_hash() != Some(unlock_hash)) {
+		let error = anyhow!("round output {} has another participation's unlock hash", output.id());
+		return Err(if sent_forfeit_sigs {
+			HarkForfeitError::SentForfeits(error)
+		} else {
+			HarkForfeitError::Err(error)
+		});
+	}
 	let (mut srv, _) = wallet.require_server().await.map_err(HarkForfeitError::Err)?;
 
 	// before we start make sure the server has our input vtxo signatures
@@ -1778,7 +1786,7 @@ async fn progress_attempt(
 			}
 
 			match construct_new_vtxos(
-				part, unsigned_round_tx, vtxos_spec, cosign_sigs,
+				part, unsigned_round_tx, vtxos_spec, cosign_sigs, *unlock_hash,
 			).await {
 				Ok(v) => AttemptProgressResult::Finished {
 					funding_tx: signed_round_tx.clone(),
@@ -1875,6 +1883,7 @@ async fn construct_new_vtxos(
 	unsigned_round_tx: &Transaction,
 	vtxo_tree: &VtxoTreeSpec,
 	vtxo_cosign_sigs: &[schnorr::Signature],
+	unlock_hash: UnlockHash,
 ) -> anyhow::Result<Vec<Vtxo<Full>>> {
 	let round_txid = unsigned_round_tx.compute_txid();
 	let vtxos_utxo = OutPoint::new(round_txid, ROUND_TX_VTXO_TREE_VOUT);
@@ -1890,37 +1899,18 @@ async fn construct_new_vtxos(
 		.into_signed_tree(vtxo_cosign_sigs.to_vec())
 		.into_cached_tree();
 
-	let mut expected_vtxos = participation.outputs.iter().collect::<Vec<_>>();
-	let total_nb_expected_vtxos = expected_vtxos.len();
-
-	let mut new_vtxos = vec![];
-	for (idx, req) in signed_vtxos.spec.spec.vtxos.iter().enumerate() {
-		if let Some(expected_idx) = expected_vtxos.iter().position(|r| **r == req.vtxo) {
-			let vtxo = signed_vtxos.build_vtxo(idx);
-
-			// validate the received vtxos
-			// This is more like a sanity check since we crafted them ourselves.
-			check_vtxo_fails_hash_lock(unsigned_round_tx, &vtxo)
-				.context("constructed invalid vtxo from tree")?;
-
-			info!("New VTXO from round: {} ({}, {})",
-				vtxo.id(), vtxo.amount(), vtxo.policy_type(),
-			);
-
-			new_vtxos.push(vtxo);
-			expected_vtxos.swap_remove(expected_idx);
-		}
-	}
-
-	if !expected_vtxos.is_empty() {
-		if expected_vtxos.len() == total_nb_expected_vtxos {
-			// we must have done something wrong
-			bail!("None of our VTXOs were present in round!");
-		} else {
-			bail!("Server included some of our VTXOs but not all: {} missing: {:?}",
-				expected_vtxos.len(), expected_vtxos,
-			);
-		}
+	let leaf_idxs = signed_vtxos.spec.spec.leaf_idxs_for_participation(
+		unlock_hash, participation.outputs.iter(),
+	).context("our outputs not part of tree for this participation")?;
+	let mut new_vtxos = Vec::with_capacity(leaf_idxs.len());
+	for idx in leaf_idxs {
+		let vtxo = signed_vtxos.build_vtxo(idx);
+		check_vtxo_fails_hash_lock(unsigned_round_tx, &vtxo)
+			.context("constructed invalid vtxo from tree")?;
+		info!("New VTXO from round: {} ({}, {})",
+			vtxo.id(), vtxo.amount(), vtxo.policy_type(),
+		);
+		new_vtxos.push(vtxo);
 	}
 	Ok(new_vtxos)
 }
