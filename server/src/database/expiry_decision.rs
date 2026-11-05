@@ -1,6 +1,6 @@
 //! Short durable allocation commits for independently ready, same-expiry outputs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use bitcoin::{Amount, ScriptBuf, Transaction, TxIn, TxOut, Sequence, Witness};
@@ -128,7 +128,7 @@ impl Tx<'_> {
 		subscriptions.sort_unstable(); subscriptions.dedup();
 		self.query("SELECT id FROM lightning_htlc_subscription WHERE id=ANY($1) ORDER BY id FOR UPDATE", &[&subscriptions]).await?;
 		self.query("SELECT id FROM round_participation WHERE id=ANY($1) ORDER BY id FOR UPDATE", &[&parts]).await?;
-		let mut accepted: Vec<(ServerVtxo, Vec<ReadyCoin>)> = Vec::new();
+		let mut ready: Vec<(ServerVtxo, Vec<ReadyCoin>)> = Vec::new();
 		let mut existing_entitlements = BTreeMap::new();
 		let mut dropped = 0;
 		for root in roots {
@@ -203,21 +203,34 @@ impl Tx<'_> {
 				valid = self.can_cancel_expiry_participations(&cancellations).await?;
 			}
 			if valid && !coins.is_empty() {
-				accepted.push((root, coins));
-				if !group_fits(&accepted)? {
-					let (root, coins) = accepted.pop().expect("just inserted");
-					if !group_fits(&[(root.clone(), coins)])? { self.request_held_expiry_split(view, &root, "output_requires_split").await?; }
-					dropped += 1;
-				}
+				ready.push((root, coins));
 			} else {
 				if needs_split || !coins.is_empty() { self.request_held_expiry_split(view, &root, "output_requires_split").await?; }
 				dropped += 1;
 			}
 		}
+		let mut script_by_id = BTreeMap::new();
+		let mut ready_scripts = BTreeMap::<ScriptBuf, usize>::new();
+		for (_, coins) in &ready {
+			for coin in coins {
+				if let Some(payee) = &coin.payee {
+					script_by_id.insert(coin.ownership.id, payee.script.clone());
+					*ready_scripts.entry(payee.script.clone()).or_default() += 1;
+				}
+			}
+		}
+		let mut accepted = Vec::new();
+		for output in ready {
+			accepted.push(output);
+			if !group_fits(&accepted)? {
+				let output = accepted.pop().expect("just inserted");
+				if !group_fits(std::slice::from_ref(&output))? {
+					self.request_held_expiry_split(view, &output.0, "output_requires_split").await?;
+				}
+				dropped += 1;
+			}
+		}
 		if accepted.is_empty() { return Ok(None); }
-		let leaves = accepted.iter().flat_map(|o| &o.1).filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
-			id: c.ownership.id, script: payee.script.clone(), amount: c.ownership.gross,
-		})).collect();
 		let paid = self.query("
 			SELECT c.spk,SUM(c.gross_sat)::BIGINT AS gross,SUM(c.fee_sat)::BIGINT AS fee
 			FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id
@@ -230,7 +243,35 @@ impl Tx<'_> {
 				Amount::from_sat(u64::try_from(row.get::<_, i64>("fee"))?),
 			)))
 		}).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-		let plan = allocate(leaves, &paid)?;
+		let plan = loop {
+			let leaves = accepted.iter().flat_map(|o| &o.1).filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
+				id: c.ownership.id, script: payee.script.clone(), amount: c.ownership.gross,
+			})).collect();
+			let plan = allocate(leaves, &paid)?;
+			let mut selected_scripts = BTreeMap::<ScriptBuf, usize>::new();
+			for (_, coins) in &accepted {
+				for payee in coins.iter().filter_map(|coin| coin.payee.as_ref()) {
+					*selected_scripts.entry(payee.script.clone()).or_default() += 1;
+				}
+			}
+			let delayed = plan.iter().filter(|leaf| leaf.forfeited > Amount::ZERO)
+				.filter(|leaf| script_by_id.get(&leaf.id).is_some_and(|script|
+					ready_scripts[script] > selected_scripts[script]))
+				.map(|leaf| leaf.id).collect::<BTreeSet<_>>();
+			if delayed.is_empty() { break plan; }
+			// A size cut cannot forfeit a leaf while another ready leaf for
+			// the same script was left outside this transaction. Keep its root
+			// unspent rather than turn a batching remainder into operator revenue.
+			accepted.retain(|(root, coins)| {
+				let hold = coins.iter().any(|coin| delayed.contains(&coin.ownership.id));
+				if hold {
+					self.observe_expiry_hold(root.id(), "customer payout below dust after batching");
+					dropped += 1;
+				}
+				!hold
+			});
+			if accepted.is_empty() { return Ok(None); }
+		};
 
 		// Final selection precedes every cancellation effect. All candidate
 		// inputs/participations were locked and checked without writes above;
