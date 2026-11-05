@@ -42,7 +42,7 @@ use clap::Args;
 use log::{debug, info, warn};
 use tonic::transport::Uri;
 
-use bark::{BarkNetwork, Config, OpenWalletArgs, Wallet as BarkWallet, WalletSeed};
+use bark::{BarkNetwork, Config, OpenWalletArgs, RecoveryStatus, Wallet as BarkWallet, WalletSeed};
 use bark::lock_manager::{self, LockManager, PidLockError};
 use bark::lock_manager::pid_flock::LOCK_FILE;
 use bark::onchain::OnchainWallet;
@@ -496,6 +496,7 @@ async fn try_create_wallet(
 	// recovery mailbox. The on-chain scan above has already run, so recovery can
 	// validate recovered VTXOs against their chain anchors. `run_daemon` stays
 	// off - this only needs to create and recover.
+	let (recovery_tx, recovery_rx) = std::sync::mpsc::channel();
 	BarkWallet::open(
 		net.as_bitcoin(),
 		WalletSeed::new_from_mnemonic(net.as_bitcoin(), &mnemonic),
@@ -507,9 +508,19 @@ async fn try_create_wallet(
 			create_without_server: opts.force,
 			onchain: Some(Arc::new(tokio::sync::RwLock::new(onchain))),
 			run_daemon: false,
+			on_recovery_finished: Some(Box::new(move |status| {
+			let _ = recovery_tx.send(status);
+		})),
 			..Default::default()
 		},
 	).await.context("error creating wallet")?;
+	if !is_new_wallet {
+		match recovery_rx.try_recv().context("wallet open returned without a recovery outcome")? {
+			RecoveryStatus::Completed(_) => {},
+			RecoveryStatus::Failed(e) => return Err(e).context("seed recovery failed; retry the restore"),
+			RecoveryStatus::NotRun => bail!("seed recovery did not run; retry the restore"),
+		}
+	}
 	Ok(())
 }
 
