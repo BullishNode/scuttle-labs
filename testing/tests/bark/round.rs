@@ -7,7 +7,8 @@ use futures::future::join_all;
 use log::{debug, info, trace};
 use tokio_stream::StreamExt;
 
-use ark::{VtxoPolicy, VtxoRequest};
+use ark::{ProtocolEncoding, VtxoPolicy, VtxoRequest};
+use ark::attestations::RoundParticipationStatusAttestation;
 use ark::rounds::RoundEvent;
 use ark::tree::signed::HashlockVersion;
 use ark::vtxo::policy::PubkeyVtxoPolicy;
@@ -15,7 +16,7 @@ use bark::persist::models::{StoredRoundState, Unlocked};
 use bark::round::{RoundFlowKind, RoundParticipation};
 use bark::subsystem::RoundMovement;
 use bark::vtxo::{VtxoLockHolder, VtxoState};
-use server::database::Db;
+use server::database::{Db, MailboxPayload};
 use server_log::{AttemptingRound, NoRoundPayments, RestartMissingVtxoSigs, RoundFinished, RoundUserVtxoNotAllowed};
 use server_rpc::protos;
 
@@ -23,6 +24,72 @@ use ark_testing::{TestContext, btc, is_bark_version, require_bark_version, sat, 
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::daemon::captaind::{self, ArkClient};
 use ark_testing::util::FutureExt;
+
+#[tokio::test]
+async fn interactive_round_posts_recovery_notice() {
+	interactive_round_recovery_notice(false).await;
+}
+
+#[tokio::test]
+async fn payout_interactive_round_posts_recovery_notice() {
+	interactive_round_recovery_notice(true).await;
+}
+
+async fn interactive_round_recovery_notice(payout: bool) {
+	require_bark_version!(> "0.6.2");
+	let ctx = TestContext::new(if payout {
+		"bark/payout_interactive_round_posts_recovery_notice"
+	} else { "bark/interactive_round_posts_recovery_notice" }).await;
+	let srv = ctx.captaind("server").cfg(move |cfg| {
+		cfg.round_interval = Duration::from_secs(3600);
+		cfg.round_status_attestation_required = true;
+		cfg.expiry_payouts = payout;
+	}).funded(btc(10)).create().await;
+	let bark = ctx.bark("bark", &srv)
+		.cfg(|cfg| cfg.daemon_manual_sync = true)
+		.funded(sat(500_000)).create().await;
+	let [input] = bark.board_and_confirm_and_register(&ctx, sat(200_000)).await
+		.try_into().expect("one board output");
+	let wallet = bark.client().await;
+	let participation = wallet.build_refresh_participation(vec![input]).await.unwrap()
+		.expect("board coin can refresh");
+	let round = wallet.join_next_round(participation, Some(RoundMovement::Refresh)).await.unwrap();
+	drop(round);
+	let mut finished = srv.subscribe_log::<RoundFinished>();
+	let (driven, ()) = tokio::join!(wallet.participate_ongoing_rounds(), srv.trigger_round());
+	driven.expect("interactive round should finish");
+	let finished = finished.recv().wait(secs(30)).await.expect("server should finish the round");
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let expected_hash = db.read(async |t| {
+		let rows = t.query("SELECT vtxo FROM vtxo WHERE anchor_point=$1",
+			&[&format!("{}:0", finished.txid)]).await?;
+		Ok(rows.into_iter().find_map(|row| {
+			let coin = ark::ServerVtxo::<ark::vtxo::Full>::deserialize(row.get("vtxo")).ok()?;
+			coin.unlock_hash()
+		}))
+	}).await.unwrap().expect("the finished round has a hash-locked output");
+	let mailbox = wallet.mailbox_identifier();
+	let entries = db.read(async |t| t.get_mailbox_messages(mailbox, 0, 100).await).await.unwrap();
+	let matches = entries.iter().filter(|entry| matches!(&entry.payload,
+		MailboxPayload::RoundParticipationCompleted { unlock_hash } if *unlock_hash == expected_hash
+	)).count();
+	assert_eq!(matches, 1, "the output must have one matching recovery notice");
+	let mut rpc = srv.get_public_rpc().await;
+	let status = rpc.round_participation_status(protos::RoundParticipationStatusRequest {
+		unlock_hash: expected_hash.serialize(),
+		attestation: RoundParticipationStatusAttestation::new(
+			expected_hash, &wallet.mailbox_keypair(),
+		).serialize(),
+	}).await.expect("owner can authenticate the completed round status").into_inner();
+	assert_eq!(status.output_vtxos.len(), 1);
+	let denied = rpc.round_participation_status(protos::RoundParticipationStatusRequest {
+		unlock_hash: expected_hash.serialize(), attestation: vec![],
+	}).await.expect_err("unauthenticated round status must be hidden");
+	assert_eq!(denied.code(), tonic::Code::NotFound);
+	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
+	wallet.sync().await;
+	assert_eq!(wallet.spendable_vtxos().await.unwrap().len(), 1);
+}
 
 #[tokio::test]
 async fn large_round() {
