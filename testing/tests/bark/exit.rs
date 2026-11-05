@@ -657,6 +657,25 @@ async fn exit_revoked_lightning_payment() {
 }
 
 #[tokio::test]
+async fn pending_board_starts_exit_with_server_offline() {
+	let ctx = TestContext::new("exit/pending_board_starts_exit_with_server_offline").await;
+	let srv = ctx.captaind("server").create().await;
+	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
+	let board_amount = sat(500_000);
+	bark.board(board_amount).await;
+	let board_vtxo = bark.vtxos().await.first().cloned().unwrap();
+	assert_eq!(bark.list_exits().await.len(), 0);
+
+	srv.stop().await.unwrap();
+	let tip = ctx.bitcoind().sync_client().tip().unwrap().height;
+	ctx.generate_blocks(board_vtxo.expiry_height.checked_blocks_since(tip).unwrap() - 2).await;
+	bark.sync().await;
+
+	assert_eq!(bark.list_exits().await.len(), 1, "the pending board must start exiting without the server");
+	assert_eq!(bark.pending_board_balance().await, board_amount);
+}
+
+#[tokio::test]
 async fn bark_should_exit_a_pending_board() {
 	let ctx = TestContext::new("exit/bark_should_exit_a_pending_board").await;
 

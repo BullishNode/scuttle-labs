@@ -293,9 +293,7 @@ async fn run_broadcast(
 /// sufficiently confirmed, and kick off an exit near expiry (keeping the board
 /// around so registration can still win while the exit is abortable).
 async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, AdvanceError> {
-	let (_, ark_info) = wallet.require_server().await.retry()?;
 	let current_height = wallet.inner.chain.tip().await.retry()?;
-	let required = BlockDelta::new(ark_info.required_board_confirmations as u16);
 
 	let vtxo = wallet.get_vtxo_by_id(board.vtxo_id).await.retry()?;
 
@@ -354,7 +352,21 @@ async fn run_confirm(wallet: &Wallet, board: Board) -> Result<Advance<Board>, Ad
 		Err(_) => None,
 	};
 
-	if confs.is_some_and(|c| c >= required.to_u32()) {
+	// Chain-only cleanup and the near-expiry exit must still run when the
+	// server is offline. Only registration needs a server connection.
+	let can_register = if let Some(confs) = confs {
+		match wallet.require_server().await {
+			Ok((_, ark_info)) => confs >= BlockDelta::new(ark_info.required_board_confirmations as u16).to_u32(),
+			Err(e) => {
+				let reason = format!("{:#}", e);
+				warn!("Failed to register board {}: {}", board.id, reason);
+				last_park_error = Some(reason);
+				false
+			},
+		}
+	} else { false };
+
+	if can_register {
 		// Attempt registration inline. A failure here (the server can't see
 		// enough confirmations yet, or refuses) is not terminal: leave the vtxo
 		// Locked and retry next drive, exactly like the old loop. The funding tx
