@@ -15,6 +15,10 @@ use crate::database::{Checkpoint, MailboxEntry, MailboxPayload};
 use crate::rpcserver::{StatusContext, ToStatus, ToStatusResult};
 use crate::rpcserver::macros::badarg;
 
+// Mailbox posts are limited by tonic's 4 MiB request limit, while Bark reads
+// at most 64 MiB per response. Leave room for encoding and other message types.
+const MAX_READ_MAILBOX_CHECKPOINTS: usize = 8;
+
 /// Bail with `invalid_argument` if the authorization is expired, logging the
 /// timing details so we can attribute failures to clock skew.
 fn check_auth_not_expired(auth: &MailboxAuthorization) -> Result<(), tonic::Status> {
@@ -203,7 +207,7 @@ impl rpc::server::MailboxService for crate::Server {
 		if !auth.verify() {
 			self::badarg!("invalid mailbox authorization signature");
 		}
-		let limit = self.config.max_read_mailbox_items;
+		let limit = self.config.max_read_mailbox_items.min(MAX_READ_MAILBOX_CHECKPOINTS);
 		let entries_by_checkpoint = self.db.read(async |t|
 			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await
 		).await.to_status()?;
@@ -248,7 +252,7 @@ impl rpc::server::MailboxService for crate::Server {
 
 		let db = self.db.clone();
 		let starting_checkpoint = Checkpoint::from(req.checkpoint.max(0));
-		let ret_limit = self.config.max_read_mailbox_items;
+		let ret_limit = self.config.max_read_mailbox_items.min(MAX_READ_MAILBOX_CHECKPOINTS);
 
 		// Start listening for updates on the tip of the mailbox.
 		// Marking the first value as changed makes `changed()` return
