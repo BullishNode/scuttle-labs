@@ -66,6 +66,9 @@ impl Server {
 		};
 
 		for (idx, b) in ret.builders.iter().enumerate() {
+			b.input().check_standard().map_err(|e| badarg_err!(
+				"input VTXO {} cannot be enforced onchain: {}", b.input().id(), e,
+			))?;
 			if let Some(max_exit_depth) = params.max_input_exit_depth {
 				let depth = b.input().exit_depth();
 				if depth >= max_exit_depth {
@@ -83,6 +86,11 @@ impl Server {
 					b.input().id(), idx, nb_outputs, params.max_outputs_per_input,
 				);
 			}
+		}
+		for output in ret.build_unsigned_vtxos() {
+			output.check_standard().map_err(|e| badarg_err!(
+				"output VTXO {} cannot be enforced onchain: {}", output.id(), e,
+			))?;
 		}
 
 		Ok(ret)

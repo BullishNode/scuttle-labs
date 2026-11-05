@@ -189,6 +189,9 @@ impl Server {
 		let tip = self.chain_tip().height;
 		for v in &vtxos {
 			v.check_spendable(tip)?;
+			v.vtxo.check_standard().map_err(|e| badarg_err!(
+				"input VTXO {} cannot be enforced onchain: {}", v.vtxo_id, e,
+			))?;
 		}
 
 		// Check delivery address against blocklist
