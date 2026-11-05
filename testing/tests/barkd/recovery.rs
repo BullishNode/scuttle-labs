@@ -9,6 +9,8 @@ use bark_json::primitives::{VtxoStateInfo, WalletVtxoInfo};
 use bitcoin::Amount;
 use bitcoin_ext::BlockDelta;
 use server_rpc::protos;
+use bark_rest_client::apis::wallet_api;
+use bark_rest_client::models::WalletDeleteRequest;
 
 use crate::helpers::wait_for_boards_synced;
 
@@ -29,6 +31,54 @@ fn partition_recovered(vtxos: Vec<WalletVtxoInfo>) -> (Vec<WalletVtxoInfo>, Vec<
 		);
 	}
 	(spendable, spent)
+}
+
+/// A failed xpub lookup cannot produce a successful restore with a misleading
+/// zero balance. The partial wallet is removed so the same seed can be retried.
+#[tokio::test]
+async fn failed_xpub_restore_can_be_retried() {
+	let ctx = TestContext::new("barkd/failed_xpub_restore_can_be_retried").await;
+	let srv = ctx.captaind("server").funded(btc(10)).create().await;
+	let funded = ctx.barkd("funded", &srv).boarded(sat(100_000))
+		.expose_mnemonic().create().await;
+	let original = funded.vtxos(Some(true)).await;
+	let mnemonic = funded.mnemonic().await;
+
+	#[derive(Clone)]
+	struct RefuseXpub;
+	#[async_trait::async_trait]
+	impl captaind::proxy::ArkRpcProxy for RefuseXpub {
+		async fn recover_vtxos_by_xpub(
+			&self, _upstream: &mut ArkClient, _req: protos::RecoverVtxosByXpubRequest,
+		) -> Result<protos::RecoverVtxosByXpubResponse, tonic::Status> {
+			Err(tonic::Status::resource_exhausted("recovery queue is full"))
+		}
+	}
+	let proxy = srv.start_proxy_no_mailbox(RefuseXpub).await;
+	let restored = ctx.barkd("restored", &srv).create().await;
+	let config = restored.client_config();
+	let fingerprint = wallet_api::wallet_exists(&config).await.unwrap().fingerprint.unwrap();
+	wallet_api::wallet_delete(&config, WalletDeleteRequest {
+		dangerous: true, fingerprint,
+	}).await.unwrap();
+	let mut request = restored.create_wallet_request();
+	request.mnemonic = Some(mnemonic.clone());
+	request.birthday_height = Some(1);
+	request.ark_server = Some(proxy.address.clone());
+	assert!(restored.create_wallet_from_args(request).await.is_err(),
+		"failed xpub scan must refuse the restore");
+	assert_eq!(wallet_api::wallet_exists(&config).await.unwrap().fingerprint, None);
+	assert!(!restored.datadir().join("db.sqlite").exists(),
+		"failed restore must remove its partial database");
+
+	let mut request = restored.create_wallet_request();
+	request.mnemonic = Some(mnemonic);
+	request.birthday_height = Some(1);
+	restored.create_wallet_from_args(request).await.expect("restore should retry cleanly");
+	let recovered = restored.vtxos(Some(true)).await;
+	assert_eq!(recovered.len(), 1);
+	assert_eq!(recovered[0].vtxo.id, original[0].vtxo.id);
+	assert_eq!(recovered[0].vtxo.amount, original[0].vtxo.amount);
 }
 
 /// Wallet recovery from seed.

@@ -1899,6 +1899,148 @@ async fn revoke_judged_on_own_attempt_not_newer_same_hash_attempt() {
 	honest.revoke(&srv).await.expect("revoke of the failed payment should be cosigned");
 }
 
+/// A different receive can reveal the same preimage after an external send
+/// fails. The watchman must not claim that failed send's exited collateral.
+#[tokio::test]
+async fn unrelated_preimage_does_not_claim_failed_send_source() {
+	unrelated_preimage_does_not_claim_failed_send_source_in_mode(false).await;
+}
+
+#[tokio::test]
+async fn payout_unrelated_preimage_does_not_claim_failed_send_source() {
+	unrelated_preimage_does_not_claim_failed_send_source_in_mode(true).await;
+}
+
+async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bool) {
+	let ctx = TestContext::new(if payout {
+		"server/payout_unrelated_preimage_does_not_claim_failed_send_source"
+	} else { "server/unrelated_preimage_does_not_claim_failed_send_source" }).await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let ark_ln = lightning.internal;
+	let eve_ln = Arc::new(lightning.external);
+	let srv = ctx.captaind("server").lightningd(&ark_ln).watchmand()
+		.watchmand_cfg(|cfg| {
+			cfg.watchman.reaction_interval = Duration::from_millis(100);
+			cfg.watchman.sweep_interval = Duration::from_millis(100);
+		})
+		.cfg(move |cfg| cfg.expiry_payouts = payout).create().await;
+	ctx.fund_captaind(&srv, btc(10)).await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let victim = ctx.bark("victim", &srv).funded(btc(3)).create().await;
+	victim.board_and_confirm_and_register(&ctx, btc(2)).await;
+	ark_ln.wait_for_block_sync().await;
+	eve_ln.wait_for_block_sync().await;
+
+	let preimage = ark::lightning::Preimage::random();
+	let hash = preimage.compute_payment_hash();
+	let mut hold = eve_ln.hold_client().await;
+	let invoice = hold.invoice(hold::InvoiceRequest {
+		payment_hash: hash.to_vec(), amount_msat: btc(1).to_msat(),
+		description: Some(hold::invoice_request::Description::Memo("failed original".into())),
+		min_final_cltv_expiry: Some(18), expiry: Some(3600), routing_hints: vec![],
+	}).await.unwrap().into_inner().bolt11;
+	victim.try_pay_lightning(&invoice, None, false).await.unwrap();
+	wait_for_hold_invoice_accepted(&mut hold, hash).await;
+	let client = victim.client().await;
+	let [source_id] = htlc_send_vtxo_ids(&client, hash).await.try_into()
+		.expect("one original HTLC source");
+	let source = client.get_full_vtxo(source_id).await.unwrap();
+
+	let mut rpc = srv.get_public_rpc().await;
+	let second = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		claim_destination: None, payment_hash: hash.to_vec(), amount_sat: 100_000,
+		min_cltv_delta: 6, mailbox_id: None, description: None, expiry_secs: None,
+	}).await.unwrap().into_inner().bolt11;
+	let paying = {
+		let eve_ln = eve_ln.clone();
+		tokio::spawn(async move { eve_ln.try_pay_bolt11(second).await })
+	};
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	wait_for_subscription_status(&db, hash, "accepted").await;
+	let sub = db.read(async |t| t.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap();
+	let key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let link = OwnerLink::new_joint(Network::Regtest, srv.ark_info().await.mailbox_pubkey,
+		&key, &key).unwrap();
+	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(link.clone().into()), payment_hash: hash.to_vec(),
+		user_pubkey: key.public_key().serialize().to_vec(),
+		htlc_recv_expiry: sub.lowest_incoming_htlc_expiry.unwrap()
+			.saturating_sub(srv.config().htlc_expiry_delta).into(),
+		lightning_receive_anti_dos: None,
+	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
+		.map(|bytes| Vtxo::<Full>::deserialize(&bytes).unwrap()).collect::<Vec<_>>();
+	let keys = vec![key; grants.len()];
+	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		grants, VtxoPolicy::new_pubkey(key.public_key()),
+	).unwrap().generate_user_nonces(&keys).unwrap();
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in package.parts.iter_mut().flat_map(|part|
+		part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.owner_proof = Some(link.clone().into());
+	}
+	rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
+		cosign_request: Some(package),
+	}).await.unwrap();
+	assert!(paying.wait_millis(10_000).await.unwrap().is_ok());
+	assert!(is_preimage_recorded(&db, hash).await);
+
+	hold.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
+	let mut ark_rpc = ark_ln.grpc_client().await;
+	async {
+		loop {
+			let pays = ark_rpc.list_pays(cln_rpc::ListpaysRequest {
+				payment_hash: Some(hash.to_vec()), ..Default::default()
+			}).await.unwrap().into_inner().pays;
+			if pays.iter().any(|pay|
+				pay.status() == cln_rpc::listpays_pays::ListpaysPaysStatus::Failed) { break; }
+			tokio::time::sleep(Duration::from_millis(100)).await;
+		}
+	}.wait_millis(10_000).await;
+	assert_eq!(db.read(async |t| t.source_settlement(hash, source_id).await).await.unwrap(),
+		SourceSettlement::Unknown);
+
+	let mut seen = HashSet::new();
+	for item in source.transactions() {
+		if seen.insert(item.tx.compute_txid()) {
+			ctx.broadcast_cpfp(&item.tx).await;
+			ctx.generate_blocks(1).await;
+		}
+	}
+	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	srv.watchmand().wait_for_sync_height(tip).await;
+	let tip = ctx.generate_blocks(source.exit_delta().to_u32() + 1).await;
+	srv.watchmand().wait_for_sync_height(tip).await;
+	srv.watchmand().trigger_sweep().await;
+	tokio::time::sleep(Duration::from_secs(2)).await;
+	assert!(server::bitcoind::get_mempool_spending_tx(
+		&ctx.bitcoind().async_client(), source.point(),
+	).await.unwrap().is_none(), "watchman tried to claim a failed source using another payment's preimage");
+	assert!(ctx.bitcoind().sync_client().get_tx_out(
+		&source.point().txid, source.point().vout, Some(true),
+	).unwrap().is_some(), "failed source collateral was spent on chain");
+
+	// The customer can still take the timeout branch of the same contract.
+	let expiry = source.policy().as_server_htlc_send().unwrap().htlc_expiry;
+	let now = ctx.bitcoind().get_block_count().await as u32;
+	if now <= expiry.to_u32() {
+		ctx.generate_blocks(expiry.to_u32() + 1 - now).await;
+	}
+	victim.sync().await;
+	assert_eq!(client.stuck_failed_lightning_sends().await.unwrap().len(), 1);
+	client.allow_lightning_send_to_exit(hash).await.unwrap();
+	victim.sync().await;
+	assert!(!victim.list_exits().await.is_empty(), "failed sender has no timeout exit");
+	complete_exit(&ctx, &victim).await;
+	let before = victim.onchain_balance().await;
+	victim.claim_all_exits(victim.get_onchain_address().await).await;
+	ctx.generate_blocks(1).await;
+	victim.progress_exit().await;
+	assert!(victim.onchain_balance().await >= before + sat(90_000_000),
+		"customer timeout claim did not return funds on chain");
+}
+
 /// Requests the server to sign a HTLC while using a HTCL VTXO as an input
 async fn request_second_htlc_cosign(
 	ctx: &TestContext,

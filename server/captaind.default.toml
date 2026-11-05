@@ -82,7 +82,7 @@ nursery_confirm_target_blocks = 6
 otel_deployment_name = "my_regtest"
 
 # The maximum number of items we return to mailbox queries
-max_read_mailbox_items = 100
+max_read_mailbox_items = 8
 
 # Number of child keys derived from a client xpub when it recovers its VTXOs
 # without the mailbox. Each key costs one EC multiplication per call.

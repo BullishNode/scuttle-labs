@@ -9,6 +9,7 @@ use axum::routing::post;
 use axum::Router;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
+use ark::vtxo::Full;
 use bitcoin_ext::rpc::RpcApi;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use server_rpc::protos;
@@ -84,6 +85,82 @@ async fn reject_arkoor_with_bad_signature() {
 		line.contains("error verifying one of the genesis transitions \
 			(idx=2/3 type=arkoor): invalid signature")
 	}));
+}
+
+/// Individually valid-size posts must not combine into a mailbox response
+/// larger than Bark can decode, hiding a later honest payment.
+#[tokio::test]
+async fn large_mailbox_posts_are_paged_before_an_honest_payment() {
+	let ctx = TestContext::new("bark/large_mailbox_posts_are_paged_before_an_honest_payment").await;
+	let srv = ctx.captaind("server").funded(btc(10))
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.max_read_mailbox_items = 100; }).create().await;
+	let sender_a = ctx.bark("sender_a", &srv).funded(sat(500_000))
+		.cfg(|cfg| cfg.change_vtxo_split_factor = 1).create().await;
+	let sender_b = ctx.bark("sender_b", &srv).funded(sat(500_000))
+		.cfg(|cfg| cfg.change_vtxo_split_factor = 1).create().await;
+	sender_a.board_and_confirm_and_register(&ctx, sat(200_000)).await;
+	sender_b.board_and_confirm_and_register(&ctx, sat(200_000)).await;
+	let recipient = ctx.bark("recipient", &srv).create().await;
+	let address = recipient.address().await;
+
+	#[derive(Clone, Default)]
+	struct InflatePosts(Arc<AtomicUsize>);
+
+	#[async_trait::async_trait]
+	impl captaind::proxy::MailboxRpcProxy for InflatePosts {
+		async fn post_arkoor_message(
+			&self, upstream: &mut MailboxClient,
+			mut req: protos::mailbox_server::PostArkoorMessageRequest,
+		) -> Result<protos::core::Empty, tonic::Status> {
+			assert_eq!(req.vtxos.len(), 1);
+			let original = &req.vtxos[0];
+			let coin = Vtxo::<Full>::deserialize(original).unwrap();
+			let header_len = 2 + 8 + 4 + 33 + 2 + 36;
+			let count = usize::from(original[header_len]);
+			assert!((1..253).contains(&count));
+			let tail_len = coin.policy().serialize().len() + 36;
+			let genesis = &original[header_len + 1..original.len() - tail_len];
+			let repeats = (2_650_000 / genesis.len()).max(2).min(18_000 / count);
+			let new_count = count * repeats;
+			let mut body = Vec::with_capacity(original.len() + genesis.len() * repeats);
+			body.extend_from_slice(&original[..header_len]);
+			body.extend_from_slice(&[0xfd, new_count as u8, (new_count >> 8) as u8]);
+			for _ in 0..repeats { body.extend_from_slice(genesis); }
+			body.extend_from_slice(&original[original.len() - tail_len..]);
+			assert!(body.len() > 2_500_000 && body.len() < 4_000_000);
+			assert_eq!(Vtxo::<Full>::deserialize(&body).unwrap().id(), coin.id());
+			self.0.fetch_add(body.len(), Ordering::SeqCst);
+			req.vtxos = vec![body];
+			Ok(upstream.post_arkoor_message(req).await?.into_inner())
+		}
+	}
+	let inflated = InflatePosts::default();
+	let proxy = srv.start_proxy_with_mailbox((), inflated.clone()).await;
+	sender_a.set_ark_url(&proxy.address).await;
+	sender_b.set_ark_url(&proxy.address).await;
+	for sender in [&sender_a, &sender_b] {
+		for _ in 0..14 {
+			sender.send_oor_nosync(address.clone(), sat(1_000)).await;
+		}
+	}
+	assert!(inflated.0.load(Ordering::SeqCst) > 64 * 1024 * 1024);
+	let honest = ctx.bark("honest", &srv).funded(sat(200_000)).create().await;
+	honest.board_and_confirm_and_register(&ctx, sat(50_000)).await;
+	honest.send_oor_nosync(address, sat(20_000)).await;
+
+	let receiver = recipient.client().await;
+	let auth = receiver.mailbox_authorization(chrono::Local::now() + Duration::from_secs(300));
+	let mut rpc = srv.get_mailbox_public_rpc().await.max_decoding_message_size(64 * 1024 * 1024);
+	let first = rpc.read_mailbox(
+		protos::mailbox_server::MailboxRequest {
+			mailbox_id: receiver.mailbox_identifier().serialize(),
+			authorization: Some(auth.serialize()), checkpoint: 0,
+		},
+	).await.unwrap().into_inner();
+	assert_eq!(first.messages.len(), 8);
+	assert!(first.have_more);
+	recipient.sync().await;
+	assert_eq!(recipient.spendable_balance().await, sat(20_000));
 }
 
 /// Concurrent consumers of one wallet's mailbox must not double-count a receive.
