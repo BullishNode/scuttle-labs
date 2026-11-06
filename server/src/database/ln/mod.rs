@@ -961,6 +961,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE payment_hash = $1

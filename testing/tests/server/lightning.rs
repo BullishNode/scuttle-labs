@@ -1959,6 +1959,9 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 	wait_for_subscription_status(&db, hash, "accepted").await;
 	let sub = db.read(async |t| t.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap();
+	let open = db.read(async |t| t.get_open_htlc_subscription_for_node_by_payment_hash(sub.lightning_node_id, &hash).await)
+		.await.unwrap().unwrap();
+	assert_eq!(open.id, sub.id);
 	let key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let link = OwnerLink::new_joint(Network::Regtest, srv.ark_info().await.mailbox_pubkey,
 		&key, &key).unwrap();
