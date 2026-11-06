@@ -200,9 +200,6 @@ fn validate_payment_amounts(
 	let mut in_set = HashSet::with_capacity(inputs.len());
 	let mut in_sum = Amount::ZERO;
 	for input in inputs {
-		input.check_standard().map_err(|e| badarg_err!(
-			"input VTXO {} cannot be enforced onchain: {}", input.id(), e,
-		))?;
 		// checked_add: bitcoin::Amount addition panics on overflow, so never feed it
 		// an untrusted running total. See the output loop below for the client-facing case.
 		in_sum = in_sum.checked_add(input.amount())
