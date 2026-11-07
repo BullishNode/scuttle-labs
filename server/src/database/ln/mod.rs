@@ -522,11 +522,13 @@ impl<'t> Tx<'t> {
 		invoice: &Bolt11Invoice,
 		amount_msat: u64,
 		receiver_mailbox_id: Option<&MailboxIdentifier>,
+		claim_pubkey: Option<PublicKey>,
 		claim_destination_user_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let mailbox_str = receiver_mailbox_id.map(|id| id.to_string());
+		let claim_pubkey_str = claim_pubkey.map(|k| k.to_string());
 
 		// The hash can settle while the invoice is generated. The gate
 		// serializes with `store_htlc_settlement`, so no receive opens for a
@@ -535,8 +537,8 @@ impl<'t> Tx<'t> {
 
 		self.inner_store_lightning_htlc_subscription(
 			node_id, &payment_hash.to_string(), &invoice.to_string(),
-			Some(amount_msat), mailbox_str.as_deref(), claim_destination_user_pubkey,
-			user_agent,
+			Some(amount_msat), mailbox_str.as_deref(), claim_pubkey_str.as_deref(),
+			claim_destination_user_pubkey, user_agent,
 		).await?;
 
 		Ok(())
@@ -552,6 +554,7 @@ impl<'t> Tx<'t> {
 		invoice: &str,
 		final_amount_msat: Option<u64>,
 		receiver_mailbox_id: Option<&str>,
+		claim_pubkey: Option<&str>,
 		claim_destination_user_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<(i64, DateTime<Local>)> {
@@ -564,12 +567,13 @@ impl<'t> Tx<'t> {
 				invoice,
 				final_amount_msat,
 				receiver_mailbox_id,
+				claim_pubkey,
 				claim_destination_user_pubkey,
 				status,
 				user_agent,
 				created_at,
 				updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
 			RETURNING id, updated_at;
 		").await?;
 
@@ -579,7 +583,7 @@ impl<'t> Tx<'t> {
 			&stmt,
 			&[
 				&node_id, &payment_hash, &invoice, &final_amount, &receiver_mailbox_id,
-				&claim_key, &requested_status, &user_agent,
+				&claim_pubkey, &claim_key, &requested_status, &user_agent,
 			],
 		).await?;
 
@@ -819,7 +823,7 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Vec<LightningHtlcSubscription>> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
-				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				status, lowest_incoming_htlc_expiry, accepted_at, user_agent, claim_pubkey,
 				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
@@ -846,7 +850,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT lhs.id, lhs.lightning_node_id, lhs.payment_hash, lhs.invoice,
 				lhs.status, lhs.lowest_incoming_htlc_expiry, lhs.accepted_at, lhs.user_agent,
-				lhs.claim_destination_user_pubkey,
+				lhs.claim_pubkey, lhs.claim_destination_user_pubkey,
 				lhs.created_at, lhs.updated_at,
 				COALESCE(array_agg(vtxo.vtxo_id::text), ARRAY[]::text[]) AS htlc_vtxos
 			FROM lightning_htlc_subscription lhs
@@ -877,7 +881,7 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<LightningHtlcSubscription>> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
-				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				status, lowest_incoming_htlc_expiry, accepted_at, user_agent, claim_pubkey,
 				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
@@ -960,7 +964,7 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<LightningHtlcSubscription>> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
-				status, lowest_incoming_htlc_expiry, accepted_at, user_agent,
+				status, lowest_incoming_htlc_expiry, accepted_at, user_agent, claim_pubkey,
 				claim_destination_user_pubkey,
 				created_at, updated_at
 			FROM lightning_htlc_subscription

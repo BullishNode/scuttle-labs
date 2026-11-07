@@ -435,11 +435,14 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
-	// Point-in-time check for an explicit recipient before invoice creation.
-	VtxoRequest claim_destination = 7;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
 	optional uint64 expiry_secs = 6;
+	// The key the HTLC-recv VTXOs will be locked to. When set, the claim can
+	// only be prepared with this key and a claim_attestation signed by it.
+	optional bytes claim_pubkey = 7;
+	// Point-in-time check for an explicit recipient before invoice creation.
+	VtxoRequest claim_destination = 8;
 }
 
 message StartLightningReceiveResponse {
@@ -459,7 +462,10 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
-	OwnerProof owner_proof = 6;
+	// Signature by user_pubkey over the payment hash and htlc_recv_expiry,
+	// required when the receive was started with a claim_pubkey.
+	optional bytes claim_attestation = 6;
+	OwnerProof owner_proof = 7;
 }
 
 message PrepareLightningReceiveClaimResponse {

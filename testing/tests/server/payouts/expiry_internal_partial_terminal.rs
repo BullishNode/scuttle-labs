@@ -40,7 +40,8 @@ async fn partial_terminal() {
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create()).await;
 	let invoice = recipient.bolt11_invoice(sat(180_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
+	let receive_keypair = super::receive_claim_keypair(&srv, &recipient, hash).await;
+	let receive_key = receive_keypair.public_key();
 	let receive_destination = recipient.fallback_script();
 	let actor = ctx.bark("sender", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(400_000)).create().await;
@@ -81,6 +82,7 @@ async fn partial_terminal() {
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(36)).to_u32(), lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, tip + BlockDelta::new(36), &receive_keypair).serialize()),
 	}).await.unwrap().into_inner();
 	let grants = reply.htlc_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(Vtxo::amount).sum::<bitcoin::Amount>(), sat(180_000));

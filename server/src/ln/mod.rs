@@ -26,7 +26,7 @@ use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy, VtxoRequest, ServerVtxo};
 use ark::arkoor::ArkoorDestination;
 use ark::vtxo::Full;
 use ark::arkoor::package::{ArkoorPackageCosignRequest, ArkoorPackageCosignResponse};
-use ark::attestations::{LightningReceiveAttestation, LightningSendIntent};
+use ark::attestations::{LightningReceiveAttestation, LightningReceiveClaimAttestation, LightningSendIntent};
 use ark::fees::{validate_and_subtract_fee, VtxoFeeInfo};
 use ark::integration::{TokenStatus, TokenType};
 use ark::lightning::{Bolt12Invoice, Invoice, Offer, PaymentHash, PaymentStatus, Preimage};
@@ -657,6 +657,7 @@ impl Server {
 		mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
 		description: Option<String>,
 		expiry: Option<Duration>,
+		claim_pubkey: Option<PublicKey>,
 		claim_destination: Option<protos::VtxoRequest>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
@@ -754,6 +755,13 @@ impl Server {
 							);
 						}
 					}
+					if let Some(requested) = claim_pubkey {
+						if subscription.claim_pubkey != Some(requested) {
+							return badarg!("an invoice for payment hash {} already exists \
+								with a different claim key", payment_hash,
+							);
+						}
+					}
 					trace!("Found existing created subscription, returning invoice: {}",
 						subscription.invoice.to_string(),
 					);
@@ -778,7 +786,7 @@ impl Server {
 		let ln_cltv_delta = min_cltv_delta + self.config.htlc_expiry_delta;
 
 		let invoice = self.lightning_manager.generate_invoice(
-			payment_hash, amount, ln_cltv_delta, expiry, description, mailbox_id,
+			payment_hash, amount, ln_cltv_delta, expiry, description, mailbox_id, claim_pubkey,
 			claim_destination_user_pubkey,
 		).await?;
 		trace!("Hold invoice created. payment_hash: {}, amount: {}, {}",
@@ -881,6 +889,7 @@ impl Server {
 		anti_dos: Option<protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos>,
 		owner_links: &crate::owner_proof::OwnerLinks,
 		client_address: Option<SocketAddr>,
+		claim_attestation: Option<LightningReceiveClaimAttestation>,
 	) -> anyhow::Result<(LightningHtlcSubscription, Vec<Vtxo<Full>>)> {
 		if self.config.expiry_payouts {
 			owner_links.check_signatures([user_pubkey], self.mailbox_key.leak_ref(), self.config.network)?;
@@ -905,6 +914,17 @@ impl Server {
 		}
 
 		slog!(LightningReceivePrepareRequested, payment_hash, user_pubkey, htlc_recv_expiry);
+
+		// A receive started with a claim key is only prepared for that key, by
+		// its owner. This also covers the retry below that returns the grant.
+		if let Some(claim_pubkey) = sub.claim_pubkey {
+			if user_pubkey != claim_pubkey {
+				return badarg!("user pubkey doesn't match the receive's claim key");
+			}
+			claim_attestation.badarg("claim attestation required")?
+				.verify(payment_hash, htlc_recv_expiry, claim_pubkey)
+				.badarg("invalid claim attestation")?;
+		}
 
 		// first check whether we're in the right state to do this
 		match sub.status {
@@ -1260,6 +1280,7 @@ mod tests {
 			lowest_incoming_htlc_expiry: None,
 			accepted_at: None,
 			user_agent: None,
+			claim_pubkey: None,
 			created_at: now,
 			updated_at: now,
 			htlc_vtxos: vec![],

@@ -1319,7 +1319,10 @@ CREATE TABLE public.lightning_htlc_subscription (
     invoice text NOT NULL,
     final_amount_msat bigint,
     receiver_mailbox_id text,
-    user_agent text
+    user_agent text,
+    claim_destination_user_pubkey text,
+    claim_pubkey text,
+    CONSTRAINT lightning_htlc_subscription_claim_destination_user_pubkey_check CHECK (((claim_destination_user_pubkey IS NULL) OR (length(claim_destination_user_pubkey) = 66)))
 );
 
 
@@ -1480,7 +1483,9 @@ CREATE TABLE public.lightning_payment_attempt (
     user_fee_sat bigint,
     user_agent text,
     retry_for_secs integer,
-    max_routing_fee_msat bigint
+    max_routing_fee_msat bigint,
+    intent_id text,
+    CONSTRAINT lightning_payment_attempt_intent_id_check CHECK (((intent_id IS NULL) OR (length(intent_id) = 64)))
 );
 
 
@@ -2828,6 +2833,14 @@ ALTER TABLE ONLY public.lightning_node
 
 ALTER TABLE ONLY public.lightning_payment_attempt_htlc_vtxo
     ADD CONSTRAINT lightning_payment_attempt_htlc_vtxo_pkey PRIMARY KEY (lightning_payment_attempt_id, vtxo_id);
+
+
+--
+-- Name: lightning_payment_attempt lightning_payment_attempt_intent_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lightning_payment_attempt
+    ADD CONSTRAINT lightning_payment_attempt_intent_id_key UNIQUE (intent_id);
 
 
 --

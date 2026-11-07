@@ -55,7 +55,8 @@ async fn native_refund_status(two_sources: bool) {
 	let invoice_amount = if two_sources { 180_000 } else { 90_000 };
 	let invoice = recipient.bolt11_invoice(sat(invoice_amount), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
+	let receive_keypair = super::receive_claim_keypair(&srv, &recipient, hash).await;
+	let receive_key = receive_keypair.public_key();
 	let recipient_destination = recipient.fallback_script();
 	let actor = ctx.bark("absent-sender", &srv).funded(sat(400_000)).create().await;
 	let first = actor.board_and_confirm_and_register(&ctx, sat(100_000)).await;
@@ -118,6 +119,7 @@ async fn native_refund_status(two_sources: bool) {
 		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(12)).to_u32(), lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, tip + BlockDelta::new(12), &receive_keypair).serialize()),
 	}).await.unwrap().into_inner();
 	let grants = reply.htlc_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(Vtxo::amount).sum::<bitcoin::Amount>(), sat(invoice_amount));

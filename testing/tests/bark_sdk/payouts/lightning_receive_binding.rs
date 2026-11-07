@@ -80,6 +80,7 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(), owner_proof: Some(link.into()),
 		}),
+		claim_pubkey: None,
 	};
 	let postgres = srv.config().postgres.clone();
 	let db = Db::connect(&postgres).await.unwrap();
@@ -124,6 +125,7 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 					htlc_recv_expiry: lowest.saturating_sub(srv.config().htlc_expiry_delta).into(),
 					lightning_receive_anti_dos: None,
 					owner_proof: Some(attacker_link.into()),
+					claim_attestation: None,
 				}).await.expect_err("foreign mailbox won the receive grant");
 				assert!(refused.message().contains("invoice mailbox"), "{refused}");
 				provider.try_claim_lightning_receive(hash, true).await

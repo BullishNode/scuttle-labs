@@ -107,7 +107,7 @@ async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
 			tx.execute("DELETE FROM coin_owner WHERE vtxo_id=$1", &[&coin.id().to_string()]).await?;
 			Ok(())
 		}).await.unwrap_err();
-		assert_eq!(missing.to_string(), "tx commit error");
+		assert_eq!(missing.to_string(), "db tx commit error");
 		let error = missing.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();
 		assert_eq!(error.code(), &tokio_postgres::error::SqlState::CHECK_VIOLATION);
 		assert_eq!(error.message(), "customer VTXO has no coin_owner");

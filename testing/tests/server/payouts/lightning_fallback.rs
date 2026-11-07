@@ -60,6 +60,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 		claim_destination: None,
 		payment_hash: hash.to_vec(), amount_sat: 90_000, min_cltv_delta: 58,
 		mailbox_id: None, description: None,
+		claim_pubkey: None,
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
 	let mut payer = lightning.external.grpc_client().await;
@@ -75,6 +76,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 		owner_proof: Some(super::test_owner_link(&srv, &receiver).await.into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 		htlc_recv_expiry: tip + 32, lightning_receive_anti_dos: None,
+		claim_attestation: None,
 	}).await.unwrap().into_inner().htlc_vtxos;
 	assert!(!grants.is_empty());
 	wait_for_subscription_status(&db, hash, "htlcs-ready").await;
@@ -150,6 +152,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		claim_destination: None,
 		payment_hash: hash.to_vec(), amount_sat: 100_000, min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
 		mailbox_id: None, description: None,
+		claim_pubkey: None,
 	}).await.unwrap().into_inner().bolt11;
 	let pay_task = {
 		let payer = payer.clone();
@@ -167,6 +170,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 		htlc_recv_expiry: incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta).into(),
 		lightning_receive_anti_dos: None,
+		claim_attestation: None,
 	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
 		.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.len(), 1);

@@ -237,7 +237,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 				let refusal = rpc.request_lightning_pay_htlc_revocation(super::signed_package(&srv, &[&wallet], protos::ArkoorPackageCosignRequest::from(repeat.cosign_request())).await)
 					.await.unwrap_err();
 				assert_eq!(refusal.code(), tonic::Code::Internal);
-				assert_eq!(refusal.message(), format!("tx body error: vtxo {} is already spent", internal[0].0.id()));
+				assert_eq!(refusal.message(), format!("db tx body error: vtxo {} is already spent", internal[0].0.id()));
 				assert_eq!(read_state().await, before);
 			} else { assert_eq!(response.unwrap_err().code(), tonic::Code::InvalidArgument); }
 		}

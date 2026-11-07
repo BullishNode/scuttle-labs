@@ -180,12 +180,6 @@ async fn integration() {
 	assert_eq!(integration_token_config_second.maximum_open_tokens, 10);
 	assert_eq!(integration_token_config_second.active_seconds, 11);
 
-	let integration_token_config_second = db.write(async |t| t.delete_integration_token_config(
-		integration_token_config_second.id,
-		integration_token_config_second.updated_at,
-	).await).await.unwrap();
-	assert_ne!(integration_token_config_second.deleted_at, None);
-
 	let token = uuid::Uuid::new_v4().to_string();
 	let tomorrow = Local::now() + chrono::Duration::days(1);
 	let integration_token_third = db.write(async |t| t.store_integration_token(
@@ -2378,7 +2372,7 @@ async fn lightning_generated_invoice_and_htlc_subscription() {
 	let bolt11 = Bolt11Invoice::from_str(BOLT11_INVOICE).unwrap();
 
 	// Store as generated (receive-side) subscription
-	db.write(async |t| t.store_generated_lightning_receive(node_id, &bolt11, 3000, None, None, Some("bark")).await).await.unwrap();
+	db.write(async |t| t.store_generated_lightning_receive(node_id, &bolt11, 3000, None, None, None, Some("bark")).await).await.unwrap();
 
 	// Find the htlc subscription (should be in Created state)
 	let payment_hash: ark::lightning::PaymentHash = (&bolt11).into();

@@ -113,7 +113,8 @@ async fn reclaim_reorg() {
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let invoice = recipient.bolt11_invoice(sat(90_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	let receiver_key = recipient.new_address().await.unwrap().policy().user_pubkey();
+	let receiver_keypair = super::receive_claim_keypair(&srv, &recipient, hash).await;
+	let receiver_key = receiver_keypair.public_key();
 	let receiver_destination = recipient.fallback_script();
 	let sender = ctx.bark("absent-sender", &srv).funded(sat(200_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
@@ -146,6 +147,7 @@ async fn reclaim_reorg() {
 		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, outgoing_deadline, &receiver_keypair).serialize()),
 	}).await.unwrap().into_inner();
 	let grants = granted.htlc_vtxos.iter().map(|b| Vtxo::<Full>::deserialize(b).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(|g| g.amount()).sum::<bitcoin::Amount>(), sat(90_000));

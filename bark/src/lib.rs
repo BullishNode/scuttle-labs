@@ -437,7 +437,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context};
 use bip39::Mnemonic;
-use bitcoin::{Amount, Network, OutPoint};
+use bitcoin::{Amount, FeeRate, Network, OutPoint};
 use bitcoin::bip32::{self, ChildNumber, Fingerprint};
 use bitcoin::secp256k1::{self, Keypair, PublicKey};
 use futures::stream::FuturesUnordered;
@@ -458,7 +458,7 @@ use server_rpc::protos::VtxoSpendState;
 use server_rpc::client::{ConnectError, CreateEndpointError};
 
 use crate::chain::{ChainSource, ChainSourceSpec};
-use crate::exit::Exit;
+use crate::exit::{Exit, ExitError, PresignedExits, RemainingExitTransactions};
 use crate::lock_manager::LockManager;
 use crate::movement::{Movement, MovementId, PaymentMethod};
 use crate::movement::manager::MovementManager;
@@ -523,6 +523,10 @@ fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyh
 	ensure!(ark_info.nb_round_nonces > 0,
 		"server-advertised nb_round_nonces is 0; refusing to connect",
 	);
+	ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
+		"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
+		ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
+	);
 	if ark_info.network == Network::Bitcoin {
 		// No upper bound: a long lifetime is safe because unilateral exit is
 		// always available before the server-only timeout leaf activates.
@@ -535,10 +539,6 @@ fn check_ark_info_safe(ark_info: &ArkInfo, vtxo_exit_margin: BlockDelta) -> anyh
 			"server-advertised vtxo_exit_delta {} is below the mainnet minimum of {} \
 			 blocks; refusing to connect",
 			ark_info.vtxo_exit_delta, MIN_MAINNET_VTXO_EXIT_DELTA,
-		);
-		ensure!(ark_info.nb_round_nonces <= MAX_NB_ROUND_NONCES,
-			"server-advertised nb_round_nonces {} exceeds cap {}; refusing to connect",
-			ark_info.nb_round_nonces, MAX_NB_ROUND_NONCES,
 		);
 	}
 	Ok(())
@@ -1521,6 +1521,44 @@ impl Wallet {
 		Ok(ret)
 	}
 
+	/// Builds a wallet on an in-memory database, with a chain source and an
+	/// Ark server that cannot be reached, for tests of paths that must not
+	/// reach either: a call that does reach them fails. The connection is
+	/// returned because dropping it drops the database.
+	#[cfg(all(test, feature = "sqlite"))]
+	pub(crate) async fn offline_for_test() -> (Wallet, rusqlite::Connection) {
+		let network = Network::Regtest;
+		let seed = WalletSeed::new_from_seed(network, &[1; 64]);
+		let mut config = Config::network_default(network);
+		config.server_address = "http://127.0.0.1:1".to_owned();
+
+		let (path, conn) = crate::persist::sqlite::helpers::in_memory_db();
+		let db: Arc<dyn BarkPersister> = Arc::new(crate::persist::sqlite::SqliteClient::open(path).unwrap());
+		db.init_wallet(&WalletProperties {
+			network,
+			fingerprint: seed.fingerprint(),
+			server_pubkey: None,
+			server_mailbox_pubkey: None,
+			server_payouts: None,
+			mailbox_identity: None,
+		}).await.unwrap();
+
+		let chain = Arc::new(ChainSource::offline_for_test(network));
+		let notifications = NotificationDispatch::new();
+		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
+		let exit = Exit::new(db.clone(), chain.clone(), movements.clone()).await.unwrap();
+		let wallet = Wallet { inner: Arc::new(WalletInner {
+			config, db, seed, exit, movements, notifications, chain,
+			lock_manager: Box::new(crate::lock_manager::memory::MemoryLockManager::new()),
+			server: tokio::sync::OnceCell::new(),
+			onchain: None,
+			daemon: parking_lot::Mutex::new(None),
+			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
+			round_secret_nonces: RoundSecretNonces::new(),
+		})};
+		(wallet, conn)
+	}
+
 	/// Returns the config used to create/load the bark [Wallet].
 	pub fn config(&self) -> &Config {
 		&self.inner.config
@@ -2222,6 +2260,28 @@ impl Wallet {
 	pub async fn progress_exits(&self) -> anyhow::Result<()> {
 		self.exit_mgr().progress_exits_with_cpfp(&self, None).await?;
 		Ok(())
+	}
+
+	/// Presign the CPFP children needed to unilaterally (emergency) exit the given VTXOs.
+	///
+	/// Thin wrapper over [Exit::presign_emergency_exit]; see it and [PresignedExits] for the
+	/// broadcast rules and the wallet state this touches.
+	pub async fn presign_emergency_exit(
+		&self,
+		vtxos: &[VtxoId],
+		fee_rate: Option<FeeRate>,
+	) -> anyhow::Result<PresignedExits, ExitError> {
+		self.exit_mgr().presign_emergency_exit(vtxos, self, fee_rate).await
+	}
+
+	/// List the exit transactions still awaiting confirmation for the given VTXOs.
+	///
+	/// Thin wrapper over [Exit::remaining_exit_transactions]; see it for the semantics.
+	pub async fn remaining_exit_transactions(
+		&self,
+		vtxos: &[VtxoId],
+	) -> anyhow::Result<RemainingExitTransactions, ExitError> {
+		self.exit_mgr().remaining_exit_transactions(vtxos).await
 	}
 
 	/// Detect spendable VTXOs that were exited on-chain without the user asking for it — e.g.
@@ -2929,10 +2989,14 @@ mod tests {
 
 	#[test]
 	fn ark_info_over_nb_round_nonces_cap_is_rejected() {
+		// the cap holds on every network, not only on mainnet
 		let mut ai = ark_info_with_lifetime(4032, 6);
+		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
+		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
+		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
+
 		ai.network = Network::Bitcoin;
 		ai.vtxo_exit_delta = MIN_MAINNET_VTXO_EXIT_DELTA;
-		ai.nb_round_nonces = MAX_NB_ROUND_NONCES + 1;
 		let err = check_ark_info_safe(&ai, BlockDelta::new(12)).unwrap_err().to_string();
 		assert!(err.contains("nb_round_nonces"), "unexpected error: {err}");
 	}

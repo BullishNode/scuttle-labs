@@ -70,3 +70,12 @@ async fn signed_package(
 	}
 	package
 }
+
+/// The key a wallet bound its receive to, with its secret, for tests that
+/// prepare the claim by hand.
+async fn receive_claim_keypair(srv: &Captaind, wallet: &Wallet, hash: ark::lightning::PaymentHash) -> Keypair {
+	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
+	let sub = db.read(async |t| t.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
+	let key = sub.claim_pubkey.expect("the wallet bound its receive to a claim key");
+	wallet.pubkey_keypair(&key).await.unwrap().expect("the claim key is the wallet's").1
+}
