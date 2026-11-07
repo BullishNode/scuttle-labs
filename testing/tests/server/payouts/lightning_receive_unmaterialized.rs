@@ -403,6 +403,11 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(original.promised.policy(), address.policy());
 		assert_eq!(original.promised.user_pubkey(), recipient_key);
 		assert_ne!(original.source.user_pubkey(), recipient_key);
+		// The provider bound the grant to its own claim key and the invoice to
+		// the recipient: two distinct keys, and only the recipient is paid.
+		let subscription = tx.get_htlc_subscription_by_payment_hash(hash).await?.unwrap();
+		assert_eq!(subscription.claim_pubkey, Some(original.source.user_pubkey()));
+		assert_eq!(subscription.claim_destination_user_pubkey, Some(recipient_key));
 		assert!(original.source.has_all_witnesses(), "the grant itself was signed before the interruption");
 		let funding = ctx.bitcoind().await_transaction(original.source.chain_anchor().txid).await;
 		original.source.validate(&funding).unwrap();

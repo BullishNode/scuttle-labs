@@ -902,16 +902,6 @@ impl Server {
 
 		let mut sub = self.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await?
 			.not_found([payment_hash], "no pending payment with this payment hash")?;
-		if let Some(invoice_mailbox) = self.db.read(async |t|
-			t.get_lightning_receiver_mailbox_id(payment_hash).await
-		).await? {
-			let claimant_mailbox = owner_links.verified_mailbox(
-				user_pubkey, self.mailbox_key.leak_ref(), self.config.network,
-			)?;
-			if claimant_mailbox != invoice_mailbox {
-				return badarg!("receive claimant does not own the invoice mailbox");
-			}
-		}
 
 		slog!(LightningReceivePrepareRequested, payment_hash, user_pubkey, htlc_recv_expiry);
 

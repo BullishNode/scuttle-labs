@@ -8,7 +8,6 @@ use ark::{ProtocolEncoding, VtxoPolicy};
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::arkoor::state::ServerCanCosign;
 use ark::fallback::OwnerLink;
-use ark::mailbox::MailboxIdentifier;
 use server_rpc::protos;
 
 use crate::database::Tx;
@@ -56,25 +55,18 @@ impl OwnerLinks {
 			if !keys.contains(key) { return Err(OwnershipRefusal::Invalid(*key).into()); }
 		}
 		for key in &keys {
-			self.verified_mailbox(*key, server_mailbox_key, network)?;
+			let copies = self.0.get(key).ok_or(OwnershipRefusal::Required(*key))?;
+			let mut mailbox = None;
+			for link in copies {
+				let current = link.verify_joint(network, server_mailbox_key, *key)
+					.map_err(|_| OwnershipRefusal::Invalid(*key))?;
+				if mailbox.is_some_and(|previous| previous != current) {
+					return Err(OwnershipRefusal::Conflicting(*key).into());
+				}
+				mailbox = Some(current);
+			}
 		}
 		Ok(keys)
-	}
-
-	pub fn verified_mailbox(
-		&self, key: PublicKey, server_mailbox_key: &Keypair, network: Network,
-	) -> anyhow::Result<MailboxIdentifier> {
-		let copies = self.0.get(&key).ok_or(OwnershipRefusal::Required(key))?;
-		let mut mailbox = None;
-		for link in copies {
-			let current = link.verify_joint(network, server_mailbox_key, key)
-				.map_err(|_| OwnershipRefusal::Invalid(key))?;
-			if mailbox.is_some_and(|previous| previous != current) {
-				return Err(OwnershipRefusal::Conflicting(key).into());
-			}
-			mailbox = Some(current);
-		}
-		mailbox.ok_or_else(|| OwnershipRefusal::Required(key).into())
 	}
 
 	/// Store distinct bindings in key order only after every copy is checked.

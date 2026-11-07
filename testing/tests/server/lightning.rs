@@ -2757,21 +2757,24 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	let address: ark::Address = recipient.address().await.parse().unwrap();
 	let mailbox_key = srv.ark_info().await.mailbox_pubkey;
 	let recipient_link = address.owner_link(Network::Regtest, mailbox_key).unwrap().unwrap();
-	let recipient_client = recipient.client().await;
 	let preimage = ark::lightning::Preimage::from([23u8; 32]);
 	let hash = preimage.compute_payment_hash();
 	let amount = sat(100_000);
 	let net = amount - srv.config().fees.lightning_receive.calculate(amount).unwrap();
+	// A forwarding provider: its own mailbox and grant key, the recipient's address.
+	let provider_mailbox = Keypair::from_seckey_slice(&SECP, &[60; 32]).unwrap();
+	let grant_key = Keypair::from_seckey_slice(&SECP, &[61; 32]).unwrap();
+	assert_ne!(grant_key.public_key(), address.policy().user_pubkey());
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 40,
-		mailbox_id: Some(recipient_client.mailbox_identifier().serialize()),
+		mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
 		description: None, expiry_secs: None,
 		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(),
 			owner_proof: Some(recipient_link.into()),
 		}),
-		claim_pubkey: None,
+		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
 	}).await.unwrap().into_inner().bolt11;
 
 	let payer = lightning.external;
@@ -2782,30 +2785,44 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap();
+	// The grant key and the payee are two different keys, both bound.
 	assert_eq!(sub.claim_destination_user_pubkey, Some(address.policy().user_pubkey()));
+	assert_eq!(sub.claim_pubkey, Some(grant_key.public_key()));
 	let lowest = sub.lowest_incoming_htlc_expiry.unwrap();
+	let expiry = lowest.saturating_sub(srv.config().htlc_expiry_delta);
 
-	let grant_key = Keypair::from_seckey_slice(&SECP, &[61; 32]).unwrap();
-	let grant_link = OwnerLink::new_joint(Network::Regtest, mailbox_key,
-		&recipient_client.mailbox_keypair(), &grant_key).unwrap();
-	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(grant_link.into()),
-		payment_hash: hash.to_vec(), user_pubkey: grant_key.public_key().serialize().to_vec(),
-		htlc_recv_expiry: lowest.saturating_sub(srv.config().htlc_expiry_delta).into(),
+	// A third key, with its own attestation and owner link, cannot take the grant.
+	let third_key = Keypair::from_seckey_slice(&SECP, &[63; 32]).unwrap();
+	let third_link = OwnerLink::new_joint(Network::Regtest, mailbox_key, &third_key, &third_key).unwrap();
+	let refused = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(third_link.into()),
+		payment_hash: hash.to_vec(), user_pubkey: third_key.public_key().serialize().to_vec(),
+		htlc_recv_expiry: expiry.into(),
 		lightning_receive_anti_dos: None,
-		claim_attestation: None,
+		claim_attestation: Some(LightningReceiveClaimAttestation::new(hash, expiry, &third_key).serialize()),
+	}).await.expect_err("a third key took the grant");
+	assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+	assert!(refused.message().contains("claim key"), "{refused}");
+	assert_eq!(count_htlc_recv_vtxos(&db).await, 0);
+
+	let grant_link = OwnerLink::new_joint(Network::Regtest, mailbox_key, &provider_mailbox, &grant_key).unwrap();
+	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(grant_link.clone().into()),
+		payment_hash: hash.to_vec(), user_pubkey: grant_key.public_key().serialize().to_vec(),
+		htlc_recv_expiry: expiry.into(),
+		lightning_receive_anti_dos: None,
+		claim_attestation: Some(LightningReceiveClaimAttestation::new(hash, expiry, &grant_key).serialize()),
 	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
 		.map(|bytes| Vtxo::<Full>::deserialize(&bytes).unwrap()).collect::<Vec<_>>();
 	assert!(!granted.is_empty());
 
-	let wrong_key = Keypair::from_seckey_slice(&SECP, &[62; 32]).unwrap();
-	let wrong_link = OwnerLink::new_joint(Network::Regtest, mailbox_key, &wrong_key, &wrong_key).unwrap();
+	// The provider cannot redirect the claim to its own key.
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
-		granted.clone(), VtxoPolicy::new_pubkey(wrong_key.public_key()),
+		granted.clone(), VtxoPolicy::new_pubkey(grant_key.public_key()),
 	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.owner_proof = Some(wrong_link.clone().into());
+		output.owner_proof = Some(grant_link.clone().into());
 	}
 	let bad = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
@@ -2818,7 +2835,7 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
 
 	let valid_builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
-		granted, address.policy().clone(),
+		granted.clone(), address.policy().clone(),
 	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
 	let mut valid_package = protos::ArkoorPackageCosignRequest::from(valid_builder.cosign_request());
 	for output in valid_package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
@@ -2833,6 +2850,16 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	assert!(!outputs.is_empty());
 	assert!(outputs.iter().all(|v| v.amount() == net
 		&& v.policy().user_pubkey() == address.policy().user_pubkey() && v.has_all_witnesses()));
+	// The payout engine reads the payee from these rows: one per grant, each
+	// paying the recipient.
+	let claims = db.read(async |tx| Ok(tx.query("SELECT source_vtxo_id, output_vtxo \
+		FROM expiry_lightning_receive_claim WHERE payment_hash=$1", &[&hash.to_string()]).await?)).await.unwrap();
+	assert_eq!(claims.len(), granted.len());
+	for claim in &claims {
+		assert!(granted.iter().any(|grant| grant.id().to_string() == claim.get::<_, String>("source_vtxo_id")));
+		let output = Vtxo::<Full>::deserialize(claim.get("output_vtxo")).unwrap();
+		assert_eq!(output.policy().user_pubkey(), address.policy().user_pubkey());
+	}
 	rpc.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
 		vtxos: outputs.iter().map(|v| v.serialize()).collect(),
 	}).await.expect("the intended output can be registered");

@@ -381,3 +381,105 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	assert_eq!(final_state.get::<_, i64>("allocations"), 1);
 	assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 }
+
+/// A forwarded receive whose hash settles without a cooperative claim leaves
+/// no claim row naming the recipient. Its grant, still unspent offchain at
+/// expiry, must not be paid to the provider's grant key.
+#[tokio::test]
+async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
+	let ctx = TestContext::new("server/settled_forwarded_receive_without_claim").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let payer = Arc::new(lightning.external);
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
+			cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
+		}).watchmand().create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let mailbox_key = srv.ark_info().await.mailbox_pubkey;
+	let recipient = ctx.bark("recipient", &srv).create().await;
+	let address: ark::Address = recipient.address().await.parse().unwrap();
+	let recipient_link = address.owner_link(Network::Regtest, mailbox_key).unwrap().unwrap();
+	let provider_mailbox = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let grant_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let provider_script = ark::fallback::payout_script(provider_mailbox.public_key());
+
+	let preimage = ark::lightning::Preimage::random();
+	let hash = preimage.compute_payment_hash();
+	let amount = sat(100_000);
+	let net = amount - srv.config().fees.lightning_receive.calculate(amount).unwrap();
+	let mut rpc = srv.get_public_rpc().await;
+	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(),
+		min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
+		mailbox_id: Some(MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
+		description: None, expiry_secs: None,
+		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
+		claim_destination: Some(protos::VtxoRequest {
+			amount: net.to_sat(), policy: address.policy().serialize(),
+			owner_proof: Some(recipient_link.into()),
+		}),
+	}).await.unwrap().into_inner().bolt11;
+	let pay_task = {
+		let payer = payer.clone();
+		tokio::spawn(async move { payer.try_pay_bolt11(invoice).await })
+	};
+	wait_for_subscription_status(&db, hash, "accepted").await;
+	let incoming_expiry = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap().lowest_incoming_htlc_expiry.unwrap();
+	let expiry = incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta);
+	let grant_link = OwnerLink::new_joint(Network::Regtest, mailbox_key, &provider_mailbox, &grant_key).unwrap();
+	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		owner_proof: Some(grant_link.into()),
+		payment_hash: hash.to_vec(), user_pubkey: grant_key.public_key().serialize().to_vec(),
+		htlc_recv_expiry: expiry.into(),
+		lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(
+			hash, expiry, &grant_key).serialize()),
+	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
+		.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
+	assert!(!grants.is_empty());
+	assert!(grants.iter().all(|grant| grant.user_pubkey() == grant_key.public_key()));
+
+	// The preimage reaches the settler without a cooperative claim, which
+	// settles the hold invoice and pays the payer's invoice.
+	assert!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap().is_some());
+	wait_for_subscription_status(&db, hash, "settled").await;
+	pay_task.wait_millis(30_000).await.unwrap().expect("the payer's invoice is paid");
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_lightning_receive_claim \
+		WHERE payment_hash=$1", &[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+
+	let fee_address = srv.watchmand().wait_wallet_address().await;
+	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
+	ctx.generate_blocks(2).await;
+	let latest = grants.iter().map(|grant| grant.expiry_height()).max().unwrap();
+	let tip = ctx.bitcoind().get_block_count().await as u32;
+	let expired = ctx.generate_blocks(latest.to_u32() + 1 - tip).await;
+	srv.wait_for_sync_height(expired).await;
+	srv.watchmand().wait_for_sync_height(expired).await;
+
+	// Give the watchman several passes to decide, then check every decision
+	// on a grant: none may pay the provider.
+	for _ in 0..3 {
+		let tip = ctx.generate_blocks(1).await;
+		srv.watchmand().wait_for_sync_height(tip).await;
+		tokio::time::sleep(Duration::from_secs(5)).await;
+	}
+	for grant in &grants {
+		let decisions = db.read(async |tx| Ok(tx.query("SELECT c.disposition, c.user_pubkey, c.owner_mailbox, a.sweep_tx \
+			FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
+			&[&grant.id().to_string()]).await?)).await.unwrap();
+		for decision in decisions {
+			assert_ne!(decision.get::<_, Option<String>>("user_pubkey"), Some(grant_key.public_key().to_string()),
+				"grant {} was allocated to the provider's grant key", grant.id());
+			assert_ne!(decision.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()),
+				"grant {} was allocated to the provider's mailbox", grant.id());
+			if let Some(raw) = decision.get::<_, Option<Vec<u8>>>("sweep_tx") {
+				let parent = deserialize::<Transaction>(&raw).unwrap();
+				assert!(parent.output.iter().all(|out| out.script_pubkey != provider_script),
+					"the provider was paid for grant {}", grant.id());
+			}
+		}
+	}
+}
