@@ -121,15 +121,16 @@ async fn failed_external_payout() {
 	// This native completion is the missing zero-part authority. Neither
 	// empty parts nor the copied failed status is its substitute.
 	assert!(native.is_empty(), "the no-channel case must exercise a genuine zero-part reply");
+	let label = ark_testing::lightning::attempt_xpay_label(&db, attempt).await;
 	let row = db.read(async |t| Ok(t.query_one("SELECT x.id,x.lightning_node_id,x.label,x.payment_hash, \
 		x.payment_amount_msat,x.max_routing_fee_msat,x.status::TEXT,x.error_code,a.error, \
 		x.signed_invoice,x.htlc_expiry,a.retry_for_secs, \
 		a.lightning_node_id AS attempt_node,n.pubkey FROM cln_xpay x \
 		JOIN lightning_payment_attempt a ON a.id=$1 JOIN lightning_node n ON n.id=x.lightning_node_id \
-		WHERE x.label=$2", &[&attempt, &attempt.to_string()]).await?)).await.unwrap();
+		WHERE x.label=$2", &[&attempt, &label]).await?)).await.unwrap();
 	assert_eq!(row.get::<_, &str>("status"), "fail");
-	assert_eq!(row.get::<_, Option<i32>>("error_code"), Some(205));
-	assert_eq!(row.get::<_, &str>("label"), attempt.to_string());
+	assert_eq!(row.get::<_, Option<i32>>("error_code"), None);
+	assert_eq!(row.get::<_, &str>("label"), label);
 	assert_eq!(row.get::<_, &str>("payment_hash"), hash.to_string());
 	assert_eq!(row.get::<_, i64>("payment_amount_msat"), 90_000_000);
 	assert_eq!(row.get::<_, i64>("lightning_node_id"), row.get::<_, i64>("attempt_node"));
@@ -718,7 +719,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			assert_eq!(linked[0].get::<_, String>(0), source.id().to_string());
 			Ok(id)
 		}).await.unwrap();
-		let label = attempt.to_string();
+		let label = ark_testing::lightning::attempt_xpay_label(&db, attempt).await;
 		let peer_parts = async || {
 			let tip = ctx.bitcoind().get_block_count().await as u32;
 			let mut both = Vec::new();

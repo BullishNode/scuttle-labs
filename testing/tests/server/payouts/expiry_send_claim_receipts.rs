@@ -76,7 +76,8 @@ async fn external_dispatch(db: &Db, hash: PaymentHash, sources: &[Vtxo<Full>]) -
 			a.lightning_htlc_subscription_id FROM lightning_payment_attempt a WHERE a.payment_hash=$1", &[&hash.to_string()]).await?;
 		assert_eq!(rows.len(), 1, "one accepted payment must retain one upstream attempt");
 		let id = rows[0].get::<_, i64>("id");
-		let label = id.to_string();
+		let label = tx.query_one("SELECT label FROM cln_xpay WHERE payment_hash=$1", &[&hash.to_string()]).await?
+			.get::<_, String>(0);
 		assert!(!label.is_empty());
 		let amount_msat = sources.iter().map(|source| source.amount().to_sat() * 1_000).sum::<u64>();
 		assert_eq!(rows[0].get::<_, i64>("amount_msat"), i64::try_from(amount_msat).unwrap());

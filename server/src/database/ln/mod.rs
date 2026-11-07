@@ -225,12 +225,10 @@ impl<'t> Tx<'t> {
 				&& amount >= subscription.amount(), "recorded intra-Ark invoice differs from initiation");
 		} else {
 			let records = super::xpay::get_xpays_by_payment_hash(&**self, attempt.payment_hash).await?;
-			let label = attempt.id.to_string();
-			let mut matching = records.into_iter().filter(|record| record.label.as_deref() == Some(label.as_str()));
+			let mut matching = records.into_iter().filter(|record| record.status == super::xpay::ClnXpayStatus::Pending);
 			let record = matching.next().context("recorded payment has no original xpay request")?;
 			ensure!(matching.next().is_none(), "recorded payment has ambiguous original xpay requests");
-			ensure!(record.status == super::xpay::ClnXpayStatus::Pending
-				&& record.lightning_node_id == attempt.lightning_node_id
+			ensure!(record.lightning_node_id == attempt.lightning_node_id
 				&& record.payment_hash == attempt.payment_hash
 				&& record.payment_amount_msat == amount.to_msat()
 				&& record.signed_invoice.as_deref() == Some(invoice.to_string().as_str()),

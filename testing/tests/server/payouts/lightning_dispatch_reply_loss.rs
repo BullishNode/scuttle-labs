@@ -121,7 +121,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		let old_attempt = db.read(async |tx| Ok(tx.query_one("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1",
 			&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
-		let old_label = old_attempt.to_string();
+		let old_label = ark_testing::lightning::attempt_xpay_label(&db, old_attempt).await;
 		srv.watchmand().stop().await.unwrap();
 		srv.stop().await.unwrap();
 		first_hold.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
@@ -206,7 +206,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		assert!(later.is_invoice_paid(hash).await.unwrap());
 		let later_attempt = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert_ne!(later_attempt.id, old_attempt);
-		let later_label = later_attempt.id.to_string();
+		let later_label = ark_testing::lightning::attempt_xpay_label(&db, later_attempt.id).await;
 		assert_ne!(later_label, old_label);
 		let mut rpc = srv.get_public_rpc().await;
 		for (ids, success) in [(&old_htlcs.vtxo_ids, false), (&later_htlcs.vtxo_ids, true)] {

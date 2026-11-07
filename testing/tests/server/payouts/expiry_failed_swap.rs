@@ -74,7 +74,7 @@ async fn assert_original_attempt(
 		FROM lightning_payment_attempt a WHERE a.id=$1 AND a.payment_hash=$3",
 		&[&attempt, &source.to_string(), &hash.to_string()],
 	).await?)).await.unwrap();
-	assert_eq!(label, attempt.to_string());
+	assert_eq!(label, ark_testing::lightning::attempt_xpay_label(db, attempt).await);
 	if proof.is_some() { assert_eq!(row.get::<_, String>("status"), "failed"); }
 	assert_eq!(row.get::<_, i64>("amount_msat"), 100_000_000);
 	assert_eq!(row.get::<_, Option<i64>>("user_fee_sat"), Some(0));
@@ -164,7 +164,7 @@ async fn failed_swap_during_restart() {
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT a.id FROM lightning_payment_attempt a WHERE a.payment_hash=$1", &[&hash.to_string()],
 	).await?)).await.unwrap();
 	let attempt: i64 = row.get("id");
-	let label = attempt.to_string();
+	let label = ark_testing::lightning::attempt_xpay_label(&db, attempt).await;
 	assert_original_attempt(&db, hash, source, attempt, &label, None).await;
 	let pending = remote_pays(&lightning.internal, hash).await;
 	assert!(pending.iter().any(|pay| pay.payment_hash == hash.to_vec() && pay.label.as_deref() == Some(label.as_str())

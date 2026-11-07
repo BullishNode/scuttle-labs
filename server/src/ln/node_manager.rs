@@ -52,6 +52,7 @@ use tracing::{debug, error, info, trace, warn};
 use ark::VtxoId;
 use ark::lightning::{Bolt12Invoice, Bolt12InvoiceExt, Invoice, Offer, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
+use uuid::Uuid;
 
 use crate::Server;
 use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle, unary_rpc};
@@ -151,7 +152,6 @@ impl LightningManager {
 		};
 		let xpay_config = ClnXpayConfig {
 			invoice_check_interval: config.invoice_check_interval,
-			cln_xpay_timeout: config.cln_xpay_timeout,
 			check_base_delay: config.invoice_check_base_delay,
 			max_check_delay: config.max_invoice_check_delay,
 		};
@@ -328,24 +328,19 @@ impl LightningManager {
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let node = self.active_node().context("no active cln node").map_err(PaymentPreflightRefusal)?;
+		let tip = node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {}).await
+			.context("failed to get info from rpc")?
+			.into_inner().blockheight;
+
+		debug!("Selected cln node {} for bolt11 payment with payment hash {} and amount {}. \
+			Current block height is {}", node.id, payment_hash, amount, tip,
+		);
 
 		// If a subscription already exists for this payment hash, the payment
 		// routes through the intra-Ark path. Only an attempt that actually
 		// promotes its subscription is linked as that receive's funding.
 		let sub = self.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await?;
 		let validation = sub.as_ref().map(|sub| validate_intra_ark_payment(sub, &invoice, amount));
-		// Refuse an unqualified external endpoint before committing an attempt.
-		// Dispatch still rechecks it: endpoint changes after commit stay unknown.
-		let info = if sub.is_none() {
-			node.xpay.node_info().await.map_err(PaymentPreflightRefusal)?
-		} else {
-			unary_rpc(node.rpc.clone().getinfo(cln_rpc::GetinfoRequest {})).await
-				.context("failed to get info from rpc")?.into_inner()
-		};
-		let tip = info.blockheight;
-		debug!("Selected cln node {} for bolt11 payment with payment hash {} and amount {}. \
-			Current block height is {}", node.id, payment_hash, amount, tip,
-		);
 
 		// Read here, while we are still on the user's RPC task: every later
 		// status transition of this attempt is emitted by the xpay monitor,
@@ -357,7 +352,7 @@ impl LightningManager {
 		// cln_xpay next to the attempt. An intra-Ark payment never calls xpay
 		// and gets no row. The deadlines are computed here, before anything is
 		// stored, so a payment we cannot make leaves nothing behind.
-		let mut new_xpay = async {
+		let new_xpay = async {
 			if sub.is_some() { return Ok::<_, anyhow::Error>(None); }
 			// A lagging CLN must not enlarge the route's budget beyond the
 			// processed server tip or the height already bound to this attempt.
@@ -378,6 +373,8 @@ impl LightningManager {
 				.context("retry_for does not fit in a timestamp")?;
 			let htlc_expiry = tip + max_cltv_expiry_delta;
 
+			// A unique label ties this call to CLN's own record of it.
+			let label = Uuid::new_v4().to_string();
 			Ok(Some((max_cltv_expiry_delta, NewClnXpay {
 				lightning_node_id: node.id,
 				payment_amount_msat: amount.to_msat(),
@@ -385,7 +382,7 @@ impl LightningManager {
 				attempt_expiry,
 				partial_msat: None,
 				htlc_expiry: Some(htlc_expiry),
-				label: None,
+				label: Some(label),
 				payment_hash,
 				signed_invoice: Some(invoice.to_string()),
 				user_fee_msat: Some(user_fee.to_msat()),
@@ -431,8 +428,10 @@ impl LightningManager {
 				sub.is_none().then_some(max_routing_fee),
 				Some(intent_id),
 			).await?;
-			if let Some((_, new)) = &mut new_xpay {
-				new.label = Some(attempt_id.to_string());
+			// Same transaction as the attempt: the attempt check above is what
+			// keeps one payment per hash in flight, and the cln_xpay row must
+			// not outlive an attempt that was never stored.
+			if let Some((_, new)) = &new_xpay {
 				xpay::create_xpay(&**t, new).await.context("failed to store the xpay call")?;
 			}
 			Ok(attempt_id)
@@ -450,7 +449,7 @@ impl LightningManager {
 			return Ok(());
 		}
 
-		let (max_cltv_expiry_delta, _) = new_xpay
+		let (max_cltv_expiry_delta, new_xpay) = new_xpay
 			.expect("an outgoing payment has its xpay call prepared above");
 
 		// Fire-and-forget: ClnXpayClient::pay issues the gRPC and reconciles
@@ -466,6 +465,7 @@ impl LightningManager {
 				max_routing_fee,
 				max_cltv_expiry_delta,
 				retry_for,
+				new_xpay.label,
 			).await;
 		});
 		slog!(LightningPaymentInitiated, payment_hash, amount, fee: user_fee,

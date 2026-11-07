@@ -1,9 +1,8 @@
-//! Separate decision and external dispatch locks on one payment hash.
+//! A lock on one payment hash.
 //!
-//! [`PaymentGuards::lock`] takes a decision lock and returns a [`PaymentGuard`].
-//! Other decisions on that hash wait until the guard is dropped. Dispatch
-//! locks independently exclude another xpay or its monitor; they permit a
-//! receive decision while an external payment is pending.
+//! [`PaymentGuards::lock`] takes the lock and returns a [`PaymentGuard`]. No
+//! other task can lock the same payment hash while that guard exists. The lock
+//! is free again when the guard is dropped.
 //!
 //! Each payment hash has its own lock. A payment never waits for a different
 //! payment.
@@ -28,15 +27,11 @@ use ark::lightning::PaymentHash;
 #[derive(Debug, Clone)]
 pub struct PaymentGuards {
 	locks: Arc<Locks>,
-	dispatch_locks: Arc<Locks>,
 }
 
 impl PaymentGuards {
 	pub fn new() -> PaymentGuards {
-		PaymentGuards {
-			locks: Arc::new(Locks::default()),
-			dispatch_locks: Arc::new(Locks::default()),
-		}
+		PaymentGuards { locks: Arc::new(Locks::default()) }
 	}
 
 	/// Takes the lock on the payment hash.
@@ -44,21 +39,10 @@ impl PaymentGuards {
 	/// The call waits until the current holder drops its guard. The call is
 	/// safe to cancel.
 	pub async fn lock(&self, payment_hash: PaymentHash) -> PaymentGuard {
-		Self::lock_in(&self.locks, payment_hash).await
-	}
-
-	/// Exclude another xpay or monitor while its remote result is unresolved.
-	/// Take this before the decision lock; receive decisions need not wait for
-	/// the external payment to finish. Clones share both sets of locks.
-	pub async fn lock_dispatch(&self, payment_hash: PaymentHash) -> PaymentGuard {
-		Self::lock_in(&self.dispatch_locks, payment_hash).await
-	}
-
-	async fn lock_in(locks: &Arc<Locks>, payment_hash: PaymentHash) -> PaymentGuard {
 		let mut waiting = Waiting {
-			locks,
+			locks: &self.locks,
 			payment_hash,
-			semaphore: Some(locks.semaphore(payment_hash)),
+			semaphore: Some(self.locks.semaphore(payment_hash)),
 			acquired: false,
 		};
 
@@ -73,34 +57,13 @@ impl PaymentGuards {
 		waiting.acquired = true;
 
 		PaymentGuard {
-			locks: locks.clone(),
+			locks: self.locks.clone(),
 			payment_hash,
 			semaphore: waiting.semaphore.take(),
 		}
 	}
 
-	/// Skip monitoring an xpay still held by any client, including one whose
-	/// node connection has since been replaced.
-	pub fn try_lock_dispatch(&self, payment_hash: PaymentHash) -> Option<PaymentGuard> {
-		Self::try_lock_in(&self.dispatch_locks, payment_hash)
-	}
-
-	fn try_lock_in(locks: &Arc<Locks>, payment_hash: PaymentHash) -> Option<PaymentGuard> {
-		let mut waiting = Waiting {
-			locks, payment_hash,
-			semaphore: Some(locks.semaphore(payment_hash)), acquired: false,
-		};
-		let permit = waiting.semaphore.as_ref().expect("a waiting caller has the lock")
-			.try_acquire().ok()?;
-		permit.forget();
-		waiting.acquired = true;
-		Some(PaymentGuard {
-			locks: locks.clone(), payment_hash,
-			semaphore: waiting.semaphore.take(),
-		})
-	}
-
-	/// The number of decision hashes that are locked or waited for.
+	/// The number of payment hashes that are locked or waited for.
 	///
 	/// For tests and diagnostics.
 	pub fn tracked(&self) -> usize {
@@ -233,21 +196,6 @@ mod tests {
 
 	fn hash(n: u8) -> PaymentHash {
 		PaymentHash::from([n; 32])
-	}
-
-	#[tokio::test]
-	async fn a_dispatch_excludes_other_clients_without_blocking_receive_decisions() {
-		let guards = PaymentGuards::new();
-		let other_client = guards.clone();
-		let dispatch = guards.lock_dispatch(hash(1)).await;
-		assert!(other_client.try_lock_dispatch(hash(1)).is_none());
-		let decision = other_client.lock(hash(1)).await;
-		assert!(poll(&mut Box::pin(guards.lock(hash(1)))).await.is_none());
-		drop(decision);
-		assert!(other_client.try_lock_dispatch(hash(1)).is_none());
-		drop(dispatch);
-		let monitor = other_client.try_lock_dispatch(hash(1)).expect("the monitor can reconcile after xpay returns");
-		drop(monitor);
 	}
 
 	/// Polls a lock one time and does not wait for it.

@@ -97,26 +97,6 @@ impl<'a> PaymentAttemptHandler<'a> {
 		final_amount_msat: Option<u64>,
 		preimage: Option<Preimage>,
 	) -> anyhow::Result<()> {
-		self.process_attempt(settler, attempt, status, payment_error, final_amount_msat, preimage, None).await
-	}
-
-	/// An original live reply or privileged cold-lifecycle reconciliation may
-	/// retire an empty native attempt through the same source-guarded commit.
-	pub(crate) async fn process_native_failure(
-		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
-		error: Option<&str>, record: &crate::database::xpay::ClnXpayRecord, code: Option<i32>,
-	) -> anyhow::Result<()> {
-		ensure!(code.is_none_or(|code| matches!(code, 205 | 206 | 207)), "unsupported native zero-part code");
-		self.process_attempt(settler, attempt, LightningPaymentStatus::Failed,
-			error, None, None, Some((record, code))).await
-	}
-
-	async fn process_attempt(
-		&self, settler: &HtlcSettler, attempt: &LightningPaymentAttempt,
-		status: LightningPaymentStatus, payment_error: Option<&str>,
-		final_amount_msat: Option<u64>, preimage: Option<Preimage>,
-		zero_part: Option<(&crate::database::xpay::ClnXpayRecord, Option<i32>)>,
-	) -> anyhow::Result<()> {
 		// Native success is authoritative even when an optimistic status write
 		// loses its race. Its actual attempt provenance and WAL commit together.
 		if let Some(preimage) = preimage {
@@ -141,9 +121,6 @@ impl<'a> PaymentAttemptHandler<'a> {
 				t.lock_htlc_settlements().await?;
 				t.ensure_attempt_sources_allow_failure(attempt).await?;
 			}
-			if zero_part.is_some() {
-				t.ensure_not_settled(attempt.payment_hash).await?;
-			}
 			let updated = t.verify_and_update_payment_attempt(
 				attempt, status, payment_error, final_amount_msat
 			).await?;
@@ -159,16 +136,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 					},
 					_ => ClnXpayOutcome::Fail { error_code: None },
 				};
-				if let Some((record, code)) = zero_part {
-					ensure!(!attempt.is_self_payment(), "native result belongs to an intra-Ark attempt");
-					let current = crate::database::xpay::get_xpay_for_payment_attempt(&**t, attempt).await?;
-					ensure!(current == *record && current.status == crate::database::xpay::ClnXpayStatus::Pending
-						&& current.error_code.is_none(), "native request changed during its original call");
-					ensure!(crate::database::xpay::mark_xpay_fail(&**t, current.id, code).await?.is_some(),
-						"live native result lost its pending request");
-				} else {
-					end_xpay(t, attempt, outcome).await?;
-				}
+				end_xpay(t, attempt, outcome).await?;
 			}
 
 			// Only mark linked HTLC-send vtxos as ln-spent once the attempt
@@ -295,7 +263,7 @@ async fn end_xpay(
 	let ended = xpay::end_pending_xpay_by_payment_hash(&**tx, attempt.payment_hash, outcome)
 		.await?;
 	if ended.is_none() {
-		// A pre-V76 attempt never had one; anything else has two writers
+		// A pre-V75 attempt never had one; anything else has two writers
 		// disagreeing on which attempt is open, which the attempt's own
 		// optimistic lock should have prevented.
 		warn!("Lightning payment attempt ({}): no pending cln_xpay row to end for \

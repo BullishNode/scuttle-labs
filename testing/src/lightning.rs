@@ -122,3 +122,11 @@ pub async fn sign_lightning_send_request_with_keys(
 		intent.sign(keypair).serialize().to_vec()).collect();
 	req
 }
+
+/// The label of the xpay call made for a payment attempt. Both rows are
+/// written in one transaction, so they share their creation time.
+pub async fn attempt_xpay_label(db: &server::database::Db, attempt_id: i64) -> String {
+	db.read(async |t| Ok(t.query_one("SELECT x.label FROM cln_xpay x \
+		JOIN lightning_payment_attempt a ON a.payment_hash = x.payment_hash AND a.created_at = x.created_at \
+		WHERE a.id = $1", &[&attempt_id]).await?.get::<_, String>(0))).await.unwrap()
+}

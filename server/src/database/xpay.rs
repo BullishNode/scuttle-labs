@@ -21,7 +21,7 @@
 
 use std::str::FromStr;
 
-use anyhow::{ensure, Context};
+use anyhow::Context;
 use chrono::{DateTime, Local};
 use postgres_types::{FromSql, ToSql};
 use tokio_postgres::{GenericClient, Row};
@@ -76,7 +76,7 @@ impl std::fmt::Display for ClnXpayStatus {
 }
 
 /// A row of the `cln_xpay` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ClnXpayRecord {
 	pub id: i64,
 	pub lightning_node_id: LightningNodeId,
@@ -107,8 +107,6 @@ pub struct ClnXpayRecord {
 	/// the server subsidized the payment so that the recipient still received
 	/// the intended amount.
 	pub routing_fee_msat: Option<i64>,
-	/// Original live zero-part replies persist their actual native code.
-	/// A stored code alone never authorizes a terminal transition.
 	pub error_code: Option<i32>,
 
 	pub created_at: DateTime<Local>,
@@ -379,21 +377,4 @@ pub async fn get_xpays_by_payment_hash<T: GenericClient>(
 		.context("failed to list xpays by payment hash")?;
 
 	rows.into_iter().map(ClnXpayRecord::try_from).collect()
-}
-
-/// Recover the original request written in the same transaction as this attempt.
-/// Never infer an absent/ambiguous label from a payment hash or native outcome.
-pub(crate) async fn get_xpay_for_payment_attempt<T: GenericClient>(
-	client: &T, attempt: &crate::database::ln::LightningPaymentAttempt,
-) -> anyhow::Result<ClnXpayRecord> {
-	let mut matching = get_xpays_by_payment_hash(client, attempt.payment_hash).await?
-		.into_iter().filter(|record| record.lightning_node_id == attempt.lightning_node_id
-			&& record.payment_hash == attempt.payment_hash
-			&& record.payment_amount_msat == attempt.amount_msat
-			&& record.created_at == attempt.created_at);
-	let record = matching.next().context("attempt has no exact original xpay request")?;
-	ensure!(matching.next().is_none(), "attempt has ambiguous original xpay requests");
-	ensure!(record.label.as_deref().is_some_and(|label| !label.is_empty()),
-		"original xpay request has no native label; attempt stays held");
-	Ok(record)
 }

@@ -1749,6 +1749,63 @@ async fn failed_lightning_source_needs_fresh_owner_intent() {
 	source.revoke(&srv).await.expect("failed source remains refundable");
 }
 
+/// A client whose initiation reply was lost sends the same signed request
+/// again. The server acknowledges it without a second attempt or xpay call,
+/// and the same intent with a changed amount is refused.
+#[tokio::test]
+async fn exact_lightning_send_retry_is_acknowledged_once() {
+	let ctx = TestContext::new("server/exact_lightning_send_retry_is_acknowledged_once").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
+	let inputs = sender.board_and_confirm_and_register(&ctx, sat(300_000)).await;
+	lightning.sync().await;
+
+	// The receiver holds the payment, so the attempt stays open.
+	let hash = ark::lightning::Preimage::random().compute_payment_hash();
+	let mut hold = lightning.external.hold_client().await;
+	let invoice = hold.invoice(hold::InvoiceRequest {
+		payment_hash: hash.to_vec(),
+		amount_msat: 100_000_000,
+		description: Some(hold::invoice_request::Description::Memo("exact retry".to_string())),
+		min_final_cltv_expiry: Some(18),
+		expiry: Some(3600),
+		routing_hints: vec![],
+	}).await.unwrap().into_inner().bolt11;
+	let wallet = sender.client().await;
+	let source = RawHtlcSend::cosign(&ctx, &srv, &wallet, &inputs, hash).await;
+	let request = protos::InitiateLightningPaymentRequest {
+		invoice, payment_amount_sat: 100_000,
+		htlc_vtxo_ids: source.vtxos.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
+		mailbox_id: None, retry_for_secs: Some(60),
+		intent_nonce: None, source_owner_signatures: Vec::new(),
+	};
+	let signed = ark_testing::lightning::sign_lightning_send_request(&srv, request, &source.keypair).await;
+	let mut calls = srv.subscribe_log::<server_log::XpayRpcCalled>();
+	let mut rpc = srv.get_public_rpc().await;
+	rpc.initiate_lightning_payment(signed.clone()).await.unwrap();
+	wait_for_hold_invoice_accepted(&mut hold, hash).await;
+
+	rpc.initiate_lightning_payment(signed.clone()).await.expect("an exact retry is acknowledged");
+	let mut changed = signed.clone();
+	changed.payment_amount_sat += 1;
+	rpc.initiate_lightning_payment(changed).await.expect_err("a changed request is not the same intent");
+
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let counts = db.read(async |t| Ok(t.query_one("SELECT \
+		(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1), \
+		(SELECT COUNT(*) FROM cln_xpay WHERE payment_hash=$1)", &[&hash.to_string()]).await?)).await.unwrap();
+	assert_eq!(counts.get::<_, i64>(0), 1, "the retry created another attempt");
+	assert_eq!(counts.get::<_, i64>(1), 1, "the retry created another xpay call");
+	calls.recv().wait_millis(10_000).await.expect("the original xpay call");
+	assert!(calls.try_recv().is_err(), "the retry called xpay again");
+	let attempt = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
+	assert!(!attempt.status.is_final());
+
+	hold.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
+	wait_for_attempt_status(&db, hash, "failed").await;
+}
+
 /// A server with a victim holding an open bolt11 receive and a funded
 /// attacker, both on the same server.
 struct ForeignReceive {
@@ -5362,18 +5419,6 @@ async fn zero_part_and_cold_restart_refund() {
 	let mut replies = srv.subscribe_log::<server_log::XpayRpcReturned>();
 	let mut operator = server_rpc::admin::LightningAdminServiceClient::connect(
 		format!("http://{}", srv.config().rpc.admin_address.unwrap())).await.unwrap();
-	let (cut_tx, mut cut_rx) = tokio::sync::mpsc::unbounded_channel();
-	let (empty_tx, mut empty_rx) = tokio::sync::mpsc::unbounded_channel();
-	srv.add_stdout_handler(move |line: &str| {
-		if let Ok(record) = server_log::parse_record(line) {
-			if record.message == "Native dispatch was not admitted; retaining custody" {
-				let _ = cut_tx.send(());
-			} else if record.message == "Own native payment lookup is empty; retaining custody without resubmitting" {
-				let _ = empty_tx.send(record.extra.get("attempt_id").and_then(|v| v.as_i64()));
-			}
-		}
-		false
-	});
 
 	for orphan in [false, true] {
 		let invoice = external.invoice(Some(sat(10_000)), if orphan { "orphan" } else { "no-route" },
@@ -5435,53 +5480,21 @@ async fn zero_part_and_cold_restart_refund() {
 			.await.unwrap().into_iter().map(|row| row.get::<_, String>(0).parse::<ark::VtxoId>().unwrap())
 			.collect::<Vec<_>>();
 		assert!(!sources.is_empty());
+		let label = ark_testing::lightning::attempt_xpay_label(&db, attempt.id).await;
 		let request = db.read(async |t| Ok(t.query_one("SELECT row_to_json(x)::TEXT FROM cln_xpay x \
-			WHERE label=$1 AND payment_hash=$2", &[&attempt.id.to_string(), &hash.to_string()]).await?
+			WHERE label=$1 AND payment_hash=$2", &[&label, &hash.to_string()]).await?
 			.get::<_, String>(0))).await.unwrap();
 		let recorded: serde_json::Value = serde_json::from_str(&request).unwrap();
 		assert_eq!(recorded["signed_invoice"], invoice);
 		assert_eq!(recorded["lightning_node_id"], attempt.lightning_node_id);
 		assert_eq!(recorded["payment_amount_msat"], 10_000_000);
 		if orphan {
-			// STOP is before dispatch getinfo, so this is a real transport deadline,
-			// not an invented xpay reply or a manually inserted attempt.
-			cut_rx.recv().wait_millis(30_000).await.unwrap();
-			paused.unwrap().resume().unwrap();
+			// The xpay call waits on the stopped node. Kill its xpay plugin
+			// before the node runs again, so the call never starts a part.
 			db.write(async |t| {
 				t.batch_execute("DROP TRIGGER hold_original_dispatch_commit ON cln_xpay; DROP FUNCTION hold_original_dispatch_commit();").await?;
 				Ok(())
 			}).await.unwrap();
-			assert!(calls.try_recv().is_err(), "the orphan reached native xpay");
-			assert!(replies.try_recv().is_err());
-			let checkpoint = wallet.lightning_send_checkpoint(hash).await.unwrap().unwrap();
-			let coins = wallet.all_vtxos().await.unwrap();
-			let history = wallet.history().await.unwrap();
-			let original_attempt = db.read(async |t| Ok(t.query_one("SELECT row_to_json(a)::TEXT FROM lightning_payment_attempt a WHERE id=$1",
-				&[&attempt.id]).await?.get::<_, String>(0))).await.unwrap();
-			assert!(sources.iter().all(|id| coins.iter().any(|coin| coin.vtxo.id() == *id
-				&& matches!(coin.state, bark::vtxo::VtxoState::Locked { holder: Some(_) }))));
-			// The ordinary due monitor must observe the actual empty native
-			// lookup without refunding or replaying the original request.
-			assert_eq!(empty_rx.recv().wait_millis(30_000).await.unwrap(), Some(attempt.id));
-			let mut observe = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
-				attempt_id: attempt.id, native_cold_restart_confirmed: false,
-			});
-			server_rpc::RequestExt::set_pver(&mut observe, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
-			assert_eq!(operator.reconcile_lightning_attempt(observe).await.unwrap().into_inner().status, "requested");
-			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT row_to_json(a)::TEXT FROM lightning_payment_attempt a WHERE id=$1",
-				&[&attempt.id]).await?.get::<_, String>(0))).await.unwrap(), original_attempt);
-			Box::pin(wallet.check_lightning_payment(hash, false)).await.unwrap();
-			assert_eq!(wallet.lightning_send_checkpoint(hash).await.unwrap(), Some(checkpoint));
-			assert_eq!(wallet.all_vtxos().await.unwrap(), coins);
-			assert_eq!(wallet.history().await.unwrap(), history);
-			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1",
-				&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
-			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT row_to_json(x)::TEXT FROM cln_xpay x \
-				WHERE label=$1", &[&attempt.id.to_string()]).await?.get::<_, String>(0))).await.unwrap(), request);
-			for source in &sources {
-				assert_eq!(db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, *source).await)
-					.await.unwrap().unwrap().htlc.resolution(), None);
-			}
 			let native = node.native_child().await.unwrap();
 			// Capture every owned descendant before causing the important
 			// xpay plugin's genuine death, then require all old workers ceased.
@@ -5496,6 +5509,7 @@ async fn zero_part_and_cold_restart_refund() {
 			}
 			assert!(workers.len() > 2, "whole backend/plugin population was not observed");
 			node.kill_owned_xpay().await.unwrap();
+			paused.unwrap().resume().unwrap();
 			node.restart_same_ports_after_exit().await.unwrap();
 			tokio::time::timeout(wait_timeout(), async {
 				loop {
@@ -5519,8 +5533,41 @@ async fn zero_part_and_cold_restart_refund() {
 			assert!(node.grpc_client().await.list_send_pays(cln_rpc::ListsendpaysRequest {
 				payment_hash: Some(hash.to_vec()), ..Default::default()
 			}).await.unwrap().into_inner().payments.is_empty());
-			assert!(calls.try_recv().is_err());
-			assert!(replies.try_recv().is_err());
+			assert_eq!(calls.recv().wait_millis(30_000).await.unwrap().payment_hash, hash);
+			let returned = replies.recv().wait_millis(30_000).await.unwrap();
+			assert_eq!(returned.payment_hash, hash);
+			assert!(!returned.error.unwrap().contains("RpcError { code: Some(205)"));
+			// The monitor finds no record of the call and holds it well past
+			// the time it waits for xpay's answer.
+			tokio::time::sleep(Duration::from_secs(20)).await;
+			let checkpoint = wallet.lightning_send_checkpoint(hash).await.unwrap().unwrap();
+			let coins = wallet.all_vtxos().await.unwrap();
+			let history = wallet.history().await.unwrap();
+			let original_attempt = db.read(async |t| Ok(t.query_one("SELECT row_to_json(a)::TEXT FROM lightning_payment_attempt a WHERE id=$1",
+				&[&attempt.id]).await?.get::<_, String>(0))).await.unwrap();
+			assert!(sources.iter().all(|id| coins.iter().any(|coin| coin.vtxo.id() == *id
+				&& matches!(coin.state, bark::vtxo::VtxoState::Locked { holder: Some(_) }))));
+			let held = db.read(async |t| t.get_lightning_payment_attempt_by_id(attempt.id).await).await.unwrap().unwrap();
+			assert!(!held.status.is_final(), "an unresolved attempt was finalized: {}", held.status);
+			let mut observe = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
+				attempt_id: attempt.id, native_cold_restart_confirmed: false,
+			});
+			server_rpc::RequestExt::set_pver(&mut observe, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
+			assert_eq!(operator.reconcile_lightning_attempt(observe).await.unwrap().into_inner().status, held.status.to_string());
+			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT row_to_json(a)::TEXT FROM lightning_payment_attempt a WHERE id=$1",
+				&[&attempt.id]).await?.get::<_, String>(0))).await.unwrap(), original_attempt);
+			Box::pin(wallet.check_lightning_payment(hash, false)).await.unwrap();
+			assert_eq!(wallet.lightning_send_checkpoint(hash).await.unwrap(), Some(checkpoint));
+			assert_eq!(wallet.all_vtxos().await.unwrap(), coins);
+			assert_eq!(wallet.history().await.unwrap(), history);
+			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM mailbox WHERE payment_hash=$1",
+				&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT row_to_json(x)::TEXT FROM cln_xpay x \
+				WHERE label=$1", &[&label]).await?.get::<_, String>(0))).await.unwrap(), request);
+			for source in &sources {
+				assert_eq!(db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, *source).await)
+					.await.unwrap().unwrap().htlc.resolution(), None);
+			}
 			// Existing reconnection supervision must re-admit this same node.
 			tokio::time::timeout(wait_timeout(), async {
 				loop {
@@ -5547,9 +5594,9 @@ async fn zero_part_and_cold_restart_refund() {
 		}
 		assert_eq!(lightning_attempt_status(&db, hash).await.as_deref(), Some("failed"));
 		let outcome = db.read(async |t| Ok(t.query_one("SELECT status::TEXT,error_code FROM cln_xpay \
-			WHERE label=$1", &[&attempt.id.to_string()]).await?)).await.unwrap();
+			WHERE label=$1", &[&label]).await?)).await.unwrap();
 		assert_eq!(outcome.get::<_, &str>(0), "fail");
-		assert_eq!(outcome.get::<_, Option<i32>>(1), if orphan { None } else { Some(205) });
+		assert_eq!(outcome.get::<_, Option<i32>>(1), None);
 		assert!(node.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().pays.is_empty());

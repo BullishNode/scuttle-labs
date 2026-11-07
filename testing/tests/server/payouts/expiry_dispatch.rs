@@ -110,7 +110,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 			.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())).await.unwrap();
 		assert_eq!(links, vec![sources[0].0.id().to_string()]);
 		assert!(db.read(async |t| t.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
-		let rejected_label = rejected.id.to_string();
+		let rejected_label = ark_testing::lightning::attempt_xpay_label(&db, rejected.id).await;
 		let rejected_parts = payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().payments;
@@ -148,7 +148,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 		assert_ne!(pending.id, rejected.id);
 		assert!(matches!(pending.status, LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted));
 		assert!(pending.final_amount_msat.is_none());
-		let label = pending.id.to_string();
+		let label = ark_testing::lightning::attempt_xpay_label(&db, pending.id).await;
 		let native_parts = payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
 		}).await.unwrap().into_inner().payments;
