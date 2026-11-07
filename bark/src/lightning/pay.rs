@@ -10,14 +10,15 @@ use log::{info, warn};
 use server_rpc::protos;
 
 use ark::lightning::{
-	offer_request_amount, Bolt12Invoice, Bolt12InvoiceExt, Invoice, Offer, PaymentHash,
+	offer_request_amount, Bolt12Invoice, Bolt12InvoiceExt, Invoice, Offer, PaymentHash, Preimage,
 };
 
 use crate::Wallet;
 use crate::WalletVtxo;
-use crate::actions::{DriveMode, WalletAction};
+use crate::actions::{AdvanceResultExt, DriveMode, GuardedCheckpoint, WalletAction};
 use crate::actions::lightning::pay::{
-	LightningSend, LightningSendState, start_lightning_send, ln_pay_action_id,
+	Htlcs, LightningSend, LightningSendState, settle_lightning_send_payment,
+	start_lightning_send, ln_pay_action_id,
 };
 use crate::lightning::{lnaddr_invoice, lnurlp_invoice};
 use crate::movement::PaymentMethod;
@@ -128,11 +129,11 @@ impl Wallet {
 	pub async fn lightning_send_state(&self, hash: PaymentHash)
 		-> anyhow::Result<LightningSendState>
 	{
-		if let Some(cp) = self.lightning_send_checkpoint(hash).await? {
-			return Ok(LightningSendState::InProgress(cp));
-		}
 		if let Some(paid) = self.inner.db.get_paid_invoice(hash).await? {
 			return Ok(LightningSendState::Paid(paid));
+		}
+		if let Some(cp) = self.lightning_send_checkpoint(hash).await? {
+			return Ok(LightningSendState::InProgress(cp));
 		}
 		Ok(LightningSendState::Unknown)
 	}
@@ -153,6 +154,25 @@ impl Wallet {
 		let mode = if wait { DriveMode::UntilDone } else { DriveMode::UntilParkOrDone };
 		self.drive_action::<LightningSend>(&ln_pay_action_id(hash), mode).await?;
 		self.lightning_send_state(hash).await
+	}
+
+	/// Settle a payment using a preimage we already have (e.g. from a
+	/// mailbox notification), skipping the server poll.
+	pub(crate) async fn settle_lightning_send_with_preimage(
+		&self,
+		checkpoint: GuardedCheckpoint<LightningSend>,
+		htlcs: Htlcs,
+		preimage: Preimage,
+	) -> anyhow::Result<()> {
+		let send = checkpoint.get().context("lightning send has no checkpoint")?;
+		let payment_hash = send.invoice.payment_hash();
+		if preimage.compute_payment_hash() != payment_hash {
+			bail!("preimage mismatch for payment hash {}", payment_hash);
+		}
+		settle_lightning_send_payment(self, send, &htlcs, preimage).await.into_anyhow()?;
+		// Clean up like the executor does when an action is done. The
+		// paid_invoice record is the source of truth from here on.
+		checkpoint.finish(self).await
 	}
 
 	/// Pays a Lightning [Invoice] using Ark VTXOs.
@@ -378,12 +398,11 @@ mod test {
 	use server_rpc::protos::mailbox_server::mailbox_message::Message as MailboxMessageKind;
 
 	use ark::VtxoId;
-	use ark::lightning::Preimage;
 	use ark::test_util::VTXO_VECTORS;
 	use bitcoin_ext::BlockHeight;
 
 	use crate::{NotificationStream, WalletNotification};
-	use crate::actions::lightning::pay::{Htlcs, Progress};
+	use crate::actions::lightning::pay::Progress;
 	use crate::movement::{MovementId, MovementStatus};
 	use crate::movement::update::MovementUpdate;
 	use crate::subsystem::{LightningSendMovement, Subsystem};
@@ -619,10 +638,17 @@ mod test {
 	/// must then finish it, without the server, and exactly once.
 	#[tokio::test]
 	async fn every_driver_finishes_an_interrupted_settlement_once() {
-		for driver in [Driver::CheckPayment, Driver::Sync, Driver::Mailbox] {
+		// Against a server that pays out expired coins too: the settlement
+		// needs no server either way.
+		for (driver, payouts) in [Driver::CheckPayment, Driver::Sync, Driver::Mailbox].into_iter()
+			.flat_map(|driver| [(driver, false), (driver, true)])
+		{
 			for writes in 1..=SETTLEMENT_WRITES {
-				let case = format!("{:?} after {} write(s)", driver, writes);
+				let case = format!("{:?} after {} write(s), payouts {}", driver, writes, payouts);
 				let (wallet, _conn) = Wallet::offline_for_test().await;
+				if payouts {
+					wallet.inner.db.set_server_payouts(true).await.unwrap();
+				}
 				let mut notifications = wallet.subscribe_notifications();
 				let send = pending_send(&wallet).await;
 
