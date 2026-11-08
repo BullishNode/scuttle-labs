@@ -135,7 +135,7 @@ async fn boundaries() {
 		}
 	}
 	let dust = 330;
-	let amounts = [999 + dust, 1_000 + dust, 1_001 + dust];
+	let amounts = [1_999 + dust, 2_000 + dust, 2_001 + dust];
 	let mut leaves = Vec::new();
 	let mut old = BTreeSet::from([source.id()]);
 	for (index, wallet) in recipients.iter().enumerate() {
@@ -143,7 +143,7 @@ async fn boundaries() {
 		old.extend(consumed);
 		let pays = index != 0;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: bindings[index + 1].clone(),
-			fee: if pays { 1_000 } else { 0 }, payout: if pays { dust + index as u64 - 1 } else { 0 },
+			fee: if pays { 2_000 } else { 0 }, payout: if pays { dust + index as u64 - 1 } else { 0 },
 			forfeited: if pays { 0 } else { amounts[index] }, group_payout: if pays { dust + index as u64 - 1 } else { 0 } });
 	}
 	let mut change = Vec::new();
@@ -152,19 +152,19 @@ async fn boundaries() {
 	assert_eq!(change.len(), 4);
 	let change_gross = change.iter().map(|coin| coin.amount().to_sat()).sum::<u64>();
 	assert_eq!(change_gross + amounts.iter().sum::<u64>(), 100_000);
-	let mut fee = 1_000;
+	let mut fee = 2_000;
 	for coin in change {
 		let charged = coin.amount().to_sat().min(fee);
 		fee -= charged;
 		let payout = coin.amount().to_sat() - charged;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[0], script: sender_binding.clone(), fee: charged,
-			payout, forfeited: 0, group_payout: change_gross - 1_000 });
+			payout, forfeited: 0, group_payout: change_gross - 2_000 });
 	}
 	assert_eq!(fee, 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.coin.amount()).sum::<Amount>(), sat(100_000));
-	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 3_000);
+	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 6_000);
 	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), amounts[0]);
-	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 96_001 - dust);
+	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 92_001 - dust);
 	balances(&sender, sat(change_gross)).await;
 	for leaf in &leaves {
 		assert_eq!(leaf.coin.chain_anchor(), root);
@@ -207,7 +207,7 @@ async fn boundaries() {
 	assert_eq!(epoch.children.len(), 1);
 	let parent = epoch.parents.values().next().unwrap();
 	let payees = vec![(bindings[1].clone(), None), (bindings[2].clone(), Some(dust)),
-		(bindings[3].clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 1_000))];
+		(bindings[3].clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 2_000))];
 	let operator = {
 		let config = srv.watchmand().config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -215,7 +215,7 @@ async fn boundaries() {
 	assert!(payees.iter().all(|(script, _)| script != &operator));
 	let remainder = parent.output.iter().filter(|output| payees.iter().all(|(script, _)| output.script_pubkey != *script)).collect::<Vec<_>>();
 	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>(), sat(100_000));
-	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>(), sat(3_000 + amounts[0]));
+	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>(), sat(6_000 + amounts[0]));
 	assert!(remainder.iter().all(|output| output.script_pubkey == operator || output.is_p2a_fee_anchor()));
 	let forbidden = old.iter().map(ToString::to_string).collect::<Vec<_>>();
 	assert!(db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_allocation_coin c \

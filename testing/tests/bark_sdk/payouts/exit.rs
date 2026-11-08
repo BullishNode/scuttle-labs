@@ -183,7 +183,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 	let mut paid_points = std::collections::BTreeMap::new();
 	let mut total_fees = sat(0);
 	for (owner, id, gross) in owners {
-		let fee = sat(gross.to_sat().div_ceil(100).max(1_000));
+		let fee = sat(gross.to_sat().div_ceil(100).max(2_000));
 		total_fees += fee;
 		owner.chain().invalidate_caches().await;
 		owner.sync_fallback_payouts().await.unwrap();
@@ -400,7 +400,7 @@ async fn watchman_sweeps_vtxo_chain_during_exit() {
 	let mut paid_points = std::collections::BTreeMap::new();
 	let mut total_fees = sat(0);
 	for (owner, id, gross) in owners {
-		let fee = sat(gross.to_sat().div_ceil(100).max(1_000));
+		let fee = sat(gross.to_sat().div_ceil(100).max(2_000));
 		total_fees += fee;
 		owner.chain().invalidate_caches().await;
 		owner.sync_fallback_payouts().await.unwrap();

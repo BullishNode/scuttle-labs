@@ -217,8 +217,8 @@ async fn mixed_split(pin: bool, crash_successor: bool, large_child: bool) {
 	assert_eq!(ctx.bitcoind().await_transaction(second.compute_txid()).await, second);
 	assert_eq!(second.output.iter().find(|o| o.script_pubkey == destination).unwrap().value, sat(50_000));
 	assert_eq!(first.output.iter().filter(|o| o.script_pubkey == destination).map(|o| o.value).sum::<bitcoin::Amount>()
-		+ second.output.iter().filter(|o| o.script_pubkey == destination).map(|o| o.value).sum::<bitcoin::Amount>(), sat(99_000),
-		"both 50,000 sat siblings pay the 1,000 sat floor once at their original expiry height");
+		+ second.output.iter().filter(|o| o.script_pubkey == destination).map(|o| o.value).sum::<bitcoin::Amount>(), sat(98_000),
+		"both 50,000 sat siblings pay the 2,000 sat floor once at their original expiry height");
 	let upstream = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, htlc).await).await.unwrap().unwrap();
 	assert_eq!(upstream.htlc.resolution(), None);
 	assert!(first.input.iter().all(|a| second.input.iter().all(|b| a.previous_output != b.previous_output)));

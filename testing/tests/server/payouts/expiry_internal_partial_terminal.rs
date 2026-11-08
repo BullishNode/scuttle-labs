@@ -188,7 +188,7 @@ async fn partial_terminal() {
 		"a grant-funded parent alone cannot discharge B while its original backing remains independently live");
 	assert!(!parent.input.iter().any(|input| input.previous_output == point));
 	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == fallback).unwrap();
-	assert_eq!(output.value, sat(99_000));
+	assert_eq!(output.value, sat(98_000));
 	assert!(!parent.output.iter().any(|output| output.script_pubkey == receive_destination));
 	let mut value = sat(0);
 	for input in &parent.input {

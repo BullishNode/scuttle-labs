@@ -32,7 +32,7 @@ async fn assert_payouts_once(
 		assert_eq!(row.get::<_, Option<String>>("user_pubkey").as_ref(), Some(key));
 		assert_eq!(row.get::<_, Option<String>>("spk"), Some(script.to_hex_string()));
 		assert_eq!(row.get::<_, i64>("gross_sat"), gross.to_sat() as i64);
-		let fee = gross.to_sat().div_ceil(100).max(1_000);
+		let fee = gross.to_sat().div_ceil(100).max(2_000);
 		assert_eq!(row.get::<_, i64>("fee_sat"), i64::try_from(fee).unwrap());
 		assert_eq!(row.get::<_, i64>("payout_sat"), i64::try_from(gross.to_sat() - fee).unwrap());
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);

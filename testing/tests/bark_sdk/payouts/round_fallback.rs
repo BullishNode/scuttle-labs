@@ -45,7 +45,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 				}
 				for txid in txids {
 					let tx = ctx.bitcoind().await_transaction(txid).await;
-					if tx.output.iter().any(|output| output.script_pubkey == registration && output.value == sat(99_000)) {
+					if tx.output.iter().any(|output| output.script_pubkey == registration && output.value == sat(98_000)) {
 						break 'paid tx;
 					}
 				}
@@ -55,7 +55,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		assert!(parent.input.iter().any(|input| input.previous_output == source.chain_anchor()));
 		let customer = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == registration).collect::<Vec<_>>();
 		assert_eq!(customer.len(), 1);
-		assert_eq!(customer[0].1.value, sat(99_000));
+		assert_eq!(customer[0].1.value, sat(98_000));
 		let payout = OutPoint::new(parent.compute_txid(), customer[0].0 as u32);
 		let operator_script = srv.watchmand().config().sweep_address.clone().unwrap().require_network(Network::Regtest).unwrap().script_pubkey();
 		for output in &parent.output {
@@ -70,7 +70,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		assert!(info.confirmations.unwrap_or(0) >= 6);
 		let paid = core.get_tx_out(&payout.txid, payout.vout, Some(true)).unwrap().unwrap();
 		assert!(paid.confirmations >= 6);
-		assert_eq!(paid.value, sat(99_000));
+		assert_eq!(paid.value, sat(98_000));
 		assert_eq!(paid.script_pub_key.script().unwrap(), registration);
 		let mut outputs = std::collections::BTreeMap::new();
 		let mut transactions = std::collections::BTreeMap::new();
@@ -83,7 +83,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 				outputs.insert(OutPoint::new(txid, vout as u32), output.value);
 			}
 		}
-		assert_eq!(outputs, std::collections::BTreeMap::from([(payout, sat(99_000))]));
+		assert_eq!(outputs, std::collections::BTreeMap::from([(payout, sat(98_000))]));
 		let wallet = Box::pin(reopen_refresh(&ctx, &proxy, &mnemonic, database.clone())).await;
 		assert!(wallet.pending_round_states().await.unwrap().is_empty());
 		assert_eq!(wallet.history().await.unwrap(), history);
@@ -103,8 +103,8 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 		let receipts = database.get_all_vtxos().await.unwrap();
 		assert!(receipts.iter().any(|r| r.id() == source.id() && r.fallback_status == Some(bark::vtxo::FallbackStatus::Spent)));
 		assert!(!receipts.iter().any(|r| r.id() == source.id() && r.fallback_status == Some(bark::vtxo::FallbackStatus::Pending)));
-		assert_eq!(source.amount() - sat(1_000) - paid.value, Amount::ZERO,
-			"the canonical 99,000-sat output and 1,000-sat charge leave no forfeited principal");
+		assert_eq!(source.amount() - sat(2_000) - paid.value, Amount::ZERO,
+			"the canonical 98,000-sat output and 2,000-sat charge leave no forfeited principal");
 		wallet.sync_onchain().await.unwrap();
 		let own_payouts = {
 			let onchain = wallet.onchain().unwrap();
@@ -114,7 +114,7 @@ async fn cancelled_issued_refresh_reopens_and_receives_one_fallback_payout() {
 				.map(|coin| coin.txout.clone()).collect::<Vec<_>>()
 		};
 		assert_eq!(own_payouts.len(), 1);
-		assert_eq!(own_payouts[0].value, sat(99_000));
+		assert_eq!(own_payouts[0].value, sat(98_000));
 		assert_eq!(own_payouts[0].script_pubkey, registration);
 		assert_eq!(transport.accepted_forfeits.load(Ordering::SeqCst), 0);
 	})).await.expect("cancelled refresh and absent-owner payout must finish within the test budget");

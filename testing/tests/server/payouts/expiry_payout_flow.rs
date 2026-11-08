@@ -56,7 +56,7 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 	assert_eq!(quote.gross_amount, source.amount() + quote.fee);
 
 	let destination = client.fallback_script();
-	let expected = source.amount() - sat(1_000);
+	let expected = source.amount() - sat(2_000);
 	source.validate(&funding).unwrap();
 	drop(client);
 
@@ -104,7 +104,7 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 	assert_eq!(parent.input[0].previous_output, source.chain_anchor());
 	assert_eq!(parent.output.len(), 3);
 	assert_eq!(payouts[0].0, 0);
-	assert_eq!(parent.output[1].value, quote.fee + sat(1_000));
+	assert_eq!(parent.output[1].value, quote.fee + sat(2_000));
 	assert_ne!(parent.output[1].script_pubkey, destination);
 	assert_eq!(parent.output[2], bitcoin_ext::fee::fee_anchor());
 	assert_eq!(child.input.len(), 2);

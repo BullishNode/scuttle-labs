@@ -138,7 +138,7 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 			paid += actual.value;
 		}
 	}
-	assert_eq!(paid, sat(19_000), "the two deliveries share one cumulative 1,000-sat fee");
+	assert_eq!(paid, sat(18_000), "the two deliveries share one cumulative 2,000-sat fee");
 	for id in &ids { assert!(local.get_wallet_vtxo(*id).await.unwrap().is_none()); }
 	let returned = reopen(&ctx, "recipient", &srv).await;
 	assert!(returned.history().await.unwrap().is_empty());
@@ -158,8 +158,8 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	let history = returned.history().await.unwrap();
 	assert!(history.is_empty(), "already paid deliveries do not credit an Ark receive");
 	returned.sync_onchain().await.unwrap();
-	// The canonical output total19k and cumulative fee1k were proved above.
-	assert_eq!(paid + sat(1_000), sat(20_000));
+	// The canonical output total18k and cumulative fee2k were proved above.
+	assert_eq!(paid + sat(2_000), sat(20_000));
 	for _ in 0..2 {
 		returned.sync().await;
 		assert_eq!(returned.history().await.unwrap(), history);
@@ -294,7 +294,7 @@ async fn stalled_change() {
 		'payout: loop {
 			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
 				let tx = ctx.bitcoind().await_transaction(txid).await;
-				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(99_000)) { break 'payout tx; }
+				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(98_000)) { break 'payout tx; }
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
@@ -320,10 +320,10 @@ async fn stalled_change() {
 	owner.sync_pending_arkoor_sends().await.unwrap();
 	owner.sync_fallback_payouts().await.unwrap();
 	assert_eq!(serde_json::to_value(owner.history().await.unwrap()).unwrap(), history);
-	let (index, _) = payout.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination && output.value == sat(99_000)).unwrap();
+	let (index, _) = payout.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination && output.value == sat(98_000)).unwrap();
 	let output = ctx.bitcoind().sync_client().get_tx_out(&payout.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
 	assert!(output.confirmations >= 6);
-	assert_eq!(output.value, sat(99_000));
+	assert_eq!(output.value, sat(98_000));
 	assert_eq!(output.script_pub_key.script().unwrap(), destination);
 
 }

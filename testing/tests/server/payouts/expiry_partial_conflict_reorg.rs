@@ -53,7 +53,7 @@ async fn assert_physical_cut(
 		let remainder = parent.output.iter().filter(|output| &output.script_pubkey != customer)
 			.map(|output| output.value).sum::<Amount>();
 		let parent_gross=parent.input.iter().map(|input|backing[&input.previous_output].value).sum::<Amount>();
-		let expected_fee=sat(parent_gross.to_sat().div_ceil(100).max(1_000));
+		let expected_fee=sat(parent_gross.to_sat().div_ceil(100).max(2_000));
 		assert_eq!(payee.value+expected_fee,parent_gross);
 		assert_eq!(remainder, expected_fee);
 		for output in parent.output.iter().filter(|output| &output.script_pubkey != customer) {
@@ -426,7 +426,7 @@ async fn partial_conflict_reorg() {
 	}).await.expect("a real terminal claim and distinct unaffected-root regroup must both be recorded");
 	assert_eq!(regroup.input.len(), 1);
 	assert_eq!(regroup.input[0].previous_output, untouched.chain_anchor());
-	assert_eq!(regroup.output.iter().find(|out| out.script_pubkey == destination).unwrap().value, sat(99_000));
+	assert_eq!(regroup.output.iter().find(|out| out.script_pubkey == destination).unwrap().value, sat(98_000));
 	assert!(!ctx.bitcoind().sync_client().get_raw_mempool().unwrap().contains(&regroup.compute_txid()));
 	let claim = ctx.bitcoind().await_transaction(claim_txid).await;
 	assert!(claim.input.iter().any(|input| input.previous_output == exiting.point()));

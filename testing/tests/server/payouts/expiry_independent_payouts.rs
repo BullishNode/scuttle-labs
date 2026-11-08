@@ -126,7 +126,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 		.filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	let (vout, payout) = payouts[0];
-	assert_eq!(payout.value, ready.amount() - sat(1_000));
+	assert_eq!(payout.value, ready.amount() - sat(2_000));
 	let source = ctx.bitcoind().await_transaction(ready.chain_anchor().txid).await;
 	assert_eq!(source.output[ready.chain_anchor().vout as usize].value.to_sat(),
 		parent.output.iter().map(|output| output.value.to_sat()).sum::<u64>(),

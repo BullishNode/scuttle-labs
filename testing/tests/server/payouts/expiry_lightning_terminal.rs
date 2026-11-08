@@ -203,7 +203,7 @@ async fn failed_external_payout(settle_during_decision: bool) {
 	}).await.expect("failed send still requires an online client to refund it");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination).unwrap();
-	assert_eq!(output.value, sat(99_000));
+	assert_eq!(output.value, sat(98_000));
 	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
@@ -227,7 +227,7 @@ async fn expiry_settlement_during_decision_keeps_source_held() {
 
 /// Internal setup timeout closes a receive that never granted
 /// any coin. Both actors stay absent; only real services decide and pay back
-/// the original 100k source less its single 1k output fee.
+/// the original 100k source less its single 2k output fee.
 #[tokio::test]
 async fn expiry_internal_zero_grant_timeout_pays_absent_sender() {
 	internal_zero_grant_timeout().await;
@@ -323,7 +323,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	}).await.expect("cancelled zero-grant internal funding still requires a returning wallet");
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
-	assert_eq!(paid.value, sat(99_000));
+	assert_eq!(paid.value, sat(98_000));
 	assert_eq!(parent.output.iter().filter(|o| o.script_pubkey == destination).count(), 1);
 	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
@@ -612,7 +612,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	assert_grants_reclaimed(&ctx, &db, &grants, &receiver_destination).await;
 	let (index,paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
-	assert_eq!(paid.value, sat(99_000));
+	assert_eq!(paid.value, sat(98_000));
 	assert!(parent.output.iter().all(|o| o.script_pubkey != receiver_destination));
 	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
@@ -629,7 +629,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 			}
 		}
 	}
-	assert_eq!(outputs, vec![(bitcoin::OutPoint::new(parent.compute_txid(), index as u32), sat(99_000))]);
+	assert_eq!(outputs, vec![(bitcoin::OutPoint::new(parent.compute_txid(), index as u32), sat(98_000))]);
 	for txid in chain.get_raw_mempool().unwrap() {
 		let tx = ctx.bitcoind().await_transaction(txid).await;
 		assert!(tx.output.iter().all(|output|
@@ -818,7 +818,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 					if let Some((_, parent)) = super::expiry_test::published_payout(&db, coin.id()).await {
 						let rightful = parent.output.iter().filter(|o| &o.script_pubkey == script).collect::<Vec<_>>();
 						assert_eq!(rightful.len(), 1);
-						assert_eq!(rightful[0].value, sat(99_000));
+						assert_eq!(rightful[0].value, sat(98_000));
 						assert!(parent.output.iter().all(|o| &o.script_pubkey == script
 							|| (o.script_pubkey != destination && o.script_pubkey != earlier_destination)));
 						if ctx.bitcoind().sync_client().get_raw_transaction(&parent.compute_txid(), None).ok().as_ref() == Some(&parent) {
@@ -847,11 +847,11 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		super::expiry_test::rebuilt(&ctx, &srv, &db).await;
 		super::expiry_test::canonical(&ctx, &first.0);
 		super::expiry_test::canonical(&ctx, &first.1);
-		let output_index = first.0.output.iter().position(|o| o.script_pubkey == earlier_destination && o.value == sat(99_000)).unwrap();
+		let output_index = first.0.output.iter().position(|o| o.script_pubkey == earlier_destination && o.value == sat(98_000)).unwrap();
 		let core = ctx.bitcoind().sync_client();
 		let actual = core.get_tx_out(&first.0.compute_txid(), output_index as u32, Some(true)).unwrap().unwrap();
 		assert!(actual.confirmations >= 6);
-		assert_eq!(actual.value, sat(99_000));
+		assert_eq!(actual.value, sat(98_000));
 		assert_eq!(actual.script_pub_key.script().unwrap(), earlier_destination);
 		assert!(pending_cut().await == initial,
 			"unrelated N6 payout must leave every native part/group and both peers' future HTLC identities unchanged");
@@ -901,7 +901,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		assert!(first.0.input.iter().all(|a| second.0.input.iter().all(|b| a.previous_output != b.previous_output)));
 		ctx.generate_blocks(6).await;
 		super::expiry_test::rebuilt(&ctx, &srv, &db).await;
-		let expected = std::collections::BTreeMap::from([(earlier_destination.clone(), sat(99_000)), (destination.clone(), sat(99_000))]);
+		let expected = std::collections::BTreeMap::from([(earlier_destination.clone(), sat(98_000)), (destination.clone(), sat(98_000))]);
 		let mut paid = std::collections::BTreeMap::new();
 		let mut paid_by_script = std::collections::BTreeMap::new();
 		for (parent, child) in [&first, &second] {
@@ -920,8 +920,8 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		assert_eq!(paid_by_script, expected);
 		let miner_fees = super::expiry_test::actual_fee(&ctx, &first.1).await + super::expiry_test::actual_fee(&ctx, &second.1).await;
 		assert!(miner_fees > bitcoin::Amount::ZERO && miner_fees < sat(100_000));
-		assert_eq!(paid.values().copied().sum::<bitcoin::Amount>(), sat(198_000));
-		assert_eq!(sat(200_000), paid.values().copied().sum::<bitcoin::Amount>() + sat(2_000));
+		assert_eq!(paid.values().copied().sum::<bitcoin::Amount>(), sat(196_000));
+		assert_eq!(sat(200_000), paid.values().copied().sum::<bitcoin::Amount>() + sat(4_000));
 		for _ in 0..2 {
 			ctx.generate_blocks(6).await;
 			super::expiry_test::rebuilt(&ctx, &srv, &db).await;

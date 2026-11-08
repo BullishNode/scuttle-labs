@@ -161,7 +161,7 @@ async fn native_refund_status(two_sources: bool) {
 				ctx.generate_blocks(6).await;
 				completed_view(&ctx, &srv, &db).await;
 				let index = parent.output.iter().position(|output| output.script_pubkey == destination).unwrap();
-				assert_eq!(parent.output[index].value, sat(99_000));
+				assert_eq!(parent.output[index].value, sat(98_000));
 				assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true))
 					.unwrap().unwrap().confirmations >= 6, "partial-negative must include a real paid source");
 				let unpaid = sources.iter().find(|source| !parents.contains_key(&source.id().to_string())).unwrap();
@@ -193,7 +193,7 @@ async fn native_refund_status(two_sources: bool) {
 	for parent in parents.values() {
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, *parent);
 		let paid = parent.output.iter().find(|output| output.script_pubkey == destination).unwrap();
-		assert_eq!(paid.value, sat(99_000));
+		assert_eq!(paid.value, sat(98_000));
 		assert!(parent.output.iter().all(|output| output.script_pubkey != recipient_destination));
 		let mut total = sat(0);
 		for input in &parent.input {

@@ -114,7 +114,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 		}
 	}).await.expect("both frozen customer coins must receive actual payouts despite the sender's historical forfeits");
 	// Both source coins have the same payout script and expiry height.
-	// One or two allocations must charge the 1,000 sat floor only once.
+	// One or two allocations must charge the 2,000 sat floor only once.
 	let mut total = Amount::ZERO;
 	let mut outputs = Vec::<(Txid, u32)>::new();
 	for parent in parents.values() {
@@ -124,7 +124,7 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 		total += matching[0].1.value;
 		outputs.push((parent.compute_txid(), matching[0].0 as u32));
 	}
-	assert_eq!(total + sat(1_000), own.amount() + received.amount());
+	assert_eq!(total + sat(2_000), own.amount() + received.amount());
 	let confirmed = ctx.generate_blocks(6).await;
 	let mut expected_outputs = BTreeMap::new();
 	for (txid, vout) in &outputs {
@@ -161,6 +161,6 @@ async fn expiry_frozen_recipient_is_paid_after_sender_change_refresh() {
 		assert_eq!(output.value, expected);
 		assert_eq!(output.script_pub_key.script().unwrap(), destination);
 	}
-	assert_eq!(total + sat(1_000), own.amount() + received.amount());
+	assert_eq!(total + sat(2_000), own.amount() + received.amount());
 
 }

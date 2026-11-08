@@ -121,20 +121,20 @@ async fn assert_paid_to_owner(
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == owner.script).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
-	assert_eq!(outputs[0].1.value, sat(99_000));
+	assert_eq!(outputs[0].1.value, sat(98_000));
 	let tip = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(tip).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let core = ctx.bitcoind().sync_client();
 	let confirmed = core.get_tx_out(&parent.compute_txid(), outputs[0].0 as u32, Some(true)).unwrap().unwrap();
 	assert!(confirmed.confirmations >= 6);
-	assert_eq!(confirmed.value, sat(99_000));
+	assert_eq!(confirmed.value, sat(98_000));
 	assert_eq!(db.read(async |tx| tx.expiry_owner(owner_key).await).await.unwrap(),
 		Attribution::Owned { mailbox_pk: owner.mailbox.public_key(), spk: owner.script.clone() });
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&coin.id().to_string()]).await?)).await.unwrap();
-	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 1_000), ("payout_sat", 99_000), ("forfeited_sat", 0)] {
+	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 2_000), ("payout_sat", 98_000), ("forfeited_sat", 0)] {
 		assert_eq!(row.get::<_, i64>(field), amount);
 	}
 }

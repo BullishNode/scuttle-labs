@@ -316,7 +316,7 @@ async fn offboard_race(offboard_wins: bool, after_analysis: bool) {
 		assert_eq!(persisted, 0, "the actual registration transaction must roll back its offboard insert");
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 		let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
-		assert_eq!(output.value, coin.amount() - sat(1_000));
+		assert_eq!(output.value, coin.amount() - sat(2_000));
 		ctx.generate_blocks(6).await;
 		assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 		assert_eq!(ctx.bitcoind().get_received_by_address(&offboard_address), bitcoin::Amount::ZERO);
@@ -397,7 +397,7 @@ async fn expiry_uninitiated_grant_can_revoke_after_backing_expiry() {
 		"genuine post-expiry revocation did not permit its actual fallback payout").await;
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, output) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
-	assert_eq!(output.value, input.amount() - sat(1_000));
+	assert_eq!(output.value, input.amount() - sat(2_000));
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	assert!((ctx.bitcoind().get_block_count().await as u32) < deadline.to_u32());
@@ -586,10 +586,10 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	let original_board_fee=backing_amount.checked_sub(a.amount()+b.amount()).unwrap();
 	assert_eq!(parent.output.iter().map(|o|o.value).sum::<bitcoin::Amount>(),backing_amount);
 	let (index,output)=parent.output.iter().enumerate().find(|(_,o)|o.script_pubkey==fallback).unwrap();
-	assert_eq!(output.value,sat(99_000));
+	assert_eq!(output.value,sat(98_000));
 	let operator=srv.watchmand().config().sweep_address.clone().unwrap().require_network(bitcoin::Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator,fallback);
-	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>(),b.amount()+original_board_fee+sat(1_000));
+	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>(),b.amount()+original_board_fee+sat(2_000));
 	assert_eq!(parent.output.len(),3);
 	assert_eq!(parent.output.iter().filter(|o|**o==bitcoin_ext::fee::fee_anchor()).count(),1);
 	assert!(chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().is_some());
@@ -606,7 +606,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		WHERE e.vtxo_id=$1 ORDER BY a.id",&[&a.id().to_string()]).await?.into_iter().map(|row|
 		(row.get::<_,i64>(0),row.get::<_,i64>(1),row.get::<_,i64>(2),row.get::<_,i64>(3),row.get::<_,Vec<u8>>(4))).collect::<Vec<_>>())).await.unwrap();
-	assert_eq!(allocations.len(),1); assert_eq!((allocations[0].1,allocations[0].2,allocations[0].3),(100_000,1_000,99_000));
+	assert_eq!(allocations.len(),1); assert_eq!((allocations[0].1,allocations[0].2,allocations[0].3),(100_000,2_000,98_000));
 	let operator_rows=db.read(async |tx| Ok(tx.query("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid \
 		FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator'",
@@ -616,7 +616,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	let confirmed=ctx.generate_blocks(6).await;
 	super::expiry_test::rebuilt(&ctx,&srv,&db).await;
 	let actual=chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().unwrap();
-	assert!(actual.confirmations>=6); assert_eq!(actual.value,sat(99_000));
+	assert!(actual.confirmations>=6); assert_eq!(actual.value,sat(98_000));
 	assert_eq!(actual.script_pub_key.script().unwrap(),fallback);
 	owner.sync_fallback_payouts().await.unwrap();
 	owner.sync_pending_offboards().await.unwrap();
@@ -646,7 +646,7 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	assert_eq!(ctx.bitcoind().get_received_by_address(&offboard_address),sat(0));
 	assert!(chain.custom_get_raw_transaction_info(offboard_txid,None).unwrap().is_none());
 	assert_eq!(recipient.balance().await.unwrap().spendable,live.amount());
-	assert_eq!(live.amount()+quote+actual.value+sat(1_000),sat(200_000));
+	assert_eq!(live.amount()+quote+actual.value+sat(2_000),sat(200_000));
 	let (child,fee)=ark_testing::onchain::observed_payout_fee_child(&ctx,&parent).unwrap();
 	let sponsor_tx=ctx.bitcoind().await_transaction(sponsor).await;
 	let sponsor_points=sponsor_tx.output.iter().enumerate().filter(|(_,o)|o.script_pubkey==funding.script_pubkey())

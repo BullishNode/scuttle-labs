@@ -435,7 +435,7 @@ async fn automatic_multilevel_split() {
 	// This lower bound uses real consensus serialization, without any input,
 	// witness, drain, anchor or transaction-header overhead.
 	let minimum_outputs = owners[..324].iter().map(|o|
-		serialize(&TxOut { value: sat(LEAF_SAT - 1_000), script_pubkey: o.script.clone() }).len()
+		serialize(&TxOut { value: sat(LEAF_SAT - 2_000), script_pubkey: o.script.clone() }).len()
 	).sum::<usize>();
 	assert_eq!(minimum_outputs, 324 * 43);
 	assert!(minimum_outputs > 10_000);
@@ -577,8 +577,8 @@ async fn finish_payouts(
 	let mut payouts = BTreeMap::new();
 	for row in &payout_rows {
 		assert_eq!(row.get::<_, i64>("gross_sat"), LEAF_SAT as i64);
-		assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
-		assert_eq!(row.get::<_, i64>("payout_sat"), (LEAF_SAT - 1_000) as i64);
+		assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
+		assert_eq!(row.get::<_, i64>("payout_sat"), (LEAF_SAT - 2_000) as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 		let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 		payouts.insert(parent.compute_txid(), parent);
@@ -605,7 +605,7 @@ async fn finish_payouts(
 		)).collect::<Vec<_>>();
 		assert_eq!(matches.len(), 1, "each actual owner must have exactly one economic payout output");
 		let (txid, vout, expected) = matches[0];
-		assert_eq!(expected.value, sat(LEAF_SAT - 1_000));
+		assert_eq!(expected.value, sat(LEAF_SAT - 2_000));
 		let actual = core.get_tx_out(&txid, vout as u32, Some(true)).unwrap().unwrap();
 		assert!(actual.confirmations >= 6);
 		assert_eq!(actual.value, expected.value);
@@ -653,7 +653,7 @@ async fn finish_payouts(
 			for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
 				for output in &tx.output {
 					if customer_scripts.contains(&output.script_pubkey) {
-						assert_eq!(output.value, sat(LEAF_SAT - 1_000));
+						assert_eq!(output.value, sat(LEAF_SAT - 2_000));
 						*customer_counts.entry(output.script_pubkey.clone()).or_insert(0_usize) += 1;
 					}
 				}

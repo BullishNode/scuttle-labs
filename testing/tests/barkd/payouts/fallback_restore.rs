@@ -41,7 +41,7 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(coins.len(), 1);
 	assert_eq!(coins[0].state, bark_json::primitives::VtxoStateInfo::Spendable);
 	let coin = &coins[0];
-	let expected = coin.vtxo.amount - sat(1_000);
+	let expected = coin.vtxo.amount - sat(2_000);
 	let original = barkd.get_vtxo_encoded(&coin.vtxo.id.to_string()).await.encoded;
 
 	// Absence means the native process is stopped, including every
@@ -133,8 +133,8 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(allocation.get::<_, &str>("sweep_txid"), point.txid.to_string());
 	assert_eq!((allocation.get::<_, i64>("gross_sat"), allocation.get::<_, i64>("fee_sat"),
 		allocation.get::<_, i64>("payout_sat"), allocation.get::<_, i64>("forfeited_sat")),
-		(100_000, 1_000, 99_000, 0));
-	assert_eq!(coin.vtxo.amount, expected + sat(1_000));
+		(100_000, 2_000, 98_000, 0));
+	assert_eq!(coin.vtxo.amount, expected + sat(2_000));
 
 	barkd.stop().await.unwrap();
 

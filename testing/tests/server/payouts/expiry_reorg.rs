@@ -43,7 +43,7 @@ async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 	let client = wallet.client().await;
 	let coin = client.get_full_vtxo(ids[0]).await.unwrap();
 	let destination = client.fallback_script();
-	let expected = coin.amount() - sat(1_000);
+	let expected = coin.amount() - sat(2_000);
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
@@ -161,7 +161,7 @@ async fn expiry_payout_fee_replacement_keeps_parent_and_counts_only_confirmed_ch
 	assert!(sat(first_fee) < target * (parent.weight() + first_child.weight()));
 	let payouts = parent.output.iter().filter(|out| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
-	assert_eq!(payouts[0].value, coin.amount() - sat(1_000));
+	assert_eq!(payouts[0].value, coin.amount() - sat(2_000));
 	srv.watchmand().stop().await.unwrap();
 	{
 		let mut config = srv.watchmand().config_mut();
@@ -279,7 +279,7 @@ async fn positive_untrusted_parent_recovery() {
 	let payees = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payees.len(), 1);
 	let payout_index = payees[0].0 as u32;
-	assert_eq!(payees[0].1.value, sat(99_000));
+	assert_eq!(payees[0].1.value, sat(98_000));
 	assert_eq!(parent.output.iter().map(|out| out.value).sum::<bitcoin::Amount>(), sat(100_000));
 	let anchors = parent.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor()).collect::<Vec<_>>();
 	assert_eq!(anchors.len(), 1);
@@ -291,7 +291,7 @@ async fn positive_untrusted_parent_recovery() {
 	};
 	assert_ne!(destination, operator_spk);
 	assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == operator_spk)
-		.map(|out| out.value).sum::<bitcoin::Amount>(), sat(1_000));
+		.map(|out| out.value).sum::<bitcoin::Amount>(), sat(2_000));
 	let before = srv.watchmand().native_child().await.unwrap();
 	srv.watchmand().crash_stop().await.unwrap();
 	assert!(ctx.bitcoind().sync_client().get_mempool_entry(&parent.compute_txid()).is_err());
@@ -385,7 +385,7 @@ async fn positive_untrusted_parent_recovery() {
 	assert_eq!(canonical(&ctx, &child), confirmed, "the real sponsor child confirms with its immutable parent");
 	let block = confirmed.hash;
 	let payout = rpc.get_tx_out(&parent.compute_txid(), payout_index, Some(true)).unwrap().unwrap();
-	assert_eq!(payout.value, sat(99_000));
+	assert_eq!(payout.value, sat(98_000));
 	assert!(payout.confirmations >= 6);
 	for (transaction, index, expected) in parent.output.iter().enumerate()
 		.filter(|(_, output)| !output.is_p2a_fee_anchor())
@@ -412,10 +412,10 @@ async fn positive_untrusted_parent_recovery() {
 	assert_eq!(final_state.get::<_, i64>("active"), 1);
 	assert_eq!(final_state.get::<_, i64>("associations"), 1);
 	assert_eq!(final_state.get::<_, i64>("payments"), 1);
-	assert_eq!(final_state.get::<_, i64>("output_fee"), 1_000);
+	assert_eq!(final_state.get::<_, i64>("output_fee"), 2_000);
 	assert_eq!(deserialize::<Transaction>(final_state.get("raw")).unwrap(), parent);
 	// Exact selected cut: customer backing100k + independent fee capital100k.
-	// The 1k output charge is operator capital, not an extra miner expense.
-	assert_eq!(sat(200_000), sat(99_000) + sat(1_000)
+	// The 2k output charge is operator capital, not an extra miner expense.
+	assert_eq!(sat(200_000), sat(98_000) + sat(2_000)
 		+ child.output.iter().map(|out| out.value).sum::<bitcoin::Amount>() + fee);
 }

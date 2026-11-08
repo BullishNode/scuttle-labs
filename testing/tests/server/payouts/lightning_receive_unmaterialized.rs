@@ -142,7 +142,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 			}
 		}
 	}
-	assert_eq!(customer_outputs, BTreeMap::from([(payout, 99_000)]));
+	assert_eq!(customer_outputs, BTreeMap::from([(payout, 98_000)]));
 	let operator = {
 		let config = srv.watchmand().config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
@@ -231,7 +231,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 				if output.is_p2a_fee_anchor() { assert_eq!(output.value, Amount::ZERO); }
 				else if output.script_pubkey == *recipient {
 					assert_eq!(OutPoint::new(txid, vout as u32), payout);
-					assert_eq!(output.value, sat(99_000));
+					assert_eq!(output.value, sat(98_000));
 				} else { assert_eq!(output.script_pubkey, operator); }
 			}
 			false
@@ -255,17 +255,17 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 	let root_total = boundary.values().map(|output| output.value.to_sat()).sum::<u64>();
 	let terminal = frontier.values().map(|output| output.value.to_sat()).sum::<u64>();
 	assert_eq!(root_total, terminal + fees);
-	assert_eq!(frontier.get(&payout).unwrap().value, sat(99_000));
+	assert_eq!(frontier.get(&payout).unwrap().value, sat(98_000));
 	for (anchor, parent_height) in &parent_anchors {
 		assert_eq!(children.get(anchor), Some(parent_height), "every canonical prefix or allocation needs its genuine same-block fee child");
 	}
 	let operator_terminal = frontier.iter().filter(|(point, out)| out.script_pubkey == operator
 		|| (!source_path.contains_key(*point) && pool_path.get(*point) == Some(*out)))
 		.map(|(_, out)| out.value.to_sat()).sum::<u64>();
-	assert_eq!(operator_terminal, 101_000, "unused pool principal100k and output charge1k remain operator capital");
+	assert_eq!(operator_terminal, 102_000, "unused pool principal100k and output charge2k remain operator capital");
 	for (point, output) in &frontier {
 		if output.value == Amount::ZERO { assert!(output.is_p2a_fee_anchor()); continue; }
-		if *point == payout { assert_eq!(output.value, sat(99_000)); }
+		if *point == payout { assert_eq!(output.value, sat(98_000)); }
 		else if !fee_points.contains(point) && output.script_pubkey != operator {
 			assert!(!source_path.contains_key(point));
 			assert_eq!(pool_path.get(point), Some(output), "other terminal capital needs its exact signed operator Pool path");
@@ -527,7 +527,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 				let input_value = payout_input_value(&parent);
 				assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == destination).count(), 1);
 				for output in &parent.output {
-					if output.script_pubkey == destination { assert_eq!(output.value, sat(99_000)); }
+					if output.script_pubkey == destination { assert_eq!(output.value, sat(98_000)); }
 					else { assert!(output.script_pubkey == operator_script || output.is_p2a_fee_anchor()); }
 				}
 				assert_eq!(input_value, parent.output.iter().map(|out| out.value).sum::<Amount>());
@@ -591,7 +591,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		"the actual collected operation remains pending without a final coin row");
 	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
-	assert_eq!(outputs[0].1.value, sat(99_000));
+	assert_eq!(outputs[0].1.value, sat(98_000));
 	let payout = OutPoint::new(parent.compute_txid(), outputs[0].0 as u32);
 	assert_eq!(ctx.bitcoind().await_transaction(payout.txid).await, parent);
 	let mut parent_inputs = Amount::ZERO;
@@ -625,8 +625,8 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(row.get::<_, &str>("user_pubkey"), recipient_key.to_string());
 		assert_eq!(row.get::<_, &str>("spk"), destination.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
-		assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
-		assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
+		assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
+		assert_eq!(row.get::<_, i64>("payout_sat"), 98_000);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
@@ -663,12 +663,12 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let history = returned.history().await.unwrap();
 	assert!(history.is_empty(), "an unseen right does not manufacture an Ark coin, receipt or debit");
 	let bitcoin = returned.onchain().unwrap();
-	assert_eq!(bitcoin.read().await.balance().await, sat(99_000),
+	assert_eq!(bitcoin.read().await.balance().await, sat(98_000),
 		"the original recipient's Bitcoin wallet discovers the actual canonical payout");
 	for _ in 0..2 {
 		returned.sync_fallback_payouts().await.unwrap();
 		returned.sync_onchain().await.unwrap();
-		assert_eq!(bitcoin.read().await.balance().await, sat(99_000));
+		assert_eq!(bitcoin.read().await.balance().await, sat(98_000));
 		assert_eq!(returned.history().await.unwrap(), history);
 		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	}
@@ -700,7 +700,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	assert_eq!(native[0].amount_msat.as_ref().unwrap().msat, gross.to_msat());
 	canonical_cut(&ctx, &srv, &db, &boundary, &destination, &provider_destination, payout, &original.source, &operator_pool).await;
 	returned.sync_onchain().await.unwrap();
-	assert_eq!(bitcoin.read().await.balance().await, sat(99_000));
+	assert_eq!(bitcoin.read().await.balance().await, sat(98_000));
 	assert!(returned.history().await.unwrap() == history);
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);

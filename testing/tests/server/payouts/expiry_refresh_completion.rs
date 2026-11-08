@@ -247,7 +247,7 @@ async fn refresh_completion_race(forfeit_wins: bool) {
 		assert_eq!(rpc.round_participation_status(status_request).await.unwrap_err().code(), tonic::Code::NotFound);
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 		let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination).unwrap();
-		assert_eq!(output.value, original.amount() - sat(1_000));
+		assert_eq!(output.value, original.amount() - sat(2_000));
 		ctx.generate_blocks(6).await;
 		assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 		let replacement_ids = replacements.iter().map(|coin| coin.id().to_string()).collect::<Vec<_>>();
@@ -438,7 +438,7 @@ async fn expiry_decision_during_round_signing_is_recoverable() {
 		assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 		let paid = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 		assert_eq!(paid.len(), 1);
-		assert_eq!(paid[0].1.value, sat(99_000));
+		assert_eq!(paid[0].1.value, sat(98_000));
 		let confirmed = ctx.generate_blocks(6).await;
 		srv.wait_for_sync_height(confirmed).await;
 		srv.watchmand().wait_for_sync_height(confirmed).await;

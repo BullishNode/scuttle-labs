@@ -9,7 +9,7 @@ use ark::VtxoId;
 
 /// Fee for all payouts to one script at one expiry height.
 fn payout_fee(gross: Amount) -> Amount {
-	Amount::from_sat(1_000.max(gross.to_sat().div_ceil(100)))
+	Amount::from_sat(2_000.max(gross.to_sat().div_ceil(100)))
 }
 
 /// A customer entitlement whose ownership and backing have been resolved.
@@ -100,12 +100,12 @@ mod tests {
 	#[test]
 	fn direct_fee_many_small_leaves_pay_one_non_dust_output() {
 		let script = wpkh();
-		let plan = allocate_first((0..20).map(|i| leaf(i, 100, &script)).collect()).unwrap();
+		let plan = allocate_first((0..30).map(|i| leaf(i, 100, &script)).collect()).unwrap();
 		assert!(plan.iter().all(|leaf| leaf.forfeited == Amount::ZERO));
-		assert_eq!(plan.len(), 20);
+		assert_eq!(plan.len(), 30);
 		let recipient = &plan;
 		assert_eq!(recipient.iter().map(|leaf| leaf.payout).sum::<Amount>(), Amount::from_sat(1_000));
-		assert_eq!(recipient.iter().map(|a| a.fee.to_sat()).sum::<u64>(), 1_000);
+		assert_eq!(recipient.iter().map(|a| a.fee.to_sat()).sum::<u64>(), 2_000);
 		assert!(recipient.iter().all(|a| a.fee <= a.gross));
 	}
 
@@ -121,11 +121,11 @@ mod tests {
 			ScriptBuf::new_p2tr(&secp, key.x_only_public_key().0, None),
 		] {
 			let dust = script.minimal_non_dust().to_sat();
-			let paid = allocate_first(vec![leaf(1, 1_000 + dust, &script)]).unwrap();
+			let paid = allocate_first(vec![leaf(1, 2_000 + dust, &script)]).unwrap();
 			assert_eq!(paid.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), dust);
-			let forfeited = allocate_first(vec![leaf(1, 999 + dust, &script)]).unwrap();
+			let forfeited = allocate_first(vec![leaf(1, 1_999 + dust, &script)]).unwrap();
 			assert!(forfeited.iter().all(|leaf| leaf.payout == Amount::ZERO));
-			assert_eq!(forfeited[0].forfeited.to_sat(), 999 + dust);
+			assert_eq!(forfeited[0].forfeited.to_sat(), 1_999 + dust);
 			assert_eq!(forfeited[0].fee, Amount::ZERO);
 		}
 	}
@@ -137,7 +137,7 @@ mod tests {
 		let b = allocate_first(vec![leaf(1, 400, &script), leaf(2, 2_000, &script)]).unwrap();
 		assert_eq!(a, b);
 		assert_eq!(a[0].fee.to_sat(), 400);
-		assert_eq!(a[1].fee.to_sat(), 600);
+		assert_eq!(a[1].fee.to_sat(), 1_600);
 	}
 
 	#[test]
@@ -164,7 +164,7 @@ mod tests {
 		let script = wpkh();
 		let combined = allocate_first(vec![leaf(1, 1_200, &script), leaf(2, 1_200, &script)]).unwrap();
 		assert_eq!(combined.len(), 2);
-		assert_eq!(combined.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 1_400);
+		assert_eq!(combined.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 400);
 		for id in [1, 2] {
 			let separate = allocate_first(vec![leaf(id, 1_200, &script)]).unwrap();
 			assert!(separate.iter().all(|leaf| leaf.payout == Amount::ZERO));
@@ -176,20 +176,21 @@ mod tests {
 	fn fee_is_shared_across_allocations_at_one_height() {
 		let script = wpkh();
 		let first = allocate_first(vec![leaf(1, 50_000, &script)]).unwrap();
-		assert_eq!(first.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 49_000);
-		let paid = BTreeMap::from([(script.clone(), (Amount::from_sat(50_000), Amount::from_sat(1_000)))]);
+		assert_eq!(first.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 48_000);
+		let paid = BTreeMap::from([(script.clone(), (Amount::from_sat(50_000), Amount::from_sat(2_000)))]);
 		let second = allocate(vec![leaf(2, 50_001, &script)], &paid).unwrap();
-		assert_eq!(second.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 50_000);
-		assert_eq!(second[0].fee.to_sat(), 1);
-		assert_eq!(49_000 + 50_000, 100_001 - 1_001);
+		assert_eq!(second.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 50_001);
+		assert_eq!(second[0].fee.to_sat(), 0);
+		assert_eq!(48_000 + 50_001, 100_001 - 2_000);
 		let different = ScriptBuf::new_p2wpkh(&WPubkeyHash::from_byte_array([9; 20]));
 		let other = allocate(vec![leaf(3, 50_000, &different)], &paid).unwrap();
-		assert_eq!(other.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 49_000);
+		assert_eq!(other.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), 48_000);
 	}
 
 	#[test]
 	fn percentage_fee_rounds_up_without_overflow() {
-		for (gross, fee) in [(100_000, 1_000), (100_001, 1_001), (200_000, 2_000),
+		for (gross, fee) in [(100_000, 2_000), (100_001, 2_000), (200_000, 2_000),
+			(200_001, 2_001),
 			(u64::MAX, u64::MAX.div_ceil(100))] {
 			assert_eq!(payout_fee(Amount::from_sat(gross)).to_sat(), fee);
 		}

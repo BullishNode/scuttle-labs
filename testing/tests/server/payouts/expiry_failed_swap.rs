@@ -242,18 +242,18 @@ async fn failed_swap_during_restart() {
 	assert_eq!(parent.output.iter().map(|out| out.value.to_sat()).sum::<u64>(), backing.value.to_sat());
 	let payouts = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
-	assert_eq!(payouts[0].1.value, sat(99_000));
+	assert_eq!(payouts[0].1.value, sat(98_000));
 	let payout = OutPoint::new(parent.compute_txid(), payouts[0].0 as u32);
 	ctx.generate_blocks(6).await;
 	wait_rebuilt(&db, server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap()).await;
 	let actual = ctx.bitcoind().sync_client().get_tx_out(&payout.txid, payout.vout, Some(true)).unwrap().unwrap();
 	assert!(actual.confirmations >= 6);
-	assert_eq!(actual.value, sat(99_000));
+	assert_eq!(actual.value, sat(98_000));
 	assert_eq!(actual.script_pub_key.script().unwrap(), destination);
-	assert_eq!(actual.value + sat(1_000), input.amount());
+	assert_eq!(actual.value + sat(2_000), input.amount());
 	let operator_remainder = parent.output.iter().filter(|out| out.script_pubkey != destination)
 		.map(|out| out.value).sum::<Amount>();
-	assert_eq!(operator_remainder, sat(1_000));
+	assert_eq!(operator_remainder, sat(2_000));
 	let (_, child) = canonical_package(&ctx, &parent,
 		&destination, &operator_script).await;
 	let child_txid = child.compute_txid();
@@ -276,8 +276,8 @@ async fn failed_swap_during_restart() {
 			assert_eq!(row.get::<_, String>("user_pubkey"), key.public_key().to_string());
 			assert_eq!(row.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
 			assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
-			assert_eq!(row.get::<_, i64>("fee_sat"), 1_000);
-			assert_eq!(row.get::<_, i64>("payout_sat"), 99_000);
+			assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
+			assert_eq!(row.get::<_, i64>("payout_sat"), 98_000);
 			assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 			assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(parent.compute_txid().to_string()));
 			let recorded = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();

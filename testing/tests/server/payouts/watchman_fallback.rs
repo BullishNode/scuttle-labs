@@ -501,7 +501,7 @@ pub(super) async fn watchman_sweeps_arkoor_vtxos_sender_exit() {
 		assert_eq!(payouts.len(), 1, "one actual customer output per same-script allocation");
 		let expected_fee = customer_sources.iter().filter(|coin| parent.input.iter().any(|input|
 			input.previous_output == source_frontiers[&coin.id().to_string()]))
-			.map(|coin| sat(coin.amount().to_sat().div_ceil(100).max(1_000))).sum::<Amount>();
+			.map(|coin| sat(coin.amount().to_sat().div_ceil(100).max(2_000))).sum::<Amount>();
 		assert_eq!(payouts[0].1.value + expected_fee, gross);
 		let payout = OutPoint::new(parent.compute_txid(), payouts[0].0 as u32);
 		assert!(expected_payouts.insert(payout, payouts[0].1.value).is_none());
@@ -937,7 +937,7 @@ pub(super) async fn watchman_sweeps_lightning_vtxos() {
 		*customer_gross_by_expiry.entry((*owner, source.expiry_height().to_u32())).or_default() += source.amount().to_sat();
 	}
 	let expected_fees_by_expiry = customer_gross_by_expiry.iter().map(|(group, gross)|
-		(*group, gross.div_ceil(100).max(1_000))).collect::<BTreeMap<_, _>>();
+		(*group, gross.div_ceil(100).max(2_000))).collect::<BTreeMap<_, _>>();
 	let pool_remainder = futures::TryStreamExt::try_collect::<Vec<_>>(db.load_vtxopool().await.unwrap()).await.unwrap();
 	assert!(pool_remainder.iter().all(|coin| coin.chain_anchor() == pool_anchor));
 	assert_eq!(pool_remainder.iter().map(|coin| coin.amount()).sum::<Amount>(), sat(50_000));
@@ -2147,7 +2147,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 		}
 	}
 	let expected_fees_by_expiry = customer_gross_by_expiry.iter().map(|(group, gross)|
-		(*group, gross.div_ceil(100).max(1_000))).collect::<BTreeMap<_, _>>();
+		(*group, gross.div_ceil(100).max(2_000))).collect::<BTreeMap<_, _>>();
 	let mut parent_fees = BTreeMap::new();
 	let tip = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(tip).await;
@@ -2182,7 +2182,7 @@ pub(super) async fn watchman_sweeps_exit_after_oor_then_forfeit() {
 			let outputs = parent.output.iter().filter(|output| output.script_pubkey == destinations[owner]).collect::<Vec<_>>();
 			assert_eq!(outputs.len(), 1);
 			let fee = amount.checked_sub(outputs[0].value).unwrap();
-			assert!(fee.to_sat() <= amount.to_sat().div_ceil(100).max(1_000));
+			assert!(fee.to_sat() <= amount.to_sat().div_ceil(100).max(2_000));
 			assert!(parent_fees.insert((*allocation, owner), fee).is_none());
 			wanted.insert(destinations[owner].clone(), amount - fee);
 			operator_gross += fee;
@@ -2486,7 +2486,7 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 			let outputs = parent.output.iter().filter(|output| output.script_pubkey == destination).collect::<Vec<_>>();
 			assert_eq!(outputs.len(), 1);
 			let fee = customer.checked_sub(outputs[0].value).unwrap();
-			assert!(fee == Amount::ZERO || fee == sat(1_000));
+			assert!(fee == Amount::ZERO || fee == sat(2_000));
 			fee
 		} else { Amount::ZERO };
 		if customer > Amount::ZERO { wanted.insert(destination.clone(), customer.checked_sub(fee).unwrap()); }
@@ -2509,10 +2509,10 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 		}
 	}
 	assert_eq!(consumed_roots, roots.iter().map(|root| root.point()).collect());
-	assert_eq!(customer_paid, sat(18_000));
-	assert_eq!(operator_paid, sat(181_000));
-	assert_eq!(sat(19_000), customer_paid + sat(1_000),
-		"all 19 rights pay the 1,000 sat floor once across every allocation");
+	assert_eq!(customer_paid, sat(17_000));
+	assert_eq!(operator_paid, sat(182_000));
+	assert_eq!(sat(19_000), customer_paid + sat(2_000),
+		"all 19 rights pay the 2,000 sat floor once across every allocation");
 	let final_tip = ctx.generate_blocks(6).await;
 	assert!(final_tip >= claimable_height);
 	srv.wait_for_sync_height(final_tip).await;
@@ -2545,7 +2545,7 @@ pub(super) async fn watchman_doesnt_broadcast_htlc_recv_chain() {
 	failures.assert_empty();
 	let customer_payouts = payouts.iter().filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(customer_payouts.len(), 1);
-	assert_eq!(customer_payouts[0].1.value, sat(18_000));
+	assert_eq!(customer_payouts[0].1.value, sat(17_000));
 	check_receive_seed_custody(&ctx, &srv, &wallet, &oldest, &destination, *customer_payouts[0].0, &customers).await;
 }
 
@@ -2582,7 +2582,7 @@ pub(super) async fn check_receive_seed_custody(
 	restored.onchain_sync().await;
 	restored.exit_progress().await;
 	let utxos = restored.onchain_utxos().await;
-	assert!(utxos.iter().any(|coin| coin.outpoint == payout && coin.amount == sat(18_000)),
+	assert!(utxos.iter().any(|coin| coin.outpoint == payout && coin.amount == sat(17_000)),
 		"the fresh seed must recognize the actual full-cohort fallback output");
 	let recovered = restored.vtxos(Some(true)).await;
 	for id in remaining.keys() {
