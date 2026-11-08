@@ -280,7 +280,10 @@ impl Tx<'_> {
 					if subscription.payment_hash != hash { return Ok(proposal); }
 					match subscription.status {
 						LightningHtlcSubscriptionStatus::Settled => {
-							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+							// A forwarded receive is owed to the recipient bound at invoice
+							// time; the grant key is the provider's.
+							let owner = subscription.claim_destination_user_pubkey.unwrap_or(user.user_pubkey());
+							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: owner };
 							proposal.evidence = Some(OwnershipEvidence::HtlcStoredPreimage);
 						},
 						LightningHtlcSubscriptionStatus::Canceled if expired_contract => {

@@ -384,7 +384,8 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 
 /// A forwarded receive whose hash settles without a cooperative claim leaves
 /// no claim row naming the recipient. Its grant, still unspent offchain at
-/// expiry, must not be paid to the provider's grant key.
+/// expiry, is paid to the recipient bound at invoice time, never to the
+/// provider's grant key.
 #[tokio::test]
 async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 	let ctx = TestContext::new("server/settled_forwarded_receive_without_claim").await;
@@ -400,6 +401,8 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 	let recipient = ctx.bark("recipient", &srv).create().await;
 	let address: ark::Address = recipient.address().await.parse().unwrap();
 	let recipient_link = address.owner_link(Network::Regtest, mailbox_key).unwrap().unwrap();
+	let recipient_key = address.policy().user_pubkey();
+	let recipient_script = recipient.client().await.fallback_script();
 	let provider_mailbox = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let grant_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let provider_script = ark::fallback::payout_script(provider_mailbox.public_key());
@@ -458,28 +461,24 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
 
-	// Give the watchman several passes to decide, then check every decision
-	// on a grant: none may pay the provider.
-	for _ in 0..3 {
-		let tip = ctx.generate_blocks(1).await;
-		srv.watchmand().wait_for_sync_height(tip).await;
-		tokio::time::sleep(Duration::from_secs(5)).await;
-	}
+	// Each grant is paid to the recipient, once, and no allocation names the provider.
 	for grant in &grants {
-		let decisions = db.read(async |tx| Ok(tx.query("SELECT c.disposition, c.user_pubkey, c.owner_mailbox, a.sweep_tx \
-			FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
-			&[&grant.id().to_string()]).await?)).await.unwrap();
-		for decision in decisions {
-			assert_ne!(decision.get::<_, Option<String>>("user_pubkey"), Some(grant_key.public_key().to_string()),
-				"grant {} was allocated to the provider's grant key", grant.id());
-			assert_ne!(decision.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()),
-				"grant {} was allocated to the provider's mailbox", grant.id());
-			if let Some(raw) = decision.get::<_, Option<Vec<u8>>>("sweep_tx") {
-				let parent = deserialize::<Transaction>(&raw).unwrap();
-				assert!(parent.output.iter().all(|out| out.script_pubkey != provider_script),
-					"the provider was paid for grant {}", grant.id());
+		let parent: Transaction = tokio::time::timeout(Duration::from_secs(60), async {
+			loop {
+				if let Some((_, parent)) = super::expiry_test::published_payout(&db, grant.id()).await { break parent; }
+				tokio::time::sleep(poll_interval()).await;
 			}
+		}).await.expect("the settled grant was not paid to its recipient");
+		assert!(parent.output.iter().any(|out| out.script_pubkey == recipient_script && out.value > Amount::ZERO));
+		assert!(parent.output.iter().all(|out| out.script_pubkey != provider_script));
+		let owners = db.read(async |tx| Ok(tx.query("SELECT c.user_pubkey, c.owner_mailbox \
+			FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
+			&[&grant.id().to_string()]).await?)).await.unwrap();
+		assert!(!owners.is_empty());
+		for owner in owners {
+			assert_eq!(owner.get::<_, Option<String>>("user_pubkey"), Some(recipient_key.to_string()),
+				"grant {} was allocated to someone other than the recipient", grant.id());
+			assert_ne!(owner.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()));
 		}
 	}
 }
