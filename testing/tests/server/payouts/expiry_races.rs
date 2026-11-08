@@ -28,6 +28,9 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 		("Lightning grant", VtxoTreeUpdate::new().mark_vtxos_oor_spent([(coin.id(), txid)])),
 		("offboard registration", VtxoTreeUpdate::new().mark_vtxos_offboard_spent([(coin.id(), txid, txid)])),
 		("refresh completion", VtxoTreeUpdate::new().mark_vtxos_round_spent([(coin.id(), 1)])),
+		("round forfeit", VtxoTreeUpdate::new().mark_vtxos_round_forfeited([(coin.id(), txid)])),
+		("round output claim", VtxoTreeUpdate::new().mark_vtxos_claimed([coin.id()])),
+		("registration", VtxoTreeUpdate::new().mark_vtxos_registered([coin.id()])),
 	];
 	for (name, update) in writes {
 		let competing_db = db.clone();
@@ -78,6 +81,8 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 		}).await.unwrap();
 		let error = writer.await.unwrap().expect_err("decision must win after the queued writer wakes");
 		assert!(format!("{error:#}").contains("reserved for expiry recovery"), "{name}: {error:#}");
+		assert!(matches!(error.downcast_ref::<server::FallbackRefusal>(),
+			Some(server::FallbackRefusal::DecidedForFallback(id)) if *id == coin.id()), "{name}: {error:#}");
 		let state = db.read(async |t| t.get_user_vtxos_by_id(&[coin.id()]).await).await.unwrap();
 		assert_eq!(state[0].spend_state, SpendState::Spent);
 		assert_eq!(state[0].offboarded_in, None);

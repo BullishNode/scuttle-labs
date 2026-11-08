@@ -1,10 +1,9 @@
 
-/// An existing successful attempt consumes only its linked signed HTLC sources.
-#[tokio::test]
-async fn successful_attempt_consumes_its_linked_htlc_send() {
+/// An existing successful attempt linked to one signed HTLC-send source.
+async fn succeeded_linked_htlc_send(name: &str) -> (TestContext, Db, ServerVtxo<ark::vtxo::Full>, i64) {
 	use server::database::ln::LightningPaymentStatus;
 
-	let mut ctx = TestContext::new_minimal("postgresd/successful_attempt_consumes_linked_source").await;
+	let mut ctx = TestContext::new_minimal(name).await;
 	ctx.init_central_postgres().await;
 	let postgres_cfg = ctx.new_postgres(&ctx.test_name).await;
 
@@ -53,8 +52,14 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	).await).await.unwrap().expect("attempt should have transitioned to Succeeded");
 
 	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+	(ctx, db, vtxo, attempt.id)
+}
 
-	db.write(async |t| t.mark_htlc_send_vtxos_ln_spent(attempt.id).await).await.unwrap();
+/// An existing successful attempt consumes only its linked signed HTLC sources.
+#[tokio::test]
+async fn successful_attempt_consumes_its_linked_htlc_send() {
+	let (ctx, db, vtxo, attempt) = succeeded_linked_htlc_send("postgresd/successful_attempt_consumes_linked_source").await;
+	db.write(async |t| t.mark_htlc_send_vtxos_ln_spent(attempt).await).await.unwrap();
 
 	// The existing source link identifies the coin consumed by this success.
 	let db_client = ctx.postgres_manager().database_client(Some(&ctx.test_name)).await;
@@ -64,6 +69,36 @@ async fn successful_attempt_consumes_its_linked_htlc_send() {
 	).await.unwrap();
 	let spend_state: String = row.get("spend_state");
 	assert_eq!(spend_state, "ln-spent", "the successful attempt consumes its linked source");
+}
+
+/// The success writer waits behind an expiry decision on its source, then
+/// leaves the decided coin spent: one backing coin keeps one obligation.
+#[tokio::test]
+async fn success_after_expiry_decision_never_consumes_the_decided_source() {
+	let (_ctx, db, vtxo, attempt) = succeeded_linked_htlc_send("postgresd/success_after_expiry_decision").await;
+	let id = vtxo.id().to_string();
+	let competing = db.clone();
+	let (pid_send, pid_recv) = tokio::sync::oneshot::channel();
+	let writer = db.write(async |t| {
+		t.query_one("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 FOR UPDATE", &[&id]).await?;
+		let writer = tokio::spawn(async move {
+			competing.write(async |t| {
+				pid_send.send(t.query_one("SELECT pg_backend_pid()", &[]).await?.get::<_, i32>(0)).unwrap();
+				t.mark_htlc_send_vtxos_ln_spent(attempt).await
+			}).await
+		});
+		let pid = pid_recv.await?;
+		while !t.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)", &[&pid]).await?.get::<_, bool>(0) {
+			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+		}
+		t.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)", &[&id]).await?;
+		t.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&id]).await?;
+		Ok(writer)
+	}).await.unwrap();
+	assert_eq!(writer.await.unwrap().unwrap(), vec![vtxo.id()], "the decided source is reported, not consumed");
+	let state = db.read(async |t| Ok(t.query_one("SELECT spend_state::TEXT FROM vtxo WHERE vtxo_id=$1", &[&id]).await?
+		.get::<_, String>(0))).await.unwrap();
+	assert_eq!(state, "spent");
 }
 
 async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, sources: &[VtxoId]) {

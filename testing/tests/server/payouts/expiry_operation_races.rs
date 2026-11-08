@@ -176,7 +176,7 @@ async fn unbroadcast_offboard_remains_customer_liability() {
 	}).await.expect("confirmed offboard did not release its backing");
 }
 
-async fn wait_for_query_lock(tx: &Tx<'_>, prefix: &str) -> anyhow::Result<()> {
+pub(super) async fn wait_for_query_lock(tx: &Tx<'_>, prefix: &str) -> anyhow::Result<()> {
 	tokio::time::timeout(Duration::from_secs(15), async {
 		loop {
 			tx.query_one("
@@ -205,9 +205,12 @@ async fn published_payout(db: &Db, id: ark::VtxoId, message: &str) -> Transactio
 	}).await.expect(message)
 }
 
-async fn offboard_race(offboard_wins: bool) {
-	let name = if offboard_wins { "server/expiry_native_offboard_wins" }
-		else { "server/expiry_native_decision_wins" };
+async fn offboard_race(offboard_wins: bool, after_analysis: bool) {
+	let name = match (offboard_wins, after_analysis) {
+		(true, false) => "server/expiry_native_offboard_wins",
+		(true, true) => "server/expiry_native_offboard_after_analysis",
+		(false, _) => "server/expiry_native_decision_wins",
+	};
 	let ctx = TestContext::new(name).await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().funded(btc(1))
 		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); }).watchmand().create().await;
@@ -242,7 +245,19 @@ async fn offboard_race(offboard_wins: bool) {
 	let current = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - current).await;
 	srv.wait_for_sync_height(expired).await;
-	if offboard_wins {
+	if offboard_wins && after_analysis {
+		db.write(async |tx| {
+			// The decision analyses the unspent coin, then waits for this lock
+			// before its checked write while the offboard commits in full.
+			tx.execute("SELECT pg_advisory_xact_lock($1,$2)",
+				&[&5_i32, &i32::try_from(coin.expiry_height().to_u32())?]).await?;
+			srv.watchmand().start().await.unwrap();
+			wait_for_query_lock(tx, "SELECT pg_advisory_xact_lock($1,$2)").await?;
+			gate.release.notify_one();
+			while gate.response.lock().unwrap().is_none() { tokio::time::sleep(Duration::from_millis(20)).await; }
+			Ok(())
+		}).await.unwrap();
+	} else if offboard_wins {
 		db.write(async |tx| {
 			tx.query_one("
 				SELECT vtxo_id
@@ -258,6 +273,8 @@ async fn offboard_race(offboard_wins: bool) {
 			wait_for_query_lock(tx, "SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE").await?;
 			Ok(())
 		}).await.unwrap();
+	}
+	if offboard_wins {
 		let actual = tokio::time::timeout(Duration::from_secs(20), operation).await.unwrap().unwrap().unwrap().txid;
 		assert_eq!(actual, offboard_txid);
 		let response = gate.response.lock().unwrap().clone().unwrap().unwrap();
@@ -309,12 +326,19 @@ async fn offboard_race(offboard_wins: bool) {
 
 #[tokio::test]
 async fn expiry_decision_wins_over_prepared_native_offboard() {
-	offboard_race(false).await;
+	offboard_race(false, false).await;
 }
 
 #[tokio::test]
 async fn expiry_registered_native_offboard_wins_over_waiting_decision() {
-	offboard_race(true).await;
+	offboard_race(true, false).await;
+}
+
+/// The decision's checked write refuses a plan whose coin was offboarded
+/// after the analysis read it.
+#[tokio::test]
+async fn expiry_decision_aborts_after_offboard_commits_during_analysis() {
+	offboard_race(true, true).await;
 }
 
 /// A user returning after backing expiry can close a never-initiated grant

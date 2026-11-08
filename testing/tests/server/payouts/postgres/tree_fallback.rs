@@ -164,3 +164,25 @@ async fn supplied_duplicate_links_are_all_verified_and_batches_roll_back() {
 	left.unwrap();
 	right.unwrap();
 }
+
+/// An undone round resets its inputs, except one the expiry decision already
+/// entitled: that coin stays spent, so it can never be spent a second time.
+#[tokio::test]
+async fn undone_round_keeps_a_decided_input_spent() {
+	let (_ctx, db) = test_db("undo_round_decided_input").await;
+	let decided = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	let other = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
+	db.write(async |tx| tx.upsert_vtxos([&decided, &other]).await).await.unwrap();
+	let round = db.write(async |tx| Ok(tx.query_one("INSERT INTO round(seq,funding_txid,funding_tx,signed_tree,expiry,created_at) \
+		VALUES(1,'undo-fixture','\\x00','\\x00',1,NOW()) RETURNING id", &[]).await?.get::<_, i64>(0))).await.unwrap();
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.mark_vtxos_round_spent([(decided.id(), round), (other.id(), round)])).await).await.unwrap();
+	db.write(async |tx| Ok(tx.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)",
+		&[&decided.id().to_string()]).await?)).await.unwrap();
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().undo_round(round)).await).await.unwrap();
+	let state = async |id| db.read(async |tx| tx.get_user_vtxos_by_id(&[id]).await).await.unwrap().remove(0);
+	let decided = state(decided.id()).await;
+	assert_eq!((decided.spend_state, decided.spent_in_round), (SpendState::Spent, Some(round)));
+	let other = state(other.id()).await;
+	assert_eq!((other.spend_state, other.spent_in_round), (SpendState::Spendable, None));
+}

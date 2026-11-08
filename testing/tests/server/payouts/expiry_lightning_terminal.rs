@@ -12,7 +12,7 @@ use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::plugins::hold;
 use server::database::Db;
-use server_log::{XpayRpcCalled, XpayRpcReturned};
+use server_log::{ExpiryHoldObserved, XpayRpcCalled, XpayRpcReturned};
 use server_rpc::protos;
 
 /// Grant delivery must leave every signed ancestor durable on the
@@ -39,8 +39,9 @@ pub(super) async fn assert_stored_grant_ancestry(db: &Db, grants: &[Vtxo<Full>])
 	}
 }
 
-async fn failed_external_payout() {
-	let name = "server/maxdelay_uses_server_tip_when_cln_lags";
+async fn failed_external_payout(settle_during_decision: bool) {
+	let name = if settle_during_decision { "server/expiry_settlement_during_decision_keeps_source_held" }
+		else { "server/maxdelay_uses_server_tip_when_cln_lags" };
 	let ctx = TestContext::new(name).await;
 	let lightning = {
 		let internal = ctx.lightningd("lightningd_internal").own_bitcoind().create().await;
@@ -166,6 +167,30 @@ async fn failed_external_payout() {
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
+	if settle_during_decision {
+		let mut holds = srv.watchmand().subscribe_log::<ExpiryHoldObserved>();
+		let settler = db.clone();
+		db.write(async |tx| {
+			// The decision analyses the failed send as the sender's refund, then
+			// waits here; a settlement for its hash commits before the write.
+			tx.execute("SELECT pg_advisory_xact_lock($1,$2)",
+				&[&5_i32, &i32::try_from(source_expiry.to_u32())?]).await?;
+			let height = ctx.bitcoind().get_block_count().await as u32;
+			ctx.generate_blocks(source_expiry.to_u32() + 1 - height).await;
+			super::expiry_operation_races::wait_for_query_lock(tx, "SELECT pg_advisory_xact_lock($1,$2)").await?;
+			settler.write(async |t| t.store_htlc_settlement(preimage).await).await?;
+			Ok(())
+		}).await.unwrap();
+		ctx.generate_blocks(1).await;
+		tokio::time::timeout(Duration::from_secs(30), async {
+			while let Some(hold) = holds.recv().await {
+				if hold.vtxo_id == id && hold.reason == "Lightning settlement provenance unknown" { return; }
+			}
+		}).await.expect("the decision must re-read the settlement and hold the source");
+		assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1",
+			&[&id.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0, "a settled hash must never refund its sender");
+		return;
+	}
 	let height = ctx.bitcoind().get_block_count().await as u32;
 	let expired = ctx.generate_blocks(source_expiry.to_u32() + 1 - height).await;
 	srv.wait_for_sync_height(expired).await;
@@ -190,7 +215,14 @@ async fn failed_external_payout() {
 
 #[tokio::test]
 async fn maxdelay_uses_server_tip_when_cln_lags() {
-	failed_external_payout().await;
+	failed_external_payout(false).await;
+}
+
+/// A settlement that commits between the decision's analysis and its write
+/// makes the write refuse the sender's refund; the source then stays held.
+#[tokio::test]
+async fn expiry_settlement_during_decision_keeps_source_held() {
+	failed_external_payout(true).await;
 }
 
 /// Internal setup timeout closes a receive that never granted

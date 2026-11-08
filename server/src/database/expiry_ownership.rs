@@ -1,4 +1,4 @@
-//! Resolve the selected current source under allocation and settlement locks.
+//! Resolve who owns a selected current source.
 
 
 use bitcoin::Amount;
@@ -51,7 +51,7 @@ pub enum OwnershipEvidence {
 	HtlcRecvExpired,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OwnershipProposal {
 	pub id: VtxoId,
 	pub gross: Amount,
@@ -83,7 +83,7 @@ impl Tx<'_> {
 		slog!(ExpiryHoldObserved, vtxo_id: id, reason: reason.to_owned());
 	}
 
-	/// Resolve one current economic terminal under its source and settlement locks.
+	/// Resolve one current economic terminal from the caller's snapshot.
 	pub async fn propose_expiry_ownership(
 		&self,
 		fact: &BackingVtxoFact,

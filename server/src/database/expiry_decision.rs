@@ -3,17 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use bitcoin::{Amount, ScriptBuf, Transaction, TxIn, TxOut, Sequence, Witness};
+use bitcoin::{Amount, ScriptBuf, Transaction, TxIn, TxOut, Txid, Sequence, Witness};
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::PublicKey;
 
-use ark::ServerVtxo;
+use ark::{ServerVtxo, VtxoId};
+use chrono::{DateTime, Local};
 
-use bitcoin_ext::{BlockRef, TxOutExt};
+use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
+use super::expiry_inventory::BackingSnapshot;
 use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use super::expiry_payout::MAX_PAYOUT_VSIZE;
-use super::Tx;
+use super::{SpendState, Tx};
 use crate::watchman::settlement::{allocate, CustomerLeaf};
 
 pub struct VerifiedPayee {
@@ -82,21 +84,32 @@ fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
 	}
 }
 
+/// Phase A's analysis of one same-expiry group, written by phase B only if
+/// every fact it depends on is unchanged under phase B's locks.
+pub struct ExpiryGroupPlan {
+	accepted: Vec<(ServerVtxo, Vec<ReadyCoin>)>,
+	branch: ExpiryBranchState,
+	existing_entitlements: BTreeMap<VtxoId, i64>,
+	script_by_id: BTreeMap<VtxoId, ScriptBuf>,
+	ready_scripts: BTreeMap<ScriptBuf, usize>,
+	/// Held roots whose next signed tree step should be requested.
+	pub splits: Vec<ServerVtxo>,
+	dropped: usize,
+}
+
+/// Every row of the accepted branches, and every participation and Lightning
+/// attempt that competes for them. Any change to a vtxo row bumps updated_at.
+#[derive(PartialEq)]
+struct ExpiryBranchState {
+	rows: Vec<(VtxoId, DateTime<Local>, SpendState, Option<BlockHeight>, Option<Txid>)>,
+	parts: Vec<i64>,
+	attempts: Vec<(i64, Option<i64>)>,
+}
+
 impl Tx<'_> {
-	/// Resolve selected current branches once, under their source and settlement
-	/// locks, then commit the allocation and cancellation in this transaction.
-	pub async fn commit_expiry_group(
-		&self, view: BlockRef, roots: Vec<ServerVtxo>,
-	) -> anyhow::Result<Option<CommittedExpiryGroup>> {
-		if roots.is_empty() { return Ok(None); }
-		self.lock_watchman_tip(view).await?;
-		let expiry = roots[0].expiry_height();
-		ensure!(roots.iter().all(|root| root.expiry_height() == expiry && expiry <= view.height),
-			"expiry allocation mixes heights or is not mature");
-		self.execute("SELECT pg_advisory_xact_lock($1,$2)", &[&5_i32, &i32::try_from(expiry.to_u32())?]).await?;
-		let snapshot = self.backing_subtree_snapshot(&roots).await?;
+	async fn expiry_branch_state(&self, roots: &[ServerVtxo]) -> anyhow::Result<(BackingSnapshot, ExpiryBranchState)> {
+		let snapshot = self.backing_subtree_snapshot(roots).await?;
 		let mut ids = snapshot.regular.iter().map(|fact| fact.state.vtxo_id.to_string()).collect::<Vec<_>>();
-		let branch_ids = ids.clone();
 		let hashes = snapshot.regular.iter().filter_map(|fact| fact.full_vtxo.as_ref().and_then(|vtxo| vtxo.unlock_hash()))
 			.map(|hash| hash.to_string()).collect::<Vec<_>>();
 		let parts = self.query("SELECT DISTINCT p.id FROM round_participation p \
@@ -105,31 +118,34 @@ impl Tx<'_> {
 			.into_iter().map(|row| row.get::<_, i64>("id")).collect::<Vec<_>>();
 		ids.extend(self.query("SELECT vtxo_id FROM round_part_input WHERE participation_id=ANY($1)", &[&parts]).await?
 			.into_iter().map(|row| row.get::<_, String>("vtxo_id")));
-		let attempt_source_ids = ids.clone();
 		let attempts = self.query("SELECT DISTINCT a.id,a.lightning_htlc_subscription_id FROM lightning_payment_attempt a \
-			JOIN lightning_payment_attempt_htlc_vtxo i ON i.lightning_payment_attempt_id=a.id WHERE i.vtxo_id=ANY($1) ORDER BY a.id", &[&ids]).await?;
-		let attempt_ids = attempts.iter().map(|row| row.get::<_, i64>("id")).collect::<Vec<_>>();
-		let mut subscriptions = attempts.iter().filter_map(|row| row.get::<_, Option<i64>>("lightning_htlc_subscription_id")).collect::<Vec<_>>();
-		ids.extend(self.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo WHERE lightning_payment_attempt_id=ANY($1)", &[&attempt_ids]).await?
-			.into_iter().map(|row| row.get::<_, String>("vtxo_id")));
-		ids.sort(); ids.dedup();
-		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
-		let current_parts = self.query("SELECT DISTINCT p.id FROM round_participation p \
-			LEFT JOIN round_part_input i ON i.participation_id=p.id \
-			WHERE i.vtxo_id=ANY($1) OR p.unlock_hash=ANY($2) ORDER BY p.id", &[&branch_ids, &hashes]).await?
-			.into_iter().map(|row| row.get::<_, i64>("id")).collect::<Vec<_>>();
-		let current_attempts = self.query("SELECT DISTINCT a.id FROM lightning_payment_attempt a \
-			JOIN lightning_payment_attempt_htlc_vtxo i ON i.lightning_payment_attempt_id=a.id \
-			WHERE i.vtxo_id=ANY($1) ORDER BY a.id", &[&attempt_source_ids]).await?
-			.into_iter().map(|row| row.get::<_, i64>("id")).collect::<Vec<_>>();
-		ensure!(current_parts == parts && current_attempts == attempt_ids,
-			"expiry dependencies changed while acquiring source locks");
-		self.lock_htlc_settlements().await?;
-		subscriptions.sort_unstable(); subscriptions.dedup();
-		self.query("SELECT id FROM lightning_htlc_subscription WHERE id=ANY($1) ORDER BY id FOR UPDATE", &[&subscriptions]).await?;
-		self.query("SELECT id FROM round_participation WHERE id=ANY($1) ORDER BY id FOR UPDATE", &[&parts]).await?;
+			JOIN lightning_payment_attempt_htlc_vtxo i ON i.lightning_payment_attempt_id=a.id WHERE i.vtxo_id=ANY($1) ORDER BY a.id", &[&ids]).await?
+			.into_iter().map(|row| (row.get(0), row.get(1))).collect();
+		let rows = snapshot.regular.iter().map(|fact| (fact.state.vtxo_id, fact.state.updated_at, fact.state.spend_state,
+			fact.onchain_spent_height, fact.onchain_spent_txid)).collect();
+		Ok((snapshot, ExpiryBranchState { rows, parts, attempts }))
+	}
+
+	async fn expiry_entitlement(&self, id: VtxoId) -> anyhow::Result<Option<(i64, bool)>> {
+		Ok(self.query_opt("SELECT e.id,EXISTS(SELECT 1 FROM expiry_allocation_coin c \
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id \
+			AND a.status<>'conflicted') AS reserved, \
+			EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id) AS claimed \
+			FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&id.to_string()]).await?
+			.map(|row| (row.get("id"), !row.get::<_, bool>("reserved") && !row.get::<_, bool>("claimed"))))
+	}
+
+	/// Phase A: resolve the group's current branches in one consistent read,
+	/// without row or settlement locks.
+	pub async fn plan_expiry_group(
+		&self, view: BlockRef, roots: Vec<ServerVtxo>,
+	) -> anyhow::Result<ExpiryGroupPlan> {
+		self.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+		ensure!(roots.iter().all(|root| root.expiry_height() == roots[0].expiry_height() && root.expiry_height() <= view.height),
+			"expiry allocation mixes heights or is not mature");
 		let mut ready: Vec<(ServerVtxo, Vec<ReadyCoin>)> = Vec::new();
 		let mut existing_entitlements = BTreeMap::new();
+		let mut splits = Vec::new();
 		let mut dropped = 0;
 		for root in roots {
 			let current = self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND frontier_at IS NOT NULL \
@@ -137,10 +153,6 @@ impl Tx<'_> {
 				&[&root.id().to_string(), &i32::try_from(view.height.to_u32())?]).await?;
 			if current.is_none() { dropped += 1; continue; }
 			let snapshot = self.backing_subtree_snapshot(std::slice::from_ref(&root)).await?;
-			// A branch added before its parent lock must be retried with that
-			// new source in the sorted lock set, never resolved without its lock.
-			ensure!(snapshot.regular.iter().all(|fact| ids.binary_search(&fact.state.vtxo_id.to_string()).is_ok()),
-				"expiry branch changed while acquiring source locks");
 			let mut coins = Vec::new();
 			let mut valid = true;
 			let mut needs_split = false;
@@ -187,13 +199,9 @@ impl Tx<'_> {
 						valid = false; needs_split |= ownership.needs_chain_progress; continue;
 					},
 				};
-				if let Some(row) = self.query_opt("SELECT e.id,EXISTS(SELECT 1 FROM expiry_allocation_coin c \
-					JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id \
-					AND a.status<>'conflicted') AS reserved, \
-					EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id) AS claimed \
-					FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&ownership.id.to_string()]).await? {
-					valid &= !row.get::<_, bool>("reserved") && !row.get::<_, bool>("claimed");
-					existing_entitlements.insert(ownership.id, row.get::<_, i64>("id"));
+				if let Some((entitlement, free)) = self.expiry_entitlement(ownership.id).await? {
+					valid &= free;
+					existing_entitlements.insert(ownership.id, entitlement);
 				}
 				coins.push(ReadyCoin { ownership, payee });
 			}
@@ -205,7 +213,7 @@ impl Tx<'_> {
 			if valid && !coins.is_empty() {
 				ready.push((root, coins));
 			} else {
-				if needs_split || !coins.is_empty() { self.request_held_expiry_split(view, &root, "output_requires_split").await?; }
+				if needs_split || !coins.is_empty() { splits.push(root); }
 				dropped += 1;
 			}
 		}
@@ -224,13 +232,51 @@ impl Tx<'_> {
 			accepted.push(output);
 			if !group_fits(&accepted)? {
 				let output = accepted.pop().expect("just inserted");
-				if !group_fits(std::slice::from_ref(&output))? {
-					self.request_held_expiry_split(view, &output.0, "output_requires_split").await?;
-				}
+				if !group_fits(std::slice::from_ref(&output))? { splits.push(output.0); }
 				dropped += 1;
 			}
 		}
+		let roots = accepted.iter().map(|output| output.0.clone()).collect::<Vec<_>>();
+		let (_, branch) = self.expiry_branch_state(&roots).await?;
+		Ok(ExpiryGroupPlan { accepted, branch, existing_entitlements, script_by_id, ready_scripts, splits, dropped })
+	}
+
+	/// Phase B: lock the accepted branches, recheck every fact phase A used
+	/// under those locks, then commit the allocation and cancellation.
+	pub async fn commit_expiry_group(
+		&self, view: BlockRef, group: ExpiryGroupPlan,
+	) -> anyhow::Result<Option<CommittedExpiryGroup>> {
+		let ExpiryGroupPlan { mut accepted, branch, existing_entitlements, script_by_id, ready_scripts, mut dropped, .. } = group;
 		if accepted.is_empty() { return Ok(None); }
+		self.lock_watchman_tip(view).await?;
+		let expiry = accepted[0].0.expiry_height();
+		self.execute("SELECT pg_advisory_xact_lock($1,$2)", &[&5_i32, &i32::try_from(expiry.to_u32())?]).await?;
+		let ids = branch.rows.iter().map(|row| row.0.to_string()).collect::<Vec<_>>();
+		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
+		let roots = accepted.iter().map(|output| output.0.clone()).collect::<Vec<_>>();
+		let (snapshot, current) = self.expiry_branch_state(&roots).await?;
+		ensure!(current == branch, "expiry branch changed during analysis");
+		let lightning = accepted.iter().flat_map(|output| &output.1).filter(|coin| !matches!(coin.ownership.evidence,
+			Some(OwnershipEvidence::Pubkey | OwnershipEvidence::IrreversibleEntitlement | OwnershipEvidence::InputOwner
+				| OwnershipEvidence::Pool | OwnershipEvidence::Padding | OwnershipEvidence::Forfeit
+				| OwnershipEvidence::Offboard | OwnershipEvidence::Exchange { .. }))).collect::<Vec<_>>();
+		if !lightning.is_empty() {
+			self.lock_htlc_settlements().await?;
+			let mut subscriptions = branch.attempts.iter().filter_map(|attempt| attempt.1)
+				.chain(snapshot.regular.iter().filter_map(|fact| fact.lightning_htlc_subscription_id)).collect::<Vec<_>>();
+			subscriptions.sort_unstable(); subscriptions.dedup();
+			self.query("SELECT id FROM lightning_htlc_subscription WHERE id=ANY($1) ORDER BY id FOR SHARE", &[&subscriptions]).await?;
+			for coin in lightning {
+				let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == coin.ownership.id)
+					.context("expiry coin left its branch")?;
+				ensure!(self.propose_expiry_ownership(fact, view.height, Some(view.height)).await? == coin.ownership,
+					"expiry Lightning facts changed during analysis");
+			}
+		}
+		for coin in accepted.iter().flat_map(|output| &output.1) {
+			ensure!(self.expiry_entitlement(coin.ownership.id).await?
+				== existing_entitlements.get(&coin.ownership.id).map(|id| (*id, true)), "expiry entitlement changed during analysis");
+		}
 		let paid = self.query("
 			SELECT c.spk,SUM(c.gross_sat)::BIGINT AS gross,SUM(c.fee_sat)::BIGINT AS fee
 			FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id
@@ -273,9 +319,9 @@ impl Tx<'_> {
 			if accepted.is_empty() { return Ok(None); }
 		};
 
-		// Final selection precedes every cancellation effect. All candidate
-		// inputs/participations were locked and checked without writes above;
-		// an unexpected change now rolls back the entire decision transaction.
+		// Final selection precedes every cancellation effect. The branches were
+		// locked and rechecked without writes above; an unexpected change in
+		// the cancellations now rolls back the entire decision transaction.
 		for output in &accepted {
 			let cancellations = output.1.iter().flat_map(|c| c.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
 			ensure!(self.cancel_expiry_participations(&cancellations).await?, "selected expiry cancellation changed under its locks");

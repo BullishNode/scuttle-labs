@@ -4,6 +4,7 @@ mod postgres;
 mod wire;
 mod expiry_admission;
 mod expiry_attribution;
+mod expiry_decision_load;
 mod expiry_dispatch;
 mod expiry_failed_swap;
 mod expiry_hash_provenance;
