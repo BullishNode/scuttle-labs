@@ -50,18 +50,13 @@ pub(crate) fn allocate(
 		)?;
 		let (paid_gross, paid_fee) = already_paid.get(&script).copied().unwrap_or_default();
 		let total = paid_gross.checked_add(gross).context("expiry paid principal overflow")?;
-		let mut group_fee = payout_fee(total).checked_sub(paid_fee)
+		let group_fee = payout_fee(total).checked_sub(paid_fee)
 			.context("expiry fee history exceeds the total fee")?.min(gross);
-		let mut net = gross.checked_sub(group_fee).context("expiry fee exceeds principal")?;
-		let mut subsidy = Amount::ZERO;
+		let net = gross.checked_sub(group_fee).context("expiry fee exceeds principal")?;
 		let dust = script.minimal_non_dust();
-		if net > Amount::ZERO && net < dust {
-			// Waive the current charge first. If this allocation's gross is
-			// itself below dust, the operator must fund the difference.
-			group_fee = gross.checked_sub(dust).unwrap_or(Amount::ZERO);
-			subsidy = dust.checked_sub(gross).unwrap_or(Amount::ZERO);
-			net = dust;
-		}
+		// Keep the scheduled charge intact. A positive remainder below dust
+		// is still owed to the owner, so the operator tops up the one output.
+		let subsidy = if net > Amount::ZERO && net < dust { dust - net } else { Amount::ZERO };
 		let pays = net > Amount::ZERO;
 		let mut remaining_fee = group_fee;
 		for (index, leaf) in group.into_iter().enumerate() {
@@ -133,10 +128,11 @@ mod tests {
 			let dust = script.minimal_non_dust().to_sat();
 			let paid = allocate_first(vec![leaf(1, 2_000 + dust, &script)]).unwrap();
 			assert_eq!(paid.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), dust);
-			let reduced_fee = allocate_first(vec![leaf(1, 1_999 + dust, &script)]).unwrap();
-			assert_eq!(reduced_fee[0].payout.to_sat(), dust);
-			assert_eq!(reduced_fee[0].fee.to_sat(), 1_999);
-			assert_eq!(reduced_fee[0].forfeited, Amount::ZERO);
+			let subsidized = allocate_first(vec![leaf(1, 1_999 + dust, &script)]).unwrap();
+			assert_eq!(subsidized[0].payout.to_sat(), dust);
+			assert_eq!(subsidized[0].fee.to_sat(), 2_000);
+			assert_eq!(subsidized[0].subsidy.to_sat(), 1);
+			assert_eq!(subsidized[0].forfeited, Amount::ZERO);
 		}
 	}
 

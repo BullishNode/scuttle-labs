@@ -142,7 +142,7 @@ async fn boundaries() {
 		let (coin, consumed) = Box::pin(receive_boundary(&srv, &sender, wallet, sat(amounts[index]), &board)).await;
 		old.extend(consumed);
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: bindings[index + 1].clone(),
-			fee: if index == 0 { 1_999 } else { 2_000 }, payout: dust + (index as u64).saturating_sub(1),
+			fee: 2_000, payout: dust + (index as u64).saturating_sub(1), subsidy: if index == 0 { 1 } else { 0 },
 			forfeited: 0, group_payout: dust + (index as u64).saturating_sub(1) });
 	}
 	let mut change = Vec::new();
@@ -157,11 +157,12 @@ async fn boundaries() {
 		fee -= charged;
 		let payout = coin.amount().to_sat() - charged;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[0], script: sender_binding.clone(), fee: charged,
-			payout, forfeited: 0, group_payout: change_gross - 2_000 });
+			payout, subsidy: 0, forfeited: 0, group_payout: change_gross - 2_000 });
 	}
 	assert_eq!(fee, 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.coin.amount()).sum::<Amount>(), sat(100_000));
-	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 7_999);
+	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 8_000);
+	assert_eq!(leaves.iter().map(|leaf| leaf.subsidy).sum::<u64>(), 1);
 	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 92_001);
 	balances(&sender, sat(change_gross)).await;
@@ -249,7 +250,7 @@ async fn boundaries() {
 }
 
 #[tokio::test]
-async fn p2tr_positive_subdust_fee_is_reduced_to_pay_standard_output() {
+async fn p2tr_positive_subdust_fee_is_subsidized_to_pay_standard_output() {
 	require_bitcoind_chain_source!();
 	assert!(std::env::var_os("BARK_DOUBLE_DRIVE_ACTIONS").is_none());
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries())).await
