@@ -1,6 +1,6 @@
 //! Short durable allocation commits for independently ready, same-expiry outputs.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::Context;
 use bitcoin::{Amount, ScriptBuf, Transaction, TxIn, TxOut, Txid, Sequence, Witness};
@@ -37,16 +37,15 @@ fn group_fits(outputs: &[(ServerVtxo, Vec<ReadyCoin>)]) -> anyhow::Result<bool> 
 	let mut payouts = scripts.into_iter().map(|script_pubkey|
 		TxOut { value: Amount::ZERO, script_pubkey }).collect::<Vec<_>>();
 	// Every address accepted for the operator drain has a script no
-	// larger than native P2WSH/P2TR. Count both drain and P2A even when
-	// a sub-dust operator remainder will use only the latter.
+	// larger than native P2WSH/P2TR. Leave room for fee inputs.
 	payouts.push(TxOut { value: Amount::ZERO, script_pubkey: ScriptBuf::new_p2wsh(&bitcoin::WScriptHash::all_zeros()) });
-	payouts.push(bitcoin_ext::fee::fee_anchor());
 	let tx = Transaction {
-		version: bitcoin::transaction::Version::non_standard(3), lock_time: bitcoin::absolute::LockTime::ZERO,
+		version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO,
 		input: outputs.iter().map(|o| &o.0).map(|root| TxIn { previous_output: root.point(),script_sig: ScriptBuf::new(),sequence: Sequence::ZERO,witness: Witness::new() }).collect(),
 		output: payouts,
 	};
-	let mut weight = tx.weight().to_wu().checked_add(2).context("expiry group weight overflow")?;
+	let mut weight = tx.weight().to_wu().checked_add(4_000)
+		.context("expiry group weight overflow")?;
 	for root in outputs.iter().map(|o| &o.0) {
 		let witness = root.policy().clauses(root.exit_delta(),root.expiry_height(),root.server_pubkey())
 			.iter().map(|clause| clause.witness_size(root)).max().unwrap_or(66).max(66);
@@ -90,10 +89,6 @@ pub struct ExpiryGroupPlan {
 	accepted: Vec<(ServerVtxo, Vec<ReadyCoin>)>,
 	branch: ExpiryBranchState,
 	existing_entitlements: BTreeMap<VtxoId, i64>,
-	script_by_id: BTreeMap<VtxoId, ScriptBuf>,
-	ready_scripts: BTreeMap<ScriptBuf, usize>,
-	/// Held roots whose next signed tree step should be requested.
-	pub splits: Vec<ServerVtxo>,
 	dropped: usize,
 }
 
@@ -145,7 +140,6 @@ impl Tx<'_> {
 			"expiry allocation mixes heights or is not mature");
 		let mut ready: Vec<(ServerVtxo, Vec<ReadyCoin>)> = Vec::new();
 		let mut existing_entitlements = BTreeMap::new();
-		let mut splits = Vec::new();
 		let mut dropped = 0;
 		for root in roots {
 			let current = self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND frontier_at IS NOT NULL \
@@ -155,7 +149,6 @@ impl Tx<'_> {
 			let snapshot = self.backing_subtree_snapshot(std::slice::from_ref(&root)).await?;
 			let mut coins = Vec::new();
 			let mut valid = true;
-			let mut needs_split = false;
 			for fact in &snapshot.regular {
 				if fact.onchain_spent_height.is_some() || fact.onchain_spent_txid.is_some() { valid = false; break; }
 				if let Some(txid) = fact.state.oor_spent_txid.filter(|_| fact.state.offboarded_in.is_none() && fact.state.spent_in_round.is_none()) {
@@ -196,7 +189,7 @@ impl Tx<'_> {
 					OwnershipDisposition::Unresolved(reason) => {
 						if ownership.settlement_integrity_hold { self.warn_settlement_integrity(ownership.id, reason); }
 						else { self.observe_expiry_hold(ownership.id, reason); }
-						valid = false; needs_split |= ownership.needs_chain_progress; continue;
+						valid = false; continue;
 					},
 				};
 				if let Some((entitlement, free)) = self.expiry_entitlement(ownership.id).await? {
@@ -212,33 +205,22 @@ impl Tx<'_> {
 			}
 			if valid && !coins.is_empty() {
 				ready.push((root, coins));
-			} else {
-				if needs_split || !coins.is_empty() { splits.push(root); }
-				dropped += 1;
-			}
-		}
-		let mut script_by_id = BTreeMap::new();
-		let mut ready_scripts = BTreeMap::<ScriptBuf, usize>::new();
-		for (_, coins) in &ready {
-			for coin in coins {
-				if let Some(payee) = &coin.payee {
-					script_by_id.insert(coin.ownership.id, payee.script.clone());
-					*ready_scripts.entry(payee.script.clone()).or_default() += 1;
-				}
-			}
+			} else { dropped += 1; }
 		}
 		let mut accepted = Vec::new();
 		for output in ready {
 			accepted.push(output);
 			if !group_fits(&accepted)? {
 				let output = accepted.pop().expect("just inserted");
-				if !group_fits(std::slice::from_ref(&output))? { splits.push(output.0); }
+				if !group_fits(std::slice::from_ref(&output))? {
+					self.observe_expiry_hold(output.0.id(), "output_exceeds_standard_tx");
+				}
 				dropped += 1;
 			}
 		}
 		let roots = accepted.iter().map(|output| output.0.clone()).collect::<Vec<_>>();
 		let (_, branch) = self.expiry_branch_state(&roots).await?;
-		Ok(ExpiryGroupPlan { accepted, branch, existing_entitlements, script_by_id, ready_scripts, splits, dropped })
+		Ok(ExpiryGroupPlan { accepted, branch, existing_entitlements, dropped })
 	}
 
 	/// Phase B: lock the accepted branches, recheck every fact phase A used
@@ -246,7 +228,7 @@ impl Tx<'_> {
 	pub async fn commit_expiry_group(
 		&self, view: BlockRef, group: ExpiryGroupPlan,
 	) -> anyhow::Result<Option<CommittedExpiryGroup>> {
-		let ExpiryGroupPlan { mut accepted, branch, existing_entitlements, script_by_id, ready_scripts, mut dropped, .. } = group;
+		let ExpiryGroupPlan { accepted, branch, existing_entitlements, dropped, .. } = group;
 		if accepted.is_empty() { return Ok(None); }
 		self.lock_watchman_tip(view).await?;
 		let expiry = accepted[0].0.expiry_height();
@@ -289,35 +271,10 @@ impl Tx<'_> {
 				Amount::from_sat(u64::try_from(row.get::<_, i64>("fee"))?),
 			)))
 		}).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-		let plan = loop {
-			let leaves = accepted.iter().flat_map(|o| &o.1).filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
-				id: c.ownership.id, script: payee.script.clone(), amount: c.ownership.gross,
-			})).collect();
-			let plan = allocate(leaves, &paid)?;
-			let mut selected_scripts = BTreeMap::<ScriptBuf, usize>::new();
-			for (_, coins) in &accepted {
-				for payee in coins.iter().filter_map(|coin| coin.payee.as_ref()) {
-					*selected_scripts.entry(payee.script.clone()).or_default() += 1;
-				}
-			}
-			let delayed = plan.iter().filter(|leaf| leaf.forfeited > Amount::ZERO)
-				.filter(|leaf| script_by_id.get(&leaf.id).is_some_and(|script|
-					ready_scripts[script] > selected_scripts[script]))
-				.map(|leaf| leaf.id).collect::<BTreeSet<_>>();
-			if delayed.is_empty() { break plan; }
-			// A size cut cannot forfeit a leaf while another ready leaf for
-			// the same script was left outside this transaction. Keep its root
-			// unspent rather than turn a batching remainder into operator revenue.
-			accepted.retain(|(root, coins)| {
-				let hold = coins.iter().any(|coin| delayed.contains(&coin.ownership.id));
-				if hold {
-					self.observe_expiry_hold(root.id(), "customer payout below dust after batching");
-					dropped += 1;
-				}
-				!hold
-			});
-			if accepted.is_empty() { return Ok(None); }
-		};
+		let leaves = accepted.iter().flat_map(|o| &o.1).filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
+			id: c.ownership.id, script: payee.script.clone(), amount: c.ownership.gross,
+		})).collect();
+		let plan = allocate(leaves, &paid)?;
 
 		// Final selection precedes every cancellation effect. The branches were
 		// locked and rechecked without writes above; an unexpected change in
@@ -350,6 +307,7 @@ impl Tx<'_> {
 				let fee = allocation.map_or(Amount::ZERO, |a| a.fee).to_sat();
 				let payout = allocation.map_or(Amount::ZERO, |a| a.payout).to_sat();
 				let forfeited = allocation.map_or(Amount::ZERO, |a| a.forfeited).to_sat();
+				let subsidy = allocation.map_or(Amount::ZERO, |a| a.subsidy).to_sat();
 				let (mailbox, user_key, script) = match (&proposal.disposition, &coin.payee) {
 					(OwnershipDisposition::Customer { user_pubkey, .. }, Some(payee)) => (
 						Some(payee.mailbox.to_string()),
@@ -364,8 +322,8 @@ impl Tx<'_> {
 					_ => bail!("allocation ownership lacks its verified payout destination"),
 				};
 				self.execute("
-					INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,user_pubkey,spk,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,evidence)
-					VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::TEXT::JSONB)
+					INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,user_pubkey,spk,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,evidence)
+					VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::TEXT::JSONB)
 				",
 					&[
 						&id,
@@ -378,6 +336,7 @@ impl Tx<'_> {
 						&i64::try_from(fee)?,
 						&i64::try_from(payout)?,
 						&i64::try_from(forfeited)?,
+						&i64::try_from(subsidy)?,
 						&observed.to_string()
 					]).await?;
 				self.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&proposal.id.to_string()]).await?;

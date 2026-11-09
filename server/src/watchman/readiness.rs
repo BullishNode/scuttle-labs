@@ -4,12 +4,14 @@ use std::collections::BTreeMap;
 use tracing::info;
 use ark::{ServerVtxo, ServerVtxoPolicy};
 use bitcoin_ext::BlockHeight;
-use bitcoin_ext::BlockRef;
 use crate::watchman::Watchman;
 
+// A whole expiry height can have hundreds of roots. Bound each ownership
+// analysis so a new chain tip cannot invalidate a half-hour sweep pass.
+const EXPIRY_ROOTS_PER_CHUNK: usize = 16;
+
 impl Watchman {
-	pub(crate) async fn expiry_readiness_pass(&self, view: BlockRef, roots: Vec<ServerVtxo>) -> anyhow::Result<()> {
-		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+	pub(crate) async fn expiry_readiness_pass(&self, roots: Vec<ServerVtxo>) -> anyhow::Result<()> {
 		let mut groups = BTreeMap::<BlockHeight, Vec<ServerVtxo>>::new();
 		for root in roots {
 			ensure!(root.server_pubkey() == self.signer.server_pubkey(), "expiry backing belongs to another server");
@@ -19,11 +21,16 @@ impl Watchman {
 			}
 		}
 		for roots in groups.into_values() {
-			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
-			let group = self.db.read(async |tx| tx.plan_expiry_group(view, roots).await).await?;
-			if let Some(group) = self.db.write(async |tx| tx.commit_expiry_group(view, group).await).await? {
-				info!(allocation_id = group.id, inputs = group.inputs, dropped = group.dropped,
-					"Expiry payout decision committed");
+			for roots in roots.chunks(EXPIRY_ROOTS_PER_CHUNK) {
+				let Some(view) = self.db.read(async |tx| tx.expiry_view().await).await? else {
+					return Ok(());
+				};
+				crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+				let group = self.db.read(async |tx| tx.plan_expiry_group(view, roots.to_vec()).await).await?;
+				if let Some(group) = self.db.write(async |tx| tx.commit_expiry_group(view, group).await).await? {
+					info!(allocation_id = group.id, inputs = group.inputs, dropped = group.dropped,
+						"Expiry payout decision committed");
+				}
 			}
 		}
 		Ok(())

@@ -25,12 +25,12 @@ pub(crate) struct LeafAllocation {
 	pub gross: Amount,
 	pub fee: Amount,
 	pub payout: Amount,
+	pub subsidy: Amount,
 	pub forfeited: Amount,
 }
 
 /// Group by output, with stable per-leaf amounts for persisted attribution.
-/// Mining cost is independent: the watchman wallet funds the fee child,
-/// and the sweep remainder returns to the operator.
+/// Mining cost is independent of the owner payout amount.
 pub(crate) fn allocate(
 	leaves: Vec<CustomerLeaf>, already_paid: &BTreeMap<ScriptBuf, (Amount, Amount)>,
 ) -> anyhow::Result<Vec<LeafAllocation>> {
@@ -50,20 +50,30 @@ pub(crate) fn allocate(
 		)?;
 		let (paid_gross, paid_fee) = already_paid.get(&script).copied().unwrap_or_default();
 		let total = paid_gross.checked_add(gross).context("expiry paid principal overflow")?;
-		let group_fee = payout_fee(total).checked_sub(paid_fee)
+		let mut group_fee = payout_fee(total).checked_sub(paid_fee)
 			.context("expiry fee history exceeds the total fee")?.min(gross);
-		let net = gross.checked_sub(group_fee).context("expiry fee exceeds principal")?;
-		let pays = net > Amount::ZERO && net >= script.minimal_non_dust();
-		// There is no output fee when the entire group is forfeited.
-		let mut remaining_fee = if pays { group_fee } else { Amount::ZERO };
-		for leaf in group {
+		let mut net = gross.checked_sub(group_fee).context("expiry fee exceeds principal")?;
+		let mut subsidy = Amount::ZERO;
+		let dust = script.minimal_non_dust();
+		if net > Amount::ZERO && net < dust {
+			// Waive the current charge first. If this allocation's gross is
+			// itself below dust, the operator must fund the difference.
+			group_fee = gross.checked_sub(dust).unwrap_or(Amount::ZERO);
+			subsidy = dust.checked_sub(gross).unwrap_or(Amount::ZERO);
+			net = dust;
+		}
+		let pays = net > Amount::ZERO;
+		let mut remaining_fee = group_fee;
+		for (index, leaf) in group.into_iter().enumerate() {
 			let fee = leaf.amount.min(remaining_fee);
 			remaining_fee = remaining_fee.checked_sub(fee).context("expiry fee allocation overflow")?;
 			let remainder = leaf.amount.checked_sub(fee).context("expiry leaf fee exceeds principal")?;
+			let leaf_subsidy = if index == 0 { subsidy } else { Amount::ZERO };
 			allocations.push(LeafAllocation {
 				id: leaf.id, gross: leaf.amount, fee,
-				payout: if pays { remainder } else { Amount::ZERO },
-				forfeited: if pays { Amount::ZERO } else { remainder },
+				payout: if pays { remainder + leaf_subsidy } else { Amount::ZERO },
+				subsidy: leaf_subsidy,
+				forfeited: Amount::ZERO,
 			});
 		}
 		ensure!(remaining_fee == Amount::ZERO, "expiry group fee was not allocated");
@@ -123,10 +133,10 @@ mod tests {
 			let dust = script.minimal_non_dust().to_sat();
 			let paid = allocate_first(vec![leaf(1, 2_000 + dust, &script)]).unwrap();
 			assert_eq!(paid.iter().map(|leaf| leaf.payout).sum::<Amount>().to_sat(), dust);
-			let forfeited = allocate_first(vec![leaf(1, 1_999 + dust, &script)]).unwrap();
-			assert!(forfeited.iter().all(|leaf| leaf.payout == Amount::ZERO));
-			assert_eq!(forfeited[0].forfeited.to_sat(), 1_999 + dust);
-			assert_eq!(forfeited[0].fee, Amount::ZERO);
+			let reduced_fee = allocate_first(vec![leaf(1, 1_999 + dust, &script)]).unwrap();
+			assert_eq!(reduced_fee[0].payout.to_sat(), dust);
+			assert_eq!(reduced_fee[0].fee.to_sat(), 1_999);
+			assert_eq!(reduced_fee[0].forfeited, Amount::ZERO);
 		}
 	}
 
@@ -153,14 +163,15 @@ mod tests {
 			let plan = allocate_first(vec![leaf(1, total, &script)]).unwrap();
 			let allocations = plan.iter();
 			for a in allocations {
-				assert_eq!(a.gross.to_sat(), a.fee.to_sat() + a.payout.to_sat() + a.forfeited.to_sat());
-				assert!(a.payout == Amount::ZERO || a.forfeited == Amount::ZERO);
+				assert_eq!(a.gross.to_sat() + a.subsidy.to_sat(),
+					a.fee.to_sat() + a.payout.to_sat() + a.forfeited.to_sat());
+				assert_eq!(a.forfeited, Amount::ZERO);
 			}
 		}
 	}
 
 	#[test]
-	fn direct_fee_separate_outputs_forfeit_what_a_merged_output_pays() {
+	fn direct_fee_separate_outputs_charge_up_to_gross() {
 		let script = wpkh();
 		let combined = allocate_first(vec![leaf(1, 1_200, &script), leaf(2, 1_200, &script)]).unwrap();
 		assert_eq!(combined.len(), 2);
@@ -168,8 +179,19 @@ mod tests {
 		for id in [1, 2] {
 			let separate = allocate_first(vec![leaf(id, 1_200, &script)]).unwrap();
 			assert!(separate.iter().all(|leaf| leaf.payout == Amount::ZERO));
-			assert_eq!(separate[0].forfeited.to_sat(), 1_200);
+			assert_eq!(separate[0].fee.to_sat(), 1_200);
+			assert_eq!(separate[0].forfeited, Amount::ZERO);
 		}
+	}
+
+	#[test]
+	fn positive_subdust_remainder_without_waivable_fee_is_subsidized() {
+		let script = wpkh();
+		let paid = BTreeMap::from([(script.clone(), (Amount::from_sat(50_000), Amount::from_sat(2_000)))]);
+		let plan = allocate(vec![leaf(1, 100, &script)], &paid).unwrap();
+		assert_eq!(plan[0].fee, Amount::ZERO);
+		assert_eq!(plan[0].payout, script.minimal_non_dust());
+		assert_eq!(plan[0].subsidy, script.minimal_non_dust() - Amount::from_sat(100));
 	}
 
 	#[test]

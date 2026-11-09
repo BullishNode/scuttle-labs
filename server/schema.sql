@@ -838,6 +838,21 @@ CREATE TABLE public.expiry_allocation (
 
 
 --
+-- Name: expiry_payout_attempt; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_payout_attempt (
+    allocation_id bigint NOT NULL,
+    txid text NOT NULL,
+    signed_tx bytea NOT NULL,
+    fee_sat bigint NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT expiry_payout_attempt_fee_sat_check CHECK ((fee_sat >= 0)),
+    CONSTRAINT expiry_payout_attempt_txid_check CHECK ((length(txid) = 64))
+);
+
+
+--
 -- Name: expiry_allocation_coin; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -852,14 +867,16 @@ CREATE TABLE public.expiry_allocation_coin (
     fee_sat bigint NOT NULL,
     payout_sat bigint NOT NULL,
     forfeited_sat bigint NOT NULL,
+    subsidy_sat bigint DEFAULT 0 NOT NULL,
     evidence jsonb NOT NULL,
-    CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND (user_pubkey IS NOT NULL) AND (spk IS NOT NULL) AND (gross_sat = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0)))),
+    CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND (user_pubkey IS NOT NULL) AND (spk IS NOT NULL) AND ((gross_sat + subsidy_sat) = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0) AND (subsidy_sat = 0)))),
     CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
     CONSTRAINT expiry_allocation_coin_fee_sat_check CHECK ((fee_sat >= 0)),
     CONSTRAINT expiry_allocation_coin_forfeited_sat_check CHECK ((forfeited_sat >= 0)),
     CONSTRAINT expiry_allocation_coin_gross_sat_check CHECK ((gross_sat > 0)),
     CONSTRAINT expiry_allocation_coin_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66))),
-    CONSTRAINT expiry_allocation_coin_payout_sat_check CHECK ((payout_sat >= 0))
+    CONSTRAINT expiry_allocation_coin_payout_sat_check CHECK ((payout_sat >= 0)),
+    CONSTRAINT expiry_allocation_coin_subsidy_sat_check CHECK ((subsidy_sat >= 0))
 );
 
 
@@ -953,8 +970,13 @@ CREATE TABLE public.watchmand_block (
 CREATE VIEW public.expiry_allocation_state AS
  WITH observed AS (
          SELECT a_1.id,
-            ((count(i.vtxo_id) > 0) AND bool_and((COALESCE((v.onchain_spent_txid = a_1.sweep_txid), false) AND (b_1.height IS NOT NULL)))) AS confirmed,
-            bool_or(((v.onchain_spent_txid IS NOT NULL) AND (v.onchain_spent_txid IS DISTINCT FROM a_1.sweep_txid))) AS conflicted,
+            ((count(i.vtxo_id) > 0) AND bool_and(((v.onchain_spent_txid IS NOT NULL) AND (b_1.height IS NOT NULL) AND (EXISTS ( SELECT 1
+                   FROM public.expiry_payout_attempt p
+                  WHERE ((p.allocation_id = a_1.id) AND (p.txid = v.onchain_spent_txid)))))) AND (count(DISTINCT v.onchain_spent_txid) = 1)) AS confirmed,
+            (bool_or(((v.onchain_spent_txid IS NOT NULL) AND (NOT (EXISTS ( SELECT 1
+                   FROM public.expiry_payout_attempt p
+                  WHERE ((p.allocation_id = a_1.id) AND (p.txid = v.onchain_spent_txid))))))) OR (count(DISTINCT v.onchain_spent_txid) > 1)) AS conflicted,
+            min(v.onchain_spent_txid) AS confirmed_txid,
             min(b_1.height) AS height
            FROM (((public.expiry_allocation a_1
              LEFT JOIN public.expiry_allocation_input i ON ((i.allocation_id = a_1.id)))
@@ -964,8 +986,14 @@ CREATE VIEW public.expiry_allocation_state AS
         )
  SELECT a.id,
     a.expiry_height,
-    a.sweep_txid,
-    a.sweep_tx,
+        CASE
+            WHEN o.confirmed THEN o.confirmed_txid
+            ELSE a.sweep_txid
+        END AS sweep_txid,
+        CASE
+            WHEN o.confirmed THEN winner.signed_tx
+            ELSE a.sweep_tx
+        END AS sweep_tx,
     a.broadcast_at,
     a.created_at,
         CASE
@@ -976,8 +1004,8 @@ CREATE VIEW public.expiry_allocation_state AS
                        FROM public.expiry_terminal_claim t
                       WHERE (t.entitlement_id = c.entitlement_id))) OR (EXISTS ( SELECT 1
                        FROM (public.expiry_allocation_coin paid
-                         JOIN observed winner ON ((winner.id = paid.allocation_id)))
-                      WHERE ((paid.entitlement_id = c.entitlement_id) AND winner.confirmed AND (winner.id <> a.id)))) OR (((c.evidence ->> 'kind'::text) = 'htlc_internal_grants_reclaimed'::text) AND (NOT (EXISTS ( SELECT 1
+                         JOIN observed prior ON ((prior.id = paid.allocation_id)))
+                      WHERE ((paid.entitlement_id = c.entitlement_id) AND prior.confirmed AND (prior.id <> a.id)))) OR (((c.evidence ->> 'kind'::text) = 'htlc_internal_grants_reclaimed'::text) AND (NOT (EXISTS ( SELECT 1
                        FROM public.watchmand_block b_1
                       WHERE ((b_1.height = ((c.evidence ->> 'height'::text))::bigint) AND (b_1.hash = (c.evidence ->> 'hash'::text)))))))))))) THEN 'conflicted'::text
             ELSE 'pending'::text
@@ -990,8 +1018,9 @@ CREATE VIEW public.expiry_allocation_state AS
             WHEN o.confirmed THEN b.hash
             ELSE NULL::text
         END AS confirmed_hash
-   FROM ((public.expiry_allocation a
+   FROM (((public.expiry_allocation a
      JOIN observed o ON ((o.id = a.id)))
+     LEFT JOIN public.expiry_payout_attempt winner ON (((winner.allocation_id = a.id) AND (winner.txid = o.confirmed_txid))))
      LEFT JOIN public.watchmand_block b ON ((b.height = o.height)));
 
 
@@ -2668,6 +2697,22 @@ ALTER TABLE ONLY public.expiry_allocation
 
 
 --
+-- Name: expiry_payout_attempt expiry_payout_attempt_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_pkey PRIMARY KEY (allocation_id, txid);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_txid_key UNIQUE (txid);
+
+
+--
 -- Name: expiry_allocation expiry_allocation_sweep_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3471,6 +3516,14 @@ ALTER TABLE ONLY public.cln_xpay
 
 ALTER TABLE ONLY public.coin_owner
     ADD CONSTRAINT coin_owner_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
 
 
 --

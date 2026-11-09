@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
@@ -12,10 +12,9 @@ use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 use super::expiry_lightning::LightningSourceState;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
-use super::expiry_inventory::BackingSnapshot;
 use super::Tx;
 
-pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
+pub(crate) const MAX_PAYOUT_VSIZE: usize = 100_000;
 
 pub(crate) struct FallbackClaim {
 	pub vtxo_id: VtxoId,
@@ -73,80 +72,12 @@ fn receive_timeout_allowed(
 	}
 }
 
-struct SplitRecoveryPaths {
-	rows: BTreeSet<usize>,
-	transactions: BTreeSet<Txid>,
-	keys: BTreeSet<PublicKey>,
-}
-
-fn retained_server_recovery(vtxo: &ServerVtxo) -> bool {
-	matches!(vtxo.policy(), ServerVtxoPolicy::ServerOwned | ServerVtxoPolicy::Expiry(_)
-		| ServerVtxoPolicy::Checkpoint(_) | ServerVtxoPolicy::HarkLeaf(_) | ServerVtxoPolicy::HarkLeaf_v0(_)
-		| ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(_) | VtxoPolicy::ServerHtlcRecv_v0(_)))
-}
-
-/// A signed next transaction alone is insufficient. For example, a board's
-/// next transaction ends at a user-only leaf: publishing it would destroy our
-/// expiry path for an abandoned wallet. Follow every branch until there is an
-/// server recovery path, accounting for each sibling and anchor.
-fn split_recovery_paths(
-	root: &ServerVtxo, snapshot: &BackingSnapshot,
-	signed: &BTreeMap<Txid, Transaction>, owned: &BTreeSet<PublicKey>,
-) -> anyhow::Result<Option<SplitRecoveryPaths>> {
-	let facts = snapshot.regular.iter().enumerate()
-		.map(|(i, f)| (f.state.vtxo.point(), i)).collect::<BTreeMap<_, _>>();
-	ensure!(facts.len() == snapshot.regular.len(), "split inventory has duplicate outputs");
-	let mut pending = vec![(root.point(), root.txout())];
-	let mut visited = BTreeSet::new();
-	let mut transactions = BTreeSet::new();
-	let mut keys = BTreeSet::new();
-	while let Some((point, output)) = pending.pop() {
-		let Some(&index) = facts.get(&point) else { return Ok(None); };
-		ensure!(visited.insert(index), "split recovery paths overlap or cycle");
-		let fact = &snapshot.regular[index];
-		let vtxo = &fact.state.vtxo;
-		ensure!(vtxo.txout() == output && vtxo.server_pubkey() == root.server_pubkey()
-			&& vtxo.chain_anchor() == root.chain_anchor(), "split recovery metadata differs from its signed path");
-		if fact.onchain_spent_height.is_some() || fact.onchain_spent_txid.is_some() {
-			return Ok(None);
-		}
-		if point != root.point() {
-			// These exact policy kinds also delimit the metadata-only recovery
-			// inventory. Every decoded policy is validated before trusting it.
-			if retained_server_recovery(vtxo) { continue; }
-			if let ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)) = vtxo.policy() {
-				if fact.state.oor_spent_txid.is_none() {
-					if policy.user_pubkey == root.server_pubkey() { continue; }
-					if owned.contains(&policy.user_pubkey) {
-						keys.insert(policy.user_pubkey);
-						continue;
-					}
-				}
-			}
-		}
-		let Some(next) = fact.state.oor_spent_txid.and_then(|id| signed.get(&id)) else { return Ok(None); };
-		ensure!(next.input.len() == 1 && next.input[0].previous_output == point,
-			"split recovery step is not a signed single-input spend of its backing");
-		let value = next.output.iter().try_fold(Amount::ZERO, |sum, o| sum.checked_add(o.value))
-			.context("split recovery output amount overflow")?;
-		ensure!(value == output.value, "split recovery step does not conserve all backing");
-		let txid = next.compute_txid();
-		ensure!(Some(txid) == fact.state.oor_spent_txid, "split recovery transaction has the wrong id");
-		transactions.insert(txid);
-		for (vout, child) in next.output.iter().enumerate() {
-			if !child.is_p2a_fee_anchor() {
-				pending.push((OutPoint::new(txid, u32::try_from(vout)?), child.clone()));
-			}
-		}
-	}
-	Ok(Some(SplitRecoveryPaths { rows: visited, transactions, keys }))
-}
-
 pub struct PendingExpiryPayout {
 	pub id: i64,
 	pub inputs: Vec<ServerVtxo>,
 	pub payouts: Vec<TxOut>,
 	pub parent: Option<Transaction>,
+	pub parent_fee: Option<Amount>,
 }
 
 impl Tx<'_> {
@@ -365,7 +296,9 @@ impl Tx<'_> {
 	/// A group is processed as a whole. Individual-input retries would lose its
 	/// cross-tree output aggregation and could charge the output fee twice.
 	pub async fn pending_expiry_payouts(&self) -> anyhow::Result<Vec<PendingExpiryPayout>> {
-		let rows = self.query("SELECT id,sweep_tx FROM expiry_allocation_state WHERE status='pending' ORDER BY expiry_height,id", &[]).await?;
+		let rows = self.query("SELECT a.id,a.sweep_tx,p.fee_sat FROM expiry_allocation_state a \
+			LEFT JOIN expiry_payout_attempt p ON p.allocation_id=a.id AND p.txid=a.sweep_txid \
+			WHERE a.status='pending' ORDER BY a.expiry_height,a.id", &[]).await?;
 		let mut ret = Vec::with_capacity(rows.len());
 		for row in rows {
 			let id: i64 = row.get("id");
@@ -382,129 +315,81 @@ impl Tx<'_> {
 					value: Amount::from_sat(u64::try_from(r.get::<_, i64>("amount_sat"))?),
 				})).collect::<anyhow::Result<Vec<_>>>()?;
 			let parent = row.get::<_, Option<&[u8]>>("sweep_tx").map(deserialize).transpose()?;
-			ret.push(PendingExpiryPayout { id, inputs, payouts, parent });
+			let parent_fee = row.get::<_, Option<i64>>("fee_sat")
+				.map(|fee| u64::try_from(fee).map(Amount::from_sat)).transpose()?;
+			ensure!(parent.is_some() == parent_fee.is_some(),
+				"pending payout attempt lacks a recorded fee or transaction");
+			ret.push(PendingExpiryPayout { id, inputs, payouts, parent, parent_fee });
 		}
 		Ok(ret)
 	}
 
-	/// Compare-and-set the exact signed parent before any network publication.
-	/// Once present, a restart or fee bump must use precisely the same bytes.
-	pub async fn store_expiry_parent(
-		&self, view: BlockRef, id: i64, parent: &Transaction,
+	/// Keep every signed replacement and the exact owner outputs before any
+	/// network publication. An older attempt can still win on chain.
+	pub async fn store_expiry_attempt(
+		&self, view: BlockRef, id: i64, payout: &Transaction,
+		fee: Amount, operator_spk: &ScriptBuf,
 	) -> anyhow::Result<()> {
 		self.lock_watchman_tip(view).await?;
-		let row = self.query_one("SELECT sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
+		let row = self.query_one("SELECT sweep_txid,sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
 		ensure!(self.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&id]).await?.get::<_, &str>(0) == "pending",
 			"expiry allocation is no longer pending");
-		let raw = serialize(parent);
-		if let Some(old) = row.get::<_, Option<&[u8]>>("sweep_tx") {
-			ensure!(old == raw.as_slice(), "attempt to replace immutable expiry parent");
-			return Ok(());
+		ensure!(payout.version == bitcoin::transaction::Version::TWO
+			&& payout.vsize() <= MAX_PAYOUT_VSIZE
+			&& payout.input.iter().any(|input| input.sequence.to_consensus_u32() <= 0xFFFFFFFD)
+			&& payout.output.iter().all(TxOutExt::is_standard),
+			"direct expiry attempt is nonstandard or lacks RBF");
+		let backing = self.query("SELECT v.vtxo FROM expiry_allocation_input i \
+			JOIN vtxo v ON v.vtxo_id=i.vtxo_id WHERE i.allocation_id=$1", &[&id]).await?
+			.into_iter().map(|row| {
+				let root: ServerVtxo = ServerVtxo::deserialize(row.get("vtxo"))?;
+				Ok(root.point())
+			})
+			.collect::<anyhow::Result<BTreeSet<_>>>()?;
+		let spent = payout.input.iter().map(|input| input.previous_output)
+			.collect::<BTreeSet<_>>();
+		ensure!(!backing.is_empty() && backing.is_subset(&spent)
+			&& spent.len() == payout.input.len(),
+			"direct expiry attempt omits or duplicates allocated backing");
+		let expected = self.query("SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat \
+			FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' \
+			GROUP BY spk HAVING SUM(payout_sat)>0", &[&id]).await?
+			.into_iter().map(|row| Ok((ScriptBuf::from_hex(row.get("spk"))?,
+				Amount::from_sat(u64::try_from(row.get::<_, i64>("amount_sat"))?))))
+			.collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+		ensure!(!expected.contains_key(operator_spk),
+			"operator drain aliases an owner script");
+		let owner_outputs = payout.output.iter().filter(|out| expected.contains_key(&out.script_pubkey))
+			.collect::<Vec<_>>();
+		ensure!(owner_outputs.len() == expected.len() && owner_outputs.iter().all(|out|
+			expected.get(&out.script_pubkey) == Some(&out.value)),
+			"direct expiry attempt changes owner outputs");
+		let other = payout.output.iter().filter(|out| !expected.contains_key(&out.script_pubkey))
+			.collect::<Vec<_>>();
+		ensure!(other.len() <= 1 && other.iter().all(|out| &out.script_pubkey == operator_spk),
+			"direct expiry attempt pays an unknown script");
+		let txid = payout.compute_txid().to_string();
+		let raw = serialize(payout);
+		let fee_sat = i64::try_from(fee.to_sat())?;
+		if let Some(old_txid) = row.get::<_, Option<&str>>("sweep_txid") {
+			let old = self.query_one("SELECT fee_sat FROM expiry_payout_attempt WHERE allocation_id=$1 AND txid=$2",
+				&[&id,&old_txid]).await?;
+			if old_txid == txid {
+				ensure!(row.get::<_, Option<&[u8]>>("sweep_tx") == Some(raw.as_slice())
+					&& old.get::<_, i64>("fee_sat") == fee_sat,
+					"stored direct expiry attempt changed bytes or fee");
+				return Ok(());
+			}
+			ensure!(fee_sat > old.get::<_, i64>("fee_sat"),
+				"direct expiry replacement does not raise the absolute fee");
 		}
-		self.execute("UPDATE expiry_allocation SET sweep_txid=$2,sweep_tx=$3 WHERE id=$1", &[&id,&parent.compute_txid().to_string(),&raw]).await?;
+		self.execute("INSERT INTO expiry_payout_attempt(allocation_id,txid,signed_tx,fee_sat) \
+			VALUES($1,$2,$3,$4)", &[&id,&txid,&raw,&fee_sat]).await?;
+		self.execute("UPDATE expiry_allocation SET sweep_txid=$2,sweep_tx=$3 WHERE id=$1",
+			&[&id,&txid,&raw]).await?;
 		Ok(())
 	}
 
-}
-
-impl Tx<'_> {
-	/// Request only an one-input signed tree step. No manufactured
-	/// transaction or arbitrary txid can become a split instruction.
-	pub async fn request_expiry_split(
-		&self, view: BlockRef, root: &ServerVtxo,
-	) -> anyhow::Result<bool> {
-		// Prepare without coin or chain-view locks. Only the short recheck below
-		// serializes against a new obligation, a key drop or a changed chain view.
-		let snapshot = self.backing_recovery_snapshot(root).await?;
-		let txids = snapshot.regular.iter().filter(|f| f.state.vtxo_id == root.id() || !retained_server_recovery(&f.state.vtxo))
-			.filter_map(|f| f.state.oor_spent_txid)
-			.map(|id| id.to_string()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-		let raw = self.query("SELECT txid,signed_tx FROM virtual_transaction WHERE txid=ANY($1) AND signed_tx IS NOT NULL", &[&txids]).await?;
-		let mut signed = BTreeMap::new();
-		for row in raw {
-			let id = row.get::<_, &str>("txid").parse()?;
-			let tx: Transaction = deserialize(row.get::<_, &[u8]>("signed_tx"))?;
-			ensure!(tx.compute_txid() == id, "stored split transaction has the wrong id");
-			signed.insert(id, tx);
-		}
-		let pubkeys = snapshot.regular.iter().filter_map(|f| match f.state.vtxo.policy() {
-			ServerVtxoPolicy::User(VtxoPolicy::Pubkey(p)) => Some(p.user_pubkey.to_string()),
-			_ => None,
-		}).collect::<Vec<_>>();
-		let owned = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1)", &[&pubkeys]).await?
-			.into_iter().map(|r| r.get::<_, &str>("pubkey").parse()).collect::<Result<BTreeSet<_>, _>>()?;
-		let backing = root.clone();
-		let (snapshot, signed, paths) = tokio::task::spawn_blocking(move || {
-			let paths = split_recovery_paths(&backing, &snapshot, &signed, &owned)?;
-			Ok::<_, anyhow::Error>((snapshot, signed, paths))
-		}).await.context("split recovery preparation task failed")??;
-		let Some(paths) = paths else {
-			return Ok(false);
-		};
-
-		self.lock_watchman_tip(view).await?;
-		let expected = paths.rows.iter().map(|&i| {
-			let state = &snapshot.regular[i].state;
-			(state.vtxo_id.to_string(), (state.updated_at, state.spend_state.as_str().to_owned()))
-		}).collect::<BTreeMap<_, _>>();
-		let ids = expected.keys().cloned().collect::<Vec<_>>();
-		let rows = self.query("
-			SELECT vtxo_id,updated_at,spend_state::TEXT AS spend_state,onchain_spent_height,onchain_spent_txid
-			FROM vtxo
-			WHERE vtxo_id=ANY($1)
-			ORDER BY vtxo_id FOR UPDATE
-		", &[&ids]).await?;
-		let actual = rows.into_iter().map(|r| {
-			ensure!(r.get::<_, Option<i32>>("onchain_spent_height").is_none()
-				&& r.get::<_, Option<&str>>("onchain_spent_txid").is_none(), "split recovery path has been spent");
-			Ok((r.get("vtxo_id"), (r.get("updated_at"), r.get("spend_state"))))
-		}).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-		ensure!(expected == actual, "split recovery path changed during preparation");
-		let signed_ids = paths.transactions.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let locked = self.query("SELECT txid,signed_tx FROM virtual_transaction WHERE txid=ANY($1) ORDER BY txid FOR SHARE", &[&signed_ids]).await?;
-		ensure!(locked.len() == paths.transactions.len(), "split recovery signed path disappeared");
-		for row in locked {
-			let id: Txid = row.get::<_, &str>("txid").parse()?;
-			ensure!(row.get::<_, Option<&[u8]>>("signed_tx") == Some(serialize(&signed[&id]).as_slice()),
-				"split recovery signed path changed during preparation");
-		}
-		let keys = paths.keys.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let locked_keys = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1) ORDER BY pubkey FOR SHARE", &[&keys]).await?;
-		ensure!(locked_keys.len() == keys.len(), "split recovery key was dropped during preparation");
-		ensure!(root.expiry_height() <= view.height,
-			"expiry split backing is not mature");
-		let row = self.query_one("SELECT oor_spent_txid FROM vtxo WHERE vtxo_id=$1", &[&root.id().to_string()]).await?;
-		let Some(txid) = row.get::<_, Option<&str>>("oor_spent_txid") else { return Ok(false); };
-		let txid = txid.parse()?;
-		let tx = self.get_virtual_transaction_by_txid(txid).await?.context("expiry split transaction missing")?
-			.signed_tx.context("expiry split transaction is unsigned")?;
-		ensure!(tx.input.len() == 1 && tx.input[0].previous_output == root.point(),
-			"expiry split is not a single-input step on its backing path");
-		ensure!(self.query_opt("
-			SELECT i.vtxo_id
-			FROM expiry_allocation_input i JOIN expiry_allocation_state a ON a.id=i.allocation_id
-			WHERE i.vtxo_id=ANY($1) AND a.status='pending' LIMIT 1
-		", &[&ids]).await?.is_none(),
-			"cannot split a recovery path reserved for a pending payout");
-		self.execute("
-			INSERT INTO expiry_split_request(vtxo_id,progress_txid)
-			VALUES($1,$2)
-			ON CONFLICT(vtxo_id) DO UPDATE SET progress_txid=EXCLUDED.progress_txid
-		",
-			&[&root.id().to_string(),&txid.to_string()]).await?;
-		Ok(true)
-	}
-
-	pub async fn pending_expiry_splits(&self) -> anyhow::Result<Vec<(bitcoin::Txid, ServerVtxo)>> {
-		self.query("
-			SELECT s.progress_txid,v.vtxo
-			FROM expiry_split_request s JOIN vtxo v ON v.vtxo_id=s.vtxo_id
-			WHERE v.onchain_spent_height IS NULL
-			ORDER BY v.vtxo_id
-		", &[]).await?
-			.into_iter().map(|r| Ok((r.get::<_, &str>("progress_txid").parse()?,ServerVtxo::deserialize(r.get("vtxo"))?)))
-			.collect()
-	}
 }
 
 impl Tx<'_> {
@@ -591,14 +476,6 @@ impl Tx<'_> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use ark::arkoor::{ArkoorDestination, package::ArkoorPackageBuilder};
-	use ark::board::BoardBuilder;
-	use ark::lightning::PaymentHash;
-	use ark::test_util::dummy::DummyTestVtxoSpec;
-	use ark::vtxo::Full;
-	use bitcoin_ext::BlockDelta;
-	use crate::database::{SpendState, VtxoState};
-	use crate::database::expiry_inventory::BackingVtxoFact;
 	use LightningHtlcSubscriptionStatus::{Canceled, Created, Accepted, HtlcsReady, Settled};
 	use HtlcResolution::{Fulfilled, Revoked};
 	use bitcoin::hashes::Hash;
@@ -658,80 +535,4 @@ mod tests {
 		}
 	}
 
-	fn fact(vtxo: ark::ServerVtxo<Full>, spent: Option<Txid>) -> BackingVtxoFact {
-		BackingVtxoFact {
-			state: VtxoState {
-				id: 1, vtxo_id: vtxo.id(), vtxo: vtxo.to_bare(), oor_spent_txid: spent,
-				spent_in_round: None, offboarded_in: None, banned_until_height: None,
-				spend_state: SpendState::Spendable, confirmed_height: None, decided_for_fallback: false,
-				created_at: chrono::Local::now(), updated_at: chrono::Local::now(),
-			},
-			full_vtxo: Some(vtxo),
-			onchain_spent_height: None, onchain_spent_txid: None,
-			lightning_htlc_subscription_id: None,
-		}
-	}
-
-	fn board() -> (DummyTestVtxoSpec, ark::Vtxo<Full>, BackingSnapshot, BTreeMap<Txid, Transaction>) {
-		let spec = DummyTestVtxoSpec { amount: Amount::from_sat(100_330), fee: Amount::from_sat(330), ..Default::default() };
-		let (funding, board) = spec.build();
-		let builder = BoardBuilder::new_from_vtxo(&board, &funding, board.server_pubkey()).unwrap();
-		let mut rows = builder.build_server_vtxos();
-		let root = rows.remove(0);
-		let source = rows.remove(0);
-		let signed = board.transactions().map(|item| (item.tx.compute_txid(), item.tx)).collect();
-		let snapshot = BackingSnapshot {
-			roots: vec![root.to_bare()],
-			regular: vec![fact(root, Some(board.point().txid)), fact(source, None)],
-		};
-		(spec, board, snapshot, signed)
-	}
-
-	#[test]
-	fn expiry_split_never_exposes_an_abandoned_user_only_board_leaf() {
-		let (_, _, snapshot, signed) = board();
-		assert!(split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new()).unwrap().is_none());
-	}
-
-	#[test]
-	fn expiry_split_follows_real_signed_steps_to_preserve_mixed_siblings() {
-		let (spec, board, mut snapshot, mut signed) = board();
-		let package = ArkoorPackageBuilder::new_with_checkpoints([board], vec![
-			ArkoorDestination {
-				total_amount: Amount::from_sat(50_000),
-				policy: VtxoPolicy::new_pubkey(spec.user_keypair.public_key()),
-			},
-			ArkoorDestination {
-				total_amount: Amount::from_sat(50_000),
-				policy: VtxoPolicy::new_server_htlc_send(spec.user_keypair.public_key(),
-					PaymentHash::from([12; 32]), spec.expiry_height + BlockDelta::new(12)),
-			},
-		]).unwrap().cosign_both(&[spec.user_keypair], &spec.server_keypair).unwrap();
-		for (id, txid) in package.input_spend_info() {
-			snapshot.regular.iter_mut().find(|f| f.state.vtxo_id == id).unwrap().state.oor_spent_txid = Some(txid);
-		}
-		for tx in package.signed_virtual_transactions() { signed.insert(tx.compute_txid(), tx); }
-		let internal = package.build_signed_internal_vtxos();
-		for (vtxo, spent) in internal {
-			if let Some(old) = snapshot.regular.iter_mut().find(|f| f.state.vtxo_id == vtxo.id()) {
-				*old = fact(vtxo, Some(spent));
-			} else { snapshot.regular.push(fact(vtxo, Some(spent))); }
-		}
-		for leaf in package.build_signed_vtxos() { snapshot.regular.push(fact(leaf.into(), None)); }
-		let paths = split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new())
-			.unwrap().expect("both branches retain their server expiry checkpoint");
-		assert!(paths.rows.iter().any(|&i| matches!(snapshot.regular[i].state.vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))));
-		assert!(!paths.rows.iter().any(|&i| matches!(snapshot.regular[i].state.vtxo.policy(), ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcSend(_)))));
-		assert_eq!(paths.rows.iter().filter(|&&i| matches!(snapshot.regular[i].state.vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))).count(), 2);
-		let sibling = snapshot.regular.iter().position(|f| matches!(f.state.vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))).unwrap();
-		let removed = snapshot.regular.remove(sibling);
-		assert!(split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new()).unwrap().is_none(),
-			"every sibling needs its actual output metadata, including the ordinary branch");
-		snapshot.regular.insert(sibling, removed);
-		// Removing the signed bridge must not be substituted by the
-		// unsigned geometry available in the descendant's full encoding.
-		let bridge = snapshot.regular[1].state.oor_spent_txid.unwrap();
-		signed.remove(&bridge);
-		assert!(split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new()).unwrap().is_none());
-	}
 }
