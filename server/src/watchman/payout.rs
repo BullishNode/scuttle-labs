@@ -44,6 +44,9 @@ pub(super) async fn mempool_child_fee(
 impl Watchman {
 	/// Sweep server coins and pay expired customer coins.
 	pub(super) async fn process_expiry_sweeps(&self) -> anyhow::Result<()> {
+		// Committed owner decisions are ready to publish without another
+		// frontier scan or the more expensive ownership analysis below.
+		self.process_expiry_payouts().await?;
 		// Confiscated OffboardForfeit outputs are exclusively server-owned.
 		// Their Bare encoding needs no customer genesis or payout allocation.
 		// Use the original native claim: its miner fee comes from operator
@@ -74,14 +77,9 @@ impl Watchman {
 			}
 		}
 		if !claims.is_empty() { self.process_claims(claims).await?; }
-		// Publish already committed owner decisions before any expensive new
-		// ownership analysis. A long or stale readiness pass cannot starve them.
-		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
-		self.process_expiry_payouts(view).await?;
 		self.expiry_readiness_pass(sweeps).await?;
 		// Expired customer backing never reaches upstream's drain-only builder.
-		let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { return Ok(()); };
-		self.process_expiry_payouts(view).await?;
+		self.process_expiry_payouts().await?;
 		Ok(())
 	}
 
@@ -196,9 +194,12 @@ impl Watchman {
 	}
 
 	/// Publish each fully resolved group in one fee-paying transaction.
-	pub(crate) async fn process_expiry_payouts(&self, view: BlockRef) -> anyhow::Result<()> {
+	pub(crate) async fn process_expiry_payouts(&self) -> anyhow::Result<()> {
 		let groups = self.db.read(async |t| t.pending_expiry_payouts().await).await?;
 		for group in groups {
+			// A block can arrive while an earlier payout is signed or funded.
+			// Give each allocation its current common captaind/watchmand view.
+			let Some(view) = self.db.read(async |t| t.expiry_view().await).await? else { break; };
 			let id = group.id;
 			if let Err(error) = self.process_expiry_payout(view, group).await {
 				warn!(allocation_id = id, error = %format_args!("{error:#}"), "Expiry payout remains pending");
