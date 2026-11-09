@@ -1,35 +1,11 @@
 //! Allocate the current sweep frontier: analyse each group lock-free, then commit it in a short checked write.
 
 use std::collections::BTreeMap;
-use tracing::{info, warn};
+use tracing::info;
 use ark::{ServerVtxo, ServerVtxoPolicy};
 use bitcoin_ext::BlockHeight;
-use crate::database::Tx;
 use bitcoin_ext::BlockRef;
 use crate::watchman::Watchman;
-
-fn database_failure(error: &anyhow::Error) -> bool {
-	 error.downcast_ref::<tokio_postgres::Error>().is_some()
-		|| error.downcast_ref::<bb8::RunError<tokio_postgres::Error>>().is_some()
-}
-
-impl Tx<'_> {
-	pub(crate) async fn request_held_expiry_split(
-		&self, view: BlockRef, root: &ServerVtxo, reason: &str,
-	) -> anyhow::Result<()> {
-		self.observe_expiry_hold(root.id(), reason);
-		match self.request_expiry_split(view, root).await {
-			Ok(true) => self.observe_expiry_hold(root.id(), "output_requires_split"),
-			Ok(false) => {},
-			Err(error) => {
-				if database_failure(&error) { return Err(error); }
-				warn!(vtxo_id = %root.id(), error = %format!("{error:#}"),
-					"Signed expiry split remains unavailable; other outputs continue");
-			},
-		}
-		Ok(())
-	}
-}
 
 impl Watchman {
 	pub(crate) async fn expiry_readiness_pass(&self, view: BlockRef, roots: Vec<ServerVtxo>) -> anyhow::Result<()> {
@@ -45,9 +21,6 @@ impl Watchman {
 		for roots in groups.into_values() {
 			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 			let group = self.db.read(async |tx| tx.plan_expiry_group(view, roots).await).await?;
-			for root in &group.splits {
-				self.db.write(async |tx| tx.request_held_expiry_split(view, root, "output_requires_split").await).await?;
-			}
 			if let Some(group) = self.db.write(async |tx| tx.commit_expiry_group(view, group).await).await? {
 				info!(allocation_id = group.id, inputs = group.inputs, dropped = group.dropped,
 					"Expiry payout decision committed");

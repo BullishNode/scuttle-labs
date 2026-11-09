@@ -17,7 +17,7 @@ use crate::database::expiry_payout::{MAX_PAYOUT_VSIZE, PendingExpiryPayout};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoPolicy};
 
-use super::{saturating_add_feerates, Watchman};
+use super::Watchman;
 
 /// The current anchor spender supplies only Core's replacement fee and inputs.
 /// Customer settlement depends on the immutable parent, not its fee sponsor.
@@ -40,7 +40,7 @@ pub(super) async fn mempool_child_fee(
 }
 
 impl Watchman {
-	/// Sweep server coins, pay expired customer coins, and advance pending splits.
+	/// Sweep server coins and pay expired customer coins.
 	pub(super) async fn process_expiry_sweeps(&self) -> anyhow::Result<()> {
 		// Confiscated OffboardForfeit outputs are exclusively server-owned.
 		// Their Bare encoding needs no customer genesis or payout allocation.
@@ -77,60 +77,6 @@ impl Watchman {
 		self.expiry_readiness_pass(view, sweeps).await?;
 		// Expired customer backing never reaches upstream's drain-only builder.
 		self.process_expiry_payouts(view).await?;
-		let splits = self.db.read(async |t| t.pending_expiry_splits().await).await?;
-		for (txid, root) in splits {
-			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
-			let ids = [root.id()];
-			let mut fee_rate = self.fee_estimator.regular();
-			self.update_mempool_spend(root.id()).await;
-			if let Some(spend) = self.get_mempool_spend(root.id()) {
-				if spend.txid != txid {
-					warn!(vtxo_id = %root.id(), expected = %txid, actual = %spend.txid,
-						"Expiry progress is pinned by a different spender; retaining its hold");
-					continue;
-				}
-				if spend.fee_rate >= fee_rate { continue; }
-				fee_rate = fee_rate.max(saturating_add_feerates(
-					spend.fee_rate, self.config.incremental_relay_fee
-				));
-			}
-			let committed_wallet = self.db.write(async |t| {
-				t.lock_watchman_tip(view).await?;
-				// Wallet sync may hold the wallet while waiting for this connection.
-				let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(None); };
-				if !wallet.has_trusted_balance(self.config.min_cpfp_amount) {
-					warn!(vtxo_id = %root.id(), "Expiry splitting needs confirmed usable watchman funds");
-					return Ok(None);
-				}
-				// A request may outlive a later refresh, offboard or key drop.
-				// Reprove preservation and retain its sorted path locks through
-				// publication, rather than trusting the old request's txid alone.
-				if !t.request_expiry_split(view, &root).await
-					.context("expiry split request revalidation")? { return Ok(None); }
-				let current = t.query_one("
-					SELECT progress_txid FROM expiry_split_request
-					WHERE vtxo_id=$1
-				", &[&root.id().to_string()]).await.context("expiry split instruction lookup")?;
-				ensure!(
-					current.get::<_, &str>("progress_txid") == txid.to_string(),
-					"expiry split instruction changed"
-				);
-				t.lock_unallocated_watchman_inputs(&ids).await.context("expiry split input locks")?;
-				if self.process_progress_tx(t, &mut wallet, txid, &root, fee_rate).await
-					.context("expiry split progress publication")? {
-					Ok(Some(wallet))
-				} else { Ok(None) }
-			}).await;
-			match committed_wallet {
-				Ok(Some(mut wallet)) => {
-					let _ = wallet.take_staged();
-					crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
-				},
-				Ok(None) => {},
-				Err(error) => warn!(vtxo_id = %ids[0], progress_txid = %txid, error = %format!("{error:#}"),
-					"Expiry split remains pending"),
-			}
-		}
 		Ok(())
 	}
 
