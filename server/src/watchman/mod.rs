@@ -90,6 +90,7 @@ use anyhow::Context;
 use bitcoin::{Address, Amount, FeeRate, Transaction, TxIn, TxOut, Sequence, ScriptBuf, Weight, Witness, sighash};
 use bitcoin::Txid;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{info, trace, warn};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId};
@@ -240,36 +241,62 @@ impl Watchman {
 	pub fn start(self, rtmgr: RuntimeManager) -> WatchmanHandle {
 		let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(1);
 		tokio::spawn(async move {
-			self.run(rtmgr, ctrl_rx).await;
+			Arc::new(self).run(rtmgr, ctrl_rx).await;
 		});
 		WatchmanHandle { ctrl_tx }
 	}
 
-	async fn run(&self, rtmgr: RuntimeManager, mut ctrl_rx: tokio::sync::mpsc::Receiver<Ctrl>) {
+	fn enqueue_expiry_sweep(self: &Arc<Self>, tasks: &mut JoinSet<()>, pending: &mut bool) {
+		if tasks.is_empty() {
+			let watchman = Arc::clone(self);
+			tasks.spawn(async move { watchman.process_sweeps_logged().await; });
+		} else {
+			*pending = true;
+		}
+	}
+
+	async fn run(self: Arc<Self>, rtmgr: RuntimeManager, mut ctrl_rx: tokio::sync::mpsc::Receiver<Ctrl>) {
 		info!("Starting Watchman...");
 		let _worker = rtmgr.spawn_critical("Watchman");
 
 		let mut reaction_timer = tokio::time::interval(self.config.reaction_interval);
 		let mut sweep_timer = tokio::time::interval(self.config.sweep_interval);
 		let mut completed = self.sync_height.clone();
+		let mut expiry_sweeps = JoinSet::new();
+		let mut sweep_pending = false;
 		loop {
 			tokio::select! {
 				Ok(()) = completed.changed(), if self.db.expiry_payouts() => {
-					self.process_sweeps_logged().await;
+					self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
 				},
 				_ = reaction_timer.tick() => {
 					self.process_reactions_logged().await;
 					reaction_timer.reset();
 				},
 				_ = sweep_timer.tick() => {
-					self.process_sweeps_logged().await;
+					if self.db.expiry_payouts() {
+						self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
+					} else {
+						self.process_sweeps_logged().await;
+					}
 					sweep_timer.reset();
+				},
+				Some(result) = expiry_sweeps.join_next(), if !expiry_sweeps.is_empty() => {
+					if let Err(error) = result { panic!("Expiry sweep task failed: {error}"); }
+					if sweep_pending {
+						sweep_pending = false;
+						self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
+					}
 				},
 				Some(ctrl) = ctrl_rx.recv() => match ctrl {
 					// a manual trigger runs both loops so we fully catch up
 					Ctrl::TriggerSweep => {
 						self.process_reactions_logged().await;
-						self.process_sweeps_logged().await;
+						if self.db.expiry_payouts() {
+							self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
+						} else {
+							self.process_sweeps_logged().await;
+						}
 						reaction_timer.reset();
 						sweep_timer.reset();
 					},
@@ -283,9 +310,14 @@ impl Watchman {
 				},
 				_ = rtmgr.shutdown_signal() => {
 					info!("Shutdown signal received. Exiting Watchman...");
-					return;
+					break;
 				},
 			}
+		}
+		// A sweep can be between an on-chain publication and its database
+		// bookkeeping. Let that in-flight pass finish before graceful exit.
+		while let Some(result) = expiry_sweeps.join_next().await {
+			if let Err(error) = result { warn!(%error, "Expiry sweep task failed during shutdown"); }
 		}
 	}
 
@@ -1051,7 +1083,7 @@ impl Watchman {
 				},
 				Ok(false) => {},
 				Err(e) => slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
-					error: e.to_string(),
+					error: format!("{e:#}"),
 				),
 			}
 		}
