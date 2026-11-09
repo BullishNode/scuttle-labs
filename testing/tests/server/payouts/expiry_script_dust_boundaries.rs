@@ -141,10 +141,9 @@ async fn boundaries() {
 	for (index, wallet) in recipients.iter().enumerate() {
 		let (coin, consumed) = Box::pin(receive_boundary(&srv, &sender, wallet, sat(amounts[index]), &board)).await;
 		old.extend(consumed);
-		let pays = index != 0;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: bindings[index + 1].clone(),
-			fee: if pays { 2_000 } else { 0 }, payout: if pays { dust + index as u64 - 1 } else { 0 },
-			forfeited: if pays { 0 } else { amounts[index] }, group_payout: if pays { dust + index as u64 - 1 } else { 0 } });
+			fee: if index == 0 { 1_999 } else { 2_000 }, payout: dust + (index as u64).saturating_sub(1),
+			forfeited: 0, group_payout: dust + (index as u64).saturating_sub(1) });
 	}
 	let mut change = Vec::new();
 	for coin in sender.spendable_vtxos().await.unwrap() { change.push(sender.get_full_vtxo(coin.id()).await.unwrap()); }
@@ -162,9 +161,9 @@ async fn boundaries() {
 	}
 	assert_eq!(fee, 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.coin.amount()).sum::<Amount>(), sat(100_000));
-	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 6_000);
-	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), amounts[0]);
-	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 92_001 - dust);
+	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 7_999);
+	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), 0);
+	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 92_001);
 	balances(&sender, sat(change_gross)).await;
 	for leaf in &leaves {
 		assert_eq!(leaf.coin.chain_anchor(), root);
@@ -204,9 +203,9 @@ async fn boundaries() {
 	assert_eq!(backing.value, sat(100_000));
 	let epoch = Box::pin(confirm_epoch(&ctx, &srv, &db, &leaves, start, 90, 96)).await;
 	assert_eq!(epoch.parents.len(), 1);
-	assert_eq!(epoch.children.len(), 1);
+	assert!(epoch.children.is_empty());
 	let parent = epoch.parents.values().next().unwrap();
-	let payees = vec![(bindings[1].clone(), None), (bindings[2].clone(), Some(dust)),
+	let payees = vec![(bindings[1].clone(), Some(dust)), (bindings[2].clone(), Some(dust)),
 		(bindings[3].clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 2_000))];
 	let operator = {
 		let config = srv.watchmand().config();
@@ -214,9 +213,10 @@ async fn boundaries() {
 	};
 	assert!(payees.iter().all(|(script, _)| script != &operator));
 	let remainder = parent.output.iter().filter(|output| payees.iter().all(|(script, _)| output.script_pubkey != *script)).collect::<Vec<_>>();
-	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>(), sat(100_000));
-	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>(), sat(6_000 + amounts[0]));
-	assert!(remainder.iter().all(|output| output.script_pubkey == operator || output.is_p2a_fee_anchor()));
+	let miner_fee = actual_fee(&ctx, parent).await;
+	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>() + miner_fee, sat(100_000));
+	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>() + miner_fee, sat(7_999));
+	assert!(remainder.iter().all(|output| output.script_pubkey == operator));
 	let forbidden = old.iter().map(ToString::to_string).collect::<Vec<_>>();
 	assert!(db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_allocation_coin c \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND c.disposition='customer'",
@@ -249,7 +249,7 @@ async fn boundaries() {
 }
 
 #[tokio::test]
-async fn p2tr_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
+async fn p2tr_positive_subdust_fee_is_reduced_to_pay_standard_output() {
 	require_bitcoind_chain_source!();
 	assert!(std::env::var_os("BARK_DOUBLE_DRIVE_ACTIONS").is_none());
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries())).await

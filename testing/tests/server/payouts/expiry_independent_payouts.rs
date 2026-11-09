@@ -96,7 +96,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	srv.watchmand().wait_for_sync_height(expired).await;
 	assert!(expired < deadline);
 
-	let (allocation, parent, child, recorded_fee) = tokio::time::timeout(Duration::from_secs(30), async {
+	let (allocation, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx \
@@ -107,32 +107,31 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 			).await?)).await.unwrap();
 			if let Some(row) = row {
 				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-				if let Some((child, fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) {
-					break (row.get::<_, i64>("id"), parent, child, fee);
-				}
+				break (row.get::<_, i64>("id"), parent);
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("a ready root must pay without waiting for the other root's HTLC deadline");
 	assert_eq!(parent.input.len(), 1);
 	assert_eq!(parent.input[0].previous_output, ready.chain_anchor());
-	assert_eq!(parent.version.0, 3);
-	assert!(parent.vsize() <= 10_000);
+	assert_eq!(parent.version.0, 2);
+	assert!(parent.vsize() <= 100_000);
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	assert_eq!(ctx.bitcoind().await_transaction(child.compute_txid()).await, child);
-	assert!(child.input.iter().any(|input| input.previous_output.txid == parent.compute_txid()),
-		"the actual fee child must sponsor this exact payout parent");
 	let payouts = parent.output.iter().enumerate()
 		.filter(|(_, output)| output.script_pubkey == destination).collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	let (vout, payout) = payouts[0];
 	assert_eq!(payout.value, ready.amount() - sat(2_000));
 	let source = ctx.bitcoind().await_transaction(ready.chain_anchor().txid).await;
-	assert_eq!(source.output[ready.chain_anchor().vout as usize].value.to_sat(),
+	assert!(source.output[ready.chain_anchor().vout as usize].value.to_sat() >=
 		parent.output.iter().map(|output| output.value.to_sat()).sum::<u64>(),
-		"the payout parent must conserve all actual backing and charge zero miner fee");
-	let actual_fee = super::expiry_test::actual_fee(&ctx, &child).await.to_sat();
+		"the direct payout must not create value");
+	let actual_fee = super::expiry_test::actual_fee(&ctx, &parent).await.to_sat();
 	assert!(actual_fee > 0);
+	let recorded_fee = db.read(async |tx| Ok(tx.query_one(
+		"SELECT fee_sat FROM expiry_payout_attempt WHERE allocation_id=$1 AND txid=$2",
+		&[&allocation, &parent.compute_txid().to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(actual_fee, u64::try_from(recorded_fee).unwrap());
 	assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
 	let confirmed = ctx.generate_blocks(6).await;
@@ -145,26 +144,9 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	assert_eq!(output.value, payout.value);
 	assert_eq!(output.script_pub_key.script().unwrap(), destination);
 	assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
-	// A fee child observed before mining may have been replaced. Credit only
-	// the unique confirmed sponsor and verify its block and fee against Core.
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			if let Some((sponsor, measured_fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) {
-				assert!(sponsor.input.iter().any(|input| input.previous_output.txid == parent.compute_txid()));
-				let info = ctx.bitcoind().sync_client()
-					.custom_get_raw_transaction_info(sponsor.compute_txid(), None).unwrap()
-					.expect("the stored confirmed sponsor must exist in Core");
-				assert!(info.confirmations.unwrap_or(0) >= 6,
-					"the actual canonical fee child must have six confirmations");
-				assert_eq!(ctx.bitcoind().await_transaction(sponsor.compute_txid()).await, sponsor);
-				let fee = super::expiry_test::actual_fee(&ctx, &sponsor).await.to_sat();
-				assert!(fee > 0);
-				assert_eq!(fee, u64::try_from(measured_fee).unwrap());
-				break;
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("the actual confirmed fee sponsor must be canonical in Core");
+	let info = ctx.bitcoind().sync_client()
+		.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap().unwrap();
+	assert!(info.confirmations.unwrap_or(0) >= 6);
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_one("SELECT a.status,a.sweep_tx, \

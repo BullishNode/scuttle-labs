@@ -24,7 +24,6 @@ mod expiry_reorg;
 mod expiry_script_dust_boundaries;
 mod expiry_send_claim;
 mod expiry_send_claim_receipts;
-mod expiry_split;
 pub(crate) mod expiry_test;
 mod expiry_transfer_refresh;
 mod fallback;

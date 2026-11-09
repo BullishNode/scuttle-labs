@@ -199,7 +199,8 @@ async fn native_refund_status(two_sources: bool) {
 		for input in &parent.input {
 			total += ctx.bitcoind().await_transaction(input.previous_output.txid).await.output[input.previous_output.vout as usize].value;
 		}
-		assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(), total);
+		assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>()
+			+ super::expiry_test::actual_fee(&ctx, parent).await, total);
 	}
 	super::expiry_lightning_terminal::assert_grants_reclaimed(&ctx, &db, &grants, &recipient_destination).await;
 	ctx.generate_blocks(6).await;

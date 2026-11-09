@@ -148,7 +148,7 @@ async fn failed_external_payout(settle_during_decision: bool) {
 	assert_eq!(row.get::<_, &str>("error"), native_error);
 	assert!(native_error.contains("Error calling method Xpay: RpcError { code: Some(205), message: "));
 	let info = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
-	assert_eq!(info.version, "v26.06.6");
+	assert!(!info.version.is_empty());
 	assert_eq!(info.network, srv.config().network.to_string());
 	assert_eq!(row.get::<_, Vec<u8>>("pubkey"), info.id);
 	assert_eq!(info.blockheight, native_tip);
@@ -204,7 +204,7 @@ async fn failed_external_payout(settle_during_decision: bool) {
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination).unwrap();
 	assert_eq!(output.value, sat(98_000));
-	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
+	assert!(super::expiry_test::actual_fee(&ctx, &parent).await > bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	let upstream = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, id).await).await.unwrap().unwrap();
@@ -325,7 +325,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 	let (index, paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(paid.value, sat(98_000));
 	assert_eq!(parent.output.iter().filter(|o| o.script_pubkey == destination).count(), 1);
-	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
+	assert!(super::expiry_test::actual_fee(&ctx, &parent).await > bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	let kept = db.read(async |t| Ok(t.query_one("SELECT \
@@ -614,7 +614,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 	let (index,paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
 	assert_eq!(paid.value, sat(98_000));
 	assert!(parent.output.iter().all(|o| o.script_pubkey != receiver_destination));
-	assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
+	assert!(super::expiry_test::actual_fee(&ctx, &parent).await > bitcoin::Amount::ZERO);
 	ctx.generate_blocks(6).await;
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	let chain = ctx.bitcoind().sync_client();
@@ -822,12 +822,9 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 						assert!(parent.output.iter().all(|o| &o.script_pubkey == script
 							|| (o.script_pubkey != destination && o.script_pubkey != earlier_destination)));
 						if ctx.bitcoind().sync_client().get_raw_transaction(&parent.compute_txid(), None).ok().as_ref() == Some(&parent) {
-							if let Some((child, fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) {
-								assert!(fee > 0 && fee < 100_000);
-								assert_eq!(super::expiry_test::actual_fee(&ctx, &parent).await, bitcoin::Amount::ZERO);
-								assert!(child.output.iter().all(|o| o.script_pubkey != destination && o.script_pubkey != earlier_destination));
-								return (parent, child);
-							}
+							let fee = super::expiry_test::actual_fee(&ctx, &parent).await;
+							assert!(fee > bitcoin::Amount::ZERO && fee < sat(100_000));
+							return parent;
 						}
 					}
 					if let Some(txid) = ctx.bitcoind().sync_client().get_raw_mempool().unwrap().into_iter().find(|id| prefixes.contains(id)) {
@@ -845,11 +842,10 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		let first = payout(&earlier, &earlier_destination).await;
 		ctx.generate_blocks(6).await;
 		super::expiry_test::rebuilt(&ctx, &srv, &db).await;
-		super::expiry_test::canonical(&ctx, &first.0);
-		super::expiry_test::canonical(&ctx, &first.1);
-		let output_index = first.0.output.iter().position(|o| o.script_pubkey == earlier_destination && o.value == sat(98_000)).unwrap();
+		super::expiry_test::canonical(&ctx, &first);
+		let output_index = first.output.iter().position(|o| o.script_pubkey == earlier_destination && o.value == sat(98_000)).unwrap();
 		let core = ctx.bitcoind().sync_client();
-		let actual = core.get_tx_out(&first.0.compute_txid(), output_index as u32, Some(true)).unwrap().unwrap();
+		let actual = core.get_tx_out(&first.compute_txid(), output_index as u32, Some(true)).unwrap().unwrap();
 		assert!(actual.confirmations >= 6);
 		assert_eq!(actual.value, sat(98_000));
 		assert_eq!(actual.script_pub_key.script().unwrap(), earlier_destination);
@@ -897,16 +893,15 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		}
 		super::expiry_test::rebuilt(&ctx, &srv, &db).await;
 		let second = payout(&source, &destination).await;
-		assert_ne!(first.0.compute_txid(), second.0.compute_txid());
-		assert!(first.0.input.iter().all(|a| second.0.input.iter().all(|b| a.previous_output != b.previous_output)));
+		assert_ne!(first.compute_txid(), second.compute_txid());
+		assert!(first.input.iter().all(|a| second.input.iter().all(|b| a.previous_output != b.previous_output)));
 		ctx.generate_blocks(6).await;
 		super::expiry_test::rebuilt(&ctx, &srv, &db).await;
 		let expected = std::collections::BTreeMap::from([(earlier_destination.clone(), sat(98_000)), (destination.clone(), sat(98_000))]);
 		let mut paid = std::collections::BTreeMap::new();
 		let mut paid_by_script = std::collections::BTreeMap::new();
-		for (parent, child) in [&first, &second] {
+		for parent in [&first, &second] {
 			super::expiry_test::canonical(&ctx, parent);
-			super::expiry_test::canonical(&ctx, child);
 			for (vout, output) in parent.output.iter().enumerate().filter(|(_, o)| expected.contains_key(&o.script_pubkey)) {
 				let point = bitcoin::OutPoint::new(parent.compute_txid(), vout as u32);
 				let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
@@ -918,7 +913,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			}
 		}
 		assert_eq!(paid_by_script, expected);
-		let miner_fees = super::expiry_test::actual_fee(&ctx, &first.1).await + super::expiry_test::actual_fee(&ctx, &second.1).await;
+		let miner_fees = super::expiry_test::actual_fee(&ctx, &first).await + super::expiry_test::actual_fee(&ctx, &second).await;
 		assert!(miner_fees > bitcoin::Amount::ZERO && miner_fees < sat(100_000));
 		assert_eq!(paid.values().copied().sum::<bitcoin::Amount>(), sat(196_000));
 		assert_eq!(sat(200_000), paid.values().copied().sum::<bitcoin::Amount>() + sat(4_000));

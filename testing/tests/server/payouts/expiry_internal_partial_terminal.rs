@@ -195,7 +195,8 @@ async fn partial_terminal() {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 		value += previous.output[input.previous_output.vout as usize].value;
 	}
-	assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(), value);
+	assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>()
+		+ super::expiry_test::actual_fee(&ctx, &parent).await, value);
 	let height = ctx.generate_blocks(6).await;
 	assert!(chain.get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	assert!(chain.get_tx_out(&claim.compute_txid(), 0, Some(true)).unwrap().unwrap().confirmations >= 6);

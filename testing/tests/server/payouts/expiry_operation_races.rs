@@ -584,14 +584,17 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 		backing_amount+=backing.output[coin.chain_anchor().vout as usize].value;
 	}
 	let original_board_fee=backing_amount.checked_sub(a.amount()+b.amount()).unwrap();
-	assert_eq!(parent.output.iter().map(|o|o.value).sum::<bitcoin::Amount>(),backing_amount);
+	let miner_fee=super::expiry_test::actual_fee(&ctx,&parent).await;
+	assert!(miner_fee>sat(0));
+	assert_eq!(parent.output.iter().map(|o|o.value).sum::<bitcoin::Amount>()+miner_fee,backing_amount);
 	let (index,output)=parent.output.iter().enumerate().find(|(_,o)|o.script_pubkey==fallback).unwrap();
 	assert_eq!(output.value,sat(98_000));
 	let operator=srv.watchmand().config().sweep_address.clone().unwrap().require_network(bitcoin::Network::Regtest).unwrap().script_pubkey();
 	assert_ne!(operator,fallback);
-	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>(),b.amount()+original_board_fee+sat(2_000));
-	assert_eq!(parent.output.len(),3);
-	assert_eq!(parent.output.iter().filter(|o|**o==bitcoin_ext::fee::fee_anchor()).count(),1);
+	assert_eq!(parent.output.iter().filter(|o|o.script_pubkey==operator).map(|o|o.value).sum::<bitcoin::Amount>()+miner_fee,
+		b.amount()+original_board_fee+sat(2_000));
+	assert_eq!(parent.output.len(),2);
+	assert_eq!(parent.version,bitcoin::transaction::Version::TWO);
 	assert!(chain.get_tx_out(&parent.compute_txid(),index as u32,Some(true)).unwrap().is_some());
 	// The real prepare checks ordinary-Spent B before the committed fallback input A.
 	owner.sync_fallback_payouts().await.unwrap();
@@ -647,13 +650,11 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	assert!(chain.custom_get_raw_transaction_info(offboard_txid,None).unwrap().is_none());
 	assert_eq!(recipient.balance().await.unwrap().spendable,live.amount());
 	assert_eq!(live.amount()+quote+actual.value+sat(2_000),sat(200_000));
-	let (child,fee)=ark_testing::onchain::observed_payout_fee_child(&ctx,&parent).unwrap();
 	let sponsor_tx=ctx.bitcoind().await_transaction(sponsor).await;
 	let sponsor_points=sponsor_tx.output.iter().enumerate().filter(|(_,o)|o.script_pubkey==funding.script_pubkey())
 		.map(|(index,_)|bitcoin::OutPoint::new(sponsor,index as u32)).collect::<Vec<_>>();
-	assert!(child.input.iter().any(|input|sponsor_points.contains(&input.previous_output)));
-	assert!(fee>0);
-	assert_eq!(child.output.iter().map(|o|o.value).sum::<bitcoin::Amount>()+sat(u64::try_from(fee).unwrap()),sat(100_000));
+	assert!(parent.input.iter().all(|input|!sponsor_points.contains(&input.previous_output)));
+	assert!(sponsor_points.iter().all(|point|chain.get_tx_out(&point.txid,point.vout,Some(true)).unwrap().is_some()));
 	let recipient_history=recipient.history().await.unwrap();
 	let recipient_balance=recipient.balance().await.unwrap().summary();
 	let history=owner.history().await.unwrap();

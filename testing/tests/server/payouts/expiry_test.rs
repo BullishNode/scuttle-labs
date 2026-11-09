@@ -150,8 +150,8 @@ pub(super) async fn confirm_epoch(
 		assert!(parent.input.iter().any(|input| path.contains(&input.previous_output)
 			&& input.witness.taproot_leaf_script().is_some_and(|script|
 				script.version == bitcoin::taproot::LeafVersion::TapScript && script.script == clause.as_script())));
-		// A real dust allocation has NO payout association. Never replace
-		// this LEFT JOIN by an inner join which silently drops the dust leaf.
+		// A zero-net allocation has no output; a positive remainder gets a
+		// standard owner output when the scheduled fee can be reduced.
 		let index = parent.output.iter().position(|output| output.script_pubkey == leaf.script)
 			.map(|index| u32::try_from(index).unwrap());
 		if leaf.payout == 0 {
@@ -165,26 +165,12 @@ pub(super) async fn confirm_epoch(
 		result.parents.insert(txid, parent);
 	}
 	for (txid, parent) in &result.parents {
-		assert_eq!(parent.version.0, 3);
-		assert_eq!(actual_fee(ctx, parent).await, Amount::ZERO);
+		assert_eq!(parent.version.0, 2);
+		assert!(actual_fee(ctx, parent).await > Amount::ZERO);
 		let hash = result.hashes[txid];
 		let block = core.get_block(&hash).unwrap();
 		assert!(block.txdata.iter().any(|transaction| transaction == parent));
-		let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor())
-			.map(|(vout, _)| OutPoint::new(*txid, vout as u32)).collect::<Vec<_>>();
-		assert_eq!(anchors.len(), 1);
-		let children = block.txdata.iter().filter(|transaction| transaction.input.iter()
-			.any(|input| input.previous_output == anchors[0])).collect::<Vec<_>>();
-		assert_eq!(children.len(), 1);
-		let child = children[0];
-		assert_eq!(child.version.0, 3);
-		let info = core.custom_get_raw_transaction_info(child.compute_txid(), None).unwrap().unwrap();
-		assert_eq!(info.blockhash, Some(hash));
-		assert!(info.confirmations.unwrap_or(0) >= 6);
-		let fee = actual_fee(ctx, child).await;
-		assert!(fee > Amount::ZERO);
-
-		result.children.insert(child.compute_txid(), child.clone());
+		assert!(parent.output.iter().all(|output| !output.is_p2a_fee_anchor()));
 	}
 	assert!(ctx.bitcoind().get_block_count().await - start <= final_budget);
 	result

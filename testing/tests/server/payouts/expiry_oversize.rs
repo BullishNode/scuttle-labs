@@ -1,4 +1,4 @@
-//! Real-size native splitting. Run explicitly with the fallback-scale profile.
+//! Real-size direct expiry payouts. Run the large case explicitly.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
@@ -7,11 +7,11 @@ use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPacka
 use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
 use ark::vtxo::Full;
-use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, VtxoRequest, SECP};
+use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, SECP};
 use ark_testing::{sat, Captaind, TestContext};
-use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
+use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::daemon::captaind::ArkClient;
-use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut};
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::hex::DisplayHex;
@@ -22,7 +22,7 @@ use server::database::Db;
 use server::owner_proof::OwnerLinks;
 use server_rpc::protos;
 
-use super::expiry_test::{actual_fee, canonical};
+use super::expiry_test::actual_fee;
 
 const PAYEES: usize = 327;
 const LEAF_SAT: u64 = 5_000;
@@ -121,65 +121,11 @@ async fn native_node(
 	(outputs, Node { input: input_point, checkpoint_tx, branches, payees })
 }
 
-/// Observe publication, then mine its package. A package already mined
-/// alongside another observed level is checked through its canonical block.
-async fn confirm_package(
-	ctx: &TestContext, srv: &Captaind, parent: &Transaction,
-	graph: &mut BTreeMap<Txid, Transaction>,
-) {
-	let rpc = ctx.bitcoind().sync_client();
-	let txid = parent.compute_txid();
-	loop {
-		if let Some(info) = rpc.custom_get_raw_transaction_info(txid, None).unwrap() {
-			if info.confirmations.unwrap_or(0) > 0 { break; }
-			assert!(rpc.get_mempool_entry(&txid).is_ok(), "unconfirmed publication must really be in Core's mempool");
-			let height = ctx.generate_blocks(1).await;
-			srv.wait_for_sync_height(height).await;
-			srv.watchmand().wait_for_sync_height(height).await;
-		} else {
-			tokio::time::sleep(Duration::from_millis(100)).await;
-		}
-	}
-	assert_eq!(parent.version.0, 3);
-	assert!(parent.vsize() <= 10_000);
-	assert_eq!(actual_fee(ctx, parent).await, sat(0));
-	let info = rpc.custom_get_raw_transaction_info(txid, None).unwrap().unwrap();
-	let hash = info.blockhash.unwrap();
-	let height = rpc.get_block_header_info(&hash).unwrap().height;
-	let block = rpc.get_block(&hash).unwrap();
-	let anchors = parent.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor())
-		.map(|(vout, _)| OutPoint::new(txid, vout as u32)).collect::<Vec<_>>();
-	assert_eq!(anchors.len(), 1);
-	let sponsors = block.txdata.iter().filter(|tx|
-		tx.input.iter().any(|input| input.previous_output == anchors[0])
-	).collect::<Vec<_>>();
-	assert_eq!(sponsors.len(), 1, "the actual canonical package must have exactly one anchor spender");
-	let sponsor = sponsors[0];
-	assert_eq!(sponsor.version.0, 3);
-	assert!(sponsor.vsize() <= 1_000, "actual TRUC child size must satisfy Core's production bound");
-	let fee = actual_fee(ctx, sponsor).await;
-	assert!(fee > sat(0));
-	for input in &parent.input {
-		let previous = rpc.custom_get_raw_transaction_info(input.previous_output.txid, None).unwrap().unwrap();
-		let previous_height = rpc.get_block_header_info(&previous.blockhash.unwrap()).unwrap().height;
-		assert!(previous_height < height, "each new physical level must follow already confirmed backing");
-	}
-	graph.insert(txid, parent.clone());
-	graph.insert(sponsor.compute_txid(), sponsor.clone());
-}
-
 #[tokio::test]
-#[ignore = "327 native payees; declare a serial 600-second regtest slot and use fallback-scale profile"]
-async fn expiry_automatic_real_limit_multilevel_split_pays_every_owner() {
-	tokio::time::timeout(Duration::from_secs(600), automatic_multilevel_split()).await
-		.expect("automatic size-limit splitting exceeded 600 seconds");
-}
-
-#[tokio::test]
-#[ignore = "4096 funded payees; serial 3000-second regtest case in the fallback-scale profile"]
-async fn expiry_bounded_round_inventory_splits_and_pays_every_owner() {
-	tokio::time::timeout(Duration::from_secs(3000), bounded_round_inventory()).await
-		.expect("bounded round inventory exceeded 3000 seconds");
+#[ignore = "327 native payees; run serially with a 900-second regtest slot"]
+async fn expiry_direct_payout_above_ten_kilovbytes_pays_every_owner() {
+	tokio::time::timeout(Duration::from_secs(900), direct_large_payout()).await
+		.expect("large direct expiry payout exceeded 900 seconds");
 }
 
 async fn fund_sponsors(ctx: &TestContext, srv: &Captaind, count: usize) -> BTreeSet<OutPoint> {
@@ -251,177 +197,8 @@ async fn split_leaves(
 	(nodes, terminals)
 }
 
-async fn bounded_round_inventory() {
-	const COUNT: usize = 4096;
-	let ctx = TestContext::new("server/expiry_bounded_round_inventory").await;
-	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
-		.cfg(|cfg| { cfg.expiry_payouts = true;
-			cfg.vtxo_lifetime = BlockDelta::new(4320);
-			cfg.vtxo_exit_delta = BlockDelta::new(144);
-			cfg.max_vtxo_exit_depth = 10;
-			cfg.max_arkoor_fanout = 4;
-			cfg.nb_round_nonces = 3;
-			cfg.vtxopool.max_vtxo_exit_depth = 9;
-			cfg.round_interval = Duration::from_secs(86400);
-		}).watchmand().funded(sat(30_000_000)).create()).await;
-	assert!(srv.config().vtxopool.vtxo_targets.is_empty());
-	let wallet = Box::pin(ctx.bark("source", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
-		.funded(sat(21_000_000)).create()).await;
-	let ids = wallet.board_and_confirm_and_register(&ctx, sat(COUNT as u64 * LEAF_SAT)).await;
-	assert_eq!(ids.len(), 1);
-	let client = wallet.client().await;
-	let original = client.get_full_vtxo(ids[0]).await.unwrap();
-	let original_anchor = original.chain_anchor();
-	let mut participation = client.build_refresh_participation(ids).await.unwrap().unwrap();
-	participation.outputs.clear();
-	for _ in 0..16 {
-		let key = client.derive_store_next_keypair().await.unwrap().0;
-		participation.outputs.push(VtxoRequest {
-			amount: sat(256 * LEAF_SAT), policy: ark::VtxoPolicy::new_pubkey(key.public_key()),
-		});
-	}
-	assert_eq!(participation.total_in(), Some(sat(COUNT as u64 * LEAF_SAT)));
-	assert_eq!(participation.total_out(), Some(sat(COUNT as u64 * LEAF_SAT)));
-	client.join_next_round(participation, Some(bark::subsystem::RoundMovement::Refresh))
-		.await.unwrap().unlock();
-	let (round, _) = tokio::join!(client.participate_ongoing_rounds(), async {
-		tokio::time::sleep(Duration::from_secs(2)).await;
-		srv.trigger_round().await;
-	});
-	round.unwrap();
-	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
-	client.sync().await;
-	let mut sources = Vec::new();
-	for vtxo in client.spendable_vtxos().await.unwrap() {
-		sources.push(client.get_full_vtxo(vtxo.id()).await.unwrap());
-	}
-	assert_eq!(sources.len(), 16);
-	let anchor = sources[0].chain_anchor();
-	let funding = ctx.bitcoind().await_transaction(anchor.txid).await;
-	for source in &sources {
-		assert_eq!(source.chain_anchor(), anchor);
-		assert_eq!(source.exit_depth(), 3);
-		assert_eq!(source.amount(), sat(256 * LEAF_SAT));
-		source.validate(&funding).unwrap();
-	}
-	assert_eq!(funding.output[anchor.vout as usize].value, sat(COUNT as u64 * LEAF_SAT));
-	let original_state = client.get_vtxo_by_id(original.id()).await.unwrap();
-	assert_eq!(original_state.state, bark::vtxo::VtxoState::Spent);
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let native = db.read(async |tx| tx.get_user_vtxo_by_id(original.id()).await).await.unwrap();
-	assert_eq!(native.spend_state, server::database::SpendState::Spent);
-	let forfeits = db.read(async |tx| Ok(tx.query(
-		"SELECT p.id,r.funding_txid,i.signed_forfeit_tx IS NOT NULL AS signed,p.forfeited_at IS NOT NULL AS accepted \
-		FROM round_part_input i JOIN round_participation p ON p.id=i.participation_id \
-		JOIN round r ON r.funding_txid=p.round_id WHERE i.vtxo_id=$1 AND r.id=$2",
-		&[&original.id().to_string(), &native.spent_in_round.unwrap()],
-	).await?)).await.unwrap();
-	assert_eq!(forfeits.len(), 1);
-	let forfeit = &forfeits[0];
-	assert!(forfeit.get::<_, bool>("signed") && forfeit.get::<_, bool>("accepted"));
-	assert_eq!(forfeit.get::<_, String>("funding_txid"), anchor.txid.to_string());
-	let owners = (0..COUNT).map(|_| owner()).collect::<Vec<_>>();
-	assert_eq!(owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>().len(), COUNT);
-	let mut rpc = srv.get_public_rpc().await;
-	let proof_db = Db::connect(&srv.config().postgres).await.unwrap();
-	let mailbox_key = srv.mailbox_keypair();
-	// Verify distinct, repeated and invalid proofs at the configured round bound.
-	let batch_limit = 4_usize.saturating_pow(srv.config().nb_round_nonces as u32);
-	assert_eq!(batch_limit, 64);
-	let mut max_evidence_bytes = 0;
-	for group in owners.chunks(batch_limit) {
-		let keys = group.iter().map(|owner| owner.key.public_key()).collect::<Vec<_>>();
-		let mut distinct = OwnerLinks::default();
-		let mut evidence_bytes = 0;
-		for owner in group {
-			let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &owner.mailbox_key, &owner.key).unwrap();
-			evidence_bytes += proof.serialize().len(); distinct.insert(owner.key.public_key(), proof);
-		}
-		max_evidence_bytes = max_evidence_bytes.max(evidence_bytes);
-		proof_db.write(async |tx| distinct.verify(tx, keys.iter().copied(), &mailbox_key, Network::Regtest).await).await.unwrap();
-		let one = &group[0];
-		let before = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id FROM owner_key WHERE user_pubkey=$1",
-			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
-		let canonical = before.get::<_, String>(0);
-		let mut repeated = OwnerLinks::default();
-		let mut invalid = OwnerLinks::default();
-		for index in 0..batch_limit {
-			let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &one.mailbox_key, &one.key).unwrap();
-			repeated.insert(one.key.public_key(), proof);
-			let mut bad = proof;
-			if index + 1 == batch_limit { bad.signature = bitcoin::secp256k1::schnorr::Signature::from_slice(&[0; 64]).unwrap(); }
-			invalid.insert(one.key.public_key(), bad);
-		}
-		proof_db.write(async |tx| repeated.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap();
-		let error = proof_db.write(async |tx| invalid.verify(tx, [one.key.public_key()], &mailbox_key, Network::Regtest).await).await.unwrap_err();
-		assert!(error.is::<server::OwnershipRefusal>(), "{error:#}");
-		let after = proof_db.read(async |tx| Ok(tx.query_one("SELECT blinded_id FROM owner_key WHERE user_pubkey=$1",
-			&[&one.key.public_key().to_string()]).await?)).await.unwrap();
-		assert_eq!(after.get::<_, String>(0), canonical);
-	}
-	proof_db.read(async |tx| {
-		for owner in &owners {
-			assert_eq!(tx.expiry_owner(owner.key.public_key()).await?,
-				server::database::expiry_attribution::Attribution::Owned { mailbox_pk: owner.mailbox.as_pubkey(), spk: owner.script.clone() });
-		}
-		Ok(())
-	}).await.unwrap();
-	assert_eq!(max_evidence_bytes, batch_limit * 161);
-	let sponsor_funding = fund_sponsors(&ctx, &srv, 96).await;
-	ctx.generate_blocks(2).await;
-	let mut jobs = VecDeque::new();
-	for (index, source) in sources.into_iter().enumerate() {
-		let key = client.get_vtxo_key(&source).await.unwrap();
-		jobs.push_back((source, key, Vec::from_iter(index * 256..(index + 1) * 256)));
-	}
-	let (nodes, terminals) = split_leaves(&srv, &client, &mut rpc, &owners, jobs, true).await;
-	assert_eq!(nodes.len(), 1360);
-	assert_eq!(terminals.len(), COUNT);
-	assert_eq!(terminals.iter().map(|(index, _)| *index).collect::<BTreeSet<_>>().len(), COUNT);
-	let mut signed_paths = BTreeMap::new();
-	for (_, leaf) in &terminals {
-		leaf.validate(&funding).unwrap();
-		for step in leaf.transactions() { signed_paths.insert(step.tx.compute_txid(), step.tx); }
-	}
-	post_leaves(&srv, &owners, &terminals).await;
-	drop(rpc);
-	drop(client);
-	drop(wallet);
-	let expiry = terminals[0].1.expiry_height();
-	assert!(terminals.iter().all(|(_, leaf)| leaf.expiry_height() == expiry));
-	let tip = ctx.bitcoind().get_block_count().await as u32;
-	assert!(tip < expiry.to_u32());
-	let height = ctx.generate_blocks(expiry.to_u32() + 1 - tip).await;
-	srv.wait_for_sync_height(height).await;
-	srv.watchmand().wait_for_sync_height(height).await;
-	finish_payouts(&ctx, &srv, &db, &owners, &terminals, &signed_paths,
-		&BTreeSet::from([anchor, original_anchor]), &sponsor_funding, BTreeMap::new(), true).await;
-	let allocations = db.read(async |tx| Ok(tx.query(
-		"SELECT (SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts,c.disposition,c.owner_mailbox,c.user_pubkey,c.spk, \
-		c.fee_sat,c.payout_sat,c.forfeited_sat FROM expiry_entitlement e \
-		LEFT JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1",
-		&[&original.id().to_string()],
-	).await?)).await.unwrap();
-	for allocation in allocations {
-		assert_eq!(allocation.get::<_, i64>("gross_sat"), (COUNT as u64 * LEAF_SAT) as i64);
-		let facts: serde_json::Value = serde_json::from_str(allocation.get("facts")).unwrap();
-		assert_eq!(facts["kind"], "exchange");
-
-
-		if let Some(disposition) = allocation.get::<_, Option<String>>("disposition") {
-			assert_eq!(disposition, "operator");
-			for field in ["owner_mailbox", "user_pubkey", "spk"] {
-				assert!(allocation.get::<_, Option<String>>(field).is_none());
-			}
-			for field in ["fee_sat", "payout_sat", "forfeited_sat"] {
-				assert_eq!(allocation.get::<_, i64>(field), 0);
-			}
-		}
-	}
-}
-
-async fn automatic_multilevel_split() {
-	let ctx = TestContext::new("server/expiry_automatic_real_limit_multilevel_split").await;
+async fn direct_large_payout() {
+	let ctx = TestContext::new("server/expiry_direct_payout_above_ten_kilovbytes").await;
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|cfg| { cfg.expiry_payouts = true;
 		cfg.vtxo_lifetime = BlockDelta::new(4_320);
 		cfg.vtxo_exit_delta = BlockDelta::new(144);
@@ -458,10 +235,8 @@ async fn automatic_multilevel_split() {
 		.await?.get::<_, i64>(0))).await.unwrap(), PAYEES as i64);
 	let source = client.get_full_vtxo(ids[0]).await.unwrap();
 	let source_key = client.get_vtxo_key(&source).await.unwrap();
-	let board_exit = source.transactions().find(|step| step.tx.input[0].previous_output == source.chain_anchor())
-		.expect("the genuine board supplies its signed first exit step").tx;
 	client.register_vtxo_transactions_with_server([&source]).await.unwrap();
-	let sponsor_funding = fund_sponsors(&ctx, &srv, 16).await;
+	let _sponsor_funding = fund_sponsors(&ctx, &srv, 16).await;
 	ctx.generate_blocks(2).await;
 
 	let mut destinations = Vec::new();
@@ -488,12 +263,6 @@ async fn automatic_multilevel_split() {
 	assert_eq!(nodes.len(), 154);
 	assert_eq!(terminals.len(), PAYEES);
 	assert_eq!(terminals.iter().map(|(i, _)| *i).collect::<BTreeSet<_>>().len(), PAYEES);
-	let mut signed_paths = BTreeMap::from([(board_exit.compute_txid(), board_exit.clone())]);
-	for node in &nodes {
-		signed_paths.insert(node.checkpoint_tx.compute_txid(), node.checkpoint_tx.clone());
-		for branch in &node.branches { signed_paths.insert(branch.exit_tx.compute_txid(), branch.exit_tx.clone()); }
-	}
-	assert_eq!(signed_paths.len(), 635, "154 native operations sign 634 path transactions, plus the board exit");
 	post_leaves(&srv, &owners, &terminals).await;
 	drop(client);
 	drop(wallet);
@@ -503,166 +272,61 @@ async fn automatic_multilevel_split() {
 	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - current).await;
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let mut graph = BTreeMap::new();
-	confirm_package(&ctx, &srv, &board_exit, &mut graph).await;
-	let grace = srv.watchmand().config().watchman.progress_grace_period.to_u32();
-	ctx.generate_blocks(grace).await;
-	// The source's ordinary pubkey output is progressed by the native
-	// watchtower, after the real grace period. Its one checkpoint transaction
-	// creates all four independently recoverable branch outputs together.
-	confirm_package(&ctx, &srv, &nodes[0].checkpoint_tx, &mut graph).await;
-	let large = nodes.iter().find(|node| node.payees == 324).unwrap();
-	let large_branch = nodes[0].branches.iter().find(|branch| branch.output == large.input).unwrap();
-	assert_eq!(large_branch.checkpoint.txid, nodes[0].checkpoint_tx.compute_txid());
-	// This physical checkpoint still represents 324 distinct recipients and
-	// cannot fit a payout at the production size limit. Only the automatic
-	// readiness/split path can authorize its signed branch exit.
-	confirm_package(&ctx, &srv, &large_branch.exit_tx, &mut graph).await;
-	ctx.generate_blocks(grace).await;
-	confirm_package(&ctx, &srv, &large.checkpoint_tx, &mut graph).await;
-	let ready_nodes = nodes.iter().filter(|node| node.payees == 81).collect::<Vec<_>>();
-	assert_eq!(ready_nodes.len(), 4);
-	for node in ready_nodes {
-		assert!(large.branches.iter().any(|branch| branch.output == node.input));
-	}
-	let required_splits = [
-		(source.chain_anchor(), board_exit.compute_txid()),
-		(large_branch.checkpoint, large_branch.exit_tx.compute_txid()),
-	];
-	let requests = db.read(async |tx| Ok(tx.query("SELECT s.vtxo_id,s.progress_txid \
-		FROM expiry_split_request s JOIN vtxo v ON v.vtxo_id=s.vtxo_id WHERE v.anchor_point=$1",
-		&[&source.chain_anchor().to_string()],
-	).await?)).await.unwrap();
-	let mut observed_requests = BTreeSet::new();
-	for request in requests {
-		let backing = request.get::<_, String>("vtxo_id");
-		let progress: Txid = request.get::<_, &str>("progress_txid").parse().unwrap();
-		let path = signed_paths.get(&progress).expect("each automatic request must name a genuine signed native path");
-		assert_eq!(path.input.len(), 1);
-		assert_eq!(ark::VtxoId::from(path.input[0].previous_output).to_string(), backing);
-		observed_requests.insert((backing, progress));
-	}
-	for (point, progress) in required_splits {
-		assert!(observed_requests.contains(&(ark::VtxoId::from(point).to_string(), progress)),
-			"the daemon must create both actual oversized backing requests, independently of extra legitimate substeps");
-	}
-	finish_payouts(&ctx, &srv, &db, &owners, &terminals, &signed_paths,
-		&BTreeSet::from([source.chain_anchor()]), &sponsor_funding, graph, false).await;
-}
-
-async fn finish_payouts(
-	ctx: &TestContext, srv: &Captaind, db: &Db, owners: &[Owner],
-	terminals: &[(usize, Vtxo<Full>)], signed_paths: &BTreeMap<Txid, Transaction>,
-	backing: &BTreeSet<OutPoint>, sponsor_funding: &BTreeSet<OutPoint>,
-	mut graph: BTreeMap<Txid, Transaction>, mine_pending: bool,
-) {
-	let payees = owners.len();
 	let terminal_ids = terminals.iter().map(|(_, leaf)| leaf.id().to_string()).collect::<Vec<_>>();
-	let payout_rows = loop {
-		let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.id,a.sweep_tx,c.gross_sat,c.fee_sat, \
-			c.payout_sat,c.forfeited_sat,c.spk,c.owner_mailbox,c.user_pubkey FROM expiry_entitlement e \
-			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-			WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&terminal_ids],
-		).await?)).await.unwrap();
-		assert!(rows.len() <= payees);
-		if rows.len() == payees { break rows; }
-		if mine_pending && !ctx.bitcoind().sync_client().get_raw_mempool().unwrap().is_empty() {
-			let height = ctx.generate_blocks(1).await;
-			srv.wait_for_sync_height(height).await;
-			srv.watchmand().wait_for_sync_height(height).await;
+	let rows = tokio::time::timeout(Duration::from_secs(180), async {
+		loop {
+			srv.watchmand().trigger_sweep().await;
+			let rows = db.read(async |tx| Ok(tx.query(
+				"SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
+				 c.spk,c.owner_mailbox,c.user_pubkey,a.sweep_tx,a.sweep_txid \
+				 FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+				 JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				 WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
+				&[&terminal_ids],
+			).await?)).await.unwrap();
+			if rows.len() == PAYEES { break rows; }
+			tokio::time::sleep(Duration::from_millis(250)).await;
 		}
-		tokio::time::sleep(Duration::from_millis(100)).await;
-	};
-	let mut payouts = BTreeMap::new();
-	for row in &payout_rows {
+	}).await.expect("all owners must receive a direct payout decision");
+	let txids = rows.iter().map(|row| row.get::<_, String>("sweep_txid")).collect::<BTreeSet<_>>();
+	assert_eq!(txids.len(), 1, "one physical root needs one payout transaction");
+	let payout = deserialize::<Transaction>(rows[0].get("sweep_tx")).unwrap();
+	assert_eq!(payout.version, bitcoin::transaction::Version::TWO);
+	assert!(payout.vsize() > 10_000 && payout.vsize() <= 100_000);
+	assert!(payout.input.iter().any(|input| input.previous_output == source.chain_anchor()));
+	assert!(actual_fee(&ctx, &payout).await > sat(0));
+	let core = ctx.bitcoind().sync_client();
+	let publication = core.custom_get_raw_transaction_info(payout.compute_txid(), None).unwrap().unwrap();
+	assert_eq!(publication.txid, payout.compute_txid());
+	let owner_scripts = owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>();
+	let outputs = payout.output.iter().filter(|output| owner_scripts.contains(&output.script_pubkey))
+		.collect::<Vec<_>>();
+	assert_eq!(outputs.len(), PAYEES);
+	for output in outputs { assert_eq!(output.value, sat(LEAF_SAT - 2_000)); }
+	for (index, leaf) in &terminals {
+		let row = rows.iter().find(|row| row.get::<_, String>("vtxo_id") == leaf.id().to_string()).unwrap();
+		let owner = &owners[*index];
 		assert_eq!(row.get::<_, i64>("gross_sat"), LEAF_SAT as i64);
 		assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), (LEAF_SAT - 2_000) as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
-		let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-		payouts.insert(parent.compute_txid(), parent);
-	}
-	for parent in payouts.values() { confirm_package(ctx, srv, parent, &mut graph).await; }
-	let final_height = ctx.generate_blocks(6).await;
-	srv.wait_for_sync_height(final_height).await;
-	srv.watchmand().wait_for_sync_height(final_height).await;
-	let core = ctx.bitcoind().sync_client();
-	// Native progression can publish additional signed substeps alongside
-	// packages already observed. Include every canonical path transaction and
-	// its sponsor, so change/drain accounting never omits a real edge.
-	for (txid, path) in signed_paths {
-		if graph.contains_key(txid) { continue; }
-		let Some(info) = core.custom_get_raw_transaction_info(*txid, None).unwrap() else { continue; };
-		if info.confirmations.unwrap_or(0) > 0 {
-			confirm_package(ctx, srv, path, &mut graph).await;
-		}
-	}
-	for (index, leaf) in terminals {
-		let owner = &owners[*index];
-		let matches = graph.values().flat_map(|tx| tx.output.iter().enumerate().filter_map(move |(vout, out)|
-			(out.script_pubkey == owner.script).then_some((tx.compute_txid(), vout, out))
-		)).collect::<Vec<_>>();
-		assert_eq!(matches.len(), 1, "each actual owner must have exactly one economic payout output");
-		let (txid, vout, expected) = matches[0];
-		assert_eq!(expected.value, sat(LEAF_SAT - 2_000));
-		let actual = core.get_tx_out(&txid, vout as u32, Some(true)).unwrap().unwrap();
-		assert!(actual.confirmations >= 6);
-		assert_eq!(actual.value, expected.value);
-		assert_eq!(actual.script_pub_key.script().unwrap(), owner.script);
-		let row = payout_rows.iter().find(|r| r.get::<_, String>("vtxo_id") == leaf.id().to_string()).unwrap();
 		assert_eq!(row.get::<_, String>("spk"), owner.script.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner.mailbox.as_pubkey().to_string());
 		assert_eq!(row.get::<_, String>("user_pubkey"), owner.key.public_key().to_string());
-		let associated_parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-		assert_eq!(associated_parent.compute_txid(), txid,
-			"each terminal's stored parent must contain that owner's actual payout output");
 	}
-	loop {
-		let row = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) AS n,COUNT(DISTINCT e.vtxo_id) AS coins \
-			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
-			AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_txid IS NOT NULL AND a.confirmed_hash IS NOT NULL",
-			&[&terminal_ids],
-		).await?)).await.unwrap();
-		assert!(row.get::<_, i64>("n") <= payees as i64);
-		if row.get::<_, i64>("n") == payees as i64 && row.get::<_, i64>("coins") == payees as i64 { break; }
-		tokio::time::sleep(Duration::from_millis(100)).await;
-	}
-	for txid in payouts.keys() {
-		let canonical = core.custom_get_raw_transaction_info(*txid, None).unwrap().unwrap().blockhash.unwrap();
-		let stored = db.read(async |tx| Ok(tx.query_one(
-			"SELECT confirmed_hash FROM expiry_allocation_state WHERE sweep_txid=$1", &[&txid.to_string()],
-		).await?.get::<_, String>(0))).await.unwrap();
-		assert_eq!(stored, canonical.to_string(), "payout history must name the actual canonical block");
-	}
-	let entitlements = db.read(async |tx| Ok(tx.query_one(
-		"SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-		WHERE c.disposition='customer' AND a.status<>'conflicted'", &[],
+	let splits = db.read(async |tx| Ok(tx.query_one(
+		"SELECT COUNT(*) FROM expiry_split_request", &[],
 	).await?.get::<_, i64>(0))).await.unwrap();
-	assert_eq!(entitlements, payees as i64, "intermediate coins cannot acquire extra customer payouts");
-	if mine_pending {
-		let first = backing.iter().chain(sponsor_funding).map(|point| {
-			let info = core.custom_get_raw_transaction_info(point.txid, None).unwrap().unwrap();
-			core.get_block_header_info(&info.blockhash.unwrap()).unwrap().height
-		}).min().unwrap();
-		let customer_scripts = owners.iter().map(|owner| owner.script.clone()).collect::<BTreeSet<_>>();
-		let mut customer_counts = BTreeMap::new();
-		for height in first..=core.get_block_count().unwrap() as usize {
-			let block = core.get_block(&core.get_block_hash(height as u64).unwrap()).unwrap();
-			for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
-				for output in &tx.output {
-					if customer_scripts.contains(&output.script_pubkey) {
-						assert_eq!(output.value, sat(LEAF_SAT - 2_000));
-						*customer_counts.entry(output.script_pubkey.clone()).or_insert(0_usize) += 1;
-					}
-				}
-			}
-		}
-		assert_eq!(customer_counts.len(), payees);
-		assert!(customer_counts.values().all(|count| *count == 1));
+	assert_eq!(splits, 0, "direct payout must not create fork expiry splits");
+	let confirmed = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(confirmed).await;
+	srv.watchmand().wait_for_sync_height(confirmed).await;
+	for owner in &owners {
+		let index = payout.output.iter().position(|output| output.script_pubkey == owner.script).unwrap();
+		let utxo = core.get_tx_out(&payout.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
+		assert!(utxo.confirmations >= 6);
+		assert_eq!(utxo.value, sat(LEAF_SAT - 2_000));
 	}
-	for tx in graph.values() { canonical(ctx, tx); }
 }
 
 /// Standard, client-owned leaves must not separate two payable recipient coins.
@@ -813,13 +477,14 @@ async fn standard_padding_keeps_same_script_victim_payable() {
 	let allocations = rows.iter().map(|row| row.get::<_, i64>("allocation_id")).collect::<BTreeSet<_>>();
 	assert_eq!(allocations.len(), 1, "both victim leaves must share one physical payout");
 	assert_eq!(rows.iter().map(|row| row.get::<_, i64>("gross_sat")).sum::<i64>(), 2_400);
-	assert_eq!(rows.iter().map(|row| row.get::<_, i64>("payout_sat")).sum::<i64>(), 1_400);
+	assert_eq!(rows.iter().map(|row| row.get::<_, i64>("payout_sat")).sum::<i64>(), 400);
 	assert!(rows.iter().all(|row| row.get::<_, i64>("forfeited_sat") == 0));
 	let parent = deserialize::<Transaction>(rows[0].get::<_, &[u8]>("sweep_tx")).unwrap();
 	let payout = parent.output.iter().find(|output| output.script_pubkey == victim_script)
 		.expect("victim output missing");
-	assert_eq!(payout.value, sat(1_400));
-	assert_eq!(actual_fee(&ctx, &parent).await, sat(0));
+	assert_eq!(payout.value, sat(400));
+	assert_eq!(parent.version, bitcoin::transaction::Version::TWO);
+	assert!(actual_fee(&ctx, &parent).await > sat(0));
 	assert!(ctx.bitcoind().sync_client().custom_get_raw_transaction_info(parent.compute_txid(), None)
 		.unwrap().unwrap().confirmations.unwrap_or(0) > 0);
 }

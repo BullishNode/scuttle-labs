@@ -11,13 +11,13 @@ use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
-use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef, TxOutExt};
+use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{BlockTable, Db};
 
-/// Reconcile the winning parents and their canonical anchor spenders.
+/// Reconcile the winning direct payouts and their exact on-chain fees.
 /// Losing allocations remain signed and immutable; neither their age nor an
-/// attempted fee-child row determines the rightful canonical payment.
+/// attempted replacement determines the rightful canonical payment.
 async fn assert_physical_cut(
 	ctx: &TestContext, db: &Db, server: &Captaind, coins: &[String],
 	expected_payers: &BTreeMap<String, Txid>, stored_parents: &BTreeMap<i64, Transaction>,
@@ -43,35 +43,31 @@ async fn assert_physical_cut(
 		let point = canonical_point(ctx, parent);
 		assert_eq!(point.hash, *hash);
 		parent_points.insert(*txid, point);
-		assert_eq!(parent.version.0, 3);
-		assert!(parent.vsize() <= 10_000);
-		assert_eq!(actual_fee(ctx, parent).await, Amount::ZERO);
+		assert_eq!(parent.version.0, 2);
+		assert!(parent.vsize() <= 100_000);
+		let miner_fee = actual_fee(ctx, parent).await;
+		assert!(miner_fee > Amount::ZERO);
+		fee_total += miner_fee;
 		let payees = parent.output.iter().enumerate().filter(|(_, output)| &output.script_pubkey == customer).collect::<Vec<_>>();
 		assert_eq!(payees.len(), 1);
 		let (_, payee) = payees[0];
 		customer_total += payee.value;
 		let remainder = parent.output.iter().filter(|output| &output.script_pubkey != customer)
 			.map(|output| output.value).sum::<Amount>();
-		let parent_gross=parent.input.iter().map(|input|backing[&input.previous_output].value).sum::<Amount>();
-		let expected_fee=sat(parent_gross.to_sat().div_ceil(100).max(2_000));
-		assert_eq!(payee.value+expected_fee,parent_gross);
-		assert_eq!(remainder, expected_fee);
+		let parent_gross = parent.input.iter().filter_map(|input|
+			backing.get(&input.previous_output)).map(|output| output.value).sum::<Amount>();
+		let sponsor_gross = parent.input.iter().filter_map(|input|
+			sponsors.get(&input.previous_output)).map(|output| output.value).sum::<Amount>();
+		assert_eq!(payee.value + sat(2_000), parent_gross);
+		assert_eq!(parent_gross + sponsor_gross, payee.value + remainder + miner_fee);
 		for output in parent.output.iter().filter(|output| &output.script_pubkey != customer) {
-			assert!(output.is_p2a_fee_anchor() || output.script_pubkey == operator);
+			assert_eq!(output.script_pubkey, operator);
 		}
-		assert_eq!(parent.output.iter().filter(|output| output.is_p2a_fee_anchor()).count(), 1);
-		let (child, fee) = ark_testing::onchain::observed_payout_fee_child(ctx, parent).unwrap();
-		assert_eq!(canonical_point(ctx, &child), point);
-		assert_eq!(child.version.0, 3);
-		assert!(child.vsize() <= 1_000);
-		let child_fee = sat(u64::try_from(fee).unwrap());
-		assert!(child_fee > Amount::ZERO);
-		fee_total += child_fee;
 		let inputs = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM expiry_allocation_input WHERE allocation_id=$1", &[allocation]).await?)).await.unwrap();
 		assert_eq!(inputs.into_iter().map(|row| row.get::<_, String>(0)).collect::<BTreeSet<_>>(),
-			parent.input.iter().map(|input| input.previous_output.to_string()).collect());
+			parent.input.iter().filter(|input| backing.contains_key(&input.previous_output))
+				.map(|input| input.previous_output.to_string()).collect());
 		assert!(graph.insert(*txid, parent.clone()).is_none());
-		assert!(graph.insert(child.compute_txid(), child).is_none());
 	}
 	let package_fee = fee_total;
 	let mut actual_board_fee = Amount::ZERO;
@@ -112,10 +108,10 @@ async fn assert_physical_cut(
 		attributed_fee += fee;
 	}
 	assert_eq!(attributed_payout, customer_total);
-	assert_eq!(attributed_fee, sat(2_000));
+	assert_eq!(attributed_fee, sat(2_000 * canonical.len() as u64));
 	assert_eq!(graph.values().flat_map(|transaction| transaction.output.iter())
 		.filter(|output| &output.script_pubkey == customer).count(), canonical.len(),
-		"no accidental extra customer output may hide in a sponsor child");
+		"each canonical payout has exactly one aggregated customer output");
 	let mut spent = BTreeSet::new();
 	let mut external = BTreeSet::new();
 	for transaction in graph.values() {
@@ -136,7 +132,7 @@ async fn assert_physical_cut(
 	assert!(initial_funding.keys().all(|point| external.contains(point)));
 	assert!(backing.keys().all(|point| spent.contains(point)));
 	let mut retained = BTreeMap::new();
-	let mut child_change = BTreeSet::new();
+	let mut unspent_sponsors = BTreeSet::new();
 	let mut customer_leaves = Amount::ZERO;
 	let mut ordinary_leaves = BTreeMap::new();
 	for (txid, transaction) in &graph {
@@ -154,7 +150,7 @@ async fn assert_physical_cut(
 			else {
 				assert!(!boards.contains_key(txid), "no unexplained surviving board output may disappear from customer accounting");
 				if canonical.contains_key(txid) { assert_eq!(output.script_pubkey, operator); }
-				else { child_change.insert(point); }
+					else { panic!("unexpected non-board, non-payout retained output"); }
 				retained.insert(point, output.value);
 			}
 		}
@@ -168,16 +164,16 @@ async fn assert_physical_cut(
 		assert!(actual.confirmations >= 6);
 		assert_eq!(actual.value, output.value);
 		assert_eq!(actual.script_pub_key.script().unwrap(), output.script_pubkey);
-		child_change.insert(*point); // An unused declared sponsor must still be owned.
+		unspent_sponsors.insert(*point); // An unused declared sponsor must still be owned.
 		assert!(retained.insert(*point, output.value).is_none());
 	}
 	tokio::time::timeout(Duration::from_secs(10), async {
 		loop {
 			let owned = super::expiry_test::watchman_coins(server.watchmand()).await;
-			if child_change.is_subset(&owned) { break; }
+			if unspent_sponsors.is_subset(&owned) { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
-	}).await.expect("all actual fee-child change and unused funding must remain in the real watchman wallet");
+	}).await.expect("all unused sponsor funding must remain in the real watchman wallet");
 	let operator_total = retained.values().copied().sum::<Amount>();
 	let source_total = backing.values().map(|output| output.value).sum::<Amount>();
 	let sponsor_total = sponsors.values().map(|output| output.value).sum::<Amount>();
@@ -189,9 +185,9 @@ async fn assert_physical_cut(
 	assert_eq!(source_total, customer_total + attributed_fee);
 	assert_eq!(source_total + sponsor_total, customer_total + operator_total + package_fee);
 	assert_eq!(sponsor_total + attributed_fee, operator_total + package_fee,
-		"customer output fees and actual miner subsidy must remain separate and exactly conserved");
+		"customer payout charges and actual miner fees must remain separate and exactly conserved");
 	assert_eq!(initial_total + sponsor_total, customer_total + ordinary_total + operator_total + fee_total,
-		"the entire declared700k initial customer-plus-sponsor funding must survive as exact customer/operator Core leaves and actual board/package miner fees");
+		"the entire declared 700k initial customer-plus-sponsor funding must survive as exact customer/operator Core leaves and actual board/payout miner fees");
 	(graph, fee_total, operator_total)
 }
 
@@ -277,8 +273,8 @@ async fn partial_conflict_reorg() {
 			cfg.vtxo_lifetime = BlockDelta::new(24);
 			cfg.vtxo_exit_delta = BlockDelta::new(3);
 		}).watchmand().create().await;
-	// Keep the watchman unfunded until the alternate branch. The
-	// original immutable parent and later regroup must not broadcast early.
+	// Keep the watchman unfunded until the alternate branch. Direct payouts
+	// must still pay their miner fee from the operator's retained charge.
 	let fee_address = srv.watchmand().wait_wallet_address().await;
 	let wallet = ctx.bark("holder", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let initial_txid = ctx.fund_bark(&wallet, sat(500_000)).await;
@@ -362,21 +358,35 @@ async fn partial_conflict_reorg() {
 		}
 	}).await.expect("the original two-root customer decision must be durably signed");
 	let original_txid = original.compute_txid();
-	assert_eq!(original.version.0, 3);
+	assert_eq!(original.version.0, 2);
 	assert_eq!(original.input.len(), 2);
 	assert_eq!(original.input.iter().map(|input| input.previous_output).collect::<BTreeSet<_>>(),
 		BTreeSet::from([exiting.chain_anchor(), untouched.chain_anchor()]));
-	assert_eq!(original.output.iter().map(|out| out.value.to_sat()).sum::<u64>(),
+	let original_fee = actual_fee(&ctx, &original).await;
+	assert!(original_fee > Amount::ZERO);
+	assert_eq!(original.output.iter().map(|out| out.value.to_sat()).sum::<u64>() + original_fee.to_sat(),
 		backing.values().map(|out| out.value.to_sat()).sum::<u64>(),
-		"the immutable payout must conserve actual backing with zero parent miner fee");
+		"the direct payout must conserve actual backing and its inline miner fee");
 	let payouts = original.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == destination)
 		.collect::<Vec<_>>();
 	assert_eq!(payouts.len(), 1);
 	assert_eq!(payouts[0].1.value, sat(198_000));
-	assert!(!ctx.bitcoind().sync_client().get_raw_mempool().unwrap().contains(&original_txid));
+	assert!(ctx.bitcoind().sync_client().get_raw_mempool().unwrap().contains(&original_txid));
 	let permanent = decided_obligations(&db, &coins).await;
 
+	// The direct payout is immediately relayable, unlike the old zero-fee
+	// parent. Freeze both daemons and clear the local regtest mempool before
+	// constructing the competing holder-exit branch.
 	srv.watchmand().stop().await.unwrap();
+	srv.stop().await.unwrap();
+	let loaded_wallets = ctx.bitcoind().sync_client().list_wallets().unwrap();
+	ctx.bitcoind().restart_wiping_mempool().await;
+	for name in loaded_wallets {
+		if !ctx.bitcoind().sync_client().list_wallets().unwrap().contains(&name) {
+			ctx.bitcoind().load_wallet(&name).await;
+		}
+	}
+	assert!(ctx.bitcoind().sync_client().get_raw_mempool().unwrap().is_empty());
 	progress_exit_until_awaiting_delta(&ctx, &wallet).await;
 	let conflict = ctx.bitcoind().sync_client().custom_get_raw_transaction_info(root_exit_txid, None)
 		.unwrap().unwrap();
@@ -384,6 +394,7 @@ async fn partial_conflict_reorg() {
 	assert!(conflict.confirmations.unwrap_or(0) > 0);
 	assert!(ctx.bitcoind().sync_client().get_tx_out(&exiting.chain_anchor().txid,
 		exiting.chain_anchor().vout, Some(true)).unwrap().is_none());
+	srv.start().await.unwrap();
 	srv.watchmand().start().await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
@@ -427,7 +438,6 @@ async fn partial_conflict_reorg() {
 	assert_eq!(regroup.input.len(), 1);
 	assert_eq!(regroup.input[0].previous_output, untouched.chain_anchor());
 	assert_eq!(regroup.output.iter().find(|out| out.script_pubkey == destination).unwrap().value, sat(98_000));
-	assert!(!ctx.bitcoind().sync_client().get_raw_mempool().unwrap().contains(&regroup.compute_txid()));
 	let claim = ctx.bitcoind().await_transaction(claim_txid).await;
 	assert!(claim.input.iter().any(|input| input.previous_output == exiting.point()));
 	assert!(claim.output.iter().any(|out| out.script_pubkey == claim_address.script_pubkey() && out.value > sat(0)));
@@ -474,9 +484,8 @@ async fn partial_conflict_reorg() {
 	}
 	let mining_address = ctx.bitcoind().get_new_address();
 	rpc.generate_to_address(u64::from(removed + 2), &mining_address).unwrap();
-	// Two separate canonical winners are valid. The production fee-child
-	// builder excludes unconfirmed inputs, so provide two independent
-	// confirmed sponsors instead of implicitly requiring the merged old parent.
+	// Two separate canonical winners are valid. Provide two independent
+	// confirmed sponsors so an increased fee target can use them if needed.
 	let mut fee_sponsors = BTreeMap::new();
 	for _ in 0..2 {
 		let txid = ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
@@ -518,7 +527,7 @@ async fn partial_conflict_reorg() {
 	assert_eq!(claims, 0, "an orphaned terminal claim must not remain a paid discharge after rebuilding");
 	assert!(rpc.custom_get_raw_transaction_info(claim_txid, None).unwrap()
 		.is_none_or(|info| info.confirmations.unwrap_or(0) == 0));
-	// Old and regrouped parents may compete. Observe real packages
+	// Old and regrouped direct payouts may compete. Observe real transactions
 	// covering both restored roots; the canonical winner, not allocation age,
 	// determines payment. Preserve every signed parent as it is observed.
 	let mut stored_parents = BTreeMap::from([(original_id, original.clone()), (regroup_id, regroup.clone())]);
