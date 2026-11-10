@@ -525,7 +525,9 @@ async fn offboard_cancels_when_fees_change_after_lost_session() {
 	wallet.offboard_all(address.clone()).await
 		.expect("offboarding again at the new fee rate should succeed");
 	ctx.generate_blocks(1).await;
-	assert_eq!(ctx.bitcoind().get_received_by_address(&address), sat(799_756));
+	// The fixture charges 2 sat/vB for 221 fixed virtual bytes plus the
+	// 22-byte witness output script: 486 sat from the 800,000-sat coin.
+	assert_eq!(ctx.bitcoind().get_received_by_address(&address), sat(799_514));
 	assert_eq!(assert_balance_consistent(&wallet, false).await.spendable, sat(0));
 }
 

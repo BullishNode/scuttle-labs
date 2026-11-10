@@ -288,11 +288,21 @@ async fn stalled_change() {
 	recipient.sync_fallback_payouts().await.unwrap();
 	assert!(recipient.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
 	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
+	let payout_start_height = ctx.bitcoind().sync_client().get_block_count().unwrap();
 	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
 	ctx.generate_blocks(2).await;
 	let payout = tokio::time::timeout(Duration::from_secs(30), async {
 		'payout: loop {
-			for txid in ctx.bitcoind().sync_client().get_raw_mempool().unwrap() {
+			let core = ctx.bitcoind().sync_client();
+			for height in payout_start_height + 1..=core.get_block_count().unwrap() {
+				let hash = core.get_block_hash(height).unwrap();
+				for tx in core.get_block(&hash).unwrap().txdata {
+					if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(98_000)) {
+						break 'payout tx;
+					}
+				}
+			}
+			for txid in core.get_raw_mempool().unwrap() {
 				let tx = ctx.bitcoind().await_transaction(txid).await;
 				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(98_000)) { break 'payout tx; }
 			}
