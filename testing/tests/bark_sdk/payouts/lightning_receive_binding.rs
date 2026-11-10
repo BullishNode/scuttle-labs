@@ -96,11 +96,16 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 
 	let invoice = provider.bolt11_invoice_for_address(amount, address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	// A Created-invoice retry still checks the supplied destination first.
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		request(hash, &changed_mailbox_address), "invoice already exists for another claim destination").await;
-	assert_eq!(rpc.start_lightning_receive(request(hash, &address)).await.unwrap().into_inner().bolt11, invoice.to_string());
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
+	let claim_pubkey = sub.claim_pubkey.expect("SDK receive has a claim key").serialize().to_vec();
+	// A Created-invoice retry still checks the supplied destination first.
+	let mut changed_retry = request(hash, &changed_mailbox_address);
+	changed_retry.claim_pubkey = Some(claim_pubkey.clone());
+	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
+		changed_retry, "invoice already exists for another claim destination").await;
+	let mut exact_retry = request(hash, &address);
+	exact_retry.claim_pubkey = Some(claim_pubkey);
+	assert_eq!(rpc.start_lightning_receive(exact_retry).await.unwrap().into_inner().bolt11, invoice.to_string());
 	assert_eq!(sub.claim_destination_user_pubkey, Some(recipient_key));
 	assert_eq!(sub.claim_destination_mailbox_pk, Some(recipient.mailbox_identifier().as_pubkey()));
 	lightning.sync().await;
