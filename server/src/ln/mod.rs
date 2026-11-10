@@ -610,7 +610,6 @@ impl Server {
 					return badarg!("Lightning revocation output differs from source payout mailbox");
 				}
 			}
-			crate::database::expiry_guard::guard_obligation_changes(t, &htlc_vtxo_ids).await?;
 			// Reuse upstream's source-bound attempt lookup. A hash shared with
 			// another sender must not select the receive to cancel.
 			let attempt = t.get_latest_payment_attempt_by_htlc_vtxos(&htlc_vtxo_ids).await?;

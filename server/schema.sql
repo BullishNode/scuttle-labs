@@ -500,27 +500,6 @@ $$;
 
 
 --
--- Name: require_customer_coin_owner(); Type: FUNCTION; Schema: public; Owner: -
---
-
-CREATE FUNCTION public.require_customer_coin_owner() RETURNS trigger
-    LANGUAGE plpgsql
-    AS $$
-BEGIN
-	IF (SELECT expiry_payouts FROM server_mode WHERE singleton)
-		AND NEW.spend_state IN ('spendable', 'unregistered', 'unclaimed', 'htlc-recv-unclaimed')
-		AND NOT (NEW.spend_state = 'unclaimed' AND NEW.policy =
-			decode('0002dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c', 'hex'))
-		AND NOT EXISTS (SELECT 1 FROM coin_owner WHERE vtxo_id=NEW.vtxo_id)
-	THEN
-		RAISE EXCEPTION 'customer VTXO has no coin_owner' USING ERRCODE='23514';
-	END IF;
-	RETURN NEW;
-END;
-$$;
-
-
---
 -- Name: virtual_transaction_history_trigger(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -663,8 +642,8 @@ CREATE TABLE public.board_exit (
     funding_outpoint text NOT NULL,
     funding_spk bytea NOT NULL,
     exit_txid text NOT NULL,
-    owner_mailbox text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
+    owner_mailbox text,
     CONSTRAINT board_exit_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66)))
 );
 
@@ -840,21 +819,6 @@ CREATE TABLE public.expiry_allocation (
 
 
 --
--- Name: expiry_payout_attempt; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.expiry_payout_attempt (
-    allocation_id bigint NOT NULL,
-    txid text NOT NULL,
-    signed_tx bytea NOT NULL,
-    fee_sat bigint NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT expiry_payout_attempt_fee_sat_check CHECK ((fee_sat >= 0)),
-    CONSTRAINT expiry_payout_attempt_txid_check CHECK ((length(txid) = 64))
-);
-
-
---
 -- Name: expiry_allocation_coin; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -869,8 +833,8 @@ CREATE TABLE public.expiry_allocation_coin (
     fee_sat bigint NOT NULL,
     payout_sat bigint NOT NULL,
     forfeited_sat bigint NOT NULL,
-    subsidy_sat bigint DEFAULT 0 NOT NULL,
     evidence jsonb NOT NULL,
+    subsidy_sat bigint DEFAULT 0 NOT NULL,
     CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND (user_pubkey IS NOT NULL) AND (spk IS NOT NULL) AND ((gross_sat + subsidy_sat) = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0) AND (subsidy_sat = 0)))),
     CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
     CONSTRAINT expiry_allocation_coin_fee_sat_check CHECK ((fee_sat >= 0)),
@@ -908,6 +872,21 @@ ALTER SEQUENCE public.expiry_allocation_id_seq OWNED BY public.expiry_allocation
 CREATE TABLE public.expiry_allocation_input (
     allocation_id bigint NOT NULL,
     vtxo_id text NOT NULL
+);
+
+
+--
+-- Name: expiry_payout_attempt; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_payout_attempt (
+    allocation_id bigint NOT NULL,
+    txid text NOT NULL,
+    signed_tx bytea NOT NULL,
+    fee_sat bigint NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT expiry_payout_attempt_fee_sat_check CHECK ((fee_sat >= 0)),
+    CONSTRAINT expiry_payout_attempt_txid_check CHECK ((length(txid) = 64))
 );
 
 
@@ -1738,9 +1717,7 @@ CREATE TABLE public.round_part_output (
     participation_id bigint NOT NULL,
     policy bytea NOT NULL,
     amount bigint NOT NULL,
-    unblinded_mailbox_id text,
-    output_index integer,
-    CONSTRAINT round_part_output_output_index_check CHECK ((output_index >= 0))
+    unblinded_mailbox_id text
 );
 
 
@@ -2701,22 +2678,6 @@ ALTER TABLE ONLY public.expiry_allocation
 
 
 --
--- Name: expiry_payout_attempt expiry_payout_attempt_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_payout_attempt
-    ADD CONSTRAINT expiry_payout_attempt_pkey PRIMARY KEY (allocation_id, txid);
-
-
---
--- Name: expiry_payout_attempt expiry_payout_attempt_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_payout_attempt
-    ADD CONSTRAINT expiry_payout_attempt_txid_key UNIQUE (txid);
-
-
---
 -- Name: expiry_allocation expiry_allocation_sweep_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2770,6 +2731,22 @@ ALTER TABLE ONLY public.expiry_lightning_receive_claim
 
 ALTER TABLE ONLY public.expiry_lightning_receive_claim
     ADD CONSTRAINT expiry_lightning_receive_claim_pkey PRIMARY KEY (source_vtxo_id);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_pkey PRIMARY KEY (allocation_id, txid);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_txid_key UNIQUE (txid);
 
 
 --
@@ -3286,8 +3263,6 @@ CREATE INDEX round_part_input_participation_id_ix ON public.round_part_input USI
 
 CREATE INDEX round_part_output_participation_id_ix ON public.round_part_output USING btree (participation_id);
 
-CREATE UNIQUE INDEX round_part_output_position ON public.round_part_output USING btree (participation_id, output_index) WHERE (output_index IS NOT NULL);
-
 
 --
 -- Name: round_participation_round_id_null_ix; Type: INDEX; Schema: public; Owner: -
@@ -3423,13 +3398,6 @@ CREATE INDEX wallet_changeset_kind_ix ON public.wallet_changeset USING btree (ki
 
 
 --
--- Name: vtxo customer_coin_owner; Type: TRIGGER; Schema: public; Owner: -
---
-
-CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.require_customer_coin_owner();
-
-
---
 -- Name: integration_api_key integration_api_key_update; Type: TRIGGER; Schema: public; Owner: -
 --
 
@@ -3525,14 +3493,6 @@ ALTER TABLE ONLY public.coin_owner
 
 
 --
--- Name: expiry_payout_attempt expiry_payout_attempt_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_payout_attempt
-    ADD CONSTRAINT expiry_payout_attempt_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
-
-
---
 -- Name: expiry_allocation_coin expiry_allocation_coin_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3586,6 +3546,14 @@ ALTER TABLE ONLY public.expiry_lightning_receive_claim
 
 ALTER TABLE ONLY public.expiry_lightning_receive_claim
     ADD CONSTRAINT expiry_lightning_receive_claim_subscription_id_fkey FOREIGN KEY (subscription_id) REFERENCES public.lightning_htlc_subscription(id);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
 
 
 --

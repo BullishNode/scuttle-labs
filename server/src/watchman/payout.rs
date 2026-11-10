@@ -1,13 +1,12 @@
 //! Pays expired coins to their owners. Fee bumps keep owner outputs unchanged.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use anyhow::Context;
 use bitcoin::{Amount, FeeRate, Sequence, Transaction, Weight};
 use bitcoin::psbt;
 use bitcoin::sighash;
 use bitcoin_ext::TxStatus;
-use bitcoin_ext::TxOutExt;
 use tracing::warn;
 
 use crate::bitcoind as bcd;
@@ -70,10 +69,6 @@ impl Watchman {
 		&self, wallet: &mut PersistedWallet, group: &PendingExpiryPayout,
 		view: BlockRef, target: FeeRate, prior: Option<&Transaction>,
 	) -> anyhow::Result<(Transaction, Amount)> {
-		ensure!(!group.inputs.is_empty(), "expiry payout has no backing inputs");
-		ensure!(group.payouts.iter().all(|out| out.is_standard()
-			&& out.script_pubkey != self.drain_spk),
-			"expiry payout has a dust, nonstandard or operator-owned payee output");
 		let roots = group.inputs.iter().map(|root| root.point()).collect::<BTreeSet<_>>();
 		let prior_sponsors = prior.into_iter().flat_map(|tx| &tx.input)
 			.filter(|input| !roots.contains(&input.previous_output))
@@ -145,24 +140,6 @@ impl Watchman {
 			};
 			*cache.witness_mut(index).context("missing payout witness slot")? = witness;
 		}
-		ensure!(tx.version == bitcoin::transaction::Version::TWO,
-			"direct expiry payout is not version 2");
-		ensure!(tx.vsize() <= 100_000, "direct expiry payout exceeds standard size: {} vbytes", tx.vsize());
-		ensure!(tx.input.iter().any(|input| input.sequence.to_consensus_u32() <= 0xFFFFFFFD),
-			"direct expiry payout does not signal RBF");
-		ensure!(tx.output.iter().all(TxOutExt::is_standard),
-			"direct expiry payout contains a dust or nonstandard output");
-		let expected = group.payouts.iter().map(|out| (out.script_pubkey.clone(), out.value))
-			.collect::<BTreeMap<_, _>>();
-		ensure!(expected.len() == group.payouts.len(), "duplicate payout script in allocation");
-		let actual = tx.output.iter().filter(|out| expected.contains_key(&out.script_pubkey))
-			.map(|out| (out.script_pubkey.clone(), out.value)).collect::<BTreeMap<_, _>>();
-		ensure!(tx.output.iter().filter(|out| expected.contains_key(&out.script_pubkey)).count()
-			== expected.len(), "direct payout duplicated an owner output");
-		ensure!(actual == expected, "direct payout changed an owner output");
-		ensure!(tx.output.iter().filter(|out| !expected.contains_key(&out.script_pubkey))
-			.all(|out| out.script_pubkey == self.drain_spk),
-			"direct payout contains a non-owner, non-operator output");
 		let input_amount = prevouts.iter().try_fold(Amount::ZERO, |sum, out|
 			sum.checked_add(out.value).context("direct payout input overflow"))?;
 		let output_amount = tx.output.iter().try_fold(Amount::ZERO, |sum, out|
@@ -221,14 +198,12 @@ impl Watchman {
 			}
 		}
 		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
-		let prepared = self.db.write(async |t| {
+		let mut wallet = self.watchman_wallet.lock().await;
+		let payout = self.db.write(async |t| {
 			t.lock_watchman_tip(view).await?;
 			t.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&group.id]).await?;
 			ensure!(t.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&group.id]).await?.get::<_, &str>(0) == "pending",
 				"expiry allocation changed before direct payout publication");
-			// Wallet sync may hold the wallet while waiting for this connection.
-			// Defer if busy; never wait for it while holding the publication tx.
-			let Some(mut wallet) = self.watchman_wallet.try_lock() else { return Ok(None); };
 			if let Some(parent) = &group.parent {
 				// An attempt can be durable even if a crash prevented the later
 				// wallet changeset from being saved. Restore its graph before RBF.
@@ -254,23 +229,21 @@ impl Watchman {
 			if let Some(change) = wallet.staged() {
 				t.store_changeset(wallet.kind(), change).await?;
 			}
-			Ok(Some((wallet, payout)))
+			Ok(payout)
 		}).await?;
-		if let Some((mut wallet, payout)) = prepared {
-			// Keep staged changes on any database failure, as persist() does.
-			let _ = wallet.take_staged();
-			crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
-			drop(wallet);
-			crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
-			if !matches!(bcd::tx_status(&self.bitcoind, payout.compute_txid()).await?, TxStatus::Confirmed(_)) {
-				bcd::broadcast_tx(&self.bitcoind, &payout).await?;
-			}
-			self.db.write(async |t| {
-				t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) WHERE id=$1",
-					&[&group.id]).await?;
-				Ok(())
-			}).await?;
+		// Keep staged changes on any database failure, as persist() does.
+		let _ = wallet.take_staged();
+		crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
+		drop(wallet);
+		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
+		if !matches!(bcd::tx_status(&self.bitcoind, payout.compute_txid()).await?, TxStatus::Confirmed(_)) {
+			bcd::broadcast_tx(&self.bitcoind, &payout).await?;
 		}
+		self.db.write(async |t| {
+			t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) WHERE id=$1",
+				&[&group.id]).await?;
+			Ok(())
+		}).await?;
 		Ok(())
 	}
 

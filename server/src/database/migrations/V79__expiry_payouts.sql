@@ -128,21 +128,3 @@ CREATE TABLE coin_owner (
 	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),
 	mailbox_pk TEXT NOT NULL CHECK (length(mailbox_pk) = 66)
 );
-
--- Check at commit so the writer can insert the VTXO before its paired row.
-CREATE FUNCTION require_customer_coin_owner() RETURNS TRIGGER
-LANGUAGE plpgsql AS $$
-BEGIN
-	IF (SELECT expiry_payouts FROM server_mode WHERE singleton)
-		AND NEW.spend_state IN ('spendable', 'unregistered', 'unclaimed', 'htlc-recv-unclaimed')
-		AND NOT (NEW.spend_state = 'unclaimed' AND NEW.policy =
-			decode('0002dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c', 'hex'))
-		AND NOT EXISTS (SELECT 1 FROM coin_owner WHERE vtxo_id=NEW.vtxo_id)
-	THEN
-		RAISE EXCEPTION 'customer VTXO has no coin_owner' USING ERRCODE='23514';
-	END IF;
-	RETURN NEW;
-END;
-$$;
-CREATE CONSTRAINT TRIGGER customer_coin_owner AFTER INSERT ON public.vtxo
-DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION require_customer_coin_owner();

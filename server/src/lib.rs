@@ -846,17 +846,13 @@ impl Server {
 		// inserted-row count returned by execute_vtxo_tree_update, which makes
 		// the fresh-vs-retry decision atomic with the write rather than
 		// depending on a separate racy pre-read.
-		// The funding root is already spent by the signed board exit. Insert it
-		// in that state, rather than transiently classifying the server-only
-		// Expiry policy as a customer birth at the deferred ownership trigger.
-		let (roots, leaves): (Vec<_>, Vec<_>) = builder.build_server_vtxos().into_iter()
-			.partition(|output| output.id() == VtxoId::from(vtxo.chain_anchor()));
-		let leaf_ids = leaves.iter().map(|leaf| leaf.id()).collect::<Vec<_>>();
+		let outputs = builder.build_server_vtxos();
+		let leaf_ids = outputs.iter().filter(|output| output.policy().user_pubkey().is_some())
+			.map(|leaf| leaf.id()).collect::<Vec<_>>();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&funding_tx)
 			.upsert_unsigned_tx([builder.exit_txid()])
-			.insert_oor_spent_vtxos(roots.into_iter().map(|root| (root, builder.exit_txid())))
-			.insert_spendable_vtxos(leaves)
+			.insert_spendable_vtxos(outputs)
 			.mark_vtxos_oor_spent(builder.spend_info());
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();

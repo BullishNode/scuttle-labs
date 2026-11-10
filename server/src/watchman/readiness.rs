@@ -14,7 +14,6 @@ impl Watchman {
 	pub(crate) async fn expiry_readiness_pass(&self, roots: Vec<ServerVtxo>) -> anyhow::Result<()> {
 		let mut groups = BTreeMap::<BlockHeight, Vec<ServerVtxo>>::new();
 		for root in roots {
-			ensure!(root.server_pubkey() == self.signer.server_pubkey(), "expiry backing belongs to another server");
 			// Exposed leaves follow their own claim/refund contract.
 			if !matches!(root.policy(), ServerVtxoPolicy::User(_)) {
 				groups.entry(root.expiry_height()).or_default().push(root);

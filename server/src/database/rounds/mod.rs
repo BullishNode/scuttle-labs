@@ -36,7 +36,11 @@ impl<'t> Tx<'t> {
 		owner_bindings: &[(VtxoId, PublicKey)],
 	) -> anyhow::Result<()> {
 		let input_vtxos = input_vtxos.into_iter().collect::<Vec<_>>();
+		// Take coin locks before participation locks, matching the expiry
+		// decision's lock order and avoiding a round/payout deadlock.
 		crate::database::expiry_guard::guard_obligation_changes(self, &input_vtxos).await?;
+		// A canceled participation cannot finish even if its inputs are no
+		// longer individually fenced for fallback.
 		for hash in signed_tree.spec.spec.vtxos.iter().map(|v| v.unlock_hash) {
 			if let Some(row) = self.query_opt("SELECT id FROM round_participation WHERE unlock_hash=$1", &[&hash.to_string()]).await? {
 				crate::database::expiry_guard::guard_participation(self, row.get("id")).await?;

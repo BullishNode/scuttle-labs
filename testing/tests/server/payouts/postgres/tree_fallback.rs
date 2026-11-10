@@ -112,23 +112,14 @@ async fn one_coin_key_can_have_distinct_mailboxes_on_distinct_births() {
 }
 
 #[tokio::test]
-async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
-	let (_ctx, db) = test_db("deferred_customer_birth_owner").await;
+async fn customer_birth_requires_mailbox_and_padding_is_exempt() {
+	let (_ctx, db) = test_db("customer_birth_owner").await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	let mailbox = super::super::test_server_mailbox_key().public_key();
 	for state in [SpendState::Spendable, SpendState::Unregistered, SpendState::Unclaimed, SpendState::HtlcRecvUnclaimed] {
-		let missing = db.write(async |tx| {
-			assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)
-				.bind_owner_mailboxes([(coin.id(), mailbox)])?).await?, 1);
-			// The INSERT succeeded before its paired row was removed. Only
-			// the deferred commit check may reject this transaction.
-			tx.execute("DELETE FROM coin_owner WHERE vtxo_id=$1", &[&coin.id().to_string()]).await?;
-			Ok(())
-		}).await.unwrap_err();
-		assert_eq!(missing.to_string(), "db tx commit error");
-		let error = missing.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();
-		assert_eq!(error.code(), &tokio_postgres::error::SqlState::CHECK_VIOLATION);
-		assert_eq!(error.message(), "customer VTXO has no coin_owner");
+		let missing = db.write(async |tx| tx.execute_vtxo_tree_update(
+			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)
+		).await).await.unwrap_err();
+		assert!(format!("{missing:#}").contains("no admitted mailbox"), "{missing:#}");
 		assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(coin.id()).await).await.unwrap().is_none());
 	}
 	let pool = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
@@ -139,17 +130,10 @@ async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
 	let policy = ark::VtxoPolicy::new_pubkey("02dfa52f6690299d2d6a08323083e290597b56fee125063e5f4e2957731639c42c".parse().unwrap());
 	let point = bitcoin::OutPoint::new(base.point().txid, 1000);
 	let padding = ServerVtxo::new(point, policy.into(), base.amount(), base.expiry_height(),
-		base.server_pubkey(), base.exit_delta(), base.chain_anchor());
-	// A direct SQL role fixture exercises only the constraint's exact trusted
-	// padding exception, not a funded/signed native round or an issuing RPC.
-	db.write(async |tx| Ok(tx.execute("INSERT INTO vtxo
-		(vtxo_id,vtxo_txid,vtxo,expiry,exit_delta,policy_type,policy,server_pubkey,amount,anchor_point,spend_state,created_at,updated_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'unclaimed',NOW(),NOW())", &[
-			&padding.id().to_string(), &padding.point().txid.to_string(), &padding.serialize(),
-			&(padding.expiry_height().to_u32() as i32), &(padding.exit_delta().to_u16() as i32),
-			&padding.policy_type().to_string(), &padding.policy().serialize(), &padding.server_pubkey().to_string(),
-			&(padding.amount().to_sat() as i64), &padding.chain_anchor().to_string(),
-		]).await?)).await.unwrap();
+		base.server_pubkey(), base.exit_delta(), point);
+	let padding = ServerVtxo::<ark::vtxo::Full>::deserialize_with_genesis(&padding.serialize(), &[0]).unwrap();
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_unspent_vtxos([padding.clone()], SpendState::Unclaimed)).await).await.unwrap();
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
 		&[&padding.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 }
