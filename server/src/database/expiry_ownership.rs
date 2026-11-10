@@ -69,9 +69,6 @@ pub struct OwnershipProposal {
 	/// These entire participations must be cancelled atomically at commit.
 	/// A proposal never cancels anything during background readiness work.
 	pub cancellations: Vec<i64>,
-	/// Only a fully validated, expired HTLC settlement can request
-	/// signed progression. Missing ownership or path proof never does.
-	pub needs_chain_progress: bool,
 	/// The write-side readiness pass warns when settlement integrity is unresolved.
 	pub settlement_integrity_hold: bool,
 }
@@ -82,7 +79,7 @@ impl OwnershipProposal {
 			id: fact.state.vtxo_id, gross: fact.state.vtxo.amount(),
 			disposition: OwnershipDisposition::Unresolved(reason), evidence: None,
 			binding_source: OwnershipBindingSource::Coin(fact.state.vtxo_id),
-			cancellations: Vec::new(), needs_chain_progress: false,
+			cancellations: Vec::new(),
 			settlement_integrity_hold: false,
 		}
 	}
@@ -354,14 +351,12 @@ impl Tx<'_> {
 					});
 				} else {
 					proposal.disposition = OwnershipDisposition::Unresolved("Lightning settlement pending");
-					proposal.needs_chain_progress = expired_contract;
 				}
 				return Ok(proposal);
 			};
 			if htlc.direction() == HtlcDirection::Outgoing && resolution == HtlcResolution::Revoked
 				&& !crate::ln::htlc_recvs_expired(&htlcs, tip, watchman_tip) {
 				proposal.disposition = OwnershipDisposition::Unresolved("Lightning receive not irrevocably expired");
-				proposal.needs_chain_progress = expired_contract;
 				return Ok(proposal);
 			}
 			if htlc.htlc.chain_resolution.is_some() { return Ok(proposal); }

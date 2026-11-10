@@ -863,7 +863,7 @@ impl Watchman {
 		vtxos: &[ServerVtxo],
 		fee_rate: FeeRate,
 	) -> anyhow::Result<()> {
-		let tx = self.build_claim_tx(vtxos, fee_rate, None).await?;
+		let tx = self.build_claim_tx(vtxos, fee_rate).await?;
 		let txid = tx.compute_txid();
 		if self.db.expiry_payouts() {
 			self.db.write(async |t| {
@@ -908,7 +908,6 @@ impl Watchman {
 		&self,
 		vtxos: &[ServerVtxo],
 		fee_rate: FeeRate,
-		payout_outputs: Option<Vec<TxOut>>,
 	) -> anyhow::Result<Transaction> {
 		let mut inputs = Vec::with_capacity(vtxos.len());
 		let mut clauses = Vec::with_capacity(vtxos.len());
@@ -977,7 +976,7 @@ impl Watchman {
 		let fee = fee_rate.fee_wu(total_weight)
 			.context("fee computation overflow")?;
 		let output_amount = match total_input_amount.checked_sub(fee) {
-			Some(rem) if rem >= P2TR_DUST || payout_outputs.is_some() => rem,
+			Some(rem) if rem >= P2TR_DUST => rem,
 			_ => bail!("insufficient funds: input {} < fee {}", total_input_amount, fee),
 		};
 
@@ -987,12 +986,10 @@ impl Watchman {
 		};
 
 		let mut tx = Transaction {
-			version: if payout_outputs.is_some() {
-				bitcoin::transaction::Version::non_standard(3)
-			} else { bitcoin::transaction::Version::TWO },
+			version: bitcoin::transaction::Version::TWO,
 			lock_time,
 			input: inputs,
-			output: payout_outputs.unwrap_or_else(|| vec![output]),
+			output: vec![output],
 		};
 
 		// Sign all inputs

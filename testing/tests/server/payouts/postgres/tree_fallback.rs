@@ -59,7 +59,7 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 		id: coin.id(), gross: coin.amount(), disposition: OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() },
 		binding_source: OwnershipBindingSource::Coin(coin.id()),
 		evidence: Some(OwnershipEvidence::Pubkey), cancellations: Vec::new(),
-		needs_chain_progress: false, settlement_integrity_hold: false,
+		settlement_integrity_hold: false,
 	};
 	let original = Attribution::Owned { mailbox_pk: server.public_key(),
 		spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, server.x_only_public_key().0, None) };
@@ -104,7 +104,7 @@ async fn one_coin_key_can_have_distinct_mailboxes_on_distinct_births() {
 		let proposal = OwnershipProposal {
 			id, gross, disposition: OwnershipDisposition::Customer { user_pubkey: key },
 			binding_source: OwnershipBindingSource::Coin(id), evidence: Some(OwnershipEvidence::Pubkey),
-			cancellations: Vec::new(), needs_chain_progress: false, settlement_integrity_hold: false,
+			cancellations: Vec::new(), settlement_integrity_hold: false,
 		};
 		assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(),
 			Attribution::Owned { mailbox_pk: mailbox, spk: ark::fallback::payout_script(mailbox) });

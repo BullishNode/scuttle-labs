@@ -213,8 +213,6 @@ impl Watchman {
 		let mut bump_target = target;
 		let mut bump = false;
 		if let Some(prior) = &group.parent {
-			ensure!(prior.version == bitcoin::transaction::Version::TWO,
-				"legacy expiry package needs its original recovery stack");
 			let status = bcd::tx_status(&self.bitcoind, prior.compute_txid()).await?;
 			if matches!(status, TxStatus::Confirmed(_)) {
 				self.db.write(async |t| {

@@ -212,7 +212,6 @@ async fn failed_swap_during_restart() {
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == source).unwrap();
 	let proposal = db.read(async |tx| tx.propose_expiry_ownership(fact, before_deadline, Some(before_deadline)).await).await.unwrap();
 	assert!(matches!(proposal.disposition, OwnershipDisposition::Unresolved(_)));
-	assert!(!proposal.needs_chain_progress);
 	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \
 		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1", &[&root.to_string()],
 	).await?.get::<_, i64>(0))).await.unwrap();
