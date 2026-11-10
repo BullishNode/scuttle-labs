@@ -3,11 +3,9 @@ pub(super) use super::owner_helpers::{owner_rows, source_rows, vtxo_replay_rows,
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::lightning::PaymentHash;
 use ark::{ProtocolEncoding, VtxoPolicy};
-use ark::address::VtxoDelivery;
 use ark::mailbox::{MailboxIdentifier, MailboxType};
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::secp256k1::Keypair;
-use ark_testing::daemon::captaind::Captaind;
 use server::database::Db;
 use server_rpc::protos;
 use bitcoin_ext::{BlockDelta, BlockHeight};
@@ -77,27 +75,25 @@ async fn arkoor_output_destination_is_atomic_and_immutable() {
 	let recipient = Keypair::new(&ark::SECP, &mut bip39::rand::thread_rng());
 	let first_mailbox = Keypair::new(&ark::SECP, &mut bip39::rand::thread_rng());
 	let other_mailbox = Keypair::new(&ark::SECP, &mut bip39::rand::thread_rng());
-	let server_pubkey = srv.ark_info().await.server_pubkey;
 	let policy = VtxoPolicy::new_pubkey(recipient.public_key());
-	let address = |mailbox: &Keypair| {
+	let blinded = |mailbox: &Keypair| {
 		let blinded_id = MailboxIdentifier::from_pubkey(mailbox.public_key())
 			.to_blinded(srv.mailbox_keypair().public_key(), &recipient).unwrap();
-		ark::Address::new(true, server_pubkey, policy.clone(),
-			vec![VtxoDelivery::ServerMailbox { blinded_id }]).to_string()
+		blinded_id.as_ref().to_vec()
 	};
 	let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints([input.clone()], policy.clone())
 		.unwrap().generate_user_nonces(&[input_key]).unwrap();
 	let output_id = builder.build_unsigned_vtxos().next().unwrap().id();
 	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	let output = request.parts[0].outputs.first_mut().unwrap();
-	output.address = Some(address(&first_mailbox));
+	output.blinded_mailbox_id = blinded(&first_mailbox);
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let original_source = source_rows(&db, &[input.id(), output_id]).await;
 	let original_owners = owner_rows(&db).await;
 	let mut rpc = srv.get_public_rpc().await;
 
 	let mut missing = request.clone();
-	missing.parts[0].outputs[0].address = None;
+	missing.parts[0].outputs[0].blinded_mailbox_id.clear();
 	let error = rpc.request_arkoor_cosign(missing).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument, "{error}");
 	assert_eq!(source_rows(&db, &[input.id(), output_id]).await, original_source);
@@ -127,7 +123,7 @@ async fn arkoor_output_destination_is_atomic_and_immutable() {
 	assert_eq!(owner_rows(&db).await, committed_owners);
 
 	let mut changed = request.clone();
-	changed.parts[0].outputs[0].address = Some(address(&other_mailbox));
+	changed.parts[0].outputs[0].blinded_mailbox_id = blinded(&other_mailbox);
 	assert!(rpc.request_arkoor_cosign(changed).await.is_err());
 	assert_eq!(source_rows(&db, &[input.id(), output_id]).await, committed_source);
 	assert_eq!(owner_rows(&db).await, committed_owners);

@@ -344,9 +344,7 @@ message VtxoRequest {
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	reserved 3;
-	optional string address = 4;
-	reserved 5;
+	bytes blinded_mailbox_id = 4;
 }
 
 message ArkoorCosignRequest {

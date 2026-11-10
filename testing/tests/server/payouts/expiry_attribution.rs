@@ -158,7 +158,7 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for part in &mut request.parts {
 		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
-			output.address = Some(super::payout_address(&srv, policy.clone(), &owner.key(500),
+			output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv, policy.clone(), &owner.key(500),
 				MailboxIdentifier::from_pubkey(owner.mailbox.public_key())).await);
 		}
 	}
@@ -182,7 +182,7 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let mut request = protos::ArkoorPackageCosignRequest::from(revoke.cosign_request());
 	for part in &mut request.parts {
 		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
-			output.address = Some(super::payout_address(&srv, VtxoPolicy::new_pubkey(refund_key.public_key()),
+			output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv, VtxoPolicy::new_pubkey(refund_key.public_key()),
 				&refund_key, MailboxIdentifier::from_pubkey(owner.mailbox.public_key())).await);
 		}
 	}

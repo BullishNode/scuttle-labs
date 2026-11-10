@@ -95,7 +95,7 @@ async fn revoke_htlc_vtxos(
 
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(address.clone());
+		output.blinded_mailbox_id = super::blinded_mailbox(&address);
 	}
 	let cosign_request = super::signed_package(srv, &[], cosign_request).await;
 

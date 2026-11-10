@@ -521,7 +521,7 @@ impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
 impl From<ArkoorDestination> for protos::ArkoorDestination {
 	fn from(v: ArkoorDestination) -> Self {
 		Self {
-			address: None,
+			blinded_mailbox_id: Vec::new(),
 			total_amount: v.total_amount.to_sat(),
 			policy: v.policy.serialize(),
 		}

@@ -71,7 +71,7 @@ async fn native_node(
 	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		let key = ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
 		if let Some(owner) = owners.iter().find(|owner| owner.key.public_key() == key) {
-			output.address = Some(super::payout_address(srv,
+			output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(srv,
 				ark::VtxoPolicy::deserialize(&output.policy).unwrap(), &owner.key,
 				owner.mailbox).await);
 		}

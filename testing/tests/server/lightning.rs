@@ -43,6 +43,14 @@ use bitcoin_ext::AmountExt;
 
 use cln_rpc::plugins::hold;
 
+fn blinded_ark_address(address: &str) -> Vec<u8> {
+	let address: ark::Address = address.parse().unwrap();
+	match address.delivery() {
+		[ark::address::VtxoDelivery::ServerMailbox { blinded_id }] => blinded_id.as_ref().to_vec(),
+		_ => panic!("test address needs one server mailbox"),
+	}
+}
+
 /// Asserts that every unspent entry in `vtxo_pool` (`spent_at IS NULL`)
 /// references a `vtxo` row with `spend_state = 'pool'`.
 async fn assert_vtxopool_consistency_db(db: &Db) {
@@ -2081,7 +2089,7 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 	} else { None };
 	for output in package.parts.iter_mut().flat_map(|part|
 		part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = address.clone();
+		output.blinded_mailbox_id = address.as_deref().map(blinded_ark_address).unwrap_or_default();
 	}
 	rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
@@ -2891,7 +2899,7 @@ async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
 	let mut valid_package = protos::ArkoorPackageCosignRequest::from(valid_builder.cosign_request());
 	for output in valid_package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(address.to_string());
+		output.blinded_mailbox_id = blinded_ark_address(&address.to_string());
 	}
 	let mut changed_mailbox = valid_package.clone();
 	let (_, recipient_pair) = recipient.client().await.pubkey_keypair(&address.policy().user_pubkey())
@@ -2904,7 +2912,7 @@ async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 			ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()), &recipient_pair).unwrap()
 		.into_address().unwrap().to_string();
 	for output in changed_mailbox.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(altered_address.clone());
+		output.blinded_mailbox_id = blinded_ark_address(&altered_address);
 	}
 	// A committed expiry fence must refuse the claim before the preimage
 	// becomes durable. Remove this synthetic fence to complete the claim.
@@ -2955,7 +2963,7 @@ async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
 	let mut retry = protos::ArkoorPackageCosignRequest::from(retry_builder.cosign_request());
 	for output in retry.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(provider_address.clone());
+		output.blinded_mailbox_id = blinded_ark_address(&provider_address);
 	}
 	let refused = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(), cosign_request: Some(retry),

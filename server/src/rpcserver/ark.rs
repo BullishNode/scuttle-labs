@@ -554,8 +554,7 @@ impl rpc::server::ArkService for Server {
 			macros::badarg!("too many parts in cosign request");
 		}
 		let destinations = DestinationBindings::from_arkoor_parts(
-			&req.parts, self.config.expiry_payouts, self.config.network,
-			self.server_pubkey, self.mailbox_key.leak_ref(),
+			&req.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
 		).badarg("invalid payout destination")?;
 		let request = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
@@ -583,8 +582,7 @@ impl rpc::server::ArkService for Server {
 			macros::badarg!("too many parts in cosign request");
 		}
 		let destinations = DestinationBindings::from_arkoor_parts(
-			&req.parts, self.config.expiry_payouts, self.config.network,
-			self.server_pubkey, self.mailbox_key.leak_ref(),
+			&req.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
 		).badarg("invalid payout destination")?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
 			.badarg("invalid cosign request")?;
@@ -660,8 +658,7 @@ impl rpc::server::ArkService for Server {
 			macros::badarg!("too many parts in cosign request");
 		}
 		let destinations = DestinationBindings::from_arkoor_parts(
-			&req.parts, self.config.expiry_payouts, self.config.network,
-			self.server_pubkey, self.mailbox_key.leak_ref(),
+			&req.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
 		).badarg("invalid payout destination")?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
@@ -819,8 +816,7 @@ impl rpc::server::ArkService for Server {
 		let payment_preimage = Preimage::from_bytes(req.payment_preimage)?;
 		let raw_cosign = req.cosign_request.badarg("cosign request missing")?;
 		let destinations = DestinationBindings::from_arkoor_parts(
-			&raw_cosign.parts, self.config.expiry_payouts, self.config.network,
-			self.server_pubkey, self.mailbox_key.leak_ref(),
+			&raw_cosign.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
 		).badarg("invalid payout destination")?;
 		let cosign_request = ArkoorPackageCosignRequest::try_from(raw_cosign)
 			.badarg("invalid cosign request")?;

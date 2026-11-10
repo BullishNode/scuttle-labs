@@ -112,7 +112,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let owner_address = super::payout_address(&srv, ark::VtxoPolicy::new_pubkey(owner.public_key()),
 		&owner, owner_mailbox).await;
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(owner_address.clone());
+		output.blinded_mailbox_id = super::blinded_mailbox(&owner_address);
 	}
 	let reply = rpc.request_lightning_pay_htlc_revocation(
 		super::signed_package(&srv, &[&wallet], cosign_request).await,
@@ -195,7 +195,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let receiver_address = super::payout_address(&srv, ark::VtxoPolicy::new_pubkey(receiver.public_key()),
 		&receiver, MailboxIdentifier::from_pubkey(receiver.public_key())).await;
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(receiver_address.clone());
+		output.blinded_mailbox_id = super::blinded_mailbox(&receiver_address);
 	}
 
 	// The backend is unavailable for the settlement call. The request

@@ -188,25 +188,24 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 	assert_eq!(first.parts.len(), replay.parts.len());
 	let own_mailbox = reopened.properties().await.unwrap().mailbox_identity.unwrap().public_key;
 	let mut reconstructed_own_destination = false;
-	let recipient_address = address.to_string();
+	let [VtxoDelivery::ServerMailbox { blinded_id: recipient_blinded }] = address.delivery() else {
+		panic!("recipient needs a server mailbox")
+	};
 	for (a, b) in first.parts.iter().zip(&replay.parts) {
 		assert_eq!(a.input_vtxo_id, b.input_vtxo_id); assert_eq!(a.use_checkpoint, b.use_checkpoint);
 		for (old, new) in [(&a.outputs, &b.outputs), (&a.isolated_outputs, &b.isolated_outputs)] {
 			assert_eq!(old.len(), new.len());
 			for (old, new) in old.iter().zip(new) {
 				assert_eq!(old.total_amount, new.total_amount); assert_eq!(old.policy, new.policy);
-				assert_eq!(old.address, new.address);
+				assert_eq!(old.blinded_mailbox_id, new.blinded_mailbox_id);
 				let key = VtxoPolicy::deserialize(&old.policy).unwrap().user_pubkey();
 				if key == address.policy().user_pubkey() {
-					assert_eq!(new.address.as_deref(), Some(recipient_address.as_str()),
-						"copied recipient address remains authoritative");
+					assert_eq!(new.blinded_mailbox_id, recipient_blinded.as_ref(),
+						"recipient blinded mailbox remains authoritative");
 				} else {
-					let own: ark::Address = new.address.as_deref().unwrap().parse().unwrap();
-					assert_eq!(own.policy(), &VtxoPolicy::deserialize(&new.policy).unwrap());
-					let [VtxoDelivery::ServerMailbox { blinded_id }] = own.delivery() else {
-						panic!("self output has no upstream mailbox")
-					};
-					assert_eq!(ark::mailbox::MailboxIdentifier::from_blinded(*blinded_id,
+					let point = bitcoin::secp256k1::PublicKey::from_slice(&new.blinded_mailbox_id).unwrap();
+					let blinded_id = ark::mailbox::BlindedMailboxIdentifier::from_pubkey(point);
+					assert_eq!(ark::mailbox::MailboxIdentifier::from_blinded(blinded_id,
 						key, &srv.mailbox_keypair()).unwrap().as_pubkey(), own_mailbox);
 					reconstructed_own_destination = true;
 				}

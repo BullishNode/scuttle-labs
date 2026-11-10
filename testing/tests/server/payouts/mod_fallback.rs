@@ -16,6 +16,14 @@ async fn payout_address(
 		.into_address().unwrap().to_string()
 }
 
+fn blinded_mailbox(address: &str) -> Vec<u8> {
+	let address: ark::Address = address.parse().unwrap();
+	match address.delivery() {
+		[ark::address::VtxoDelivery::ServerMailbox { blinded_id }] => blinded_id.as_ref().to_vec(),
+		_ => panic!("test address needs one server mailbox"),
+	}
+}
+
 /// Give hand-built outputs the mailbox selected by their creator.
 async fn signed_package(
 	srv: &Captaind, wallets: &[&Wallet], mut package: protos::ArkoorPackageCosignRequest,
@@ -23,7 +31,7 @@ async fn signed_package(
 	if !srv.config().expiry_payouts { return package; }
 	let mut addresses = std::collections::BTreeMap::new();
 	for output in package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
-		if output.address.is_some() { continue; }
+		if !output.blinded_mailbox_id.is_empty() { continue; }
 		let policy = VtxoPolicy::deserialize(&output.policy).unwrap();
 		let key = policy.user_pubkey();
 		if addresses.contains_key(&policy.serialize()) { continue; }
@@ -38,8 +46,8 @@ async fn signed_package(
 		addresses.insert(policy.serialize(), payout_address(srv, policy, &keypair, mailbox).await);
 	}
 	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		if output.address.is_some() { continue; }
-		output.address = Some(addresses[&output.policy].clone());
+		if !output.blinded_mailbox_id.is_empty() { continue; }
+		output.blinded_mailbox_id = blinded_mailbox(&addresses[&output.policy]);
 	}
 	package
 }

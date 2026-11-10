@@ -33,7 +33,7 @@ async fn cosign_htlc_send_to_pubkey(
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		assert_eq!(VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey(), owner);
-		output.address = address.clone();
+		output.blinded_mailbox_id = address.as_deref().map(super::blinded_mailbox).unwrap_or_default();
 	}
 	let mut srv_rpc = srv.get_public_rpc().await;
 	let response = srv_rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
@@ -169,14 +169,14 @@ impl captaind::proxy::ArkRpcProxy for CheckClaim {
 		}
 		let mut invalid = req.clone();
 		invalid.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap()
-			.address = Some("invalid-ark-address".to_owned());
+			.blinded_mailbox_id = vec![0xff; 33];
 		assert_eq!(upstream.claim_lightning_receive(invalid).await.unwrap_err().code(), tonic::Code::InvalidArgument);
 		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash).await, before);
 		assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before,
 			"a refused claim must leave the native payer's HTLC uncollected");
 		let mut conflict = req.clone();
-		conflict.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap().address =
-			Some(self.other_address.clone().unwrap_or_else(|| "different-invalid-ark-address".to_owned()));
+		conflict.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap().blinded_mailbox_id =
+			self.other_address.as_deref().map(super::blinded_mailbox).unwrap_or_else(|| vec![0xfe; 33]);
 		let _accepted_response = upstream.claim_lightning_receive(req.clone()).await?.into_inner();
 		wait_for_subscription_status(&self.db, hash, "settled").await;
 		let settled_before = super::expiry_admission::receive_admission_rows(&self.db, hash).await;

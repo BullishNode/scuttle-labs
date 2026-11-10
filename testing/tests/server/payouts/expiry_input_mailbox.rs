@@ -39,7 +39,7 @@ async fn mixed_input_mailboxes_are_refused_before_cosign() {
 		.generate_user_nonces(&[first_key, foreign_key]).unwrap();
 	let mixed_ids = mixed.build_unsigned_vtxos().map(|v| v.id()).collect::<Vec<_>>();
 	let mut request = protos::ArkoorPackageCosignRequest::from(mixed.cosign_request());
-	// The removed bare-mailbox representation has no address. Reject it
+	// An absent blinded mailbox has no payout destination. Reject it
 	// before cosigning or creating a coin binding.
 	let bare = rpc.request_arkoor_cosign(request.clone()).await.unwrap_err();
 	assert_eq!(bare.code(), tonic::Code::InvalidArgument);
@@ -47,7 +47,7 @@ async fn mixed_input_mailboxes_are_refused_before_cosign() {
 	assert!(db.read(async |tx| tx.coin_owner_mailboxes(&mixed_ids).await).await.unwrap().is_empty());
 	assert!(db.read(async |tx| tx.get_existing_server_vtxos_by_id(&mixed_ids).await).await.unwrap().is_empty());
 	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(super::payout_address(&srv,
+		output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv,
 			VtxoPolicy::deserialize(&output.policy).unwrap(), &recipient, mailbox).await);
 	}
 	let refusal = rpc.request_arkoor_cosign(request).await.expect_err("mixed input mailboxes must fail before cosign");
@@ -65,7 +65,7 @@ async fn mixed_input_mailboxes_are_refused_before_cosign() {
 	let accepted_ids = accepted.build_unsigned_vtxos().map(|v| v.id()).collect::<Vec<_>>();
 	let mut request = protos::ArkoorPackageCosignRequest::from(accepted.cosign_request());
 	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(super::payout_address(&srv,
+		output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv,
 			VtxoPolicy::deserialize(&output.policy).unwrap(), &recipient, mailbox).await);
 	}
 	rpc.request_arkoor_cosign(request).await.expect("same-M inputs should be cosigned");
