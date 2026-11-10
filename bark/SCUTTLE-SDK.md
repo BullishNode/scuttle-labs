@@ -16,10 +16,12 @@ wallet. Opening then requires a reachable Ark server that advertises the
 server remains usable. The server and wallet must come from the same tested
 Scuttle commit.
 
-Ark addresses retain upstream bytes. Scuttle sends the recipient's full
-address, and full addresses for the wallet's own Arkoor outputs, so the server
-can bind each output's payout mailbox at birth. A full address does not prove
-that the coin key and mailbox key share a seed. A receiving wallet must verify
+Ark addresses retain upstream bytes. For each Arkoor output the wallet sends
+the blinded mailbox identifier from the recipient's address, or derives one
+from its own output key and fixed mailbox key. The server unblinds that value
+with the output's actual coin key to bind its payout mailbox at birth. The
+blinded point does not prove that the coin key and mailbox key share a seed.
+A receiving wallet must verify
 the actual server-cosigned coin and its attested `owner_mailbox` before
 crediting it. A missing delivery or status is not acceptance.
 

@@ -1,4 +1,5 @@
 use ark_testing::TestContext;
+use ark_testing::sat;
 use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
 use bitcoin::Network;
 
@@ -24,23 +25,46 @@ async fn required_scuttle_label_refuses_offline_creation_before_store() {
 
 #[tokio::test]
 #[ignore = "requires SCUTTLE_CONSUMER_EXE built from a pinned Scuttle Git revision"]
-async fn external_git_consumer_opens_against_paired_payout_server() {
+async fn external_git_consumer_sends_and_receives_with_paired_payout_server() {
 	let consumer = std::env::var_os("SCUTTLE_CONSUMER_EXE")
 		.expect("SCUTTLE_CONSUMER_EXE must name the pinned external consumer binary");
 	let ctx = TestContext::new("bark_sdk/external_git_consumer").await;
 	let payout = ctx.captaind("payout").cfg(|cfg| cfg.expiry_payouts = true).create().await;
-	let output = tokio::process::Command::new(consumer)
-		.env("SCUTTLE_ARK_URL", payout.ark_url())
-		.env("SCUTTLE_BITCOIND_URL", ctx.bitcoind().rpc_url())
-		.env("SCUTTLE_BITCOIND_COOKIE", ctx.bitcoind().rpc_cookie())
-		.env("SCUTTLE_WALLET_DIR", ctx.datadir.join("external-consumer"))
-		.output().await.expect("run external consumer");
+	let run = |action: &'static str, destination: Option<String>| {
+		let mut command = tokio::process::Command::new(&consumer);
+		command.env("SCUTTLE_ARK_URL", payout.ark_url())
+			.env("SCUTTLE_BITCOIND_URL", ctx.bitcoind().rpc_url())
+			.env("SCUTTLE_BITCOIND_COOKIE", ctx.bitcoind().rpc_cookie())
+			.env("SCUTTLE_WALLET_DIR", ctx.datadir.join("external-consumer"))
+			.env("SCUTTLE_ACTION", action);
+		if let Some(address) = destination {
+			command.env("SCUTTLE_SEND_ADDRESS", address)
+				.env("SCUTTLE_SEND_SATS", "50000");
+		}
+		command
+	};
+	let output = run("address", None).output().await.expect("run external consumer");
 	assert!(output.status.success(), "consumer exit: {}\nstdout: {}\nstderr: {}",
 		output.status,
 		String::from_utf8_lossy(&output.stdout),
 		String::from_utf8_lossy(&output.stderr),
 	);
-	assert!(String::from_utf8_lossy(&output.stdout).contains("scuttle-1 wallet open"));
+	let address_line = String::from_utf8_lossy(&output.stdout);
+	let address = address_line.trim().strip_prefix("scuttle-1 wallet open: ")
+		.expect("external consumer produced an Ark address").parse().unwrap();
+	let sender = ctx.bark_sdk("sender", &payout).boarded(sat(400_000)).create().await;
+	sender.send_arkoor_payment(&address, sat(100_000)).await.unwrap();
+	let received = run("sync", None).output().await.expect("sync external consumer");
+	assert!(received.status.success(), "external receive: {}", String::from_utf8_lossy(&received.stderr));
+	assert!(String::from_utf8_lossy(&received.stdout).contains("scuttle-1 spendable: 100000"),
+		"external balance: {}", String::from_utf8_lossy(&received.stdout));
+	let return_address = sender.new_address().await.unwrap();
+	let sent = run("send", Some(return_address.to_string())).output().await.expect("external send");
+	assert!(sent.status.success(), "external send: {}", String::from_utf8_lossy(&sent.stderr));
+	assert!(String::from_utf8_lossy(&sent.stdout).contains("scuttle-1 sent: 50000"));
+	sender.sync_mailbox().await.unwrap();
+	assert!(sender.balance().await.unwrap().spendable >= sat(340_000),
+		"sender did not credit the return payment");
 }
 
 #[tokio::test]
