@@ -872,7 +872,6 @@ async fn stepwise_round() {
 	// need the chain).
 	let full_input = bark.get_full_vtxo(inputs[0].vtxo.id()).await.unwrap();
 	let participation = RoundParticipation {
-		owner_proofs: Default::default(),
 		inputs: vec![full_input],
 		outputs: vec![VtxoRequest {
 			policy: VtxoPolicy::Pubkey(PubkeyVtxoPolicy {

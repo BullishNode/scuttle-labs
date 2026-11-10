@@ -2,7 +2,7 @@
 //! Round State Machine
 //!
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::fmt;
 use std::iter;
 use std::borrow::Cow;
@@ -19,7 +19,7 @@ use bitcoin::consensus::encode::{deserialize, serialize_hex};
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::key::Keypair;
-use bitcoin::secp256k1::{schnorr, PublicKey};
+use bitcoin::secp256k1::schnorr;
 use futures::future::join_all;
 use futures::{Stream, StreamExt};
 use log::{debug, error, info, trace, warn};
@@ -30,7 +30,6 @@ use ark::attestations::{
 	DelegatedRoundParticipationAttestation, ForfeitNoncesAttestation, RoundAttemptAttestation, RoundParticipationStatusAttestation,
 };
 use ark::fees::FeeValidationError;
-use ark::fallback::OwnerLink;
 use ark::forfeit::HashLockedForfeitBundle;
 use ark::musig::{self, PublicNonce, SecretNonce};
 use ark::rounds::{RoundAttempt, RoundEvent, RoundFinished, RoundSeq, ROUND_TX_VTXO_TREE_VOUT};
@@ -70,8 +69,6 @@ pub struct RoundParticipation {
 	/// The output VTXOs that we request in the round,
 	/// including change
 	pub outputs: Vec<VtxoRequest>,
-	/// Explicit recipient authorizations, preserved in pending participation state.
-	pub owner_proofs: BTreeMap<PublicKey, OwnerLink>,
 	/// Optional mailbox identifier for round completion notification
 	#[serde(default, skip_serializing_if = "Option::is_none", with = "ark::encode::serde::opt")]
 	pub unblinded_mailbox_id: Option<ark::mailbox::MailboxIdentifier>,
@@ -509,9 +506,6 @@ impl RoundState {
 	/// Whether every output of this participation pays back into this wallet,
 	/// the only shape [RoundState::try_shrink_participation] can rebuild.
 	async fn is_self_refresh(&self, wallet: &Wallet) -> anyhow::Result<bool> {
-		// Preserve supplied recipient bindings even if the local store also knows
-		// a coin key. A self-refresh must not replace the authorized recipient.
-		if !self.participation.owner_proofs.is_empty() { return Ok(false); }
 		for output in self.participation.outputs.iter() {
 			let user_pubkey = match output.policy {
 				VtxoPolicy::Pubkey(PubkeyVtxoPolicy { user_pubkey }) => user_pubkey,
@@ -1219,14 +1213,7 @@ async fn start_attempt(
 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
 		.map_err(HarkForfeitError::Err)?;
 
-	let links = wallet.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
-		&participation.owner_proofs, ark_info.mailbox_pubkey).await?;
-	let mut requests = signed_reqs.into_iter().map(Into::into).collect::<Vec<protos::SignedVtxoRequest>>();
-	for request in &mut requests {
-		let output = request.vtxo.as_mut().context("missing round output")?;
-		let key = VtxoPolicy::deserialize(&output.policy)?.user_pubkey();
-		output.owner_proof = links.get(&key).copied().map(Into::into);
-	}
+	let requests = signed_reqs.into_iter().map(Into::into).collect::<Vec<protos::SignedVtxoRequest>>();
 	let resp = srv.client.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: input_vtxos,
 		vtxo_requests: requests,
@@ -2140,9 +2127,6 @@ impl Wallet {
 		participation: RoundParticipation,
 		movement_kind: Option<RoundMovement>,
 	) -> anyhow::Result<StoredRoundState> {
-		let (_, info) = self.require_server().await?;
-		self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
-			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		for output in &participation.outputs {
 			let key = output.policy.user_pubkey();
 			ensure!(self.pubkey_keypair(&key).await?.is_some(),
@@ -2203,9 +2187,6 @@ impl Wallet {
 		// Pending participations over the same inputs stand: the server drops
 		// the ones it holds when it stores this submission, and they notice
 		// on their next sync.
-		let (_, info) = self.require_server().await?;
-		self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
-			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		for output in &participation.outputs {
 			let key = output.policy.user_pubkey();
 			ensure!(self.pubkey_keypair(&key).await?.is_some(),
@@ -2262,7 +2243,7 @@ impl Wallet {
 		movement_id: Option<MovementId>,
 		scheduled_height: Option<BlockHeight>,
 	) -> anyhow::Result<StoredRoundState<Unlocked>> {
-		let (mut srv, info) = self.require_server().await?;
+		let (mut srv, _) = self.require_server().await?;
 
 		// Get mailbox identifier for VTXO delivery
 		let unblinded_mailbox_id = self.mailbox_identifier();
@@ -2287,13 +2268,10 @@ impl Wallet {
 			});
 		}
 
-		let links = self.output_owner_links(participation.outputs.iter().map(|o| o.policy.user_pubkey()),
-			&participation.owner_proofs, info.mailbox_pubkey).await?;
 		// Build proto VtxoRequests
 		let vtxo_requests = participation.outputs.iter()
 			.map(|req|
 				protos::VtxoRequest {
-					owner_proof: links.get(&req.policy.user_pubkey()).copied().map(Into::into),
 					policy: req.policy.serialize(),
 					amount: req.amount.to_sat(),
 			})
@@ -2451,7 +2429,6 @@ impl Wallet {
 		let participation = RoundParticipation {
 			inputs,
 			outputs,
-			owner_proofs: BTreeMap::new(),
 			unblinded_mailbox_id: Some(self.mailbox_identifier()),
 		};
 

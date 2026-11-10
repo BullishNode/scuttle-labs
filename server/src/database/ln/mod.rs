@@ -522,8 +522,17 @@ impl<'t> Tx<'t> {
 		receiver_mailbox_id: Option<&MailboxIdentifier>,
 		claim_pubkey: Option<PublicKey>,
 		claim_destination_user_pubkey: Option<PublicKey>,
+		claim_destination_mailbox_pk: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<()> {
+	if self.expiry_payouts() {
+		if claim_pubkey.is_none() || receiver_mailbox_id.is_none() {
+			return crate::error::badarg!("receive subscription requires claim key and mailbox");
+		}
+		if claim_destination_user_pubkey.is_some() != claim_destination_mailbox_pk.is_some() {
+			return crate::error::badarg!("forwarded receive has an incomplete recipient destination");
+		}
+	}
 		let payment_hash = invoice.payment_hash();
 		let mailbox_str = receiver_mailbox_id.map(|id| id.to_string());
 		let claim_pubkey_str = claim_pubkey.map(|k| k.to_string());
@@ -536,7 +545,7 @@ impl<'t> Tx<'t> {
 		self.inner_store_lightning_htlc_subscription(
 			node_id, &payment_hash.to_string(), &invoice.to_string(),
 			Some(amount_msat), mailbox_str.as_deref(), claim_pubkey_str.as_deref(),
-			claim_destination_user_pubkey, user_agent,
+			claim_destination_user_pubkey, claim_destination_mailbox_pk, user_agent,
 		).await?;
 
 		Ok(())
@@ -554,6 +563,7 @@ impl<'t> Tx<'t> {
 		receiver_mailbox_id: Option<&str>,
 		claim_pubkey: Option<&str>,
 		claim_destination_user_pubkey: Option<PublicKey>,
+		claim_destination_mailbox_pk: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<(i64, DateTime<Local>)> {
 		let requested_status = LightningHtlcSubscriptionStatus::Created;
@@ -567,21 +577,23 @@ impl<'t> Tx<'t> {
 				receiver_mailbox_id,
 				claim_pubkey,
 				claim_destination_user_pubkey,
+				claim_destination_mailbox_pk,
 				status,
 				user_agent,
 				created_at,
 				updated_at
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW())
 			RETURNING id, updated_at;
 		").await?;
 
 		let final_amount = final_amount_msat.map(|u| u as i64);
 		let claim_key = claim_destination_user_pubkey.map(|key| key.to_string());
+		let claim_mailbox = claim_destination_mailbox_pk.map(|key| key.to_string());
 		let row = self.query_one(
 			&stmt,
 			&[
 				&node_id, &payment_hash, &invoice, &final_amount, &receiver_mailbox_id,
-				&claim_pubkey, &claim_key, &requested_status, &user_agent,
+				&claim_pubkey, &claim_key, &claim_mailbox, &requested_status, &user_agent,
 			],
 		).await?;
 
@@ -822,7 +834,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent, claim_pubkey,
-				claim_destination_user_pubkey,
+				claim_destination_user_pubkey, claim_destination_mailbox_pk,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE status NOT IN ($1, $2) AND lightning_node_id = $3
@@ -848,7 +860,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT lhs.id, lhs.lightning_node_id, lhs.payment_hash, lhs.invoice,
 				lhs.status, lhs.lowest_incoming_htlc_expiry, lhs.accepted_at, lhs.user_agent,
-				lhs.claim_pubkey, lhs.claim_destination_user_pubkey,
+				lhs.claim_pubkey, lhs.claim_destination_user_pubkey, lhs.claim_destination_mailbox_pk,
 				lhs.created_at, lhs.updated_at,
 				COALESCE(array_agg(vtxo.vtxo_id::text), ARRAY[]::text[]) AS htlc_vtxos
 			FROM lightning_htlc_subscription lhs
@@ -880,7 +892,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent, claim_pubkey,
-				claim_destination_user_pubkey,
+				claim_destination_user_pubkey, claim_destination_mailbox_pk,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE id = $1
@@ -963,7 +975,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT id, lightning_node_id, payment_hash, invoice,
 				status, lowest_incoming_htlc_expiry, accepted_at, user_agent, claim_pubkey,
-				claim_destination_user_pubkey,
+				claim_destination_user_pubkey, claim_destination_mailbox_pk,
 				created_at, updated_at
 			FROM lightning_htlc_subscription
 			WHERE payment_hash = $1

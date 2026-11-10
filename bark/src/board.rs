@@ -4,7 +4,6 @@ use bitcoin::key::Keypair;
 use bitcoin::{Address, OutPoint, Psbt};
 use log::{info, warn};
 
-use ark::fallback::OwnerLink;
 use ark::board::BoardBuilder;
 use ark::fees::validate_and_subtract_fee;
 use bitcoin_ext::BlockHeight;
@@ -261,7 +260,7 @@ impl Wallet {
 			.generate_user_nonces();
 
 		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
-			owner_proof: Some(OwnerLink::new_joint(self.network().await?, ark_info.mailbox_pubkey, &self.mailbox_keypair(), &user_keypair)?.into()),
+			mailbox_id: Some(self.mailbox_identifier().as_pubkey().serialize().to_vec()),
 			amount: amount.to_sat(),
 			utxo: bitcoin::consensus::serialize(&utxo), //TODO(stevenroose) change to own
 			expiry_height: expiry_height.into(),

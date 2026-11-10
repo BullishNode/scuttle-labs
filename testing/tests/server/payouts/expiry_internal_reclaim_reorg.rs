@@ -144,7 +144,6 @@ async fn reclaim_reorg() {
 		intent_nonce: None, source_owner_signatures: Vec::new(),
 	}, &key).await).await.unwrap();
 	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
 		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, outgoing_deadline, &receiver_keypair).serialize()),

@@ -704,7 +704,7 @@ impl WalletProperties {
 		ensure!(self.mailbox_identity.is_some() || self.server_payouts != Some(true),
 			"payout wallet is missing its original mailbox identity");
 		if self.mailbox_identity.is_none() {
-			ensure!(seed.to_mailbox_keypair().public_key() == seed.legacy_mailbox_keypair().public_key(),
+			ensure!(seed.to_mailbox_keypair().public_key() == seed.mailbox.public_key(),
 				"legacy wallet mailbox key differs from its seed");
 		}
 		if let Some(identity) = &self.mailbox_identity {
@@ -731,13 +731,12 @@ impl WalletSeed {
 	/// Create a new [WalletSeed] from a given BIP-32 master seed
 	pub fn new_from_seed(network: Network, seed: &[u8; 64]) -> Self {
 		let root = bip32::Xpriv::new_master(network, seed).expect("invalid seed");
-		let mailbox_path = [ChildNumber::from_hardened_idx(86).unwrap(),
-			ChildNumber::from_hardened_idx(u32::from(network != Network::Bitcoin)).unwrap(),
-			ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
-		let mailbox = root.derive_priv(&SECP, &mailbox_path).expect("valid BIP86 path").to_keypair(&SECP);
 		let bark_path = [ChildNumber::from_hardened_idx(BARK_PURPOSE_INDEX).unwrap()];
 		let master = root.derive_priv(&SECP, &bark_path)
 			.expect("purpose is valid");
+		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
+		let mailbox = master.derive_priv(&SECP, &mailbox_path)
+			.expect("mailbox path is valid").to_keypair(&SECP);
 
 		let vtxo_path = [ChildNumber::from_hardened_idx(VTXO_KEYS_INDEX).unwrap()];
 		let vtxo = master.derive_priv(&SECP, &vtxo_path)
@@ -751,12 +750,14 @@ impl WalletSeed {
 		Self::new_from_seed(network, &mnemonic.to_seed(""))
 	}
 
-	/// Use the application's mailbox key without changing any Ark child keys or
-	/// bitcoin wallet descriptors. Supply the same key on each subsequent open.
+	/// Use the application's mailbox key without changing any Ark child keys.
+	/// Supply the same key on each subsequent open and to the onchain payout
+	/// wallet's descriptor.
 	///
 	/// The key stays in memory; only its full public identity is persisted. The
-	/// application is responsible for its backup and discovery policy. This does
-	/// not prove control of any unrelated Bitcoin wallet. The payout is `tr(M)`.
+	/// application is responsible for its backup. Opening the Ark wallet then
+	/// requires an onchain wallet that watches `tr(M)`. This does not prove
+	/// control of any unrelated Bitcoin wallet.
 	pub fn with_external_mailbox_keypair(mut self, keypair: Keypair) -> Self {
 		self.external_mailbox = Some(keypair);
 		self
@@ -777,19 +778,6 @@ impl WalletSeed {
 	fn to_mailbox_keypair(&self) -> Keypair {
 		if let Some(keypair) = self.external_mailbox { return keypair; }
 		self.mailbox
-	}
-
-	fn legacy_mailbox_keypair(&self) -> Keypair {
-		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
-		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
-	}
-
-	fn mailbox_keypair_for_mode(&self, payouts: bool, identity: Option<&MailboxIdentity>) -> Keypair {
-		if !payouts && self.external_mailbox.is_none() {
-			let legacy = self.legacy_mailbox_keypair();
-			if identity.is_none_or(|stored| stored.public_key == legacy.public_key()) { return legacy; }
-		}
-		self.to_mailbox_keypair()
 	}
 
 	fn to_recovery_mailbox_keypair(&self) -> Keypair {
@@ -1229,17 +1217,11 @@ impl Wallet {
 				(ark_info.server_pubkey, ark_info.mailbox_pubkey)
 			};
 
-		let payouts = match properties.server_payouts {
-			Some(payouts) => payouts,
-			None => self.require_server().await?.0.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
-		};
 		let builder = ark::Address::builder()
 			.testnet(network != bitcoin::Network::Bitcoin)
 			.server_pubkey(server_pubkey)
 			.pubkey_policy(keypair.public_key());
-		let builder = if payouts {
-			builder.mailbox_joint(network, mailbox_pubkey, &self.mailbox_keypair(), &keypair)
-		} else { builder.mailbox(mailbox_pubkey, self.mailbox_identifier(), &keypair) }
+		let builder = builder.mailbox(mailbox_pubkey, self.mailbox_identifier(), &keypair)
 			.context("failed to assign mailbox")?;
 		Ok(builder.into_address().context("failed to build address")?)
 	}
@@ -1344,7 +1326,7 @@ impl Wallet {
 			server_mailbox_pubkey: mailbox_pubkey,
 			server_payouts,
 			mailbox_identity: Some(MailboxIdentity { network,
-				public_key: seed.mailbox_keypair_for_mode(server_payouts.unwrap_or(true), None).public_key() }),
+			public_key: seed.to_mailbox_keypair().public_key() }),
 		};
 
 		// write the config to db
@@ -1425,12 +1407,15 @@ impl Wallet {
 		if properties.fingerprint != fingerprint {
 			bail!("incorrect mnemonic")
 		}
-		// V42 SQLite and old adaptor properties used the upstream mailbox.
-		// A wallet created offline already has an identity; preserve that key.
-		let mut seed = seed;
-		seed.mailbox = seed.mailbox_keypair_for_mode(properties.server_payouts.unwrap_or(false),
-			properties.mailbox_identity.as_ref());
+		let seed = seed;
 		properties.check_mailbox_identity(network, &seed)?;
+		if seed.external_mailbox.is_some() {
+			let onchain = args.onchain.as_ref().context(
+				"external mailbox requires an onchain wallet that watches its payout address")?;
+			let script = ark::fallback::payout_script(seed.to_mailbox_keypair().public_key());
+			ensure!(onchain.read().await.is_mine(&script).await?,
+				"onchain wallet does not watch the external mailbox payout address");
+		}
 		if properties.mailbox_identity.is_none() {
 			if properties.server_payouts.is_none() { db.set_server_payouts(false).await?; }
 			db.set_mailbox_identity(seed.mailbox_identity(network)).await?;
@@ -2475,7 +2460,6 @@ impl Wallet {
 		};
 
 		Ok(Some(RoundParticipation {
-			owner_proofs: Default::default(),
 			inputs: vtxos,
 			outputs: vec![req],
 			unblinded_mailbox_id: None,
@@ -2808,10 +2792,12 @@ impl std::ops::Drop for WalletInner {
 
 #[cfg(test)]
 mod tests {
+	use std::str::FromStr;
 	use bitcoin::{Amount, FeeRate, Network};
 	use bitcoin::secp256k1::PublicKey;
 
 	use ark::ArkInfo;
+	use ark::address::VtxoDelivery;
 	use bitcoin_ext::BlockDelta;
 	use server_rpc::client::CreateEndpointError;
 
@@ -2850,7 +2836,7 @@ mod tests {
 	}
 
 	#[test]
-	fn payout_off_preserves_upstream_and_already_bound_mailbox_keys() {
+	fn payout_mailbox_uses_upstream_derivation() {
 		let seed = || super::WalletSeed::new_from_seed(Network::Regtest, &[17; 64]);
 		let root = bitcoin::bip32::Xpriv::new_master(Network::Regtest, &[17; 64]).unwrap();
 		let path = [bitcoin::bip32::ChildNumber::from_hardened_idx(350).unwrap(),
@@ -2861,22 +2847,73 @@ mod tests {
 			server_pubkey: None, server_mailbox_pubkey: None,
 			server_payouts: Some(false), mailbox_identity: None,
 		};
-		let mut reopened = seed();
-		reopened.mailbox = reopened.mailbox_keypair_for_mode(false, None);
+		let reopened = seed();
 		props.check_mailbox_identity(Network::Regtest, &reopened).unwrap();
 		assert_eq!(reopened.to_mailbox_keypair().public_key(), upstream.public_key());
 		let bound = reopened.mailbox_identity(Network::Regtest);
-		assert_eq!(seed().mailbox_keypair_for_mode(false, Some(&bound)).public_key(), upstream.public_key());
+		assert_eq!(seed().to_mailbox_keypair().public_key(), bound.public_key);
 		assert_eq!(reopened.to_recovery_mailbox_keypair().public_key(), seed().to_recovery_mailbox_keypair().public_key());
 		assert_eq!(reopened.derive_vtxo_keypair(0).public_key(), seed().derive_vtxo_keypair(0).public_key());
-		let bip86 = seed().mailbox_identity(Network::Regtest);
-		assert_ne!(bip86.public_key, upstream.public_key());
-		assert_eq!(seed().mailbox_keypair_for_mode(true, None).public_key(), bip86.public_key);
-		// An offline-created wallet bound its BIP86 identity before knowing
-		// the server's mode; an OFF handshake must not change it on reopen.
-		assert_eq!(seed().mailbox_keypair_for_mode(false, Some(&bip86)).public_key(), bip86.public_key);
+		let bip86_path = [bitcoin::bip32::ChildNumber::from_hardened_idx(86).unwrap(),
+			bitcoin::bip32::ChildNumber::from_hardened_idx(1).unwrap(),
+			bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
+		let bip86 = root.derive_priv(&super::SECP, &bip86_path).unwrap().to_keypair(&super::SECP);
+		assert_ne!(seed().to_mailbox_keypair().public_key(), bip86.public_key());
 		let other = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[1; 32]).unwrap();
 		assert!(props.check_mailbox_identity(Network::Regtest, &seed().with_external_mailbox_keypair(other)).is_err());
+	}
+
+	#[cfg(feature = "sqlite")]
+	#[tokio::test]
+	async fn wallet_addresses_with_both_parities_unblind_to_one_payout() {
+		let (wallet, conn) = super::Wallet::offline_for_test().await;
+		let server = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[3; 32]).unwrap();
+		let mailbox_server = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[4; 32]).unwrap();
+		wallet.inner.db.set_server_pubkey(server.public_key()).await.unwrap();
+		wallet.inner.db.set_server_mailbox_pubkey(mailbox_server.public_key()).await.unwrap();
+		conn.execute("UPDATE bark_properties SET server_payouts = 1 WHERE id = 1", []).unwrap();
+		let mut parity_addresses = [None, None];
+		for _ in 0..30 {
+			let (address, _) = wallet.new_address_with_index().await.unwrap();
+			let parity = usize::from(address.policy().user_pubkey().serialize()[0] == 3);
+			parity_addresses[parity] = Some(address);
+			if parity_addresses.iter().all(Option::is_some) { break; }
+		}
+		let [Some(even), Some(odd)] = parity_addresses else { panic!("both pubkey parities not derived") };
+		assert_ne!(even.policy().user_pubkey(), odd.policy().user_pubkey());
+		// Both test networks use the same upstream `tark` address encoding.
+		let expected = [
+			"tark1pxtssqlpzqqpyr47y3e899gt0g00fu0qvnex0am6msz0fs49mpqzuk0nuv5lz6xpzqypye58qmyl9sjwfhcpjdlawr4eh0fap24yy3ch2ppvudl843mw5j6qcufv8c",
+			"tark1pxtssqlpzqqp6ldhkqxzlqavkc0eql4hzx5lh6kg5e8sme9fgm8hg08drk4vvkrpzqyp45dp04r538prj7xem6n28qcrufh49h3gy9lpjf328j455xr5s7kge5tjv6",
+		];
+		for (address, expected) in [even, odd].into_iter().zip(expected) {
+			let encoded = address.to_string();
+			assert_eq!(encoded, expected);
+			let parsed = ark::Address::from_str(&encoded).unwrap();
+			assert_eq!(parsed, address);
+			let [VtxoDelivery::ServerMailbox { blinded_id }] = parsed.delivery() else {
+				panic!("wallet issued a non-upstream mailbox delivery")
+			};
+			let recovered = ark::mailbox::MailboxIdentifier::from_blinded(
+				*blinded_id, parsed.policy().user_pubkey(), &mailbox_server,
+			).unwrap();
+			assert_eq!(recovered.as_pubkey(), wallet.mailbox_keypair().public_key());
+			assert_eq!(ark::fallback::payout_script(recovered.as_pubkey()), wallet.fallback_script());
+		}
+	}
+
+	#[cfg(feature = "sqlite")]
+	#[tokio::test]
+	async fn incoming_coin_is_rejected_when_server_binding_differs_from_wallet() {
+		let (wallet, conn) = super::Wallet::offline_for_test().await;
+		conn.execute("UPDATE bark_properties SET server_payouts = 1 WHERE id = 1", []).unwrap();
+		let id = ark::VtxoId::from_slice(&[1; 36]).unwrap();
+		let wrong = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[9; 32]).unwrap();
+		let state = server_rpc::protos::VtxoSpendState::Spendable;
+		assert!(wallet.observe_server_vtxo_status(id, &wrong.public_key().serialize(), state, false)
+			.await.is_err());
+		assert_eq!(wallet.observe_server_vtxo_status(id,
+			&wallet.mailbox_keypair().public_key().serialize(), state, false).await.unwrap(), state);
 	}
 
 	#[test]

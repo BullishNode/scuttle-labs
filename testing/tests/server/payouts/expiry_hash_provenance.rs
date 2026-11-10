@@ -132,7 +132,6 @@ async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
 		let unused = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, grants[1]).await).await.unwrap().unwrap();
 		assert_eq!(unused.htlc.offchain_resolution, None);
 		assert_eq!(unused.vtxo.oor_spent_txid, None);
-		let keys = sources.iter().map(|(_, key)| key.public_key()).collect::<Vec<_>>();
 		for index in [0, 1] {
 			let key = sources[index].1;
 			let builder = ArkoorPackageBuilder::new_claim_all_with_checkpoints([signed_grants[index].clone()],
@@ -143,7 +142,7 @@ async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
 			ids.extend(builder.build_unsigned_internal_vtxos().into_iter().map(|(v, _)| v.id()));
 			let txids = builder.virtual_transactions().map(|id| id.to_string()).collect::<Vec<_>>();
 			let source_before = super::expiry_admission::source_rows(&db, &ids).await;
-			let owners_before = super::expiry_admission::owner_rows(&db, &keys).await;
+			let owners_before = super::expiry_admission::owner_rows(&db).await;
 			let ids_text = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 			let committed = async || db.read(async |t| Ok(t.query_one("SELECT jsonb_build_object(
 				'htlcs',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM htlc_vtxo h WHERE h.payment_hash=$2),
@@ -165,7 +164,7 @@ async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
 				else { "source settlement provenance is unknown" }), "{error}");
 			assert_eq!(committed().await, before);
 			assert_eq!(super::expiry_admission::source_rows(&db, &ids).await, source_before);
-			assert_eq!(super::expiry_admission::owner_rows(&db, &keys).await, owners_before);
+			assert_eq!(super::expiry_admission::owner_rows(&db).await, owners_before);
 		}
 	}
 
@@ -208,10 +207,8 @@ async fn expiry_unused_same_hash_grant_stays_held_after_other_source_paid() {
 	let local = client.get_vtxo_by_id(grants[1]).await.unwrap();
 	assert_eq!(local.state, VtxoState::Spendable);
 	assert!(local.fallback_status.is_none());
-	assert_eq!(db.read(async |t| t.expiry_owner(recovered.user_pubkey()).await).await.unwrap(),
-		server::database::expiry_attribution::Attribution::Owned {
-			mailbox_pk: client.mailbox_keypair().public_key(), spk: client.fallback_script(),
-		});
+	assert_eq!(db.read(async |t| t.coin_owner_mailboxes(&[recovered.id()]).await).await.unwrap()
+		.get(&recovered.id()), Some(&client.mailbox_keypair().public_key()));
 	let fallback = client.fallback_script();
 	drop(client);
 

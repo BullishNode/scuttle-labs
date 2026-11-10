@@ -879,6 +879,16 @@ impl<'t> Tx<'t> {
 		if vtxo_ids.is_empty() {
 			return Ok(None);
 		}
+		if self.expiry_payouts() {
+			let admitted = self.coin_owner_mailboxes(vtxo_ids).await?;
+			for id in vtxo_ids {
+				if admitted.get(id).is_some_and(|owner| *owner != mailbox_id.as_pubkey()) {
+					return crate::error::badarg!(
+						"vtxo {} is bound to another mailbox", id,
+					);
+				}
+			}
+		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
@@ -1035,23 +1045,29 @@ impl<'t> Tx<'t> {
 		funding_outpoint: OutPoint,
 		funding_spk: &Script,
 		exit_txid: Txid,
-	) -> anyhow::Result<Txid> {
+		owner_mailbox: Option<PublicKey>,
+	) -> anyhow::Result<(Txid, Option<PublicKey>)> {
 		let insert = self.prepare_typed(
-			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid)
-			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;",
-			&[Type::TEXT, Type::BYTEA, Type::TEXT],
+			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid, owner_mailbox)
+			VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING;",
+			&[Type::TEXT, Type::BYTEA, Type::TEXT, Type::TEXT],
 		).await?;
 		let outpoint = funding_outpoint.to_string();
 		let spk = funding_spk.as_bytes();
-		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string()]).await?;
+		let mailbox = owner_mailbox.map(|key| key.to_string());
+		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string(), &mailbox]).await?;
 
 		// a separate statement, so it sees a row a concurrent insert committed
 		let select = self.prepare_typed(
-			"SELECT exit_txid FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
+			"SELECT exit_txid, owner_mailbox FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
 			&[Type::TEXT, Type::BYTEA],
 		).await?;
 		let row = self.query_one(&select, &[&outpoint, &spk]).await?;
-		Ok(Txid::from_str(row.get("exit_txid"))?)
+		let stored_mailbox = row.get::<_, Option<&str>>("owner_mailbox").map(PublicKey::from_str).transpose()?;
+		if owner_mailbox.is_some() && owner_mailbox != stored_mailbox {
+			return crate::error::badarg!("board output already has another payout mailbox");
+		}
+		Ok((Txid::from_str(row.get("exit_txid"))?, stored_mailbox))
 	}
 
 	/// Flip `wallet_commit` from FALSE to TRUE for the given offboard.

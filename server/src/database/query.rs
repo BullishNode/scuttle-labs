@@ -12,7 +12,7 @@ use std::error::Error;
 use std::fmt;
 use std::str::FromStr;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
 use bitcoin::hashes::Hash;
 use bitcoin::hex::DisplayHex;
 use bitcoin::{Amount, Txid};
@@ -298,18 +298,20 @@ pub async fn store_round_participation(
 	}
 
 	let output_stmt = tx.prepare_typed(
-		"INSERT INTO round_part_output (participation_id, policy, amount, unblinded_mailbox_id) \
-		VALUES ($1, $2, $3, $4)",
-		&[Type::INT8, Type::BYTEA, Type::INT8, Type::TEXT]
+		"INSERT INTO round_part_output (participation_id, policy, amount, unblinded_mailbox_id, output_index) \
+		VALUES ($1, $2, $3, $4, $5)",
+		&[Type::INT8, Type::BYTEA, Type::INT8, Type::TEXT, Type::INT4]
 	).await?;
 
-	for output in outputs {
+	for (index, output) in outputs.into_iter().enumerate() {
 		let unblinded_mailbox_id = output.unblinded_mailbox_id.map(|b| b.to_string());
+		let output_index = i32::try_from(index).context("too many round outputs")?;
 		tx.execute(&output_stmt, &[
 			&part_id,
 			&output.vtxo_request.policy.serialize(),
 			&(output.vtxo_request.amount.to_sat() as i64),
 			&unblinded_mailbox_id,
+			&output_index,
 		]).await?;
 	}
 
@@ -381,12 +383,16 @@ pub async fn complete_round_participation(
 	}
 
 	let output_rows = tx.query(
-		"SELECT policy, amount, unblinded_mailbox_id FROM round_part_output WHERE participation_id = $1",
+		"SELECT policy, amount, unblinded_mailbox_id, output_index FROM round_part_output \
+			WHERE participation_id = $1 ORDER BY output_index",
 		&[&part_id],
 	).await?;
 
 	let mut outputs = Vec::with_capacity(output_rows.len());
-	for row in output_rows {
+	for (index, row) in output_rows.into_iter().enumerate() {
+		if row.get::<_, Option<i32>>("output_index") != Some(i32::try_from(index)?) {
+			bail!("round output order is missing or ambiguous for participation {part_id}");
+		}
 		let policy_bytes = row.get::<_, &[u8]>("policy");
 		let amount = row.get::<_, i64>("amount");
 		let unblinded_mailbox_id_str = row.get::<_, Option<&str>>("unblinded_mailbox_id");

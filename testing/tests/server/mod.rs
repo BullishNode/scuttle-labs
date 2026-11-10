@@ -41,7 +41,6 @@ use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::attestations::ArkoorCosignAttestation;
 use ark::attestations::VtxoStatusAttestation;
-use ark::fallback::OwnerLink;
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::rounds::{Challenge, RoundAttemptAttestation, RoundEvent, RoundSeq};
 use ark::test_util::dummy::{DummyTestVtxoSpec, DUMMY_USER_KEY};
@@ -1218,7 +1217,6 @@ async fn double_spend_arkoor() {
 		protos::ArkoorPackageCosignRequest::from(cosign_request)
 	};
 
-	test_owner_link(&srv, &RANDOM_KEY).await;
 	let req1 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder1)).await;
 	let req2 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder2)).await;
 	let req3 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder3)).await;
@@ -1290,7 +1288,6 @@ async fn reject_expired_arkoor_cosign() {
 		builder.generate_user_nonces(&[vtxo_keypair]).unwrap().cosign_request(),
 	);
 
-	test_owner_link(&srv, &RANDOM_KEY).await;
 	let cosign_request = signed_package(&srv, &[&bark_client], cosign_request).await;
 
 	// Let the vtxo expire before the server sees the request.
@@ -1501,7 +1498,6 @@ async fn bad_round_input() {
 		input_vtxos: vec![],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
-				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
 			}),
@@ -1550,7 +1546,6 @@ async fn bad_round_input() {
 		input_vtxos: vec![fake_input],
 		vtxo_requests: vec![protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
-				owner_proof: Some(test_owner_link(&srv, &key).await.into()),
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
 			}),
@@ -1579,7 +1574,6 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
-				owner_proof: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({
@@ -1702,7 +1696,7 @@ async fn reject_overlong_board_cosign() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
-		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
+		mailbox_id: Some(user_key.public_key().serialize().to_vec()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
 		expiry_height,
@@ -1759,7 +1753,7 @@ async fn request_board_cosign_with_funding_tx(
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
-		owner_proof: Some(test_owner_link(&srv, &user_key).await.into()),
+		mailbox_id: Some(user_key.public_key().serialize().to_vec()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
 		expiry_height: tip + ark_info.vtxo_lifetime.to_u32(),
@@ -2605,7 +2599,7 @@ async fn test_register_board() {
 
 	// Request server to cosign the board
 	let cosign_request = protos::BoardCosignRequest {
-		owner_proof: Some(test_owner_link(&srv, &client_cosign_keypair).await.into()),
+		mailbox_id: Some(client_cosign_keypair.public_key().serialize().to_vec()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),
@@ -2802,17 +2796,11 @@ async fn undo_round() {
 	let outputs = tree.output_vtxos().collect::<Vec<_>>();
 	let output_ids = tree.internal_vtxos().map(|(v,_)| v.id().to_string())
 		.chain(outputs.iter().map(|v| v.id().to_string())).collect::<Vec<_>>();
-	let keys = db.read(async |tx| Ok(tx.query("SELECT user_pubkey FROM owner_key ORDER BY user_pubkey", &[])
-		.await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
 	let input_ids = db.read(async |tx| Ok(tx.query("SELECT i.vtxo_id FROM round_part_input i \
 		JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$1 ORDER BY i.vtxo_id",
 		&[&funding_txid.to_string()]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
 	assert!(!input_ids.is_empty());
 	let all_ids = output_ids.iter().chain(&input_ids).cloned().collect::<Vec<_>>();
-	let global_owners = async || db.read(async |tx| Ok(tx.query_one("SELECT COALESCE(jsonb_agg(to_jsonb(k) \
-		ORDER BY user_pubkey),'[]')::TEXT FROM owner_key k WHERE user_pubkey=ANY($1)", &[&keys]).await?.get::<_,String>(0))).await.unwrap();
-	let owner_keys_before = global_owners().await;
-	assert_ne!(owner_keys_before,"[]");
 	let input_owners = async || db.read(async |tx| Ok(tx.query_one("SELECT COALESCE(jsonb_agg(to_jsonb(c) \
 		ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c WHERE vtxo_id=ANY($1)", &[&input_ids]).await?.get::<_,String>(0))).await.unwrap();
 	let input_owners_before = input_owners().await;
@@ -2824,16 +2812,15 @@ async fn undo_round() {
 	let snapshot = async || db.read(async |tx| Ok(tx.query_one("SELECT jsonb_build_object(
 		'vtxos',(SELECT COALESCE(jsonb_agg(to_jsonb(v) ORDER BY vtxo_id),'[]') FROM vtxo v WHERE vtxo_id=ANY($1)),
 		'owners',(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]') FROM coin_owner c WHERE vtxo_id=ANY($1)),
-		'keys',(SELECT COALESCE(jsonb_agg(to_jsonb(k) ORDER BY user_pubkey),'[]') FROM owner_key k WHERE user_pubkey=ANY($2)),
-		'round',(SELECT to_jsonb(r) FROM round r WHERE funding_txid=$3),
-		'parts',(SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY id),'[]') FROM round_participation p WHERE round_id=$3),
+		'round',(SELECT to_jsonb(r) FROM round r WHERE funding_txid=$2),
+		'parts',(SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY id),'[]') FROM round_participation p WHERE round_id=$2),
 		'inputs',(SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY participation_id,vtxo_id),'[]') FROM round_part_input i
-			JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$3),
+			JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$2),
 		'outputs',(SELECT COALESCE(jsonb_agg(to_jsonb(o) ORDER BY participation_id,amount),'[]') FROM round_part_output o
-			JOIN round_participation p ON p.id=o.participation_id WHERE p.round_id=$3),
+			JOIN round_participation p ON p.id=o.participation_id WHERE p.round_id=$2),
 		'entitlements',(SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY vtxo_id),'[]') FROM expiry_entitlement e WHERE vtxo_id=ANY($1)),
 		'history_count',(SELECT COUNT(*) FROM vtxo_history WHERE vtxo_id=ANY($1)))::TEXT",
-		&[&all_ids,&keys,&funding_txid.to_string()]).await?.get::<_,String>(0))).await.unwrap();
+		&[&all_ids,&funding_txid.to_string()]).await?.get::<_,String>(0))).await.unwrap();
 	let before_refusal = snapshot().await;
 	// A constructed PG fence on the actual round output exercises only the
 	// transactional refusal. It rolls back together with the attempted undo.
@@ -2865,7 +2852,6 @@ async fn undo_round() {
 	assert_eq!(removed.get::<_,i64>(0),0);
 	assert_eq!(removed.get::<_,i64>(1),0);
 	assert_eq!(removed.get::<_,i64>(2),0);
-	assert_eq!(global_owners().await,owner_keys_before, "undo removes only per-coin projections, never global signed owner bindings");
 	assert_eq!(input_owners().await,input_owners_before, "original round inputs retain their admitted ownership");
 }
 
@@ -2996,8 +2982,7 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	let attestation = RoundAttemptAttestation::new(
 		challenge, input_id, &[request.clone()], &input_key,
 	);
-	let mut request = protos::SignedVtxoRequest::from(request);
-	request.vtxo.as_mut().unwrap().owner_proof = Some(wallet.owner_link(input.user_pubkey()).await.unwrap().into());
+	let request = protos::SignedVtxoRequest::from(request);
 	rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![protos::InputVtxo {
 			vtxo_id: input_id.to_bytes().to_vec(),

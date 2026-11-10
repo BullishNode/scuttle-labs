@@ -4,6 +4,7 @@ use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy};
+use ark::mailbox::MailboxIdentifier;
 use ark::arkoor::state::ServerCanCosign;
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::lightning::PaymentHash;
@@ -41,6 +42,26 @@ impl ReceiveClaimBinding {
 
 
 impl Tx<'_> {
+	/// An explicit recipient uses its own mailbox; the invoice provider's
+	/// notification mailbox is only the default recipient's payout mailbox.
+	pub(crate) async fn receive_subscription_mailbox(
+		&self, subscription: i64, claimant: PublicKey,
+	) -> anyhow::Result<Option<PublicKey>> {
+		let Some(row) = self.query_opt("SELECT claim_destination_user_pubkey,claim_destination_mailbox_pk, \
+			claim_pubkey,receiver_mailbox_id FROM lightning_htlc_subscription WHERE id=$1",
+			&[&subscription]).await? else { return Ok(None); };
+		let claimant = claimant.to_string();
+		if let Some(explicit) = row.get::<_, Option<&str>>("claim_destination_user_pubkey") {
+			if explicit != claimant { return Ok(None); }
+			return row.get::<_, Option<&str>>("claim_destination_mailbox_pk")
+				.map(str::parse).transpose().map_err(Into::into);
+		}
+		if row.get::<_, Option<&str>>("claim_pubkey") != Some(claimant.as_str()) { return Ok(None); }
+		row.get::<_, Option<&str>>("receiver_mailbox_id")
+			.map(|raw| raw.parse::<MailboxIdentifier>().map(|id| id.as_pubkey()))
+			.transpose().map_err(Into::into)
+	}
+
 	pub(crate) async fn prepare_receive_claims(&self, bindings: &[ReceiveClaimBinding]) -> anyhow::Result<()> {
 		let mut ids = bindings.iter().map(|binding| binding.source).collect::<Vec<_>>();
 		ids.sort_unstable();
@@ -51,6 +72,11 @@ impl Tx<'_> {
 				WHERE v.vtxo_id=$1 AND h.direction='outgoing' AND h.payment_hash=$2 AND s.payment_hash=$2 \
 				AND s.status IN ('htlcs-ready','settled')", &[&binding.source.to_string(), &binding.payment_hash.to_string()]).await?
 				.context("receive source is not its subscription's grant")?.get(0);
+			if self.expiry_payouts() {
+				let VtxoPolicy::Pubkey(policy) = binding.output.policy() else { unreachable!() };
+				ensure!(self.receive_subscription_mailbox(subscription, policy.user_pubkey).await?.is_some(),
+					"receive claim differs from its admitted claimant mailbox");
+			}
 			self.execute("INSERT INTO expiry_lightning_receive_claim \
 				(source_vtxo_id,subscription_id,payment_hash,output_vtxo_id,output_vtxo) VALUES($1,$2,$3,$4,$5) \
 				ON CONFLICT(source_vtxo_id) DO NOTHING", &[&binding.source.to_string(), &subscription,
@@ -68,8 +94,8 @@ impl Tx<'_> {
 	}
 
 	/// Only upstream settlement or fulfillment makes the recorded destination payable.
-	pub(crate) async fn receive_claim_recipient(&self, id: VtxoId) -> anyhow::Result<Option<(VtxoId, PublicKey)>> {
-		let Some(row) = self.query_opt("SELECT c.output_vtxo_id,c.output_vtxo FROM expiry_lightning_receive_claim c \
+	pub(crate) async fn receive_claim_recipient(&self, id: VtxoId) -> anyhow::Result<Option<(VtxoId, PublicKey, i64)>> {
+		let Some(row) = self.query_opt("SELECT c.output_vtxo_id,c.output_vtxo,c.subscription_id FROM expiry_lightning_receive_claim c \
 			JOIN vtxo v ON v.vtxo_id=c.source_vtxo_id AND v.lightning_htlc_subscription_id=c.subscription_id \
 			JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing' AND h.payment_hash=c.payment_hash \
 			JOIN lightning_htlc_subscription s ON s.id=c.subscription_id AND s.payment_hash=c.payment_hash \
@@ -80,6 +106,6 @@ impl Tx<'_> {
 		let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
 		ensure!(output.id() == output_id, "receive destination identity differs");
 		let VtxoPolicy::Pubkey(policy) = output.policy() else { bail!("receive destination is not a pubkey"); };
-		Ok(Some((output_id, policy.user_pubkey)))
+		Ok(Some((output_id, policy.user_pubkey, row.get("subscription_id"))))
 	}
 }

@@ -1,8 +1,8 @@
-/// A native daemon retains the complete signed recipient address through
+/// A native daemon retains the complete recipient address through
 /// restart and forwards the receive to that mailbox instead of its own.
 #[tokio::test]
-async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
-	let ctx = TestContext::new("barkd/forwarded_receive_to_signed_address_restart").await;
+async fn forwarded_receive_to_address_survives_barkd_restart() {
+	let ctx = TestContext::new("barkd/forwarded_receive_to_address_restart").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	srv.wait_for_vtxopool(&ctx).await;
@@ -19,12 +19,18 @@ async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
 	let address = recipient.ark_address().await;
 	let parsed = ark::Address::from_str(&address).unwrap();
 	let recipient_key = parsed.policy().user_pubkey();
-	let link = parsed.owner_link(bitcoin::Network::Regtest, server_key.public_key()).unwrap().unwrap();
-	let recipient_mailbox = MailboxIdentifier::from_blinded(link.blinded_id, recipient_key, &server_key).unwrap();
+	let blinded = parsed.delivery().iter().find_map(|delivery| match delivery {
+		VtxoDelivery::ServerMailbox { blinded_id } => Some(*blinded_id),
+		_ => None,
+	}).unwrap();
+	let recipient_mailbox = MailboxIdentifier::from_blinded(blinded, recipient_key, &server_key).unwrap();
 	let claimant_address = ark::Address::from_str(&claimant.ark_address().await).unwrap();
-	let claimant_link = claimant_address.owner_link(bitcoin::Network::Regtest, server_key.public_key()).unwrap().unwrap();
+	let claimant_blinded = claimant_address.delivery().iter().find_map(|delivery| match delivery {
+		VtxoDelivery::ServerMailbox { blinded_id } => Some(*blinded_id),
+		_ => None,
+	}).unwrap();
 	let claimant_mailbox = MailboxIdentifier::from_blinded(
-		claimant_link.blinded_id, claimant_address.policy().user_pubkey(), &server_key,
+		claimant_blinded, claimant_address.policy().user_pubkey(), &server_key,
 	).unwrap();
 	assert_ne!(recipient_mailbox, claimant_mailbox);
 	assert_eq!(recipient.bark_balance().await.spendable, Amount::ZERO);
@@ -33,7 +39,7 @@ async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
 	let amount = sat(50_000);
 	let invoice = lightning_api::generate_invoice_for_address(&claimant.client_config(), LightningInvoiceForAddressRequest {
 		amount_sat: amount.to_sat(), address: address.clone(), description: None, expiry_secs: None,
-	}).await.expect("native claimant must accept the full signed recipient address");
+	}).await.expect("native claimant must accept the full recipient address");
 	let hash = Invoice::from_str(&invoice.invoice).unwrap().payment_hash();
 	claimant.stop().await.unwrap();
 	claimant.start().await.unwrap();
@@ -61,11 +67,14 @@ async fn forwarded_receive_to_signed_address_survives_barkd_restart() {
 	assert!(!coins.is_empty());
 	assert_eq!(coins.iter().map(|coin| coin.vtxo.amount).sum::<Amount>(), amount);
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	assert_eq!(db.read(async |tx| tx.expiry_owner(recipient_key).await).await.unwrap(),
-		Attribution::Owned { mailbox_pk: recipient_mailbox.as_pubkey(),
-			spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, recipient_mailbox.as_pubkey().x_only_public_key().0, None) });
+	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap();
+	assert_eq!(sub.claim_destination_user_pubkey, Some(recipient_key));
+	assert_eq!(sub.claim_destination_mailbox_pk, Some(recipient_mailbox.as_pubkey()));
 	for coin in coins {
 		assert_eq!(coin.vtxo.user_pubkey, recipient_key);
+		assert_eq!(db.read(async |tx| tx.coin_owner_mailboxes(&[coin.vtxo.id]).await).await.unwrap()
+			.get(&coin.vtxo.id), Some(&recipient_mailbox.as_pubkey()));
 		let encoded = recipient.get_vtxo_encoded(&coin.vtxo.id.to_string()).await;
 		let full = Vtxo::<Full>::deserialize_hex(&encoded.encoded.0).unwrap();
 		let funding = ctx.bitcoind().await_transaction(full.chain_anchor().txid).await;

@@ -10,6 +10,7 @@ use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 
 use super::expiry_lightning::LightningSourceState;
+use super::expiry_ownership::OwnershipBindingSource;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
 use super::Tx;
@@ -19,12 +20,36 @@ pub(crate) const MAX_PAYOUT_VSIZE: usize = 100_000;
 pub(crate) struct FallbackClaim {
 	pub vtxo_id: VtxoId,
 	pub source_vtxo_ids: BTreeSet<VtxoId>,
+	pub binding_source: Option<OwnershipBindingSource>,
+	pub user_pubkey: PublicKey,
 	pub owner_mailbox: PublicKey,
 	pub gross: Amount,
 	pub payout: Amount,
 	pub confirmed_block: Option<BlockRef>,
 	/// Canonical N6 user discharge, independent of the superseded payout parent.
 	pub user_claimed: bool,
+}
+
+fn binding_source_from_evidence(evidence: &serde_json::Value)
+	-> anyhow::Result<Option<OwnershipBindingSource>>
+{
+	let Some(source) = evidence.get("binding_source") else { return Ok(None); };
+	let kind = source.get("kind").and_then(serde_json::Value::as_str)
+		.context("payout evidence has no binding source kind")?;
+	let parsed = match kind {
+		"coin" => OwnershipBindingSource::Coin(source.get("id").and_then(serde_json::Value::as_str)
+			.context("payout evidence has no coin id")?.parse()?),
+		"input_coins" => OwnershipBindingSource::InputCoins(source.get("ids").and_then(serde_json::Value::as_array)
+			.context("payout evidence has no input coin ids")?.iter()
+			.map(|id| -> anyhow::Result<VtxoId> { Ok(id.as_str().context("invalid input coin id")?.parse()?) })
+			.collect::<anyhow::Result<Vec<_>>>()?),
+		"subscription" => OwnershipBindingSource::Subscription(source.get("id").and_then(serde_json::Value::as_i64)
+			.context("payout evidence has no subscription id")?),
+		"allocation" => OwnershipBindingSource::Allocation(source.get("id").and_then(serde_json::Value::as_i64)
+			.context("payout evidence has no allocation id")?),
+		_ => bail!("unknown payout binding source kind"),
+	};
+	Ok(Some(parsed))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,9 +146,31 @@ impl Tx<'_> {
 		let mut outcomes = BTreeMap::new();
 		for (id, source) in sources {
 			let Some(owner) = owners.get(&id) else { continue; };
-			let matching = claims.values().filter(|claim|
-				claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(&id));
-			if let Some(outcome) = fallback_outcome(source.vtxo.amount(), matching)? {
+			let mut group = BTreeSet::from([id]);
+			loop {
+				let before = group.len();
+				for claim in claims.values().filter(|claim| claim.owner_mailbox == *owner) {
+					if let Some(OwnershipBindingSource::InputCoins(input_ids)) = &claim.binding_source {
+						if input_ids.iter().any(|input| group.contains(input)) {
+							group.extend(input_ids.iter().copied());
+						}
+					}
+				}
+				if group.len() == before { break; }
+			}
+			let principal = if group.len() == 1 { source.vtxo.amount() } else {
+				let all = group.iter().copied().collect::<Vec<_>>();
+				let all_sources = self.get_existing_server_vtxos_by_id(&all).await?;
+				let all_owners = self.coin_owner_mailboxes(&all).await?;
+				ensure!(all_sources.len() == group.len() && all_owners.len() == group.len()
+					&& all_owners.values().all(|mailbox| mailbox == owner),
+					"multi-input receipt has incomplete owner sources");
+				all_sources.values().try_fold(Amount::ZERO, |sum, source|
+					sum.checked_add(source.vtxo.amount()).context("multi-input receipt principal overflow"))?
+			};
+			let matching = claims.values().filter(|claim| claim.owner_mailbox == *owner
+				&& claim.source_vtxo_ids.iter().any(|source| group.contains(source)));
+			if let Some(outcome) = fallback_outcome(principal, matching)? {
 				outcomes.insert(id, outcome);
 			}
 		}
@@ -148,7 +195,11 @@ impl Tx<'_> {
 			.collect::<Result<BTreeSet<VtxoId>, _>>()?;
 		ensure!(grants == sub.htlc_vtxos.iter().copied().collect(), "receive grant identities differ from subscription");
 		let mut principal = Amount::ZERO;
-		let mut destinations = BTreeMap::new();
+		let claimant = sub.claim_destination_user_pubkey.or(sub.claim_pubkey)
+			.context("receive subscription has no admitted claimant")?;
+		let owner = self.receive_subscription_mailbox(sub.id, claimant).await?
+			.context("receive subscription has no admitted claimant mailbox")?;
+		let mut destinations = BTreeSet::new();
 		let mut ids = grants.iter().copied().collect::<Vec<_>>();
 		for row in rows {
 			let source: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
@@ -159,17 +210,18 @@ impl Tx<'_> {
 			let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
 			ensure!(output.id() == output_id
 				&& output.amount() == amount, "receive destination differs from its source");
-			let Some((id, key)) = self.receive_claim_recipient(source).await? else { continue; };
+			let Some((id, key, subscription)) = self.receive_claim_recipient(source).await? else { continue; };
 			ensure!(id == output.id(), "collected receive destination differs");
-			let super::expiry_attribution::Attribution::Owned { mailbox_pk, .. } = self.expiry_owner(key).await? else {
-				bail!("collected receive destination has no admitted mailbox");
-			};
-			destinations.insert(id, mailbox_pk);
+			ensure!(subscription == sub.id && key == claimant,
+				"collected receive destination differs from subscription");
+			destinations.insert(id);
 			ids.push(id);
 		}
 		let claims = self.source_fallback_claims(&ids).await?;
-		let matching = claims.values().filter(|claim| destinations.iter().any(|(id, owner)|
-			claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(id)));
+		let matching = claims.values().filter(|claim| claim.owner_mailbox == owner
+			&& ((grants.contains(&claim.vtxo_id)
+				&& claim.binding_source == Some(OwnershipBindingSource::Subscription(sub.id)))
+				|| destinations.iter().any(|id| claim.source_vtxo_ids.contains(id))));
 		fallback_outcome(principal, matching)
 	}
 
@@ -178,7 +230,7 @@ impl Tx<'_> {
 	/// or replace the wallet's independent canonical-chain confirmation check.
 	async fn fallback_claims(&self, ids: &[VtxoId], point: BlockRef) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let rows = self.query("SELECT c.vtxo_id,c.owner_mailbox,c.gross_sat,c.payout_sat,
+		let rows = self.query("SELECT c.vtxo_id,c.owner_mailbox,c.user_pubkey,c.evidence::TEXT AS evidence,c.gross_sat,c.payout_sat,
 			CASE WHEN a.status='confirmed'
 				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
@@ -192,7 +244,7 @@ impl Tx<'_> {
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=t.height AND b.hash=t.hash)
 				AND cv.processed_height=(SELECT MAX(height) FROM watchmand_block)
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=cv.processed_height AND b.hash=cv.processed_hash)) AS user_claimed
-			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,e.id AS entitlement_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
+			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,e.id AS entitlement_id,c.allocation_id,c.owner_mailbox,c.user_pubkey,c.evidence,c.gross_sat,c.fee_sat,
 				c.payout_sat,c.forfeited_sat,c.spk,c.disposition FROM expiry_entitlement e
 				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
@@ -200,7 +252,8 @@ impl Tx<'_> {
 			JOIN expiry_allocation_state a ON a.id=c.allocation_id
 			CROSS JOIN (SELECT $2::BIGINT AS processed_height,$3::TEXT AS processed_hash) cv
 			WHERE c.disposition='customer'", &[&ids, &i64::from(point.height), &point.hash.to_string()]).await?;
-		let mut claims: BTreeMap<VtxoId, FallbackClaim> = rows.into_iter().map(|row| {
+		let mut claims = BTreeMap::new();
+		for row in rows {
 			let height: Option<i64> = row.get("confirmed_height");
 			let hash: Option<&str> = row.get("confirmed_hash");
 			let confirmed_block = match (height, hash) {
@@ -208,19 +261,21 @@ impl Tx<'_> {
 				(None, None) => None,
 				_ => bail!("incomplete fallback confirmation receipt"),
 			};
+			let evidence: serde_json::Value = serde_json::from_str(row.get("evidence"))?;
 			let claim = FallbackClaim {
 				vtxo_id: row.get::<_, &str>("vtxo_id").parse()?,
 				source_vtxo_ids: BTreeSet::new(),
+				binding_source: binding_source_from_evidence(&evidence)?,
+				user_pubkey: row.get::<_, &str>("user_pubkey").parse()?,
 				owner_mailbox: row.get::<_, &str>("owner_mailbox").parse()?,
 				gross: Amount::from_sat(u64::try_from(row.get::<_, i64>("gross_sat"))?),
 				payout: Amount::from_sat(u64::try_from(row.get::<_, i64>("payout_sat"))?),
 				confirmed_block,
 				user_claimed: row.get("user_claimed"),
 			};
-			Ok((row.get::<_, &str>("vtxo_id").parse()?, claim))
-		}).collect::<anyhow::Result<_>>()?;
-		for claim in claims.values_mut() {
-			claim.source_vtxo_ids = self.fallback_claim_sources(claim).await?;
+			let mut claim = claim;
+			claim.source_vtxo_ids = self.fallback_claim_sources(&claim).await?;
+			claims.insert(claim.vtxo_id, claim);
 		}
 		Ok(claims)
 	}
@@ -234,42 +289,44 @@ impl Tx<'_> {
 		if self.coin_owner_mailboxes(&[claim.vtxo_id]).await?.get(&claim.vtxo_id) == Some(&claim.owner_mailbox) {
 			sources.insert(claim.vtxo_id);
 		}
-		let row = self.query_one("SELECT c.evidence->>'kind' FROM expiry_entitlement e \
-			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1 \
-			ORDER BY c.allocation_id LIMIT 1", &[&claim.vtxo_id.to_string()]).await?;
-		match row.get::<_, Option<&str>>(0) {
-			Some("lightning_receive_claim") => {
-				let (output, key) = self.receive_claim_recipient(claim.vtxo_id).await?
-					.context("committed receive receipt has no collected claim")?;
-				ensure!(matches!(self.expiry_owner(key).await?, super::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
-					if mailbox_pk == claim.owner_mailbox), "receive receipt differs from its admitted claimant");
-				sources.insert(output);
+		match &claim.binding_source {
+			Some(OwnershipBindingSource::Coin(id)) => {
+				ensure!(*id == claim.vtxo_id && sources.contains(id),
+					"coin receipt differs from its admitted birth binding");
 			},
-			Some("input_owner") => {
-				let mut current = self.get_server_vtxo_by_id(claim.vtxo_id).await?.vtxo;
-				let mut seen = BTreeSet::from([current.id()]);
-				loop {
-					let last = current.transactions().last().context("input-owner receipt has no source transaction")?;
-					let [input] = last.tx.input.as_slice() else { bail!("input-owner receipt is not a single-input transition"); };
-					let parent = VtxoId::from(input.previous_output);
-					ensure!(seen.insert(parent), "input-owner receipt source cycle");
-					ensure!(self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND oor_spent_txid=$2",
-						&[&parent.to_string(), &current.point().txid.to_string()]).await?.is_some(),
-						"input-owner receipt lacks its immutable source spend");
-					current = self.get_server_vtxo_by_id(parent).await?.vtxo;
-					match current.policy() {
-						ServerVtxoPolicy::Checkpoint(_) => continue,
-						ServerVtxoPolicy::User(_) => {
-							if self.coin_owner_mailboxes(&[parent]).await?.get(&parent) == Some(&claim.owner_mailbox) {
-								sources.insert(parent);
-							}
-							break;
-						},
-						_ => bail!("input-owner receipt has an unsupported source policy"),
-					}
+			Some(OwnershipBindingSource::InputCoins(ids)) => {
+				let actual = self.expiry_input_owner_sources(claim.vtxo_id).await?
+					.context("input-owner receipt lost its registered funding lineage")?;
+				ensure!(actual.iter().map(|source| source.0).collect::<Vec<_>>() == *ids
+					&& actual.iter().all(|source| source.2 == claim.owner_mailbox),
+					"input-owner receipt differs from its admitted source bindings");
+				sources.extend(ids.iter().copied());
+			},
+			Some(OwnershipBindingSource::Subscription(id)) => {
+				ensure!(self.receive_subscription_mailbox(*id, claim.user_pubkey).await?
+					== Some(claim.owner_mailbox), "receive receipt differs from its admitted claimant");
+				if self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND lightning_htlc_subscription_id=$2",
+					&[&claim.vtxo_id.to_string(), id]).await?.is_some() {
+					sources.insert(claim.vtxo_id);
 				}
+				if let Some((output, key, subscription)) = self.receive_claim_recipient(claim.vtxo_id).await? {
+					ensure!(key == claim.user_pubkey && subscription == *id,
+						"receive receipt source differs from its subscription");
+					sources.insert(output);
+				}
+				ensure!(!sources.is_empty(), "receive receipt has no admitted source");
 			},
-			_ => {},
+			Some(OwnershipBindingSource::Allocation(id)) => {
+				let row = self.query_opt("SELECT c.owner_mailbox FROM expiry_allocation_coin c \
+					JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+					WHERE c.allocation_id=$1 AND e.vtxo_id=$2 AND c.disposition='customer'",
+					&[id, &claim.vtxo_id.to_string()]).await?
+					.context("irreversible receipt lost its original allocation")?;
+				ensure!(row.get::<_, Option<&str>>(0) == Some(claim.owner_mailbox.to_string().as_str()),
+					"irreversible receipt differs from its original allocation");
+				sources.insert(claim.vtxo_id);
+			},
+			None => {},
 		}
 		Ok(sources)
 	}
@@ -278,19 +335,18 @@ impl Tx<'_> {
 	/// unregistered change output can use a fresh key in the same immutable
 	/// mailbox as its input owner; a recipient in another mailbox cannot.
 	pub(crate) async fn fallback_customer_vtxos(
-		&self, vtxos: &[(VtxoId, PublicKey)],
+		&self, vtxos: &[VtxoId],
 	) -> anyhow::Result<BTreeSet<VtxoId>> {
 		if vtxos.is_empty() { return Ok(BTreeSet::new()); }
-		let ids = vtxos.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>();
-		let keys = vtxos.iter().map(|(_, key)| key.to_string()).collect::<Vec<_>>();
-		self.query("SELECT q.vtxo_id FROM unnest($1::TEXT[],$2::TEXT[]) q(vtxo_id,user_pubkey) \
-			JOIN (SELECT DISTINCT ON (e.vtxo_id) e.vtxo_id,c.disposition,c.user_pubkey,c.owner_mailbox \
+		let ids = vtxos.iter().map(ToString::to_string).collect::<Vec<_>>();
+		self.query("SELECT q.vtxo_id FROM unnest($1::TEXT[]) q(vtxo_id) \
+			JOIN (SELECT DISTINCT ON (e.vtxo_id) e.vtxo_id,c.disposition,c.owner_mailbox \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
 				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC \
-			) c ON c.vtxo_id=q.vtxo_id LEFT JOIN owner_key k ON k.user_pubkey=q.user_pubkey \
-			WHERE c.disposition='customer' AND (c.user_pubkey=q.user_pubkey OR c.owner_mailbox=k.mailbox_pk)",
-			&[&ids,&keys]).await?.into_iter().map(|row| Ok(row.get::<_, &str>("vtxo_id").parse()?)).collect()
+			) c ON c.vtxo_id=q.vtxo_id JOIN coin_owner k ON k.vtxo_id=q.vtxo_id \
+			WHERE c.disposition='customer' AND c.owner_mailbox=k.mailbox_pk",
+			&[&ids]).await?.into_iter().map(|row| Ok(row.get::<_, &str>("vtxo_id").parse()?)).collect()
 	}
 
 	/// A group is processed as a whole. Individual-input retries would lose its
@@ -485,6 +541,7 @@ mod tests {
 		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7;32]).unwrap().public_key();
 		let mut first = FallbackClaim {
 			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
+			binding_source: None, user_pubkey: key,
 			owner_mailbox: key, gross: Amount::from_sat(40_000),
 			payout: Amount::from_sat(39_000),
 			confirmed_block: None, user_claimed: false,
@@ -496,6 +553,7 @@ mod tests {
 		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
 		let mut second = FallbackClaim {
 			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), owner_mailbox: key,
+			binding_source: None, user_pubkey: key,
 			gross: Amount::from_sat(60_000), payout: Amount::ZERO,
 			confirmed_block: None, user_claimed: false,
 		};

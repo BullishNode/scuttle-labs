@@ -1,16 +1,14 @@
-//! Authenticated payout mailbox links.
+//! Immutable sources for expiry payout mailboxes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
 
-use bitcoin::secp256k1::{Keypair, PublicKey};
-use bitcoin::{Network, ScriptBuf};
+use bitcoin::secp256k1::PublicKey;
+use bitcoin::ScriptBuf;
 
-use ark::fallback::OwnerLink;
-use ark::VtxoId;
+use ark::{ServerVtxoPolicy, VtxoId};
 
-use crate::error::OwnershipRefusal;
-use super::expiry_ownership::{OwnershipDisposition, OwnershipProposal};
+use super::expiry_ownership::{OwnershipBindingSource, OwnershipDisposition, OwnershipProposal};
 use super::Tx;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,44 +26,88 @@ impl Tx<'_> {
 				row.get::<_, &str>(1).parse()?))).collect()
 	}
 
-	/// Resolve the stage-selected key from admission's immutable binding.
-	/// Birth metadata constrains an ordinary coin, not a different entitled key
-	/// selected by an input-owner, receive-claim or participation rule.
+	/// Follow registered out-of-round spends to each user coin funding an
+	/// unregistered output. Every funding mailbox must agree.
+	pub(crate) async fn expiry_input_owner_sources(&self, id: VtxoId)
+		-> anyhow::Result<Option<Vec<(VtxoId, PublicKey, PublicKey)>>>
+	{
+		let mut pending = vec![id];
+		let mut seen = BTreeSet::from([id]);
+		let mut sources = Vec::new();
+		while let Some(current_id) = pending.pop() {
+			let current = self.get_server_vtxo_by_id(current_id).await?.vtxo;
+			let Some(last) = current.transactions().last() else { return Ok(None); };
+			if last.tx.input.is_empty() { return Ok(None); }
+			for input in &last.tx.input {
+				let parent = VtxoId::from(input.previous_output);
+				if !seen.insert(parent) { return Ok(None); }
+				let Some(row) = self.query_opt("SELECT v.vtxo_id,c.mailbox_pk FROM vtxo v \
+					LEFT JOIN coin_owner c ON c.vtxo_id=v.vtxo_id \
+					WHERE v.vtxo_id=$1 AND v.oor_spent_txid=$2",
+					&[&parent.to_string(), &current.point().txid.to_string()]).await? else { return Ok(None); };
+				let source = self.get_server_vtxo_by_id(parent).await?.vtxo;
+				match source.policy() {
+					ServerVtxoPolicy::Checkpoint(_) => pending.push(parent),
+					ServerVtxoPolicy::User(policy) => {
+						let Some(mailbox) = row.get::<_, Option<&str>>("mailbox_pk") else { return Ok(None); };
+						sources.push((parent, policy.user_pubkey(), PublicKey::from_str(mailbox)?));
+					},
+					_ => return Ok(None),
+				}
+			}
+		}
+		sources.sort_by_key(|source| source.0);
+		if sources.is_empty() || sources.iter().any(|source| source.2 != sources[0].2) { return Ok(None); }
+		Ok(Some(sources))
+	}
+
+	/// Resolve the stage-selected obligation from its immutable source record.
 	pub async fn derived_expiry_owner(&self, ownership: &OwnershipProposal) -> anyhow::Result<Attribution> {
 		let OwnershipDisposition::Customer { user_pubkey } = &ownership.disposition
 			else { return Ok(Attribution::Unresolved); };
 		if ownership.evidence.is_none() { return Ok(Attribution::Unresolved); }
-		self.expiry_owner(*user_pubkey).await
-	}
-
-	/// Verify both holders once at admission and keep the first signed binding.
-	pub async fn verify_owner_link(
-		&self, server_mailbox_key: &Keypair, user_pubkey: PublicKey,
-		link: &OwnerLink, network: Network,
-	) -> anyhow::Result<PublicKey> {
-		let mailbox = link.verify_joint(network, server_mailbox_key, user_pubkey)
-			.map_err(|_| OwnershipRefusal::Invalid(user_pubkey))?.as_pubkey();
-		self.execute("INSERT INTO owner_key (user_pubkey, mailbox_pk, blinded_id)
-			VALUES ($1, $2, $3) ON CONFLICT (user_pubkey) DO NOTHING",
-			&[&user_pubkey.to_string(), &mailbox.to_string(), &link.blinded_id.to_string()]).await?;
-		let canonical = self.query_one("SELECT mailbox_pk, blinded_id FROM owner_key WHERE user_pubkey=$1",
-			&[&user_pubkey.to_string()]).await?;
-		if canonical.get::<_, &str>("mailbox_pk") != mailbox.to_string()
-			|| canonical.get::<_, &str>("blinded_id") != link.blinded_id.to_string()
-		{
-			return Err(OwnershipRefusal::Conflicting(user_pubkey).into());
-		}
-		Ok(mailbox)
-	}
-
-	/// Read admission's immutable mailbox. No signature is replayed at payout.
-	pub async fn expiry_owner(&self, user_pubkey: PublicKey) -> anyhow::Result<Attribution> {
-		let Some(row) = self.query_opt("SELECT mailbox_pk FROM owner_key WHERE user_pubkey=$1",
-			&[&user_pubkey.to_string()]).await? else { return Ok(Attribution::Unresolved); };
-		let Ok(mailbox) = PublicKey::from_str(row.get("mailbox_pk"))
-			else { return Ok(Attribution::Unresolved); };
-		Ok(Attribution::Owned { mailbox_pk: mailbox,
-			spk: ark::fallback::payout_script(mailbox) })
+		let mailbox = match &ownership.binding_source {
+			OwnershipBindingSource::Coin(id) => {
+				if *id != ownership.id { return Ok(Attribution::Unresolved); }
+				let coin = self.get_server_vtxo_by_id(*id).await?.vtxo;
+				if !matches!(coin.policy(), ServerVtxoPolicy::User(policy) if policy.user_pubkey() == *user_pubkey) {
+					return Ok(Attribution::Unresolved);
+				}
+				self.coin_owner_mailboxes(&[*id]).await?.get(id).copied()
+			},
+			OwnershipBindingSource::InputCoins(ids) => {
+				let Some(sources) = self.expiry_input_owner_sources(ownership.id).await? else { return Ok(Attribution::Unresolved); };
+				let actual = sources.iter().map(|source| source.0).collect::<Vec<_>>();
+				if &actual != ids || !sources.iter().any(|source| source.1 == *user_pubkey) {
+					return Ok(Attribution::Unresolved);
+				}
+				Some(sources[0].2)
+			},
+			OwnershipBindingSource::Subscription(id) => {
+				let linked = self.query_opt("SELECT v.vtxo_id FROM vtxo v WHERE v.vtxo_id=$1 \
+					AND v.lightning_htlc_subscription_id=$2 UNION \
+					SELECT c.output_vtxo_id FROM expiry_lightning_receive_claim c \
+					WHERE c.output_vtxo_id=$1 AND c.subscription_id=$2",
+					&[&ownership.id.to_string(), id]).await?.is_some();
+				if !linked { return Ok(Attribution::Unresolved); }
+				self.receive_subscription_mailbox(*id, *user_pubkey).await?
+			},
+			OwnershipBindingSource::Allocation(id) => {
+				let row = self.query_opt("SELECT c.owner_mailbox,c.user_pubkey FROM expiry_allocation_coin c \
+					JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+					WHERE c.allocation_id=$1 AND e.vtxo_id=$2 AND c.disposition='customer'",
+					&[id, &ownership.id.to_string()]).await?;
+				row.and_then(|row| {
+					if row.get::<_, Option<&str>>("user_pubkey") != Some(user_pubkey.to_string().as_str()) { return None; }
+					row.get::<_, Option<&str>>("owner_mailbox").and_then(|s| PublicKey::from_str(s).ok())
+				})
+			},
+		};
+		Ok(match mailbox {
+			Some(mailbox_pk) => Attribution::Owned { mailbox_pk,
+				spk: ark::fallback::payout_script(mailbox_pk) },
+			None => Attribution::Unresolved,
+		})
 	}
 }
 

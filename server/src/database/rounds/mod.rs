@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Transaction, Txid};
 use bitcoin::consensus::serialize;
 use tokio_postgres::types::Type;
@@ -24,7 +25,7 @@ use crate::round::InteractiveParticipation;
 
 
 impl<'t> Tx<'t> {
-	#[tracing::instrument(skip(self, unsigned_funding_tx, input_vtxos, signed_tree, interactive_participations))]
+	#[tracing::instrument(skip(self, unsigned_funding_tx, input_vtxos, signed_tree, interactive_participations, owner_bindings))]
 	pub async fn finish_round(
 		&self,
 		round_seq: RoundSeq,
@@ -32,6 +33,7 @@ impl<'t> Tx<'t> {
 		input_vtxos: impl IntoIterator<Item = VtxoId>,
 		signed_tree: &CachedSignedVtxoTree,
 		interactive_participations: &HashMap<UnlockHash, InteractiveParticipation>,
+		owner_bindings: &[(VtxoId, PublicKey)],
 	) -> anyhow::Result<()> {
 		let input_vtxos = input_vtxos.into_iter().collect::<Vec<_>>();
 		crate::database::expiry_guard::guard_obligation_changes(self, &input_vtxos).await?;
@@ -119,7 +121,8 @@ impl<'t> Tx<'t> {
 			.upsert_unsigned_tx(signed_tree.unsigned_leaf_txs().iter().map(Transaction::compute_txid))
 			.insert_oor_spent_vtxos(signed_tree.internal_vtxos())
 			.insert_unclaimed_vtxos(signed_tree.output_vtxos().map(ServerVtxo::from))
-			.mark_vtxos_round_spent(input_vtxos.into_iter().map(|id| (id, round_id)));
+			.mark_vtxos_round_spent(input_vtxos.into_iter().map(|id| (id, round_id)))
+			.bind_owner_mailboxes(owner_bindings.iter().copied())?;
 		tree::execute_vtxo_tree_update(self, update).await?;
 
 		// register the funding output vtxos directly into the frontier

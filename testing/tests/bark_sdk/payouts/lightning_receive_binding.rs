@@ -2,38 +2,35 @@
 
 use std::time::Duration;
 use ark::attestations::LightningReceiveClaimAttestation;
-use ark::fallback::OwnerLink;
+use ark::address::VtxoDelivery;
+use ark::mailbox::MailboxIdentifier;
 use ark::lightning::{PaymentHash, Preimage};
 use ark::{ProtocolEncoding, VtxoPolicy, SECP};
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::daemon::captaind::ArkClient;
 use ark_testing::daemon::lightningd::Lightningd;
 use bark::actions::lightning::receive::LightningReceiveState;
-use bark::FallbackRefusal;
-use bitcoin::Network;
-use bitcoin::secp256k1::{schnorr, Keypair};
+use bitcoin::secp256k1::Keypair;
 use cln_rpc::plugins::hold;
 use server::database::Db;
 use server_rpc::protos;
 
 async fn assert_receive_start_refused(
 	rpc: &mut ArkClient, db: &Db, node: &Lightningd,
-	request: protos::StartLightningReceiveRequest, reason: Option<FallbackRefusal>,
+	request: protos::StartLightningReceiveRequest, expected_message: &str,
 ) {
 	let hash = PaymentHash::try_from(request.payment_hash.as_slice()).unwrap();
-	let destination = request.claim_destination.as_ref().unwrap();
-	let key = VtxoPolicy::deserialize(&destination.policy).unwrap().user_pubkey();
 	let snapshot = async || db.read(async |tx| {
-		let subscription = tx.query("SELECT status::TEXT, updated_at::TEXT, invoice \
+		let subscription = tx.query("SELECT status::TEXT, updated_at::TEXT, invoice, \
+			claim_destination_user_pubkey, claim_destination_mailbox_pk \
 			FROM lightning_htlc_subscription WHERE payment_hash=$1", &[&hash.to_string()]).await?
-			.into_iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1), r.get::<_, String>(2))).collect::<Vec<_>>();
+			.into_iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1), r.get::<_, String>(2),
+				r.get::<_, Option<String>>(3), r.get::<_, Option<String>>(4))).collect::<Vec<_>>();
 		let counts = tx.query_one("SELECT \
 			(SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM htlc_vtxo WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE payment_hash=$1)", &[&hash.to_string()]).await?;
-		let owner = tx.query_opt("SELECT mailbox_pk, blinded_id FROM owner_key WHERE user_pubkey=$1",
-			&[&key.to_string()]).await?.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)));
-		Ok((subscription, counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2), owner))
+		Ok((subscription, counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2)))
 	}).await.unwrap();
 	let before = snapshot().await;
 	let mut hold = node.hold_client().await;
@@ -42,12 +39,7 @@ async fn assert_receive_start_refused(
 	}).await.unwrap().into_inner().invoices;
 	let error = rpc.start_lightning_receive(request).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
-	assert_eq!(FallbackRefusal::from_status(&error), reason);
-	if reason.is_some() {
-		assert_eq!(error.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
-	} else {
-		assert!(error.message().contains("claim destination amount differs"), "{error}");
-	}
+	assert!(error.message().contains(expected_message), "{error}");
 	assert_eq!(snapshot().await, before, "refusal must preserve the exact receive and output binding state");
 	let native_after = hold.list(hold::ListRequest {
 		constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())),
@@ -69,43 +61,48 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	let recipient_key = address.policy().user_pubkey();
 	assert_ne!(provider.mailbox_identifier(), recipient.mailbox_identifier());
 	let server = srv.mailbox_keypair();
-	let valid_link = address.owner_link(bitcoin::Network::Regtest, server.public_key()).unwrap().unwrap();
+	let server_pubkey = srv.ark_info().await.server_pubkey;
 	let recipient_pair = recipient.peek_keypair(0).await.unwrap();
 	assert_eq!(recipient_pair.public_key(), recipient_key);
+	let other = Keypair::from_seckey_slice(&SECP, &[73; 32]).unwrap();
+	let other_blinded = MailboxIdentifier::from_pubkey(other.public_key())
+		.to_blinded(server.public_key(), &recipient_pair).unwrap();
+	let changed_mailbox_address = ark::Address::new(true, server_pubkey,
+		address.policy().clone(), vec![VtxoDelivery::ServerMailbox { blinded_id: other_blinded }]);
+	let wrong_server_address = ark::Address::new(true, other.public_key(),
+		address.policy().clone(), address.delivery().to_vec());
 	let amount = sat(50_000);
 	let net = amount - srv.ark_info().await.fees.lightning_receive.calculate(amount).unwrap();
-	let request = |hash: PaymentHash, link: OwnerLink| protos::StartLightningReceiveRequest {
+	let request = |hash: PaymentHash, destination: &ark::Address| protos::StartLightningReceiveRequest {
 		expiry_secs: None,
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 18,
 		mailbox_id: Some(provider.mailbox_identifier().serialize()), description: None,
 		claim_destination: Some(protos::VtxoRequest {
-			amount: net.to_sat(), policy: address.policy().serialize(), owner_proof: Some(link.into()),
+			amount: net.to_sat(), policy: address.policy().serialize(),
 		}),
 		claim_pubkey: None,
+		claim_destination_address: Some(destination.to_string()),
 	};
 	let postgres = srv.config().postgres.clone();
 	let db = Db::connect(&postgres).await.unwrap();
 	let mut rpc = srv.get_public_rpc().await;
-	assert!(db.read(async |tx| Ok(tx.query_opt("SELECT user_pubkey FROM owner_key WHERE user_pubkey=$1",
-		&[&recipient_key.to_string()]).await?)).await.unwrap().is_none());
-	let mut invalid = valid_link;
-	invalid.signature = schnorr::Signature::from_slice(&[0; 64]).unwrap();
 	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		request(Preimage::random().compute_payment_hash(), invalid), Some(FallbackRefusal::InvalidOwnerProof)).await;
-	let mut wrong_amount = request(Preimage::random().compute_payment_hash(), valid_link);
+		request(Preimage::random().compute_payment_hash(), &wrong_server_address),
+		"claim destination address differs").await;
+	let mut wrong_amount = request(Preimage::random().compute_payment_hash(), &address);
 	wrong_amount.claim_destination.as_mut().unwrap().amount += 1;
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal, wrong_amount, None).await;
-	let other = Keypair::from_seckey_slice(&SECP, &[73; 32]).unwrap();
-	let other_link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &other, &recipient_pair).unwrap();
+	assert_receive_start_refused(&mut rpc, &db, &lightning.internal, wrong_amount,
+		"claim destination amount differs").await;
 
 	let invoice = provider.bolt11_invoice_for_address(amount, address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
 	// A Created-invoice retry still checks the supplied destination first.
 	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		request(hash, invalid), Some(FallbackRefusal::InvalidOwnerProof)).await;
-	assert_eq!(rpc.start_lightning_receive(request(hash, valid_link)).await.unwrap().into_inner().bolt11, invoice.to_string());
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		request(Preimage::random().compute_payment_hash(), other_link), Some(FallbackRefusal::ConflictingOwnerBinding)).await;
+		request(hash, &changed_mailbox_address), "invoice already exists for another claim destination").await;
+	assert_eq!(rpc.start_lightning_receive(request(hash, &address)).await.unwrap().into_inner().bolt11, invoice.to_string());
+	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
+	assert_eq!(sub.claim_destination_user_pubkey, Some(recipient_key));
+	assert_eq!(sub.claim_destination_mailbox_pk, Some(recipient.mailbox_identifier().as_pubkey()));
 	lightning.sync().await;
 	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {
 		tokio::join!(
@@ -118,15 +115,12 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 					tokio::time::sleep(Duration::from_millis(50)).await;
 				};
 				let attacker = Keypair::from_seckey_slice(&SECP, &[74; 32]).unwrap();
-				let attacker_link = OwnerLink::new_joint(Network::Regtest,
-					server.public_key(), &attacker, &attacker).unwrap();
 				let expiry = lowest.saturating_sub(srv.config().htlc_expiry_delta);
 				let refused = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 					payment_hash: hash.to_vec(),
 					user_pubkey: attacker.public_key().serialize().to_vec(),
 					htlc_recv_expiry: expiry.into(),
 					lightning_receive_anti_dos: None,
-					owner_proof: Some(attacker_link.into()),
 					claim_attestation: Some(LightningReceiveClaimAttestation::new(hash, expiry, &attacker).serialize()),
 				}).await.expect_err("a foreign key won the receive grant");
 				assert_eq!(refused.code(), tonic::Code::InvalidArgument);
@@ -170,7 +164,6 @@ async fn receive_binding_self_receive_is_bound_to_the_wallet_key() {
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
 	let claim_key = sub.claim_pubkey.expect("the wallet binds its receive to a claim key");
 	assert_eq!(sub.claim_destination_user_pubkey, None);
-	let server = srv.mailbox_keypair();
 	let mut rpc = srv.get_public_rpc().await;
 	lightning.sync().await;
 	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {
@@ -184,14 +177,12 @@ async fn receive_binding_self_receive_is_bound_to_the_wallet_key() {
 					tokio::time::sleep(Duration::from_millis(50)).await;
 				};
 				let other = Keypair::from_seckey_slice(&SECP, &[75; 32]).unwrap();
-				let other_link = OwnerLink::new_joint(Network::Regtest, server.public_key(), &other, &other).unwrap();
 				let expiry = lowest.saturating_sub(srv.config().htlc_expiry_delta);
 				let refused = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
 					payment_hash: hash.to_vec(),
 					user_pubkey: other.public_key().serialize().to_vec(),
 					htlc_recv_expiry: expiry.into(),
 					lightning_receive_anti_dos: None,
-					owner_proof: Some(other_link.into()),
 					claim_attestation: Some(LightningReceiveClaimAttestation::new(hash, expiry, &other).serialize()),
 				}).await.expect_err("another key won the receive grant");
 				assert_eq!(refused.code(), tonic::Code::InvalidArgument);

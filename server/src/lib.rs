@@ -33,7 +33,7 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
-pub mod owner_proof;
+mod destination;
 pub mod recovery;
 mod round;
 pub mod telemetry;
@@ -45,7 +45,7 @@ use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
-pub use crate::error::{FallbackRefusal, OwnershipRefusal};
+pub use crate::error::FallbackRefusal;
 pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
@@ -638,7 +638,7 @@ impl Server {
 		utxo: OutPoint,
 		funding_tx: Option<&Transaction>,
 		user_pub_nonce: PublicNonce,
-		owner_links: &crate::owner_proof::OwnerLinks,
+		owner_mailbox: Option<PublicKey>,
 	) -> anyhow::Result<ark::board::BoardCosignResponse> {
 		check_max_amount("board", amount, self.config.max_board_amount)?;
 
@@ -753,15 +753,16 @@ impl Server {
 			user_pub_nonce,
 		);
 
-		self.db.write(async |t| owner_links.verify(t, [user_pubkey],
-			self.mailbox_key.leak_ref(), self.config.network).await).await?;
+		if self.config.expiry_payouts && owner_mailbox.is_none() {
+			return badarg!("board output requires a payout mailbox");
+		}
 
 		// Fees and the exit delta can change, so bind the output to one exit
 		// before signing, or two signed exits could spend it.
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();
-		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid).await).await?;
-		if bound != exit_txid {
+		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid, owner_mailbox).await).await?;
+		if bound.0 != exit_txid {
 			return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
 		}
 
@@ -850,6 +851,7 @@ impl Server {
 		// Expiry policy as a customer birth at the deferred ownership trigger.
 		let (roots, leaves): (Vec<_>, Vec<_>) = builder.build_server_vtxos().into_iter()
 			.partition(|output| output.id() == VtxoId::from(vtxo.chain_anchor()));
+		let leaf_ids = leaves.iter().map(|leaf| leaf.id()).collect::<Vec<_>>();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&funding_tx)
 			.upsert_unsigned_tx([builder.exit_txid()])
@@ -860,12 +862,16 @@ impl Server {
 		let exit_txid = builder.exit_txid();
 		let inserted = self.db.write(async |t| {
 			// also binds boards cosigned before outputs were bound on cosign
-			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid).await?;
-			if bound != exit_txid {
+			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid, None).await?;
+			if bound.0 != exit_txid {
 				return badarg!("board utxo {} is already registered with another exit tx",
 					vtxo.chain_anchor(),
 				);
 			}
+			let update = if self.config.expiry_payouts {
+				let mailbox = bound.1.context("board exit has no admitted payout mailbox")?;
+				update.bind_owner_mailboxes(leaf_ids.iter().map(|id| (*id, mailbox)))?
+			} else { update };
 			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;

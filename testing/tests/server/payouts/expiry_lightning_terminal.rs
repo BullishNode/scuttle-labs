@@ -418,7 +418,6 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 		intent_nonce: None, source_owner_signatures: Vec::new(),
 	}, &key).await).await.unwrap();
 	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
 		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, outgoing_deadline, &receiver_keypair).serialize()),
@@ -702,15 +701,12 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		assert!(earlier.expiry_height() < source.expiry_height());
 		assert!(deadline < source.expiry_height());
 		let db = Db::connect(&srv.config().postgres).await.unwrap();
-		for (wallet, coin, owner) in [(&sender, &source, mailbox), (&customer, &earlier, earlier_mailbox)] {
+		for (coin, owner) in [(&source, mailbox), (&earlier, earlier_mailbox)] {
 			let funding = ctx.bitcoind().await_transaction(coin.chain_anchor().txid).await;
 			coin.validate(&funding).unwrap();
-			let proof = wallet.owner_link(coin.user_pubkey()).await.unwrap();
-			assert_eq!(proof.verify_joint(bitcoin::Network::Regtest, &srv.mailbox_keypair(), coin.user_pubkey()).unwrap(), owner);
 			db.read(async |tx| {
 				assert_eq!(tx.get_user_vtxo_by_id(coin.id()).await?.vtxo.serialize(), coin.serialize());
-				assert!(matches!(tx.expiry_owner(coin.user_pubkey()).await?,
-					server::database::expiry_attribution::Attribution::Owned { mailbox_pk, .. } if mailbox_pk == owner.as_pubkey()));
+				assert_eq!(tx.coin_owner_mailboxes(&[coin.id()]).await?.get(&coin.id()), Some(&owner.as_pubkey()));
 				Ok(())
 			}).await.unwrap();
 		}

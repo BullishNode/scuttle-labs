@@ -9,7 +9,6 @@ async fn succeeded_linked_htlc_send(name: &str) -> (TestContext, Db, ServerVtxo<
 
 	Db::create_with_payouts(&postgres_cfg, true).await.expect("Database created");
 	let db = Db::connect(&postgres_cfg).await.expect("Connected to database");
-	super::register_vector_owners(&db).await;
 
 	let pubkey = PublicKey::from_str(DUMMY_PUBKEY).unwrap();
 	let (node_id, _) = db.write(async |t| t.register_lightning_node(&pubkey).await).await.unwrap();
@@ -19,7 +18,8 @@ async fn succeeded_linked_htlc_send(name: &str) -> (TestContext, Db, ServerVtxo<
 	let htlc = VTXO_VECTORS.arkoor_htlc_out_vtxo.policy().as_server_htlc_send().unwrap();
 	let hash = htlc.payment_hash;
 	db.write(async |t| {
-		t.upsert_vtxos([vtxo.clone()]).await?;
+		t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([vtxo.clone()])
+			.bind_owner_mailboxes([(vtxo.id(), super::test_server_mailbox_key().public_key())])?).await?;
 		htlc_vtxo::create_htlc_vtxos(t, &[(vtxo.id(), hash, htlc.htlc_expiry)], HtlcDirection::Incoming).await
 	}).await.unwrap();
 	let secp = Secp256k1::new();
@@ -129,7 +129,6 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 	let config = ctx.new_postgres(&ctx.test_name).await;
 	Db::create_with_payouts(&config, true).await.unwrap();
 	let db = Db::connect(&config).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let base = &VTXO_VECTORS.board_vtxo;
 	let key = base.user_pubkey();
 	let (node, _) = db.write(async |t| t.register_lightning_node(&key).await).await.unwrap();
@@ -145,7 +144,8 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 		let coin = ServerVtxo::new(point, policy.into(), sat(10_000), base.expiry_height(),
 			base.server_pubkey(), base.exit_delta(), point);
 		db.write(async |t| {
-			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([coin.clone()])).await?;
+			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([coin.clone()])
+				.bind_owner_mailboxes([(coin.id(), super::test_server_mailbox_key().public_key())])?).await?;
 			htlc_vtxo::create_htlc_vtxos(t, &[(coin.id(), hash, expiry)],
 				if index == 2 { HtlcDirection::Outgoing } else { HtlcDirection::Incoming }).await
 		}).await.unwrap();
@@ -159,7 +159,7 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 		.min_final_cltv_expiry_delta(18).amount_milli_satoshis(10_000_000)
 		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
 	let subscription = db.write(async |t| {
-		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None, None, None).await?;
+		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None, None, None, None).await?;
 		Ok(t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id)
 	}).await.unwrap();
 	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,

@@ -40,7 +40,7 @@ use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::{self as rpc, protos, TryFromBytes};
 use crate::database::SpendState;
 use crate::database::expiry_payout::FallbackOutcome;
-use crate::owner_proof::OwnerLinks;
+use crate::destination::DestinationBindings;
 
 use crate::database::rounds::StoredRoundOutput;
 use crate::recovery::NB_NORMAL_CHILDREN;
@@ -130,6 +130,7 @@ impl rpc::server::ArkService for Server {
 			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MIN_PROTOCOL_VERSION },
 			max_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MAX_PROTOCOL_VERSION },
 			psa,
+			protocol_version_label: self.config.expiry_payouts.then(|| "scuttle-1".to_owned()),
 		};
 		Ok(tonic::Response::new(ret))
 	}
@@ -192,8 +193,8 @@ impl rpc::server::ArkService for Server {
 			}
 
 			let state = t.get_server_vtxo_by_id(id).await?;
-			let keys = state.vtxo.policy().user_pubkey().map(|key| (id, key)).into_iter().collect::<Vec<_>>();
-			let fallback = t.fallback_customer_vtxos(&keys).await?;
+			let customer_ids = state.vtxo.policy().user_pubkey().map(|_| id).into_iter().collect::<Vec<_>>();
+			let fallback = t.fallback_customer_vtxos(&customer_ids).await?;
 			Ok((state, fallback, t.coin_owner_mailboxes(&[id]).await?,
 				t.fallback_outcomes(&[id]).await?))
 		}).await.to_status()?;
@@ -281,9 +282,9 @@ impl rpc::server::ArkService for Server {
 			}
 
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
-			let keys = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|key| (*id, key)))
+			let customer_ids = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|_| *id))
 				.collect::<Vec<_>>();
-			let fallback = t.fallback_customer_vtxos(&keys).await?;
+			let fallback = t.fallback_customer_vtxos(&customer_ids).await?;
 			Ok((states, fallback, t.coin_owner_mailboxes(&ids).await?,
 				t.fallback_outcomes(&ids).await?))
 		}).await.to_status()?;
@@ -377,14 +378,13 @@ impl rpc::server::ArkService for Server {
 		// from, so their status needs no attestation of its own. A VTXO in a
 		// server-internal state is left out, as GetVtxoStatus reports it as
 		// not found.
-		let keys = res.vtxos.iter().map(|v| (v.vtxo.id(), v.vtxo.user_pubkey())).collect::<Vec<_>>();
-		let ids = keys.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+		let ids = res.vtxos.iter().map(|v| v.vtxo.id()).collect::<Vec<_>>();
 		let (fallback, owners, outcomes) = self.db.read(async |t| {
 			if t.expiry_payouts() {
 				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 			}
 			Ok((
-				t.fallback_customer_vtxos(&keys).await?, t.coin_owner_mailboxes(&ids).await?,
+				t.fallback_customer_vtxos(&ids).await?, t.coin_owner_mailboxes(&ids).await?,
 				t.fallback_outcomes(&ids).await?,
 			))
 		}).await.to_status()?;
@@ -429,8 +429,10 @@ impl rpc::server::ArkService for Server {
 
 		let amount = Amount::from_sat(req.amount);
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
-		let mut owner_links = OwnerLinks::default();
-		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref(), self.config.expiry_payouts).to_status()?;
+		let owner_mailbox = req.mailbox_id.as_deref()
+			.map(ark::mailbox::MailboxIdentifier::deserialize)
+			.transpose().badarg("invalid board mailbox")?
+			.map(|id| id.as_pubkey());
 		let expiry_height = check_block_height(req.expiry_height)
 			.map_err(|e| tonic::Status::invalid_argument(format!("expiry_height: {e}")))?;
 		let utxo = OutPoint::from_bytes(&req.utxo)?;
@@ -442,7 +444,7 @@ impl rpc::server::ArkService for Server {
 		};
 
 		let resp = self.cosign_board(
-			amount, user_pubkey, expiry_height, utxo, funding_tx.as_ref(), pub_nonce, &owner_links,
+			amount, user_pubkey, expiry_height, utxo, funding_tx.as_ref(), pub_nonce, owner_mailbox,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp.into()))
@@ -536,11 +538,14 @@ impl rpc::server::ArkService for Server {
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
 		}
-		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
+		let destinations = DestinationBindings::from_arkoor_parts(
+			&req.parts, self.config.expiry_payouts, self.config.network,
+			self.server_pubkey, self.mailbox_key.leak_ref(),
+		).badarg("invalid payout destination")?;
 		let request = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
-		let response = self.cosign_oor(request, &owner_links).await.to_status()?;
+		let response = self.cosign_oor(request, &destinations).await.to_status()?;
 		Ok(tonic::Response::new(response.into()))
 	}
 
@@ -562,11 +567,14 @@ impl rpc::server::ArkService for Server {
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
 		}
-		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
+		let destinations = DestinationBindings::from_arkoor_parts(
+			&req.parts, self.config.expiry_payouts, self.config.network,
+			self.server_pubkey, self.mailbox_key.leak_ref(),
+		).badarg("invalid payout destination")?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
 			.badarg("invalid cosign request")?;
 
-		let resp = self.request_lightning_pay_htlc_cosign(cosign_requests, &owner_links)
+		let resp = self.request_lightning_pay_htlc_cosign(cosign_requests, &destinations)
 			.await.context("error making payment")?;
 
 		Ok(tonic::Response::new(resp.into()))
@@ -636,11 +644,14 @@ impl rpc::server::ArkService for Server {
 		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
 			macros::badarg!("too many parts in cosign request");
 		}
-		let owner_links = OwnerLinks::from_parts(&req.parts, self.config.expiry_payouts).to_status()?;
+		let destinations = DestinationBindings::from_arkoor_parts(
+			&req.parts, self.config.expiry_payouts, self.config.network,
+			self.server_pubkey, self.mailbox_key.leak_ref(),
+		).badarg("invalid payout destination")?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
-		let cosign_resp = self.revoke_lightning_pay_htlcs(cosign_requests, &owner_links).await
+		let cosign_resp = self.revoke_lightning_pay_htlcs(cosign_requests, &destinations).await
 			.to_status()?;
 
 		Ok(tonic::Response::new(cosign_resp.into()))
@@ -708,6 +719,7 @@ impl rpc::server::ArkService for Server {
 			req.expiry_secs.map(Duration::from_secs),
 			claim_pubkey,
 			req.claim_destination,
+			req.claim_destination_address,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp))
@@ -756,8 +768,6 @@ impl rpc::server::ArkService for Server {
 		let payment_hash = PaymentHash::from_bytes(req.payment_hash)?;
 
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
-		let mut owner_links = OwnerLinks::default();
-		owner_links.insert_proto(user_pubkey, req.owner_proof.as_ref(), self.config.expiry_payouts).to_status()?;
 		let htlc_recv_expiry = BlockHeight::new(req.htlc_recv_expiry);
 		let claim_attestation = req.claim_attestation.as_deref()
 			.map(ark::attestations::LightningReceiveClaimAttestation::deserialize)
@@ -765,7 +775,7 @@ impl rpc::server::ArkService for Server {
 			.badarg("invalid claim attestation")?;
 
 		let (sub, htlcs) = self.prepare_lightning_claim(
-			payment_hash, user_pubkey, htlc_recv_expiry, req.lightning_receive_anti_dos, &owner_links,
+			payment_hash, user_pubkey, htlc_recv_expiry, req.lightning_receive_anti_dos,
 			client_address,
 			claim_attestation,
 		).await.to_status()?;
@@ -788,7 +798,10 @@ impl rpc::server::ArkService for Server {
 
 		let payment_preimage = Preimage::from_bytes(req.payment_preimage)?;
 		let raw_cosign = req.cosign_request.badarg("cosign request missing")?;
-		let owner_links = OwnerLinks::from_parts(&raw_cosign.parts, self.config.expiry_payouts).to_status()?;
+		let destinations = DestinationBindings::from_arkoor_parts(
+			&raw_cosign.parts, self.config.expiry_payouts, self.config.network,
+			self.server_pubkey, self.mailbox_key.leak_ref(),
+		).badarg("invalid payout destination")?;
 		let cosign_request = ArkoorPackageCosignRequest::try_from(raw_cosign)
 			.badarg("invalid cosign request")?;
 
@@ -797,7 +810,7 @@ impl rpc::server::ArkService for Server {
 			payment_preimage,
 			cosign_request,
 			pver,
-			&owner_links,
+			&destinations,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(cosign_resp.into()))
@@ -890,13 +903,12 @@ impl rpc::server::ArkService for Server {
 
 		let unblinded_mailbox_id = req.unblinded_mailbox_id.as_ref()
 			.map(|b| MailboxIdentifier::deserialize(b)).transpose().badarg("invalid unblinded mailbox id")?;
-		if self.config.round_status_attestation_required && unblinded_mailbox_id.is_none() {
+		if (self.config.round_status_attestation_required || self.config.expiry_payouts)
+			&& unblinded_mailbox_id.is_none() {
 			macros::badarg!("interactive round participations need an unblinded mailbox id");
 		}
-		let mut owner_links = OwnerLinks::default();
 		let mut vtxo_requests = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests.clone() {
-			owner_links.insert_request(r.vtxo.as_ref().badarg("missing vtxo request")?, self.config.expiry_payouts).to_status()?;
 			// Make sure users provided right number of nonces.
 			if r.public_nonces.len() != self.config.nb_round_nonces {
 				macros::badarg!("need exactly {} public nonces", self.config.nb_round_nonces);
@@ -917,7 +929,6 @@ impl rpc::server::ArkService for Server {
 			inputs,
 			vtxo_requests,
 			unblinded_mailbox_id,
-			owner_links,
 			unlock_preimage: Secret::new(unlock_preimage),
 			user_agent_name: crate::telemetry::current_user_agent_name(),
 		};
@@ -991,14 +1002,13 @@ impl rpc::server::ArkService for Server {
 			.map(|b| MailboxIdentifier::deserialize(&b[..]))
 			.transpose().badarg("invalid unblinded mailbox id")?;
 		// its status could never be queried, so the wallet couldn't progress it
-		if self.config.round_status_attestation_required && unblinded_mailbox_id.is_none() {
+		if (self.config.round_status_attestation_required || self.config.expiry_payouts)
+			&& unblinded_mailbox_id.is_none() {
 			macros::badarg!("delegated round participations need an unblinded mailbox id");
 		}
 
-		let mut owner_links = OwnerLinks::default();
 		let mut outputs = Vec::with_capacity(req.vtxo_requests.len());
 		for r in req.vtxo_requests {
-			owner_links.insert_request(&r, self.config.expiry_payouts).to_status()?;
 			outputs.push(StoredRoundOutput {
 				vtxo_request: r.try_into().badarg("invalid vtxo request")?,
 				unblinded_mailbox_id,
@@ -1006,7 +1016,7 @@ impl rpc::server::ArkService for Server {
 		}
 
 		let unlock_hash = self.register_delegated_round_participation(
-			inputs, outputs, req.scheduled_height.map(BlockHeight::new), &owner_links,
+			inputs, outputs, req.scheduled_height.map(BlockHeight::new),
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(protos::RoundParticipationResponse {

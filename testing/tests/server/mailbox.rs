@@ -13,6 +13,7 @@ use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::raw::RawVtxo;
 
 use server::database::{Db, MailboxPayload};
+use server::database::tree::VtxoTreeUpdate;
 use server_rpc::{protos, MAX_NB_MAILBOX_ARKOOR_VTXOS};
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
@@ -57,8 +58,6 @@ async fn mailbox_checkpoint_visibility_gap() {
 		(kp, vtxo)
 	}).collect();
 
-	super::register_test_owners(&db, &srv.mailbox_keypair(), &mailbox_kp,
-		&vtxo_pairs.iter().map(|(key, _)| *key).collect::<Vec<_>>()).await;
 	db.write(async |t| t.upsert_vtxos(
 		vtxo_pairs.iter().map(|(_, v)| ServerVtxo::from(v.clone()))
 	).await).await.expect("upsert vtxos");
@@ -170,8 +169,9 @@ async fn mailbox_post_arkoor_requires_known_vtxos() {
 		user_keypair: owner_kp,
 		..Default::default()
 	}.build();
-	super::register_test_owners(&db, &srv.mailbox_keypair(), &mailbox_kp, &[owner_kp]).await;
-	db.write(async |t| t.upsert_vtxos([ServerVtxo::from(vtxo.clone())]).await).await
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_spendable_vtxos([ServerVtxo::from(vtxo.clone())])
+		.bind_owner_mailboxes([(vtxo.id(), mailbox_kp.public_key())])?).await).await
 		.expect("upsert vtxo");
 
 	// A vtxo the server never cosigned is rejected.

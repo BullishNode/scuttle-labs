@@ -4,13 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bitcoin::{Amount, Network, OutPoint, Transaction};
+use bitcoin::{Amount, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::secp256k1::Keypair;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark::lightning::PaymentHash;
-use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
 use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
@@ -85,7 +84,7 @@ async fn revoke_htlc_vtxos(
 	// Any pubkey works for the revocation output; the tests never claim it.
 	let revocation_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let revocation_pubkey = revocation_key.public_key();
-	let owner_proof = super::test_owner_link(srv, &revocation_key).await;
+	let mailbox = MailboxIdentifier::from_pubkey(revocation_pubkey);
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		htlc_vtxos,
 		ark::VtxoPolicy::new_pubkey(revocation_pubkey),
@@ -93,7 +92,7 @@ async fn revoke_htlc_vtxos(
 
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.owner_proof = Some(owner_proof.into());
+		output.mailbox_id = Some(mailbox.serialize());
 	}
 	let cosign_request = super::signed_package(srv, &[], cosign_request).await;
 

@@ -116,7 +116,6 @@ async fn native_refund_status(two_sources: bool) {
 		intent_nonce: None, source_owner_signatures: Vec::new(),
 	}, &keys[0]).await).await.unwrap();
 	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(12)).to_u32(), lightning_receive_anti_dos: None,
 		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, tip + BlockDelta::new(12), &receive_keypair).serialize()),

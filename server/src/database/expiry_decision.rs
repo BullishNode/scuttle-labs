@@ -13,7 +13,7 @@ use chrono::{DateTime, Local};
 
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use super::expiry_inventory::BackingSnapshot;
-use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
+use super::expiry_ownership::{OwnershipBindingSource, OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use super::expiry_payout::MAX_PAYOUT_VSIZE;
 use super::{SpendState, Tx};
 use crate::watchman::settlement::{allocate, CustomerLeaf};
@@ -292,7 +292,16 @@ impl Tx<'_> {
 			for coin in &output.1 {
 				let proposal = &coin.ownership;
 				let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
-				let observed = evidence_json(evidence);
+				let mut observed = evidence_json(evidence);
+				if matches!(proposal.disposition, OwnershipDisposition::Customer { .. }) {
+					observed["binding_source"] = match &proposal.binding_source {
+						OwnershipBindingSource::Coin(id) => serde_json::json!({"kind":"coin","id":id.to_string()}),
+						OwnershipBindingSource::InputCoins(ids) => serde_json::json!({"kind":"input_coins",
+							"ids":ids.iter().map(ToString::to_string).collect::<Vec<_>>() }),
+						OwnershipBindingSource::Subscription(id) => serde_json::json!({"kind":"subscription","id":id}),
+						OwnershipBindingSource::Allocation(id) => serde_json::json!({"kind":"allocation","id":id}),
+					};
+				}
 				let entitlement = if let Some(existing) = existing_entitlements.get(&proposal.id) {
 					*existing
 				} else {

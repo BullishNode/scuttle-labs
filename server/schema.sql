@@ -663,7 +663,9 @@ CREATE TABLE public.board_exit (
     funding_outpoint text NOT NULL,
     funding_spk bytea NOT NULL,
     exit_txid text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    owner_mailbox text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT board_exit_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66)))
 );
 
 
@@ -1350,7 +1352,9 @@ CREATE TABLE public.lightning_htlc_subscription (
     receiver_mailbox_id text,
     user_agent text,
     claim_destination_user_pubkey text,
+    claim_destination_mailbox_pk text,
     claim_pubkey text,
+    CONSTRAINT lightning_htlc_subscription_claim_destination_mailbox_pk_check CHECK (((claim_destination_mailbox_pk IS NULL) OR (length(claim_destination_mailbox_pk) = 66))),
     CONSTRAINT lightning_htlc_subscription_claim_destination_user_pubkey_check CHECK (((claim_destination_user_pubkey IS NULL) OR (length(claim_destination_user_pubkey) = 66)))
 );
 
@@ -1736,7 +1740,9 @@ CREATE TABLE public.round_part_output (
     participation_id bigint NOT NULL,
     policy bytea NOT NULL,
     amount bigint NOT NULL,
-    unblinded_mailbox_id text
+    unblinded_mailbox_id text,
+    output_index integer,
+    CONSTRAINT round_part_output_output_index_check CHECK ((output_index >= 0))
 );
 
 
@@ -3281,6 +3287,8 @@ CREATE INDEX round_part_input_participation_id_ix ON public.round_part_input USI
 --
 
 CREATE INDEX round_part_output_participation_id_ix ON public.round_part_output USING btree (participation_id);
+
+CREATE UNIQUE INDEX round_part_output_position ON public.round_part_output USING btree (participation_id, output_index) WHERE (output_index IS NOT NULL);
 
 
 --

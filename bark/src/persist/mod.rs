@@ -132,6 +132,14 @@ pub trait BarkPersister: Send + Sync + 'static {
 	#[cfg(feature = "onchain-bdk")]
 	async fn store_bdk_wallet_changeset(&self, changeset: &ChangeSet) -> anyhow::Result<()>;
 
+	/// Load the separately persisted wallet that watches and spends `tr(M)`.
+	#[cfg(feature = "onchain-bdk")]
+	async fn initialize_mailbox_bdk_wallet(&self) -> anyhow::Result<ChangeSet>;
+
+	/// Persist an incremental change to the `tr(M)` wallet.
+	#[cfg(feature = "onchain-bdk")]
+	async fn store_mailbox_bdk_wallet_changeset(&self, changeset: &ChangeSet) -> anyhow::Result<()>;
+
 	/// Read wallet properties from storage.
 	///
 	/// Returns:

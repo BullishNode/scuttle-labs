@@ -41,6 +41,7 @@ mod m0040_unlock_failed_movement_vtxos_again;
 mod m0041_offboard_action_checkpoint;
 mod m0042_vtxo_registered;
 mod m0043_fallback_display;
+mod m0044_mailbox_bdk;
 
 use anyhow::Context;
 use log::debug;
@@ -89,6 +90,7 @@ use m0040_unlock_failed_movement_vtxos_again::Migration0040;
 use m0041_offboard_action_checkpoint::Migration0041;
 use m0042_vtxo_registered::Migration0042;
 use m0043_fallback_display::Migration0043;
+use m0044_mailbox_bdk::Migration0044;
 
 pub struct MigrationContext {}
 
@@ -149,6 +151,7 @@ impl MigrationContext {
 		self.try_migration(conn, &Migration0041{})?;
 		self.try_migration(conn, &Migration0042{})?;
 		self.try_migration(conn, &Migration0043{})?;
+		self.try_migration(conn, &Migration0044{})?;
 
 		Ok(())
 	}
@@ -298,7 +301,7 @@ mod test {
 
 		// Run ordinary wallet migrations from an empty store.
 		migs.do_all_migrations(&mut conn).unwrap();
-		assert_current_version(&conn, 43).unwrap();
+		assert_current_version(&conn, 44).unwrap();
 		assert!(!table_exists(&conn, "scuttle_schema_history").unwrap());
 
 		assert!(table_exists(&conn, "bark_vtxo").unwrap());

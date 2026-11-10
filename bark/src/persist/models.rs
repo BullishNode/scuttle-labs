@@ -8,10 +8,7 @@
 //! - Provide stable, serde-friendly representations for database backends.
 //! - Enable forward/backward compatibility when schema migrations occur.
 
-use ark::fallback::OwnerLink;
-
 use std::borrow::Cow;
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -302,7 +299,6 @@ struct SerdeRoundParticipation<'a> {
 	#[serde(with = "ark::encode::serde::cow::vec")]
 	inputs: Cow<'a, [Vtxo<Full>]>,
 	outputs: Vec<SerdeVtxoRequest<'a>>,
-	owner_proofs: BTreeMap<PublicKey, OwnerLink>,
 	#[serde(default, skip_serializing_if = "Option::is_none", with = "ark::encode::serde::opt")]
 	unblinded_mailbox_id: Option<MailboxIdentifier>,
 }
@@ -312,7 +308,6 @@ impl<'a> From<&'a RoundParticipation> for SerdeRoundParticipation<'a> {
 	    Self {
 			inputs: Cow::Borrowed(&v.inputs),
 			outputs: v.outputs.iter().map(|v| v.into()).collect(),
-			owner_proofs: v.owner_proofs.clone(),
 			unblinded_mailbox_id: v.unblinded_mailbox_id,
 		}
 	}
@@ -323,7 +318,6 @@ impl<'a> From<SerdeRoundParticipation<'a>> for RoundParticipation {
 		Self {
 			inputs: v.inputs.into_owned(),
 			outputs: v.outputs.into_iter().map(|v| v.into()).collect(),
-			owner_proofs: v.owner_proofs,
 			unblinded_mailbox_id: v.unblinded_mailbox_id,
 		}
 	}

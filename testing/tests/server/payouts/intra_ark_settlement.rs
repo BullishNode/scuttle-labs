@@ -125,21 +125,20 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	}).await.unwrap().into_inner().invoices;
 	assert_eq!(native.len(),1); assert_eq!(native[0].state(),hold::InvoiceState::Cancelled);
 	let receiver_mailbox = receiver.mailbox_keypair().public_key();
-	// The first exact-P verification is in the WAL/prepared-destination Tx.
-	// Every later verification is refused before the cosign Tx takes grant locks.
+	// Fail the coin-specific payout binding in the cosign transaction, after
+	// the prepared claim has been durably recorded.
 	db.write(async |tx| {
 		tx.batch_execute(&format!("CREATE SEQUENCE issue62_claim_verifications;
 			CREATE SEQUENCE issue62_settled_failures;
 			CREATE FUNCTION issue62_refuse_cosign() RETURNS trigger AS $$
 			BEGIN
-			  IF NEW.user_pubkey='{claim_key}' THEN
-			    IF nextval('issue62_claim_verifications') > 1 THEN
-			      RAISE EXCEPTION 'ISSUE62 post-WAL cosign failure';
-			    END IF;
-			  END IF;
+		  IF NEW.mailbox_pk='{receiver_mailbox}' THEN
+		    PERFORM nextval('issue62_claim_verifications');
+		    RAISE EXCEPTION 'ISSUE62 post-WAL cosign failure';
+		  END IF;
 			  RETURN NEW;
 			END; $$ LANGUAGE plpgsql;
-			CREATE TRIGGER issue62_refuse_cosign BEFORE INSERT ON owner_key
+		CREATE TRIGGER issue62_refuse_cosign BEFORE INSERT ON coin_owner
 			FOR EACH ROW EXECUTE FUNCTION issue62_refuse_cosign();
 			CREATE FUNCTION issue62_refuse_settled() RETURNS trigger AS $$
 			BEGIN
@@ -158,7 +157,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	assert!(receiver.lightning_receive_checkpoint(hash).await.unwrap().is_some_and(|cp|cp==checkpoint));
 	let verification = db.read(async |tx| Ok(tx.query_one(
 		"SELECT last_value FROM issue62_claim_verifications",&[]).await?.get::<_,i64>(0))).await.unwrap();
-	assert_eq!(verification,2,"the genuine WAL verification passed, then only its cosign verification failed");
+	assert_eq!(verification,1,"the cosign coin-owner insert failed after the prepared claim");
 	// Both real failures must have executed, and the independent source-success
 	// transaction must be visible before any crash is allowed.
 	tokio::time::timeout(Duration::from_secs(30), async {
@@ -196,8 +195,8 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 				assert!(row.get::<_, Option<String>>("chain_resolution").is_none());
 				assert!(!row.get::<_, bool>("output_inserted"));
 				assert!(tx.get_virtual_transaction_by_txid(output.point().txid).await?.is_none());
-				let owner = tx.query_one("SELECT mailbox_pk FROM owner_key WHERE user_pubkey=$1", &[&claim_key.to_string()]).await?;
-				assert_eq!(owner.get::<_, String>(0), receiver_mailbox.to_string());
+				let owner = tx.query_opt("SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&output.id().to_string()]).await?;
+				assert!(owner.is_none(), "failed cosign must not commit an output binding");
 				prepared.push((source,row.get::<_, String>("output_vtxo_id"),output.amount().to_sat()));
 			}
 			let ids = tx.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo
@@ -230,7 +229,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	// Only the cosign fault is removed now. The real WAL worker will retry the
 	// original subscription, but the Settled write remains faulty for the timer cut.
 	db.write(async |tx| {
-		tx.batch_execute("DROP TRIGGER issue62_refuse_cosign ON owner_key;
+		tx.batch_execute("DROP TRIGGER issue62_refuse_cosign ON coin_owner;
 			DROP FUNCTION issue62_refuse_cosign(); DROP SEQUENCE issue62_claim_verifications;").await?;
 		Ok(())
 	}).await.unwrap();

@@ -1,4 +1,4 @@
-//! Joint output authorization and authenticated fallback status.
+//! Coin-specific payout destinations and authenticated fallback status.
 
 mod refusal;
 mod sync;
@@ -10,7 +10,6 @@ use anyhow::Context;
 use bitcoin::ScriptBuf;
 use bitcoin::secp256k1::PublicKey;
 use ark::{ProtocolEncoding, VtxoPolicy};
-use ark::fallback::OwnerLink;
 use server_rpc::protos;
 use crate::Wallet;
 
@@ -23,55 +22,43 @@ pub(crate) fn next_key_index(last: Option<u32>) -> anyhow::Result<u32> {
 
 impl Wallet {
 
-	/// BIP86 destination of the exact mailbox identity checked at open.
+	/// Taproot destination of the exact mailbox identity checked at open.
 	pub fn fallback_script(&self) -> ScriptBuf {
 		ark::fallback::payout_script(self.mailbox_keypair().public_key())
 	}
 
-	/// Authorize with this wallet's mailbox key and an actual coin key from its keystore.
-	pub async fn owner_link(&self, key: PublicKey) -> anyhow::Result<OwnerLink> {
-		let (_, info) = self.require_server().await?;
-		let (_, pair) = self.pubkey_keypair(&key).await?.ok_or(FallbackRefusal::OwnerProofRequired)?;
-		Ok(OwnerLink::new_joint(self.network().await?, info.mailbox_pubkey, &self.mailbox_keypair(), &pair)?)
-	}
-
-	pub(crate) async fn output_owner_links(
-		&self, keys: impl IntoIterator<Item = PublicKey>, supplied: &BTreeMap<PublicKey, OwnerLink>,
-		server_mailbox: PublicKey,
-	) -> anyhow::Result<BTreeMap<PublicKey, OwnerLink>> {
-		if !self.properties().await?.server_payouts.context("server payout capability is not known")? {
-			return Ok(BTreeMap::new());
-		}
-		let keys = keys.into_iter().collect::<BTreeSet<_>>();
-		for (key, link) in supplied {
-			ensure!(keys.contains(key), "ownership link names an absent output key {key}");
-			link.verify_coin(self.network().await?, server_mailbox, *key)
-				.map_err(|e| anyhow::Error::new(e).context(crate::FallbackRefusal::InvalidOwnerProof))?;
-		}
-		let mut links = BTreeMap::new();
-		for key in keys {
-			let link = if let Some(link) = supplied.get(&key) { *link } else {
-				let (_, pair) = self.pubkey_keypair(&key).await?
-					.ok_or(crate::FallbackRefusal::OwnerProofRequired)?;
-				OwnerLink::new_joint(self.network().await?, server_mailbox, &self.mailbox_keypair(), &pair)?
-			};
-			links.insert(key, link);
-		}
-		Ok(links)
-	}
-
-	/// Attach after fragmentation, covering every normal and isolated output.
-	pub(crate) async fn attach_owner_links(
+	/// Bind each actual arkoor output to its recipient address or this wallet's
+	/// fixed mailbox. The server verifies these values against the signed output.
+	pub(crate) async fn attach_payout_destinations(
 		&self, package: &mut protos::ArkoorPackageCosignRequest,
-		supplied: &BTreeMap<PublicKey, OwnerLink>, server_mailbox: PublicKey,
+		addresses: &BTreeMap<PublicKey, ark::Address>,
 	) -> anyhow::Result<()> {
-		let keys = package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs))
+		if !self.properties().await?.server_payouts.context("server payout capability is not known")? {
+			return Ok(());
+		}
+		let mailbox = self.mailbox_identifier().as_pubkey().serialize().to_vec();
+		let keys = package.parts.iter()
+			.flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs))
 			.map(|output| Ok(VtxoPolicy::deserialize(&output.policy)?.user_pubkey()))
-			.collect::<anyhow::Result<Vec<_>>>()?;
-		let links = self.output_owner_links(keys, supplied, server_mailbox).await?;
-		for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+			.collect::<anyhow::Result<BTreeSet<_>>>()?;
+		for key in keys {
+			if let Some(address) = addresses.get(&key) {
+				ensure!(address.policy().user_pubkey() == key,
+					"recipient address does not match arkoor output key");
+			} else {
+				ensure!(self.pubkey_keypair(&key).await?.is_some(),
+					FallbackRefusal::RecipientMustUpdate);
+			}
+		}
+		for output in package.parts.iter_mut()
+			.flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs))
+		{
 			let key = VtxoPolicy::deserialize(&output.policy)?.user_pubkey();
-			output.owner_proof = links.get(&key).copied().map(Into::into);
+			if let Some(address) = addresses.get(&key) {
+				output.address = Some(address.to_string());
+			} else {
+				output.mailbox_id = Some(mailbox.clone());
+			}
 		}
 		Ok(())
 	}

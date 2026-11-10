@@ -611,6 +611,7 @@ mod tests {
 			min_protocol_version: MAX_PROTOCOL_VERSION,
 			max_protocol_version: MAX_PROTOCOL_VERSION - 1,
 			psa: None,
+			protocol_version_label: None,
 		};
 		assert!(matches!(check_handshake(response),
 			Err(ConnectError::InvalidProtocolVersionRange { .. })));

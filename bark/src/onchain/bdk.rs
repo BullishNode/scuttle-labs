@@ -292,6 +292,8 @@ impl WalletReplica {
 pub struct OnchainWallet {
 	pub inner: BdkWallet,
 	signers: SignersContainer,
+	payout: BdkWallet,
+	payout_signers: SignersContainer,
 	db: Arc<dyn BarkPersister>,
 }
 
@@ -312,7 +314,22 @@ impl DerefMut for OnchainWallet {
 impl OnchainWallet {
 	pub async fn load_or_create(network: Network, seed: [u8; 64], db: Arc<dyn BarkPersister>) -> anyhow::Result<Self> {
 		let xpriv = bip32::Xpriv::new_master(network, &seed).expect("valid seed");
+		let mailbox_path = [bip32::ChildNumber::from_hardened_idx(350)?,
+			bip32::ChildNumber::from_hardened_idx(1)?];
+		let mailbox = xpriv.derive_priv(&bitcoin::secp256k1::Secp256k1::new(), &mailbox_path)?;
+		Self::load_or_create_with_mailbox_keypair(network, seed,
+			mailbox.to_keypair(&bitcoin::secp256k1::Secp256k1::new()), db).await
+	}
+
+	/// Use the exact mailbox key selected by the Ark wallet, including an
+	/// application-owned key, for the persisted payout descriptor.
+	pub async fn load_or_create_with_mailbox_keypair(
+		network: Network, seed: [u8; 64], mailbox: bitcoin::secp256k1::Keypair,
+		db: Arc<dyn BarkPersister>,
+	) -> anyhow::Result<Self> {
+		let xpriv = bip32::Xpriv::new_master(network, &seed).expect("valid seed");
 		let desc = bdk_wallet::template::Bip86(xpriv, KeychainKind::External);
+		let payout_desc = format!("tr({})", bitcoin::PrivateKey::new(mailbox.secret_key(), network));
 
 		let changeset = db.initialize_bdk_wallet().await.context("error reading bdk wallet state")?;
 		let wallet_opt = bdk_wallet::Wallet::load()
@@ -327,17 +344,30 @@ impl OnchainWallet {
 				.create_wallet_no_persist()?,
 		};
 		let signers = wallet.build_signers(desc).context("error building wallet signers")?;
+		let payout_changeset = db.initialize_mailbox_bdk_wallet().await
+			.context("error reading mailbox payout wallet state")?;
+		let payout_opt = BdkWallet::load()
+			.descriptor(KeychainKind::External, Some(payout_desc.clone()))
+			.check_network(network)
+			.load_wallet_no_persist(payout_changeset)?;
+		let payout = match payout_opt {
+			Some(wallet) => wallet,
+			None => BdkWallet::create_single(payout_desc.clone())
+				.network(network).create_wallet_no_persist()?,
+		};
+		let payout_signers = payout.build_signers(payout_desc)
+			.context("error building mailbox payout signers")?;
 
-		let mut ret = Self { inner: wallet, signers, db };
+		let mut ret = Self { inner: wallet, signers, payout, payout_signers, db };
 		ret.inner.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
 		ret.inner.mark_used(KeychainKind::External, 0);
+		ret.payout.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
 		ret.persist().await?;
 		Ok(ret)
 	}
-	/// The default mailbox's BIP86 external index-zero destination. External
-	/// mailbox applications must use the corresponding Bitcoin account themselves.
+	/// The upstream mailbox key's fixed Taproot payout destination.
 	pub fn fallback_script(&self) -> ScriptBuf {
-		self.inner.peek_address(KeychainKind::External, 0).address.script_pubkey()
+		self.payout.peek_address(KeychainKind::External, 0).address.script_pubkey()
 	}
 
 }
@@ -346,7 +376,7 @@ impl OnchainWallet {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl OnchainWalletTrait for OnchainWallet {
 	async fn balance(&self) -> Amount {
-		self.inner.balance().total()
+		self.balance().total()
 	}
 
 	async fn address(&mut self) -> anyhow::Result<Address> {
@@ -360,7 +390,7 @@ impl OnchainWalletTrait for OnchainWallet {
 	}
 
 	async fn is_mine(&self, spk: &Script) -> anyhow::Result<bool> {
-		Ok(self.inner.is_mine(spk.to_owned()))
+		Ok(self.inner.is_mine(spk.to_owned()) || self.payout.is_mine(spk.to_owned()))
 	}
 
 	async fn register_tx(&mut self, tx: &Transaction) -> anyhow::Result<()> {
@@ -460,7 +490,7 @@ impl OnchainWalletTrait for OnchainWallet {
 impl OnchainWallet {
 	pub async fn sync(&mut self, chain: &ChainSource) -> anyhow::Result<()> {
 		debug!("Starting wallet sync...");
-		debug!("Starting balance: {}", self.inner.balance());
+		debug!("Starting balance: {}", self.balance());
 		trace!("Starting unconfirmed txs: {:?}", self.unconfirmed_txids().collect::<Vec<_>>());
 
 		match chain.inner() {
@@ -526,16 +556,93 @@ impl OnchainWallet {
 				debug!("Finished syncing with esplora");
 			},
 		}
+		self.sync_payout(chain).await?;
 
-		debug!("Current balance: {}", self.inner.balance());
+		debug!("Current balance: {}", self.balance());
 		trace!("Current unconfirmed txs: {:?}", self.unconfirmed_txids().collect::<Vec<_>>());
 		self.rebroadcast_txs(chain, bark_runtime::timestamp_secs()).await?;
 
 		Ok(())
 	}
 
+	async fn sync_payout(&mut self, chain: &ChainSource) -> anyhow::Result<()> {
+		let sync_start = bark_runtime::timestamp_secs();
+		match chain.inner() {
+			#[cfg(feature = "bitcoind-rpc")]
+			ChainSourceClient::Bitcoind { sync, .. } => {
+				let rpc = sync.clone();
+				let tip = self.payout.latest_checkpoint();
+				let unconfirmed: Vec<_> = self.payout.unconfirmed_txs().collect();
+				let (block_tx, mut block_rx) = tokio::sync::mpsc::channel(8);
+				let (mempool_tx, mempool_rx) = tokio::sync::oneshot::channel();
+				let task = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+					let mut emitter = bdk_bitcoind_rpc::Emitter::new(&rpc, tip, 0, unconfirmed);
+					while let Some(block) = emitter.next_block()? {
+						if block_tx.blocking_send(block).is_err() { return Ok(()); }
+					}
+					drop(block_tx);
+					let _ = mempool_tx.send(emitter.mempool()?);
+					Ok(())
+				});
+				while let Some(block) = block_rx.recv().await {
+					self.payout.apply_block_connected_to(
+						&block.block, block.block_height(), block.connected_to(),
+					)?;
+				}
+				task.await.context("mailbox payout sync task panicked")??;
+				if let Ok(mempool) = mempool_rx.await {
+					let now = bark_runtime::timestamp_secs();
+					let recent = self.payout.transactions().filter_map(|tx| match tx.chain_position {
+						ChainPosition::Unconfirmed { last_seen: Some(seen), .. }
+							if now.saturating_sub(seen) < ONCHAIN_EVICTION_GRACE_SECS => Some(tx.tx_node.txid),
+						_ => None,
+					}).collect::<HashSet<_>>();
+					self.payout.apply_evicted_txs(mempool.evicted.into_iter()
+						.filter(|(txid, _)| !recent.contains(txid)));
+					self.payout.apply_unconfirmed_txs(mempool.update);
+				}
+			},
+			ChainSourceClient::Esplora(client) => {
+				let request = self.payout.start_sync_with_revealed_spks_at(bark_runtime::timestamp_secs())
+					.outpoints(self.payout.list_unspent().map(|o| o.outpoint));
+				let mut update = client.sync(request, PARALLEL_REQS).await?;
+				let now = bark_runtime::timestamp_secs();
+				let recent = self.payout.transactions().filter_map(|tx| match tx.chain_position {
+					ChainPosition::Unconfirmed { last_seen: Some(seen), .. }
+						if now.saturating_sub(seen) < ONCHAIN_EVICTION_GRACE_SECS => Some(tx.tx_node.txid),
+					_ => None,
+				}).collect::<HashSet<_>>();
+				update.tx_update.evicted_ats.retain(|(txid, _)| !recent.contains(txid));
+				self.payout.apply_update(update)?;
+			},
+		}
+		self.persist().await?;
+		let to_rebroadcast = self.payout.transactions().filter_map(|tx| {
+			if let ChainPosition::Unconfirmed { last_seen, .. } = tx.chain_position {
+				if last_seen.is_none_or(|seen| seen < sync_start) {
+					return Some(tx.tx_node.tx.clone());
+				}
+			}
+			None
+		}).collect::<Vec<_>>();
+		for tx in to_rebroadcast {
+			if let Err(e) = chain.broadcast_tx(&tx).await {
+				warn!("Error rebroadcasting payout transaction {}: {}", tx.compute_txid(), e);
+			}
+		}
+		Ok(())
+	}
+
 	pub fn balance(&self) -> Balance {
-		self.inner.balance()
+		self.inner.balance() + self.payout.balance()
+	}
+
+	pub fn payout_balance(&self) -> Balance {
+		self.payout.balance()
+	}
+
+	pub fn payout_utxos(&self) -> Vec<LocalOutput> {
+		self.payout.list_unspent().collect()
 	}
 
 	pub fn list_unspent(&self) -> Vec<LocalOutput> {
@@ -585,7 +692,8 @@ impl OnchainWallet {
 	}
 
 	pub fn utxos(&self) -> Vec<Utxo> {
-		self.list_unspent().into_iter().map(|o| Utxo::Local(o.into())).collect()
+		self.list_unspent().into_iter().chain(self.payout.list_unspent())
+			.map(|o| Utxo::Local(o.into())).collect()
 	}
 
 	/// Sign a psbt. Wallet-graph application is deferred to
@@ -609,7 +717,14 @@ impl OnchainWallet {
 
 	pub async fn send(&mut self, chain: &ChainSource, dest: Address, amount: Amount, fee_rate: FeeRate
 	)	-> anyhow::Result<Txid> {
-		let psbt = self.prepare_tx(&[(dest, amount)], fee_rate).await?;
+		let psbt = match self.prepare_tx(&[(dest.clone(), amount)], fee_rate).await {
+			Ok(psbt) => psbt,
+			Err(primary_error) if self.payout.balance().trusted_spendable() > amount => {
+				return self.send_payout(chain, dest, amount, fee_rate).await
+					.with_context(|| format!("ordinary onchain send also failed: {primary_error:#}"));
+			},
+			Err(error) => return Err(error),
+		};
 		let tx = self.sign_psbt(psbt).await?.extract_tx()?;
 		let txid = tx.compute_txid();
 		self.record_broadcast_tx(tx.clone()).await?;
@@ -631,6 +746,30 @@ impl OnchainWallet {
 		self.record_broadcast_tx(tx.clone()).await?;
 		if let Err(e) = chain.broadcast_tx(&tx).await {
 			warn!("broadcast for {txid} returned error, will retry on next sync: {e:#}");
+		}
+		Ok(txid)
+	}
+
+	/// Spend a fallback payout watched at the fixed mailbox script.
+	pub async fn send_payout(
+		&mut self,
+		chain: &ChainSource,
+		destination: Address,
+		amount: Amount,
+		fee_rate: FeeRate,
+	) -> anyhow::Result<Txid> {
+		let mut builder = self.payout.build_tx();
+		builder.add_recipient(destination.script_pubkey(), amount).fee_rate(fee_rate);
+		let mut psbt = builder.finish().context("error building payout spend")?;
+		let finalized = self.payout.sign_with_signers(&mut psbt, &[&self.payout_signers],
+			bdk_wallet::SignOptions::default())?;
+		ensure!(finalized, "failed to sign payout spend");
+		let tx = psbt.extract_tx()?;
+		let txid = tx.compute_txid();
+		self.payout.apply_unconfirmed_txs([(tx.clone(), bark_runtime::timestamp_secs())]);
+		self.persist().await?;
+		if let Err(e) = chain.broadcast_tx(&tx).await {
+			warn!("payout spend broadcast for {txid} returned error, will retry on next sync: {e:#}");
 		}
 		Ok(txid)
 	}
@@ -788,8 +927,10 @@ impl OnchainWallet {
 			},
 		}
 
-		debug!("Current balance: {}", self.inner.balance());
-		self.rebroadcast_txs(chain, bark_runtime::timestamp_secs()).await
+		self.sync_payout(chain).await?;
+		debug!("Current balance: {}", self.balance());
+		self.rebroadcast_txs(chain, bark_runtime::timestamp_secs()).await?;
+		Ok(self.balance().total())
 	}
 
 
@@ -798,56 +939,116 @@ impl OnchainWallet {
 			self.db.store_bdk_wallet_changeset(&*stage).await?;
 			let _ = self.inner.take_staged();
 		}
+		if let Some(stage) = self.payout.staged() {
+			self.db.store_mailbox_bdk_wallet_changeset(&*stage).await?;
+			let _ = self.payout.take_staged();
+		}
 		Ok(())
 	}
 }
 
 #[cfg(test)]
 mod fallback_tests {
-	use bitcoin::hex::DisplayHex;
 	use bitcoin::secp256k1::Secp256k1;
+	use bitcoin::hashes::Hash;
+	use bdk_wallet::chain::BlockId;
+	use bdk_wallet::test_utils::{insert_checkpoint, receive_output_in_latest_block};
 	use crate::persist::adaptor::StorageAdaptorWrapper;
 	use super::*;
 
 	#[test]
-	fn bip86_mailbox_mnemonic_vectors_match_native_index_zero() {
+	fn upstream_mailbox_derivation_matches_payout_descriptor() {
 		// Standard public BIP39 test mnemonic, never a wallet-store read.
 		let mnemonic: bip39::Mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about".parse().unwrap();
 		let secp = Secp256k1::new();
-		let vectors: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../testdata/bip86-mailbox.json")).unwrap();
-		assert_eq!(vectors.len(), 3);
-		for vector in vectors {
-			let network: Network = vector["network"].as_str().unwrap().parse().unwrap();
+		for network in [Network::Bitcoin, Network::Signet, Network::Regtest] {
 			let master = bip32::Xpriv::new_master(network, &mnemonic.to_seed("")).unwrap();
-			let path = [bip32::ChildNumber::from_hardened_idx(86).unwrap(),
-				bip32::ChildNumber::from_hardened_idx(u32::from(network != Network::Bitcoin)).unwrap(),
-				bip32::ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
+			let path = [bip32::ChildNumber::from_hardened_idx(350).unwrap(),
+				bip32::ChildNumber::from_hardened_idx(1).unwrap()];
 			let mailbox = master.derive_priv(&secp, &path).unwrap().to_keypair(&secp);
 			let sdk_seed = crate::WalletSeed::new_from_mnemonic(network, &mnemonic);
 			assert_eq!(sdk_seed.to_mailbox_keypair().public_key(), mailbox.public_key());
 			let script = ark::fallback::payout_script(mailbox.public_key());
-			let native = BdkWallet::create_single(bdk_wallet::template::Bip86(master, KeychainKind::External))
+			let desc = format!("tr({})", bitcoin::PrivateKey::new(mailbox.secret_key(), network));
+			let native = BdkWallet::create_single(desc)
 				.network(network).create_wallet_no_persist().unwrap();
 			assert_eq!(native.peek_address(KeychainKind::External, 0).address.script_pubkey(), script);
-			assert_eq!(mailbox.public_key().to_string(), vector["mailbox"]);
-			assert_eq!(script.as_bytes()[2..].as_hex().to_string(), vector["output_key"]);
-			assert_eq!(script.to_hex_string(), vector["script"]);
 		}
 	}
 
+	#[cfg(feature = "sqlite")]
 	#[tokio::test]
-	async fn fixed_index_zero_remains_reserved_after_reload() {
+	async fn payout_is_found_and_spendable_after_reload() {
 		let db = Arc::new(StorageAdaptorWrapper::new_memory());
 		let seed = [17; 64];
 		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, seed, db.clone()).await.unwrap();
-		let reserved = wallet.inner.peek_address(KeychainKind::External, 0).address.script_pubkey();
-		assert_eq!(reserved, wallet.fallback_script());
-		for _ in 0..30 { assert_ne!(wallet.address().await.unwrap().script_pubkey(), reserved); }
+		let payout_script = wallet.fallback_script();
+		assert_ne!(wallet.inner.peek_address(KeychainKind::External, 0).address.script_pubkey(), payout_script);
+		insert_checkpoint(&mut wallet.payout, BlockId {
+			height: 1, hash: bitcoin::BlockHash::all_zeros(),
+		});
+		let payout = receive_output_in_latest_block(&mut wallet.payout, Amount::from_sat(50_000));
+		wallet.persist().await.unwrap();
 		drop(wallet);
 		let mut wallet = OnchainWallet::load_or_create(Network::Regtest, seed, db).await.unwrap();
-		assert_ne!(wallet.inner.next_unused_address(KeychainKind::External).address.script_pubkey(), reserved);
-		assert_ne!(wallet.address().await.unwrap().script_pubkey(), reserved);
-		assert_eq!(wallet.fallback_script(), reserved);
+		assert_eq!(wallet.fallback_script(), payout_script);
+		assert_eq!(wallet.payout_balance().confirmed, Amount::from_sat(50_000));
+		assert_eq!(wallet.balance().confirmed, Amount::from_sat(50_000));
+		assert_eq!(wallet.payout_utxos().len(), 1);
+		let destination = wallet.inner.peek_address(KeychainKind::External, 1).address;
+		let chain = ChainSource::offline_for_test(Network::Regtest);
+		let txid = wallet.send(&chain, destination, Amount::from_sat(40_000),
+			FeeRate::from_sat_per_vb(1).unwrap()).await.unwrap();
+		let tx = wallet.payout.get_tx(txid).unwrap().tx_node.tx;
+		assert!(tx.input.iter().any(|input| input.previous_output == payout));
+	}
+
+	#[cfg(feature = "sqlite")]
+	#[tokio::test]
+	async fn external_mailbox_payout_watch_survives_reload_and_spends() {
+		let db = Arc::new(StorageAdaptorWrapper::new_memory());
+		let seed = [23; 64];
+		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[41; 32]).unwrap();
+		let mut wallet = OnchainWallet::load_or_create_with_mailbox_keypair(
+			Network::Regtest, seed, key, db.clone()).await.unwrap();
+		let script = ark::fallback::payout_script(key.public_key());
+		assert_eq!(wallet.fallback_script(), script);
+		insert_checkpoint(&mut wallet.payout, BlockId {
+			height: 1, hash: bitcoin::BlockHash::all_zeros(),
+		});
+		let payout = receive_output_in_latest_block(&mut wallet.payout, Amount::from_sat(50_000));
+		wallet.persist().await.unwrap();
+		drop(wallet);
+		assert!(OnchainWallet::load_or_create(Network::Regtest, seed, db.clone()).await.is_err());
+		let mut wallet = OnchainWallet::load_or_create_with_mailbox_keypair(
+			Network::Regtest, seed, key, db).await.unwrap();
+		assert_eq!(wallet.payout_balance().confirmed, Amount::from_sat(50_000));
+		let destination = wallet.inner.peek_address(KeychainKind::External, 1).address;
+		let chain = ChainSource::offline_for_test(Network::Regtest);
+		let txid = wallet.send(&chain, destination, Amount::from_sat(40_000),
+			FeeRate::from_sat_per_vb(1).unwrap()).await.unwrap();
+		assert!(wallet.payout.get_tx(txid).unwrap().tx_node.tx.input.iter()
+			.any(|input| input.previous_output == payout));
+	}
+
+	#[cfg(feature = "sqlite")]
+	#[tokio::test]
+	async fn sqlite_persists_mailbox_payout_watch() {
+		let (path, _connection) = crate::persist::sqlite::helpers::in_memory_db();
+		let db = Arc::new(crate::persist::sqlite::SqliteClient::open(path).unwrap());
+		let seed = [19; 64];
+		let mut wallet = OnchainWallet::load_or_create(Network::Signet, seed, db.clone()).await.unwrap();
+		let script = wallet.fallback_script();
+		insert_checkpoint(&mut wallet.payout, BlockId {
+			height: 1, hash: bitcoin::BlockHash::all_zeros(),
+		});
+		receive_output_in_latest_block(&mut wallet.payout, Amount::from_sat(45_000));
+		wallet.persist().await.unwrap();
+		drop(wallet);
+		let wallet = OnchainWallet::load_or_create(Network::Signet, seed, db).await.unwrap();
+		assert_eq!(wallet.fallback_script(), script);
+		assert_eq!(wallet.payout_balance().confirmed, Amount::from_sat(45_000));
+		assert_eq!(wallet.balance().confirmed, Amount::from_sat(45_000));
 	}
 }
 

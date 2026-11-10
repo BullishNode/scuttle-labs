@@ -94,6 +94,8 @@ message HandshakeResponse {
 	// Public Service Announcement, a generalized message from the server to be
 	// displayed to the user.
 	optional string psa = 3;
+	// Identifies the Scuttle payout protocol without changing numeric negotiation.
+	optional string protocol_version_label = 4;
 }
 
 message ArkInfo {
@@ -305,13 +307,6 @@ message RecoverVtxosByXpubResponse {
 
 // boarding
 
-// Coin and mailbox authorization of a server-specific link.
-message OwnerProof {
-	bytes blinded_mailbox_id = 1;
-	bytes signature = 2;
-	bytes mailbox_signature = 3;
-}
-
 message BoardCosignRequest {
 	uint64 amount = 1;
 	bytes utxo = 2;
@@ -319,7 +314,8 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	OwnerProof owner_proof = 7;
+	reserved 7;
+	optional bytes mailbox_id = 8;
 }
 
 message BoardCosignResponse {
@@ -342,13 +338,15 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	OwnerProof owner_proof = 3;
+	reserved 3;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	OwnerProof owner_proof = 3;
+	reserved 3;
+	optional string address = 4;
+	optional bytes mailbox_id = 5;
 }
 
 message ArkoorCosignRequest {
@@ -443,6 +441,9 @@ message StartLightningReceiveRequest {
 	optional bytes claim_pubkey = 7;
 	// Point-in-time check for an explicit recipient before invoice creation.
 	VtxoRequest claim_destination = 8;
+	// Full recipient address for a forwarded receive. The ordinary mailbox_id
+	// above belongs to the invoice provider and is only for notifications.
+	optional string claim_destination_address = 9;
 }
 
 message StartLightningReceiveResponse {
@@ -465,7 +466,7 @@ message PrepareLightningReceiveClaimRequest {
 	// Signature by user_pubkey over the payment hash and htlc_recv_expiry,
 	// required when the receive was started with a claim_pubkey.
 	optional bytes claim_attestation = 6;
-	OwnerProof owner_proof = 7;
+	reserved 7;
 }
 
 message PrepareLightningReceiveClaimResponse {

@@ -7,40 +7,6 @@ use anyhow::Context;
 
 use ark::VtxoId;
 use ark::tree::signed::UnlockHash;
-use bitcoin::secp256k1::PublicKey;
-
-/// Refusals for prospective outputs, which do not yet have a VTXO id.
-#[derive(Debug, Clone, Copy)]
-pub enum OwnershipRefusal {
-	Required(PublicKey),
-	Invalid(PublicKey),
-	Conflicting(PublicKey),
-}
-
-impl OwnershipRefusal {
-	pub fn reason(&self) -> &'static str {
-		match self {
-			Self::Required(_) => "owner_proof_required",
-			Self::Invalid(_) => "invalid_owner_proof",
-			Self::Conflicting(_) => "conflicting_owner_binding",
-		}
-	}
-
-	pub fn public_key(&self) -> PublicKey {
-		match self {
-			Self::Required(key) | Self::Invalid(key) | Self::Conflicting(key) => *key,
-		}
-	}
-}
-
-impl fmt::Display for OwnershipRefusal {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(f, "output {} refused: {}", self.public_key(), self.reason())
-	}
-}
-
-impl StdError for OwnershipRefusal {}
-
 /// The durable cancellation tombstone prevents this round from accepting forfeits.
 #[derive(Debug)]
 pub struct RoundCancelledBeforeForfeit(pub UnlockHash);
@@ -292,7 +258,6 @@ macro_rules! unavailable {
 		Err($crate::anyhow::Error::from($crate::error::Unavailable::new(format!($($arg)*))))
 	};
 }
-pub(crate) use unavailable;
 
 
 /// Extension trait for adding bark-server-specific error info.

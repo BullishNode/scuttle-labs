@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
-use ark::fallback::OwnerLink;
 use ark::mailbox::MailboxIdentifier;
 use ark::vtxo::Full;
 use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, SECP};
@@ -19,7 +18,6 @@ use bitcoin::secp256k1::{Keypair, rand::{thread_rng, RngCore}};
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
-use server::owner_proof::OwnerLinks;
 use server_rpc::protos;
 
 use super::expiry_test::actual_fee;
@@ -29,7 +27,6 @@ const LEAF_SAT: u64 = 5_000;
 
 struct Owner {
 	key: Keypair,
-	mailbox_key: Keypair,
 	mailbox: MailboxIdentifier,
 	script: ScriptBuf,
 }
@@ -54,7 +51,7 @@ fn owner() -> Owner {
 	let key = account.derive_priv(&SECP, &[ChildNumber::from_normal_idx(1).unwrap()]).unwrap().to_keypair(&SECP);
 	let mailbox = account.derive_priv(&SECP, &[ChildNumber::from_hardened_idx(1).unwrap()]).unwrap().to_keypair(&SECP);
 	let script = ScriptBuf::new_p2tr(&SECP, mailbox.x_only_public_key().0, None);
-	Owner { key, mailbox_key: mailbox, mailbox: MailboxIdentifier::from_pubkey(mailbox.public_key()), script }
+	Owner { key, mailbox: MailboxIdentifier::from_pubkey(mailbox.public_key()), script }
 }
 
 async fn native_node(
@@ -74,8 +71,7 @@ async fn native_node(
 	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		let key = ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
 		if let Some(owner) = owners.iter().find(|owner| owner.key.public_key() == key) {
-			output.owner_proof = Some(OwnerLink::new_joint(Network::Regtest, srv.mailbox_keypair().public_key(),
-				&owner.mailbox_key, &owner.key).unwrap().into());
+			output.mailbox_id = Some(owner.mailbox.serialize());
 		}
 	}
 	let response = rpc.request_arkoor_cosign(super::signed_package(srv, &[client], request).await)
@@ -217,22 +213,12 @@ async fn direct_large_payout() {
 	assert_eq!(minimum_outputs, 324 * 43);
 	assert!(minimum_outputs > 10_000);
 	let mut rpc = srv.get_public_rpc().await;
-	let proof_db = Db::connect(&srv.config().postgres).await.unwrap();
-	let mailbox_key = srv.mailbox_keypair();
-	for owner in &owners {
-		let proof = OwnerLink::new_joint(Network::Regtest, mailbox_key.public_key(), &owner.mailbox_key, &owner.key).unwrap();
-		proof_db.write(async |tx| tx.verify_owner_link(&mailbox_key, owner.key.public_key(), &proof, Network::Regtest).await)
-			.await.unwrap();
-	}
 	let wallet = ctx.bark("source", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(2_000_000)).create().await;
 	let ids = wallet.board_and_confirm_and_register(&ctx, sat(PAYEES as u64 * LEAF_SAT)).await;
 	assert_eq!(ids.len(), 1);
 	let client = wallet.client().await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let keys = owners.iter().map(|owner| owner.key.public_key().to_string()).collect::<Vec<_>>();
-	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&keys.as_slice()])
-		.await?.get::<_, i64>(0))).await.unwrap(), PAYEES as i64);
 	let source = client.get_full_vtxo(ids[0]).await.unwrap();
 	let source_key = client.get_vtxo_key(&source).await.unwrap();
 	client.register_vtxo_transactions_with_server([&source]).await.unwrap();
@@ -377,7 +363,7 @@ async fn standard_padding_keeps_same_script_victim_payable() {
 	for _ in 0..2 {
 		let key = recipient_client.derive_store_next_keypair().await.unwrap().0;
 		owners.push(Owner {
-			key, mailbox_key: victim_mailbox_key, mailbox: victim_mailbox,
+			key, mailbox: victim_mailbox,
 			script: victim_script.clone(),
 		});
 	}

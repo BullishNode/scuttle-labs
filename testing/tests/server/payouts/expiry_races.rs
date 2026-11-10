@@ -20,9 +20,11 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
 	Db::create_with_payouts(&cfg, true).await.unwrap();
 	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([&coin]).await).await.unwrap();
+	let mailbox = super::test_server_mailbox_key().public_key();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_spendable_vtxos([coin.clone()])
+		.bind_owner_mailboxes([(coin.id(), mailbox)])?).await).await.unwrap();
 	let txid = Txid::from_byte_array([42; 32]);
 	let writes = [
 		("Lightning grant", VtxoTreeUpdate::new().mark_vtxos_oor_spent([(coin.id(), txid)])),
@@ -112,14 +114,16 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
 	Db::create_with_payouts(&cfg, true).await.unwrap();
 	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let old = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	let other = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
 	let accepted = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
+	let mailbox = super::test_server_mailbox_key().public_key();
 	let hash = ark::tree::signed::UnlockHash::hash(&[7; 32]);
 	let accepted_hash = ark::tree::signed::UnlockHash::hash(&[8; 32]);
 	let (pending, binding) = db.write(async |t| {
-		t.upsert_vtxos([&old, &other, &accepted]).await?;
+		t.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+			.insert_spendable_vtxos([old.clone(), other.clone(), accepted.clone()])
+			.bind_owner_mailboxes([(old.id(), mailbox), (other.id(), mailbox), (accepted.id(), mailbox)])?).await?;
 		let pending = t.query_one("
 			INSERT INTO round_participation(unlock_hash, created_at)
 			VALUES($1, NOW())
@@ -170,7 +174,6 @@ async fn expiry_cancelled_native_refresh_status_never_releases_preimage() {
 	let ids = wallet.board_and_confirm_and_register(&ctx, ark_testing::sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let (part, hash, inputs, leaf) = db.read(async |t| {
 		let row = t.query_one("
 			SELECT id, unlock_hash, forfeited_at IS NOT NULL AS forfeited

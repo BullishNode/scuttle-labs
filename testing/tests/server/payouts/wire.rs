@@ -1,4 +1,3 @@
-use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use server_rpc::{protos, RequestExt};
 use ark_testing::{Captaind, TestContext};
 use server::database::Db;
@@ -33,6 +32,7 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let version = server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
 	assert_eq!(handshake.min_protocol_version, version);
 	assert_eq!(handshake.max_protocol_version, version);
+	assert_eq!(handshake.protocol_version_label.as_deref(), Some("scuttle-1"));
 	let missing = public.get_offboard_fee_rate(protos::Empty {}).await.unwrap_err();
 	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
 	assert!(missing.message().contains("pver"));
@@ -46,17 +46,6 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let mut request = tonic::Request::new(protos::Empty {});
 	request.set_pver(version);
 	public.get_offboard_fee_rate(request).await.unwrap();
-	// A missing joint proof remains refused in payout-on mode.
-	let key = Keypair::new(&ark::SECP, &mut thread_rng());
-	let mut request = tonic::Request::new(protos::BoardCosignRequest {
-		user_pubkey: key.public_key().serialize().to_vec(),
-		..Default::default()
-	});
-	request.set_pver(version);
-	let missing = public.request_board_cosign(request).await.unwrap_err();
-	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
-	assert_eq!(missing.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "owner_proof_required");
-
 	let mut mailbox = server_rpc::mailbox::MailboxServiceClient::connect(srv.ark_url()).await.unwrap();
 	let error = mailbox.read_mailbox(protos::mailbox_server::MailboxRequest::default()).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);

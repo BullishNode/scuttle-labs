@@ -13,6 +13,7 @@ use ark::arkoor::package::{
 
 use crate::database::htlc_vtxo::{self, HtlcResolution};
 use crate::database::tree::VtxoTreeUpdate;
+use crate::destination::DestinationBindings;
 use crate::error::ContextExt;
 use crate::{check_max_amount, Server};
 
@@ -92,10 +93,10 @@ impl Server {
 	/// inserted by the tree update. Callers gate retry-sensitive metrics on
 	/// this count: `> 0` means the inputs/outputs were freshly persisted,
 	/// `0` means the update collapsed onto an existing row (idempotent retry).
-	pub async fn cosign_oor_with_builder(
+	pub(crate) async fn cosign_oor_with_builder(
 		&self,
 		builder: ArkoorPackageBuilder<ServerCanCosign>,
-		owner_links: &crate::owner_proof::OwnerLinks,
+		destinations: &DestinationBindings,
 	) -> anyhow::Result<(ArkoorPackageBuilder<ServerSigned>, u64)> {
 		let vtxo_guard = self.vtxos_in_flux.try_lock(builder.input_ids()).map_err(|e| {
 			slog!(ArkoorInputAlreadyInFlux, vtxo: e.id);
@@ -117,16 +118,25 @@ impl Server {
 		// once the sender uploads the signed transaction chain via
 		// register_vtxo_transactions; until then `check_spendable` rejects
 		// them. This replaces the standalone chain-registration guard.
+		let bindings = destinations.bindings_for_package(&builder, self.config.expiry_payouts)?;
 		let update = VtxoTreeUpdate::new()
 			.upsert_unsigned_tx(builder.virtual_transactions())
 			.insert_oor_spent_vtxos(builder.build_unsigned_internal_vtxos())
 			.insert_unregistered_vtxos(builder.build_unsigned_vtxos().map(ServerVtxo::from))
-			.mark_vtxos_oor_spent(builder.input_spend_info());
+			.mark_vtxos_oor_spent(builder.input_spend_info())
+			.bind_owner_mailboxes(bindings)?;
 		let source_ids = builder.input_ids().collect::<Vec<_>>();
 		let new_lightning_send = builder.build_unsigned_vtxos()
 			.any(|v| v.policy().as_server_htlc_send().is_some());
 		let inserted = self.db.write(async |t| {
-			owner_links.verify_package(t, &builder, self.mailbox_key.leak_ref(), self.config.network).await?;
+			if self.config.expiry_payouts {
+				let owners = t.coin_owner_mailboxes(&source_ids).await?;
+				let first = source_ids.first().and_then(|id| owners.get(id))
+					.context("arkoor input has no payout mailbox")?;
+				if source_ids.iter().any(|id| owners.get(id) != Some(first)) {
+					return badarg!("arkoor inputs have ambiguous or mixed payout mailboxes");
+				}
+			}
 			if new_lightning_send {
 				// A retry has already committed all the identical input spends.
 				let states = t.get_user_vtxos_by_id(&source_ids).await?;
@@ -148,10 +158,10 @@ impl Server {
 		Ok((builder, inserted))
 	}
 
-	pub async fn cosign_oor(
+	pub(crate) async fn cosign_oor(
 		&self,
 		request: ArkoorPackageCosignRequest<VtxoId>,
-		owner_links: &crate::owner_proof::OwnerLinks,
+		destinations: &DestinationBindings,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		let input_vtxo_ids = request.inputs().cloned().collect::<Vec<VtxoId>>();
 		let input_vtxo_states = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxo_ids).await).await?;
@@ -203,7 +213,7 @@ impl Server {
 			v.check_spendable_for_oor(chain_tip, *spending_txid)?;
 		}
 
-		let (builder, inserted) = self.cosign_oor_with_builder(builder, owner_links).await?;
+		let (builder, inserted) = self.cosign_oor_with_builder(builder, destinations).await?;
 
 		slog!(ArkoorCosign, input_ids: input_vtxo_ids,
 			output_ids: builder.build_unsigned_vtxos().into_iter().map(|v| v.id()).collect(),

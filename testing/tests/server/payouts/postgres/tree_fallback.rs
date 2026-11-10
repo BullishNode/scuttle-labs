@@ -2,8 +2,7 @@
 async fn customer_births_record_their_owners_once() {
 	let (_ctx, db) = test_db("customer_birth_owners").await;
 	let server = super::super::test_server_mailbox_key();
-	// These are SQL role fixtures backed by the existing signed transaction
-	// vectors and their genuinely verified owner links, not native issuance.
+	// SQL role fixtures use one explicit mailbox for each coin birth.
 	let births = [
 		(&VTXO_VECTORS.board_vtxo, SpendState::Spendable),
 		(&VTXO_VECTORS.arkoor2_vtxo, SpendState::Unregistered),
@@ -13,35 +12,33 @@ async fn customer_births_record_their_owners_once() {
 	for (coin, state) in births {
 		let coin = ServerVtxo::from(coin.clone());
 		assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(
-			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)).await).await.unwrap(), 1);
+			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)
+				.bind_owner_mailboxes([(coin.id(), server.public_key())])?).await).await.unwrap(), 1);
 		let owner = db.read(async |tx| Ok(tx.query_one("SELECT mailbox_pk,xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
 			&[&coin.id().to_string()]).await?)).await.unwrap();
 		assert_eq!(owner.get::<_, &str>(0), server.public_key().to_string());
 		let original_xmin = owner.get::<_, String>(1);
 		assert_eq!(db.write(async |tx| tx.execute_vtxo_tree_update(
-			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)).await).await.unwrap(), 0);
+			VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)
+				.bind_owner_mailboxes([(coin.id(), server.public_key())])?).await).await.unwrap(), 0);
 		assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
 			&[&coin.id().to_string()]).await?.get::<_, String>(0))).await.unwrap(), original_xmin);
 	}
 	// An unbound customer birth is refused before either row is stored.
-	// Genuine authorization then admits the birth; replay preserves it.
+	// An explicit binding admits the birth; replay preserves it.
 	let prior = ServerVtxo::from(VTXO_VECTORS.arkoor3_vtxo.clone());
-	let key = VTXO_VECTORS.arkoor3_user_key;
-	db.write(async |tx| Ok(tx.execute("DELETE FROM owner_key WHERE user_pubkey=$1",
-		&[&key.public_key().to_string()]).await?)).await.unwrap();
 	db.write(async |tx| tx.execute_vtxo_tree_update(
 		VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await).await.unwrap_err();
 	assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(prior.id()).await).await.unwrap().is_none());
 	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
 		&[&prior.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 	db.write(async |tx| {
-		let link = OwnerLink::new_joint(Network::Regtest, server.public_key(), server, &key)?;
-		tx.verify_owner_link(server, key.public_key(), &link, Network::Regtest).await?;
-		assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await?, 1);
+		let update = || VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])
+			.bind_owner_mailboxes([(prior.id(), server.public_key())]);
+		assert_eq!(tx.execute_vtxo_tree_update(update()?).await?, 1);
 		let original_xmin = tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
 			&[&prior.id().to_string()]).await?.get::<_, String>(0);
-		tx.verify_owner_link(server, key.public_key(), &link, Network::Regtest).await?;
-		assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_vtxos([prior.clone()])).await?, 0);
+		assert_eq!(tx.execute_vtxo_tree_update(update()?).await?, 0);
 		assert_eq!(tx.query_one("SELECT count(*) FROM coin_owner WHERE vtxo_id=$1",
 			&[&prior.id().to_string()]).await?.get::<_, i64>(0), 1);
 		assert_eq!(tx.query_one("SELECT xmin::TEXT FROM coin_owner WHERE vtxo_id=$1",
@@ -55,9 +52,12 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 	let (_ctx, db) = test_db("derived_expiry_stage_owner").await;
 	let server = super::super::test_server_mailbox_key();
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |tx| tx.upsert_vtxos([coin.clone()]).await).await.unwrap();
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_spendable_vtxos([coin.clone()])
+		.bind_owner_mailboxes([(coin.id(), server.public_key())])?).await).await.unwrap();
 	let mut proposal = OwnershipProposal {
 		id: coin.id(), gross: coin.amount(), disposition: OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() },
+		binding_source: OwnershipBindingSource::Coin(coin.id()),
 		evidence: Some(OwnershipEvidence::Pubkey), cancellations: Vec::new(),
 		needs_chain_progress: false, settlement_integrity_hold: false,
 	};
@@ -65,43 +65,61 @@ async fn derived_expiry_owner_uses_the_stage_selected_key() {
 		spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, server.x_only_public_key().0, None) };
 	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), original);
 
-	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
-	let destination = Keypair::from_seckey_slice(&ark::SECP, &[37; 32]).unwrap();
-	super::super::register_test_owners(&db, server, &recipient, &[destination]).await;
-	let expected = Attribution::Owned { mailbox_pk: recipient.public_key(),
-		spk: bitcoin::ScriptBuf::new_p2tr(&ark::SECP, recipient.x_only_public_key().0, None) };
-	assert_ne!(expected, original);
-	// Test the projection of an already selected economic stage. These are
-	// not fabricated participation/settlement receipts and authorize no payout.
-	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: destination.public_key() };
-	proposal.evidence = Some(OwnershipEvidence::InputOwner);
-	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), expected);
-	proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim);
-	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), expected);
+	// A different P cannot borrow this coin's mailbox, and a different coin
+	// id cannot borrow the first coin's binding.
+	proposal.disposition = OwnershipDisposition::Customer { user_pubkey:
+		bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[37; 32]).unwrap().public_key() };
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() };
+	proposal.binding_source = OwnershipBindingSource::Coin(VTXO_VECTORS.arkoor3_vtxo.id());
+	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+	proposal.binding_source = OwnershipBindingSource::Coin(coin.id());
 	proposal.evidence = None;
 	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
 
-	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: coin.policy().user_pubkey().unwrap() };
 	proposal.evidence = Some(OwnershipEvidence::Pubkey);
-	// Admission is authoritative; payout resolves the stored binding without
-	// re-verifying a different signature or requiring registration.
+	// Admission is authoritative; payout resolves the stored coin binding.
 	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), original);
-	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: Keypair::from_seckey_slice(&ark::SECP, &[38; 32]).unwrap().public_key() };
-	proposal.evidence = Some(OwnershipEvidence::InputOwner);
-	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
-	proposal.disposition = OwnershipDisposition::Customer { user_pubkey: destination.public_key() };
-	db.write(async |tx| Ok(tx.execute("UPDATE owner_key SET mailbox_pk=$1 WHERE user_pubkey=$2",
-		&[&"00".repeat(33), &destination.public_key().to_string()]).await?)).await.unwrap();
-	assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(), Attribution::Unresolved);
+}
+
+#[tokio::test]
+async fn one_coin_key_can_have_distinct_mailboxes_on_distinct_births() {
+	let (_ctx, db) = test_db("same_key_distinct_coin_mailboxes").await;
+	let first = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	let second_point = bitcoin::OutPoint::new(first.point().txid, first.point().vout + 1000);
+	let second = ServerVtxo::new(second_point, first.policy().clone(), first.amount(),
+		first.expiry_height(), first.server_pubkey(), first.exit_delta(), second_point);
+	// A direct chain-anchor output has an empty genesis chain.
+	let second = ServerVtxo::<ark::vtxo::Full>::deserialize_with_genesis(&second.serialize(), &[0]).unwrap();
+	let first_mailbox = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[37; 32]).unwrap().public_key();
+	let second_mailbox = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[38; 32]).unwrap().public_key();
+	for (coin, mailbox) in [(first.clone(), first_mailbox), (second.clone(), second_mailbox)] {
+		db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+			.insert_spendable_vtxos([coin.clone()])
+			.bind_owner_mailboxes([(coin.id(), mailbox)])?).await).await.unwrap();
+	}
+	let key = first.policy().user_pubkey().unwrap();
+	assert_eq!(second.policy().user_pubkey(), Some(key));
+	for (id, gross, mailbox) in [(first.id(), first.amount(), first_mailbox), (second.id(), second.amount(), second_mailbox)] {
+		let proposal = OwnershipProposal {
+			id, gross, disposition: OwnershipDisposition::Customer { user_pubkey: key },
+			binding_source: OwnershipBindingSource::Coin(id), evidence: Some(OwnershipEvidence::Pubkey),
+			cancellations: Vec::new(), needs_chain_progress: false, settlement_integrity_hold: false,
+		};
+		assert_eq!(db.read(async |tx| tx.derived_expiry_owner(&proposal).await).await.unwrap(),
+			Attribution::Owned { mailbox_pk: mailbox, spk: ark::fallback::payout_script(mailbox) });
+	}
 }
 
 #[tokio::test]
 async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
 	let (_ctx, db) = test_db("deferred_customer_birth_owner").await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
+	let mailbox = super::super::test_server_mailbox_key().public_key();
 	for state in [SpendState::Spendable, SpendState::Unregistered, SpendState::Unclaimed, SpendState::HtlcRecvUnclaimed] {
 		let missing = db.write(async |tx| {
-			assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)).await?, 1);
+			assert_eq!(tx.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_unspent_vtxos([coin.clone()], state)
+				.bind_owner_mailboxes([(coin.id(), mailbox)])?).await?, 1);
 			// The INSERT succeeded before its paired row was removed. Only
 			// the deferred commit check may reject this transaction.
 			tx.execute("DELETE FROM coin_owner WHERE vtxo_id=$1", &[&coin.id().to_string()]).await?;
@@ -136,35 +154,6 @@ async fn customer_birth_constraint_is_deferred_and_padding_is_exact() {
 		&[&padding.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 }
 
-#[tokio::test]
-async fn supplied_duplicate_links_are_all_verified_and_batches_roll_back() {
-	let (_ctx, db) = test_db("duplicate_owner_links").await;
-	let server = super::super::test_server_mailbox_key();
-	let a = Keypair::new(&ark::SECP, &mut rand::thread_rng());
-	let b = Keypair::new(&ark::SECP, &mut rand::thread_rng());
-	let mut links = OwnerLinks::default();
-	links.insert(a.public_key(), OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), server, &a).unwrap());
-	links.insert(b.public_key(), OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), server, &b).unwrap());
-	let mut bad = links.clone();
-	bad.insert(a.public_key(), OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), server, &b).unwrap());
-	assert!(db.write(async |tx| bad.verify(tx, [a.public_key(), b.public_key()], server,
-		bitcoin::Network::Regtest).await).await.is_err());
-	let ids = [a.public_key().to_string(), b.public_key().to_string()];
-	let count = db.read(async |tx| Ok(tx.query_one(
-		"SELECT count(*) FROM owner_key WHERE user_pubkey=ANY($1)", &[&ids.as_slice()],
-	).await?.get::<_, i64>(0))).await.unwrap();
-	assert_eq!(count, 0, "an invalid duplicate must not leave partial mappings");
-	// Matching joint authorization remains a valid replay.
-	links.insert(a.public_key(), OwnerLink::new_joint(bitcoin::Network::Regtest, server.public_key(), server, &a).unwrap());
-	let reverse = links.clone();
-	let (left, right) = tokio::join!(
-		db.write(async |tx| links.verify(tx, [a.public_key(), b.public_key()], server, bitcoin::Network::Regtest).await),
-		db.write(async |tx| reverse.verify(tx, [b.public_key(), a.public_key()], server, bitcoin::Network::Regtest).await),
-	);
-	left.unwrap();
-	right.unwrap();
-}
-
 /// An undone round resets its inputs, except one the expiry decision already
 /// entitled: that coin stays spent, so it can never be spent a second time.
 #[tokio::test]
@@ -172,7 +161,10 @@ async fn undone_round_keeps_a_decided_input_spent() {
 	let (_ctx, db) = test_db("undo_round_decided_input").await;
 	let decided = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	let other = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
-	db.write(async |tx| tx.upsert_vtxos([&decided, &other]).await).await.unwrap();
+	let mailbox = super::super::test_server_mailbox_key().public_key();
+	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_spendable_vtxos([decided.clone(), other.clone()])
+		.bind_owner_mailboxes([(decided.id(), mailbox), (other.id(), mailbox)])?).await).await.unwrap();
 	let round = db.write(async |tx| Ok(tx.query_one("INSERT INTO round(seq,funding_txid,funding_tx,signed_tree,expiry,created_at) \
 		VALUES(1,'undo-fixture','\\x00','\\x00',1,NOW()) RETURNING id", &[]).await?.get::<_, i64>(0))).await.unwrap();
 	db.write(async |tx| tx.execute_vtxo_tree_update(VtxoTreeUpdate::new()

@@ -649,8 +649,12 @@ impl<'a> BarkSdkBuilder<'a> {
 			).await.context("creating application BIP86 wallet")?;
 			Arc::new(tokio::sync::RwLock::new(wallet))
 		} else {
-			let wallet = OnchainWallet::load_or_create(network, mnemonic.to_seed(""), db.clone())
-				.await.context("creating onchain wallet")?;
+			let wallet = if let Some(key) = self.external_mailbox {
+				OnchainWallet::load_or_create_with_mailbox_keypair(
+					network, mnemonic.to_seed(""), key, db.clone()).await
+			} else {
+				OnchainWallet::load_or_create(network, mnemonic.to_seed(""), db.clone()).await
+			}.context("creating onchain wallet")?;
 			Arc::new(tokio::sync::RwLock::new(wallet))
 		};
 

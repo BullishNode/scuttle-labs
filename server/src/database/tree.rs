@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, bail};
 
 use bitcoin::{Transaction, Txid};
+use bitcoin::secp256k1::PublicKey;
 use tracing::debug;
 
-use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy};
 use ark::vtxo::{Bare, Full};
 
 use super::model::{SpendState, VirtualTransaction};
@@ -178,6 +179,7 @@ pub struct VtxoTreeUpdate {
 	tx_inserts: Vec<VirtualTransaction<'static>>,
 	vtxo_inserts: VtxoInserts,
 	vtxo_updates: VtxoUpdates,
+	owner_bindings: BTreeMap<VtxoId, PublicKey>,
 }
 
 impl VtxoTreeUpdate {
@@ -186,7 +188,18 @@ impl VtxoTreeUpdate {
 			tx_inserts: Vec::new(),
 			vtxo_inserts: VtxoInserts::new(),
 			vtxo_updates: VtxoUpdates::new(),
+			owner_bindings: BTreeMap::new(),
 		}
+	}
+
+	/// Bind each customer birth to the mailbox admitted for that exact VTXO.
+	pub fn bind_owner_mailboxes(mut self, bindings: impl IntoIterator<Item = (VtxoId, PublicKey)>) -> anyhow::Result<Self> {
+		for (id, mailbox) in bindings {
+			if self.owner_bindings.insert(id, mailbox).is_some_and(|previous| previous != mailbox) {
+				bail!("conflicting mailbox bindings for VTXO {id}");
+			}
+		}
+		Ok(self)
 	}
 
 	// -- virtual tx upserts --
@@ -454,7 +467,6 @@ pub async fn execute_vtxo_tree_update(
 ) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
 	let mut customer_ids = Vec::new();
-	let mut customer_pubkeys = Vec::new();
 	for index in 0..update.vtxo_inserts.vtxo_ids.len() {
 		let state = update.vtxo_inserts.spend_states[index].parse::<SpendState>()?;
 		let customer_birth = match state {
@@ -465,9 +477,12 @@ pub async fn execute_vtxo_tree_update(
 		};
 		if !customer_birth { continue; }
 		let policy = ServerVtxoPolicy::deserialize(&update.vtxo_inserts.policies[index])?;
-		if let Some(key) = policy.user_pubkey() {
+		if state == SpendState::Unclaimed
+			&& policy == ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE)) {
+			continue;
+		}
+		if policy.user_pubkey().is_some() {
 			customer_ids.push(update.vtxo_inserts.vtxo_ids[index].clone());
-			customer_pubkeys.push(key.to_string());
 		}
 	}
 
@@ -486,14 +501,30 @@ pub async fn execute_vtxo_tree_update(
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
 	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
-	// Only actual births get ownership metadata. A replay or a
-	// recovery upload cannot backfill consent or rewrite an existing owner.
-	tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
-		SELECT birth.vtxo_id, owner_key.mailbox_pk
-		FROM UNNEST($1::text[], $2::text[]) AS birth(vtxo_id, user_pubkey)
-		JOIN owner_key ON owner_key.user_pubkey=birth.user_pubkey
-		WHERE birth.vtxo_id=ANY($3)
-		ON CONFLICT (vtxo_id) DO NOTHING", &[&customer_ids, &customer_pubkeys, &inserted]).await?;
+	if tx.expiry_payouts() {
+		let mut mailboxes = Vec::with_capacity(customer_ids.len());
+		for id in &customer_ids {
+			let vtxo_id = id.parse::<VtxoId>()?;
+			let mailbox = update.owner_bindings.get(&vtxo_id)
+				.with_context(|| format!("customer VTXO {id} has no admitted mailbox"))?;
+			mailboxes.push(mailbox.to_string());
+		}
+		if update.owner_bindings.len() != customer_ids.len() {
+			bail!("mailbox binding set differs from customer VTXO births");
+		}
+		tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
+			SELECT * FROM UNNEST($1::text[], $2::text[])
+			ON CONFLICT (vtxo_id) DO NOTHING", &[&customer_ids, &mailboxes]).await?;
+		let rows = tx.query("SELECT vtxo_id, mailbox_pk FROM coin_owner WHERE vtxo_id=ANY($1)", &[&customer_ids]).await?;
+		let stored = rows.into_iter().map(|row|
+			(row.get::<_, String>("vtxo_id"), row.get::<_, String>("mailbox_pk")))
+			.collect::<BTreeMap<_, _>>();
+		for (id, mailbox) in customer_ids.iter().zip(mailboxes.iter()) {
+			if stored.get(id) != Some(mailbox) {
+				bail!("customer VTXO {id} has a conflicting mailbox binding");
+			}
+		}
+	}
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 
 	Ok(inserted.len() as u64)

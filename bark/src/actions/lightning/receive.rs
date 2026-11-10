@@ -360,18 +360,11 @@ pub(crate) async fn start_lightning_receive(
 
 	let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
 	let net_amount = validate_and_subtract_fee(amount, fee)?;
-	let network = wallet.network().await?;
-	let payouts = srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
-	let destination = claim_destination.as_ref().map(|destination| -> anyhow::Result<_> {
-		let link = destination.owner_link(network, ark_info.mailbox_pubkey)?;
-		if payouts {
-			ensure!(link.is_some(), FallbackRefusal::RecipientMustUpdate);
-		}
-		Ok(protos::VtxoRequest {
+	let destination = claim_destination.as_ref().map(|destination| {
+		protos::VtxoRequest {
 			amount: net_amount.to_sat(), policy: destination.policy().serialize(),
-			owner_proof: link.map(Into::into),
-		})
-	}).transpose()?;
+		}
+	});
 
 	// User needs to enforce the following delta:
 	// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
@@ -411,6 +404,7 @@ pub(crate) async fn start_lightning_receive(
 		expiry_secs: expiry.map(|e| e.as_secs()),
 		claim_pubkey: Some(claim_keypair.public_key().serialize().to_vec()),
 		claim_destination: destination,
+		claim_destination_address: claim_destination.as_ref().map(ToString::to_string),
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
@@ -567,7 +561,6 @@ async fn prepare_lightning_receive_htlcs(
 	let htlc_recv_expiry = htlc_recv_expiry(current_height, recv.htlc_recv_cltv_delta);
 	let keypair = wallet.peek_keypair(recv.key_index).await.retry()?;
 	let req = protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(wallet.owner_link(keypair.public_key()).await.retry()?.into()),
 		payment_hash: payment_hash.to_vec(),
 		user_pubkey: keypair.public_key().serialize().to_vec(),
 		htlc_recv_expiry: htlc_recv_expiry.into(),
@@ -708,7 +701,7 @@ async fn prepare_lightning_receive_claim(
 	recv: &LightningReceive,
 	htlcs: &Htlcs,
 ) -> Result<PreparedClaim, AdvanceError> {
-	let (srv, info) = wallet.require_server().await.retry()?;
+	let (srv, _) = wallet.require_server().await.retry()?;
 
 	// Order inputs by vtxoid before generating nonces, then hydrate to
 	// full so the arkoor builder has the genesis chain.
@@ -738,17 +731,12 @@ async fn prepare_lightning_receive_claim(
 		.generate_user_nonces(&keypairs)
 		.context("arkoor nonce generation for claim failed").abort()?;
 
-	let network = wallet.network().await.retry()?;
 	let mut supplied = std::collections::BTreeMap::new();
-	if srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS {
-		if let Some(address) = recv.claim_destination.as_ref() {
-			let link = address.owner_link(network, info.mailbox_pubkey).context("invalid claim ownership link").abort()?
-				.ok_or_else(|| anyhow::Error::new(crate::FallbackRefusal::RecipientMustUpdate)).abort()?;
-			supplied.insert(address.policy().user_pubkey(), link);
-		}
+	if let Some(address) = recv.claim_destination.as_ref() {
+		supplied.insert(address.policy().user_pubkey(), address.clone());
 	}
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
-	wallet.attach_owner_links(&mut package, &supplied, info.mailbox_pubkey).await.abort()?;
+	wallet.attach_payout_destinations(&mut package, &supplied).await.abort()?;
 	Ok(PreparedClaim { srv, builder, package, keypairs })
 }
 
