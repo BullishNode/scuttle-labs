@@ -130,7 +130,7 @@ impl rpc::server::ArkService for Server {
 			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES } else { MIN_PROTOCOL_VERSION },
 			max_protocol_version: MAX_PROTOCOL_VERSION,
 			psa,
-			protocol_label: self.config.expiry_payouts.then(|| "scuttle-1".to_owned()),
+			protocol_label: self.config.expiry_payouts.then(|| rpc::SCUTTLE_PAYOUT_PROTOCOL_LABEL.to_owned()),
 		};
 		Ok(tonic::Response::new(ret))
 	}

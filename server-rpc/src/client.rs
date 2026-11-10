@@ -267,6 +267,8 @@ pub enum ConnectError {
 	InvalidProtocolVersionRange { server_min: u64, server_max: u64 },
 	#[error("server protocol changed during this connection")]
 	ProtocolLabelChanged,
+	#[error("server protocol label mismatch: expected {expected}, got {got:?}")]
+	ProtocolLabelMismatch { expected: String, got: Option<String> },
 	#[error("error getting ark info: {0}")]
 	GetArkInfo(tonic::Status),
 	#[error("invalid ark info from ark server: {0}")]
@@ -365,6 +367,7 @@ impl ServerInfo {
 pub struct ServerConnectionBuilder {
 	address: Option<String>,
 	network: Option<Network>,
+	required_protocol_label: Option<String>,
 	#[cfg(feature = "socks5-proxy")]
 	proxy: Option<String>,
 	access_token: Option<String>,
@@ -372,6 +375,12 @@ pub struct ServerConnectionBuilder {
 }
 
 impl ServerConnectionBuilder {
+	/// Require the specified protocol label in the server handshake.
+	pub fn require_protocol_label(mut self, label: impl Into<String>) -> Self {
+		self.required_protocol_label = Some(label.into());
+		self
+	}
+
 	pub fn address(mut self, address: impl Into<String>) -> Self {
 		self.address = Some(address.into());
 		self
@@ -489,6 +498,11 @@ impl ServerConnection {
 			.map_err(ConnectError::Handshake)?.into_inner();
 
 		let (pver, protocol_label) = check_handshake(handshake)?;
+		if let Some(expected) = builder.required_protocol_label {
+			if protocol_label.as_deref() != Some(expected.as_str()) {
+				return Err(ConnectError::ProtocolLabelMismatch { expected, got: protocol_label });
+			}
+		}
 		interceptor.pver = Some(pver);
 
 		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
@@ -543,7 +557,7 @@ impl ServerConnection {
 
 	/// Whether this server advertises Scuttle's payout protocol.
 	pub async fn scuttle_payouts(&self) -> bool {
-		self.info.read().await.protocol_label.as_deref() == Some("scuttle-1")
+		self.info.read().await.protocol_label.as_deref() == Some(crate::SCUTTLE_PAYOUT_PROTOCOL_LABEL)
 	}
 
 	/// Returns the cached [ArkInfo].

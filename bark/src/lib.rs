@@ -1303,7 +1303,7 @@ impl Wallet {
 				match check_ark_info_safe(&ark_info, config.vtxo_exit_margin) {
 					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey),
 						Some(conn.scuttle_payouts().await)),
-					Err(err) if allow_unreachable_server => {
+			Err(err) if allow_unreachable_server && !config.require_scuttle_payouts => {
 						warn!("server-advertised ArkInfo is unsafe, \
 							treating as unavailable: {:#}", err);
 						(None, None, None)
@@ -1311,7 +1311,7 @@ impl Wallet {
 					Err(err) => return Err(err),
 				}
 			},
-			Err(_) if allow_unreachable_server => (None, None, None),
+			Err(_) if allow_unreachable_server && !config.require_scuttle_payouts => (None, None, None),
 			Err(err) => {
 				bail!("Failed to connect to provided server: {:#}", err);
 			},
@@ -1353,6 +1353,11 @@ impl Wallet {
 				config.change_vtxo_split_factor,
 			);
 		}
+		// Verify the required server before opening or creating the wallet store.
+		// This also applies when a caller asks to create without a server.
+		let required_server = if config.require_scuttle_payouts {
+			Some(Self::connect_to_server(&config, network).await?)
+		} else { None };
 
 		let fingerprint = seed.fingerprint();
 		let lock_manager = if let Some(lm) = args.lock_manager {
@@ -1446,6 +1451,9 @@ impl Wallet {
 			.context("provided chain source doesn't meet version requirement")?;
 
 		let server = tokio::sync::OnceCell::new();
+		if let Some(connection) = required_server {
+			server.set(connection).map_err(|_| anyhow::anyhow!("new server cell is already initialized"))?;
+		}
 
 		let notifications = NotificationDispatch::new();
 		let movements = Arc::new(MovementManager::new(db.clone(), notifications.clone()));
@@ -1459,6 +1467,9 @@ impl Wallet {
 			last_force_exit_scan_tip: tokio::sync::Mutex::new(None),
 			round_secret_nonces: RoundSecretNonces::new(),
 		})};
+		if ret.inner.config.require_scuttle_payouts {
+			ret.require_server().await?;
+		}
 
 		ret.inner.exit.load().await
 			.context("error loading exit system after opening wallet")?;
@@ -1573,6 +1584,9 @@ impl Wallet {
 		let mut builder = ServerConnection::builder()
 			.address(&server_address)
 			.network(network);
+		if config.require_scuttle_payouts {
+			builder = builder.require_protocol_label(server_rpc::SCUTTLE_PAYOUT_PROTOCOL_LABEL);
+		}
 
 		#[cfg(feature = "socks5-proxy")]
 		if let Some(proxy) = proxy_for_url(&config.socks5_proxy, &server_address)? {

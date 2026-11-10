@@ -91,6 +91,9 @@ pub const MAX_VTXO_KEY_GAP_LIMIT: u32 = 100_000;
 pub struct Config {
 	/// The address of your ark server.
 	pub server_address: String,
+	/// Require the Scuttle payout protocol before this wallet opens.
+	#[serde(default)]
+	pub require_scuttle_payouts: bool,
 
 	/// An access token used to access a private server.
 	#[deprecated(
@@ -255,6 +258,7 @@ impl Config {
 		#[allow(deprecated)]
 		let mut ret = Self {
 			server_address: "http://127.0.0.1:3535".to_owned(),
+			require_scuttle_payouts: false,
 			server_access_token: None,
 			user_agent: None,
 			esplora_address: None,
