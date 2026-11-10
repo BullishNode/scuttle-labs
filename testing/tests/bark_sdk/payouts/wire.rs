@@ -1,4 +1,26 @@
 use ark_testing::TestContext;
+use bark::{Config, OpenWalletArgs, Wallet, WalletSeed};
+use bitcoin::Network;
+
+#[tokio::test]
+async fn required_scuttle_label_refuses_offline_creation_before_store() {
+	let ctx = TestContext::new("bark_sdk/required_scuttle_offline").await;
+	let datadir = ctx.datadir.join("no-wallet-store");
+	let mut config = Config::network_default(Network::Regtest);
+	config.server_address = "http://127.0.0.1:1".to_owned();
+	config.require_scuttle_payouts = true;
+	let error = Wallet::open(Network::Regtest,
+		WalletSeed::new_from_seed(Network::Regtest, &[42; 64]), config,
+		OpenWalletArgs {
+			datadir: Some(datadir.clone()),
+			create_without_server: true,
+			run_daemon: false,
+			..Default::default()
+		},
+	).await.err().expect("offline creation must fail when payouts are required");
+	assert!(format!("{error:#}").contains("Failed to connect to Ark server"), "{error:#}");
+	assert!(!datadir.exists(), "required label must be checked before creating the wallet store");
+}
 
 #[tokio::test]
 #[ignore = "requires SCUTTLE_CONSUMER_EXE built from a pinned Scuttle Git revision"]
