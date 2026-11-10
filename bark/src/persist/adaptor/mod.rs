@@ -117,9 +117,6 @@ pub mod partition {
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
 
-	// Retired registration/receipt formats. Never reuse these partitions.
-	pub const LEGACY_SCUTTLE: std::ops::RangeInclusive<u8> = 18..=21;
-
 	pub const LAST_IDS: u8 = u8::MAX;
 }
 
@@ -447,9 +444,6 @@ impl<S: StorageAdaptor> StorageAdaptorWrapper<S> {
 impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	async fn init_wallet(&self, properties: &WalletProperties) -> anyhow::Result<()> {
 		let mut lock = self.inner.write().await;
-		for old in partition::LEGACY_SCUTTLE {
-			ensure!(lock.get_all(old).await?.is_empty(), "old Scuttle state requires a fresh store");
-		}
 		let record = Record::from_data(
 			partition::PROPERTIES,
 			// NB: a single set of properties is stored, so no need for primary key
@@ -462,9 +456,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
 		let lock = self.inner.read().await;
-		for old in partition::LEGACY_SCUTTLE {
-			ensure!(lock.get_all(old).await?.is_empty(), "old Scuttle state requires a fresh store");
-		}
 		match lock.get(partition::PROPERTIES, &[]).await? {
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
