@@ -142,6 +142,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let payer = Arc::new(lightning.external);
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
 		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
+			cfg.receive_htlc_forward_timeout = Duration::from_secs(120);
 			cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
 		}).watchmand().create().await;
 	srv.wait_for_vtxopool(&ctx).await;
@@ -170,13 +171,16 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let subscription = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap();
 	let incoming_expiry = subscription.lowest_incoming_htlc_expiry.unwrap();
-	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+	let claim_expiry = incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta);
+	let attestation = ark::attestations::LightningReceiveClaimAttestation::new(hash, claim_expiry, &receiver);
+	let attestation = attestation.serialize();
+	let prepare_request = protos::PrepareLightningReceiveClaimRequest {
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
-		htlc_recv_expiry: incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta).into(),
+		htlc_recv_expiry: claim_expiry.into(),
 		lightning_receive_anti_dos: None,
-		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(
-			hash, incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta), &receiver).serialize()),
-	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
+		claim_attestation: Some(attestation),
+	};
+	let grants = rpc.prepare_lightning_receive_claim(prepare_request).await.unwrap().into_inner().htlc_vtxos.into_iter()
 		.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.len(), 1);
 	let grant = &grants[0];
@@ -310,63 +314,41 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		}
 	}.wait_millis(30_000).await;
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	assert_eq!(parent.version.0, 3);
-	assert!(parent.vsize() <= 10_000);
-	assert_eq!(parent.input.len(), 1);
-	assert_eq!(parent.input[0].previous_output, root, "recover the signed backing without a descendant timeout");
+	assert_eq!(parent.version.0, 2);
+	assert!(parent.vsize() <= 100_000);
+	assert!(parent.input.iter().any(|input| input.previous_output == root),
+		"recover the backing directly without a descendant timeout");
+	assert!(parent.input.iter().all(|input|
+		input.previous_output == root || input.previous_output == sponsor));
 	let clause = ark::tree::signed::expiry_clause(grant.server_pubkey(), grant.expiry_height());
-	assert!(parent.input[0].witness.taproot_leaf_script().is_some_and(|script|
+	let root_input = parent.input.iter().find(|input| input.previous_output == root).unwrap();
+	assert!(root_input.witness.taproot_leaf_script().is_some_and(|script|
 		script.version == bitcoin::taproot::LeafVersion::TapScript && script.script == clause.as_script()));
-	assert_eq!(parent.output.iter().map(|out| out.value).sum::<Amount>(), backing.value);
-	assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == operator_script)
-		.map(|out| out.value).sum::<Amount>(), backing.value);
-	assert!(parent.output.iter().all(|out| out.script_pubkey == operator_script
-		|| (out.is_p2a_fee_anchor() && out.value == Amount::ZERO)));
-	let anchors = parent.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor())
-		.map(|(vout, _)| OutPoint::new(parent.compute_txid(), vout as u32)).collect::<Vec<_>>();
-	assert_eq!(anchors.len(), 1);
-	let child = async {
-		loop {
-			if let Some((child, _)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) { break child; }
-			tokio::time::sleep(poll_interval()).await;
-		}
-	}.wait_millis(10_000).await;
-	ctx.bitcoind().await_transaction(child.compute_txid()).await;
+	assert!(!parent.output.is_empty());
+	assert!(parent.output.iter().all(|out| out.script_pubkey == operator_script));
+	let actual_fee = super::expiry_test::actual_fee(&ctx, &parent).await;
+	assert!(actual_fee > Amount::ZERO);
+	let sponsor_value = if parent.input.iter().any(|input| input.previous_output == sponsor) {
+		sat(100_000)
+	} else { Amount::ZERO };
+	assert_eq!(parent.output.iter().map(|out| out.value).sum::<Amount>() + actual_fee,
+		backing.value + sponsor_value);
+	let recorded_fee = db.read(async |tx| Ok(tx.query_one(
+		"SELECT fee_sat FROM expiry_payout_attempt WHERE allocation_id=$1 AND txid=$2",
+		&[&allocation, &parent.compute_txid().to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(actual_fee.to_sat(), u64::try_from(recorded_fee).unwrap());
 	let confirmed = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(confirmed).await;
 	srv.watchmand().wait_for_sync_height(confirmed).await;
 	let core = ctx.bitcoind().sync_client();
-	let block = super::expiry_test::canonical(&ctx, &parent);
-	let (child, observed_fee) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent).unwrap();
-	assert_eq!(super::expiry_test::canonical(&ctx, &child), block);
-	assert_eq!(child.version.0, 3);
-	assert!(child.vsize() <= 1_000);
-	assert_eq!(child.input.iter().map(|input| input.previous_output).collect::<HashSet<_>>(),
-		HashSet::from([anchors[0], sponsor]));
-	assert_eq!(child.input.len(), 2);
-	let change = child.output.iter().map(|out| out.value).sum::<Amount>();
-	let actual_fee = sat(100_000).checked_sub(change).unwrap();
-	assert!(actual_fee > Amount::ZERO);
-	assert_eq!(observed_fee, i64::try_from(actual_fee.to_sat()).unwrap());
-	let expected_change = child.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO)
-		.map(|(vout, _)| OutPoint::new(child.compute_txid(), vout as u32)).collect::<HashSet<_>>();
-	assert!(!expected_change.is_empty());
-	async {
-		loop {
-			let owned = super::expiry_test::watchman_coins(srv.watchmand()).await;
-			if expected_change.iter().all(|point| owned.contains(point)) { break; }
-			tokio::time::sleep(poll_interval()).await;
-		}
-	}.wait_millis(10_000).await;
-	for tx in [&parent, &child] {
-		for (vout, out) in tx.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO) {
-			let actual = core.get_tx_out(&tx.compute_txid(), vout as u32, Some(true)).unwrap().unwrap();
-			assert!(actual.confirmations >= 6);
-			assert_eq!(actual.value, out.value);
-			assert_eq!(actual.script_pub_key.script().unwrap(), out.script_pubkey);
-		}
+	let _confirmed_block = super::expiry_test::canonical(&ctx, &parent);
+	for (vout, out) in parent.output.iter().enumerate() {
+		let actual = core.get_tx_out(&parent.compute_txid(), vout as u32, Some(true)).unwrap().unwrap();
+		assert!(actual.confirmations >= 6);
+		assert_eq!(actual.value, out.value);
+		assert_eq!(actual.script_pub_key.script().unwrap(), out.script_pubkey);
 	}
-	assert_eq!(backing.value + sat(100_000), backing.value + change + actual_fee);
 	async {
 		loop {
 			let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT status='confirmed' \

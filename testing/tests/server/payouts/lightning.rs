@@ -12,7 +12,7 @@ use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
 use ark::attestations::VtxoStatusAttestation;
 use ark::lightning::PaymentHash;
 use ark::mailbox::MailboxIdentifier;
-use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
+use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use ark::vtxo::Full;
 use bark::Wallet;
