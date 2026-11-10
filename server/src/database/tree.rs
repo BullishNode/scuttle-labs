@@ -524,6 +524,12 @@ pub async fn execute_vtxo_tree_update(
 				bail!("customer VTXO {id} has a conflicting mailbox binding");
 			}
 		}
+		if tx.query_opt("SELECT c.output_vtxo_id FROM expiry_lightning_receive_claim c \
+			JOIN coin_owner o ON o.vtxo_id=c.output_vtxo_id \
+			WHERE c.output_vtxo_id=ANY($1) AND c.output_mailbox IS DISTINCT FROM o.mailbox_pk LIMIT 1",
+			&[&customer_ids]).await?.is_some() {
+			bail!("registered receive output differs from its recorded claim mailbox");
+		}
 	}
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 

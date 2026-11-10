@@ -1213,30 +1213,11 @@ impl Server {
 		};
 		let builder = self.validate_cosign_request(validation, cosign_request)
 			.badarg("invalid cosign request")?;
-		if let Some(intended) = sub.claim_destination_user_pubkey {
-			for output in builder.build_unsigned_vtxos() {
-				if output.policy() != &VtxoPolicy::new_pubkey(intended) {
-					return badarg!("receive output differs from the invoice claim destination");
-				}
-			}
-		}
-		if self.config.expiry_payouts {
-			let intended_mailbox = if let Some(mailbox) = sub.claim_destination_mailbox_pk {
-				mailbox
-			} else {
-				self.db.read(async |t| t.get_lightning_receiver_mailbox_id(payment_hash).await).await?
-					.context("receive subscription has no payout mailbox")?.as_pubkey()
-			};
-			for output in builder.build_unsigned_vtxos() {
-				if destinations.mailbox_for(output.policy().user_pubkey()) != Some(intended_mailbox) {
-					return badarg!("receive output payout mailbox differs from invoice destination");
-				}
-			}
-		}
-
-		let receive_claims = crate::database::expiry_receive::ReceiveClaimBinding::from_package(&builder)
+		let receive_claims = crate::database::expiry_receive::ReceiveClaimBinding::from_package(&builder, &destinations)
 			.badarg("invalid receive destination")?;
 		ensure!(receive_claims.len() == htlc_ids.len(), "receive claim contains a non-receive source");
+		// The grant decision fence and output mailbox are committed with the
+		// preimage. A refused grant rolls the settlement back before collection.
 		let checkpoint = self.db.write(async |t| {
 			let checkpoint = t.store_htlc_settlement(payment_preimage).await?;
 			t.prepare_receive_claims(&receive_claims).await?;

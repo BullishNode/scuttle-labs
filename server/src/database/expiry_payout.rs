@@ -177,8 +177,8 @@ impl Tx<'_> {
 		Ok(outcomes)
 	}
 
-	/// A collected receive can have no final coin row. Use its actual grants
-	/// and admitted destination bindings, not the provider's grant ownership.
+	/// A claim may precede final coin registration. Match each grant to its
+	/// provider birth binding until a payable claim names a final output.
 	/// The public hash-only response receives an outcome, never these keys.
 	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
 		-> anyhow::Result<Option<FallbackOutcome>>
@@ -195,33 +195,33 @@ impl Tx<'_> {
 			.collect::<Result<BTreeSet<VtxoId>, _>>()?;
 		ensure!(grants == sub.htlc_vtxos.iter().copied().collect(), "receive grant identities differ from subscription");
 		let mut principal = Amount::ZERO;
-		let claimant = sub.claim_destination_user_pubkey.or(sub.claim_pubkey)
-			.context("receive subscription has no admitted claimant")?;
-		let owner = self.receive_subscription_mailbox(sub.id, claimant).await?
-			.context("receive subscription has no admitted claimant mailbox")?;
-		let mut destinations = BTreeSet::new();
+		let providers = self.coin_owner_mailboxes(&grants.iter().copied().collect::<Vec<_>>()).await?;
+		let mut eligible = BTreeSet::new();
 		let mut ids = grants.iter().copied().collect::<Vec<_>>();
 		for row in rows {
 			let source: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
 			let amount = Amount::from_sat(u64::try_from(row.get::<_, i64>("amount"))?);
 			principal = principal.checked_add(amount).context("receive grant amount overflow")?;
-			let Some(raw) = row.get::<_, Option<&[u8]>>("output_vtxo") else { continue; };
-			let output = ark::Vtxo::<ark::vtxo::Full>::deserialize(raw)?;
-			let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
-			ensure!(output.id() == output_id
-				&& output.amount() == amount, "receive destination differs from its source");
-			let Some((id, key, subscription)) = self.receive_claim_recipient(source).await? else { continue; };
-			ensure!(id == output.id(), "collected receive destination differs");
-			ensure!(subscription == sub.id && key == claimant,
-				"collected receive destination differs from subscription");
-			destinations.insert(id);
-			ids.push(id);
+			if let Some(raw) = row.get::<_, Option<&[u8]>>("output_vtxo") {
+				let output = ark::Vtxo::<ark::vtxo::Full>::deserialize(raw)?;
+				let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
+				ensure!(output.id() == output_id && output.amount() == amount,
+					"receive destination differs from its source");
+				if let Some((id, _, mailbox, subscription)) = self.receive_claim_recipient(source).await? {
+					ensure!(id == output_id && subscription == sub.id,
+						"collected receive destination differs from subscription");
+					eligible.insert((source, mailbox));
+					eligible.insert((id, mailbox));
+					ids.push(id);
+					continue;
+				}
+			}
+			let provider = providers.get(&source).context("receive grant has no birth mailbox")?;
+			eligible.insert((source, *provider));
 		}
 		let claims = self.source_fallback_claims(&ids).await?;
-		let matching = claims.values().filter(|claim| claim.owner_mailbox == owner
-			&& ((grants.contains(&claim.vtxo_id)
-				&& claim.binding_source == Some(OwnershipBindingSource::Subscription(sub.id)))
-				|| destinations.iter().any(|id| claim.source_vtxo_ids.contains(id))));
+		let matching = claims.values().filter(|claim| claim.source_vtxo_ids.iter()
+			.any(|source| eligible.contains(&(*source, claim.owner_mailbox))));
 		fallback_outcome(principal, matching)
 	}
 
@@ -303,18 +303,15 @@ impl Tx<'_> {
 				sources.extend(ids.iter().copied());
 			},
 			Some(OwnershipBindingSource::Subscription(id)) => {
-				ensure!(self.receive_subscription_mailbox(*id, claim.user_pubkey).await?
-					== Some(claim.owner_mailbox), "receive receipt differs from its admitted claimant");
-				if self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND lightning_htlc_subscription_id=$2",
-					&[&claim.vtxo_id.to_string(), id]).await?.is_some() {
-					sources.insert(claim.vtxo_id);
-				}
-				if let Some((output, key, subscription)) = self.receive_claim_recipient(claim.vtxo_id).await? {
-					ensure!(key == claim.user_pubkey && subscription == *id,
-						"receive receipt source differs from its subscription");
-					sources.insert(output);
-				}
-				ensure!(!sources.is_empty(), "receive receipt has no admitted source");
+				let (output, key, mailbox, subscription) = self.receive_claim_recipient(claim.vtxo_id).await?
+					.context("receive receipt has no payable recorded claim")?;
+				ensure!(key == claim.user_pubkey && mailbox == claim.owner_mailbox && subscription == *id,
+					"receive receipt differs from its recorded output destination");
+				let row = self.query_one("SELECT source_vtxo_id FROM expiry_lightning_receive_claim \
+					WHERE (source_vtxo_id=$1 OR output_vtxo_id=$1) AND subscription_id=$2",
+					&[&claim.vtxo_id.to_string(), id]).await?;
+				sources.insert(row.get::<_, &str>(0).parse()?);
+				sources.insert(output);
 			},
 			Some(OwnershipBindingSource::Allocation(id)) => {
 				let row = self.query_opt("SELECT c.owner_mailbox FROM expiry_allocation_coin c \

@@ -207,7 +207,7 @@ impl Tx<'_> {
 			proposal.evidence = Some(OwnershipEvidence::Padding);
 			return Ok(proposal);
 		}
-		if let Some((_, key, subscription)) = self.receive_claim_recipient(state.vtxo_id).await? {
+		if let Some((_, key, _, subscription)) = self.receive_claim_recipient(state.vtxo_id).await? {
 			proposal.disposition = OwnershipDisposition::Customer { user_pubkey: key };
 			proposal.evidence = Some(OwnershipEvidence::LightningReceiveClaim);
 			proposal.binding_source = OwnershipBindingSource::Subscription(subscription);
@@ -290,12 +290,16 @@ impl Tx<'_> {
 					if subscription.payment_hash != hash { return Ok(proposal); }
 					match subscription.status {
 						LightningHtlcSubscriptionStatus::Settled => {
-							// A forwarded receive is owed to the recipient bound at invoice
-							// time; the grant key is the provider's.
-							let owner = subscription.claim_destination_user_pubkey.unwrap_or(user.user_pubkey());
-							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: owner };
+							// Until a durable claim names a final output, the grant remains
+							// the forwarding provider's coin and retains its birth mailbox.
+							let recipient = self.receive_claim_recipient(state.vtxo_id).await?;
+							proposal.disposition = OwnershipDisposition::Customer {
+								user_pubkey: recipient.as_ref().map_or(user.user_pubkey(), |(_, key, _, _)| *key),
+							};
 							proposal.evidence = Some(OwnershipEvidence::HtlcStoredPreimage);
-							proposal.binding_source = OwnershipBindingSource::Subscription(subscription_id);
+							if recipient.is_some() {
+								proposal.binding_source = OwnershipBindingSource::Subscription(subscription_id);
+							}
 						},
 						LightningHtlcSubscriptionStatus::Canceled if expired_contract => {
 							proposal.disposition = OwnershipDisposition::Operator;

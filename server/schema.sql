@@ -1076,7 +1076,9 @@ CREATE TABLE public.expiry_lightning_receive_claim (
     subscription_id bigint NOT NULL,
     payment_hash text NOT NULL,
     output_vtxo_id text NOT NULL,
-    output_vtxo bytea NOT NULL
+    output_vtxo bytea NOT NULL,
+    output_mailbox text,
+    CONSTRAINT expiry_lightning_receive_claim_output_mailbox_check CHECK (((output_mailbox IS NULL) OR (length(output_mailbox) = 66)))
 );
 
 

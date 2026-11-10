@@ -84,13 +84,10 @@ impl Tx<'_> {
 				Some(sources[0].2)
 			},
 			OwnershipBindingSource::Subscription(id) => {
-				let linked = self.query_opt("SELECT v.vtxo_id FROM vtxo v WHERE v.vtxo_id=$1 \
-					AND v.lightning_htlc_subscription_id=$2 UNION \
-					SELECT c.output_vtxo_id FROM expiry_lightning_receive_claim c \
-					WHERE c.output_vtxo_id=$1 AND c.subscription_id=$2",
-					&[&ownership.id.to_string(), id]).await?.is_some();
-				if !linked { return Ok(Attribution::Unresolved); }
-				self.receive_subscription_mailbox(*id, *user_pubkey).await?
+				match self.receive_claim_recipient(ownership.id).await? {
+					Some((_, key, mailbox, subscription)) if key == *user_pubkey && subscription == *id => Some(mailbox),
+					_ => None,
+				}
 			},
 			OwnershipBindingSource::Allocation(id) => {
 				let row = self.query_opt("SELECT c.owner_mailbox,c.user_pubkey FROM expiry_allocation_coin c \

@@ -2,7 +2,8 @@
 
 use std::collections::BTreeSet;
 use anyhow::Context;
-use ark::{VtxoId, VtxoPolicy};
+use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
+use ark::attestations::VtxoStatusAttestation;
 use ark::lightning::PaymentHash;
 use bitcoin::secp256k1::PublicKey;
 use lightning_invoice::Bolt11Invoice;
@@ -38,6 +39,24 @@ impl Wallet {
 		let actual = response.htlc_vtxos.iter().map(|raw| VtxoId::from_slice(raw)).collect::<Result<BTreeSet<_>, _>>()?;
 		ensure!(actual.len() == response.htlc_vtxos.len() && actual.len() == grants.len()
 			&& actual == grants.iter().copied().collect(), "receive status differs from the original grants");
+		if response.fallback_spend_state.is_some() {
+			// Validate every grant before changing any local payout status. The
+			// hash response is an aggregate, not an owner attestation.
+			let mailbox = self.mailbox_keypair().public_key().serialize().to_vec();
+			for id in grants {
+				let coin = self.inner.db.get_wallet_vtxo(*id).await?
+					.context("receive grant is not retained")?;
+				let key = self.get_vtxo_key(&coin.vtxo).await?;
+				let attestation = VtxoStatusAttestation::new(*id, &key);
+				let status = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+					vtxo_id: id.to_bytes().to_vec(), attestation: attestation.serialize(),
+				}).await?.into_inner();
+				if status.owner_mailbox != mailbox {
+					log::warn!("Receive grant {id} payout belongs to another mailbox; keeping the action parked");
+					return Ok(None);
+				}
+			}
+		}
 		response.fallback_spend_state.map(|raw| {
 			let state = VtxoSpendState::try_from(raw).context("unknown receive fallback status")?;
 			FallbackStatus::try_from(state)

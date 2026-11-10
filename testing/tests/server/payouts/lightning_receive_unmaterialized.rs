@@ -8,10 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ark::{ProtocolEncoding, ServerVtxo, Vtxo};
+use ark::attestations::VtxoStatusAttestation;
 use ark::lightning::PaymentHash;
 use ark::vtxo::Full;
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::daemon::captaind::{self, ArkClient, MailboxClient};
+use ark_testing::payout_wallet::PayoutWallet;
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::OnchainWallet;
 use bark::persist::{BarkPersister, sqlite::SqliteClient};
@@ -77,11 +79,12 @@ struct Binding {
 	subscription: i64,
 	source: Vtxo<Full>,
 	promised: Vtxo<Full>,
+	output_mailbox: bitcoin::secp256k1::PublicKey,
 }
 
 async fn original_binding(db: &Db, hash: PaymentHash) -> Binding {
 	let rows = db.read(async |tx| Ok(tx.query("SELECT c.subscription_id, \
-		c.source_vtxo_id,c.output_vtxo_id,c.output_vtxo,source.vtxo AS source_vtxo, \
+		c.source_vtxo_id,c.output_vtxo_id,c.output_vtxo,c.output_mailbox,source.vtxo AS source_vtxo, \
 		s.status::TEXT AS status,h.offchain_resolution::TEXT AS resolution,actual.vtxo AS actual_vtxo \
 		FROM expiry_lightning_receive_claim c \
 		JOIN lightning_htlc_subscription s ON s.id=c.subscription_id AND s.payment_hash=c.payment_hash \
@@ -98,13 +101,15 @@ async fn original_binding(db: &Db, hash: PaymentHash) -> Binding {
 	assert_eq!(row.get::<_, &str>("status"), "settled");
 	assert!(row.get::<_, Option<&[u8]>>("actual_vtxo").is_none(), "an absent provider does not upload the signed output");
 	assert!(row.get::<_, Option<&str>>("resolution").is_none());
-	Binding { subscription: row.get("subscription_id"), source, promised }
+	Binding { subscription: row.get("subscription_id"), source, promised,
+		output_mailbox: row.get::<_, &str>("output_mailbox").parse().unwrap() }
 }
 
 fn unchanged(original: &Binding, actual: &Binding) {
 	assert_eq!(actual.subscription, original.subscription);
 	assert_eq!(actual.source.serialize(), original.source.serialize());
 	assert_eq!(actual.promised.serialize(), original.promised.serialize());
+	assert_eq!(actual.output_mailbox, original.output_mailbox);
 }
 
 async fn rebuilt(ctx: &TestContext, db: &Db) {
@@ -169,11 +174,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 	let mut parent_anchors = BTreeMap::new();
 	let mut children = BTreeMap::new();
 	let mut fees = 0_u64;
-	let mut child = None;
-	let parent = inventory.iter().find(|(_, tx)| tx.compute_txid() == payout.txid).unwrap();
-	let anchors = parent.1.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor())
-		.map(|(vout, out)| { assert_eq!(out.value, Amount::ZERO); OutPoint::new(payout.txid, vout as u32) }).collect::<Vec<_>>();
-	assert_eq!(anchors.len(), 1);
+	let mut allocation_fees = 0_u64;
 	for (mined, transaction) in &inventory {
 		if !transaction.input.iter().any(|input| frontier.contains_key(&input.previous_output)) { continue; }
 		let points = transaction.input.iter().map(|input| input.previous_output).collect::<Vec<_>>();
@@ -200,11 +201,11 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 			assert!(miner > 0);
 			assert!(transaction.output.iter().all(|out| out.value > Amount::ZERO));
 			assert!(children.insert(anchor_inputs[0], *mined).is_none(), "one canonical child per actual anchor");
-			if anchor_inputs[0] == anchors[0] { assert!(child.replace(*mined).is_none(), "one payout fee child"); }
 			true
 		} else {
 			assert_eq!(allocations.get(&txid), Some(transaction), "only an actual retained expiry allocation may spend non-prefix backing");
-			assert_eq!(miner, 0);
+			assert!(miner > 0, "direct payout pays its mining fee inline");
+			allocation_fees += miner;
 			let mut collected_inputs = 0;
 			let mut pool_input_value = Amount::ZERO;
 			for input in &transaction.input {
@@ -239,8 +240,10 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 		if !fee_child {
 			let actual_anchors = transaction.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor())
 				.map(|(vout, out)| { assert_eq!(out.value, Amount::ZERO); OutPoint::new(txid, vout as u32) }).collect::<Vec<_>>();
-			assert_eq!(actual_anchors.len(), 1);
-			assert!(parent_anchors.insert(actual_anchors[0], *mined).is_none());
+			if prefixes.contains_key(&txid) {
+				assert_eq!(actual_anchors.len(), 1);
+				assert!(parent_anchors.insert(actual_anchors[0], *mined).is_none());
+			} else { assert!(actual_anchors.is_empty(), "direct payout needs no fee anchor"); }
 		}
 		for (vout, output) in transaction.output.iter().enumerate() {
 			let point = OutPoint::new(txid, vout as u32);
@@ -249,20 +252,21 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 		}
 	}
 	let parent_height = inventory.iter().find(|(_, tx)| tx.compute_txid() == payout.txid).unwrap().0;
-	let child_height = child.expect("Core must contain the funded fee child");
-	assert_eq!(child_height, parent_height);
 	assert!(height + 1 - parent_height >= 6);
 	let root_total = boundary.values().map(|output| output.value.to_sat()).sum::<u64>();
 	let terminal = frontier.values().map(|output| output.value.to_sat()).sum::<u64>();
 	assert_eq!(root_total, terminal + fees);
 	assert_eq!(frontier.get(&payout).unwrap().value, sat(98_000));
 	for (anchor, parent_height) in &parent_anchors {
-		assert_eq!(children.get(anchor), Some(parent_height), "every canonical prefix or allocation needs its genuine same-block fee child");
+		if prefixes.contains_key(&anchor.txid) {
+			assert_eq!(children.get(anchor), Some(parent_height), "every signed prefix needs its genuine same-block fee child");
+		}
 	}
 	let operator_terminal = frontier.iter().filter(|(point, out)| out.script_pubkey == operator
 		|| (!source_path.contains_key(*point) && pool_path.get(*point) == Some(*out)))
 		.map(|(_, out)| out.value.to_sat()).sum::<u64>();
-	assert_eq!(operator_terminal, 102_000, "unused pool principal100k and output charge2k remain operator capital");
+	assert_eq!(operator_terminal + allocation_fees, 102_000,
+		"unused pool principal100k and output charge2k fund the operator output and inline fees");
 	for (point, output) in &frontier {
 		if output.value == Amount::ZERO { assert!(output.is_p2a_fee_anchor()); continue; }
 		if *point == payout { assert_eq!(output.value, sat(98_000)); }
@@ -282,7 +286,7 @@ async fn canonical_cut(ctx: &TestContext, srv: &Captaind, db: &Db, boundary: &BT
 	}).await.expect("unused fee funding and fee change must remain in the watchman wallet");
 	let watch_total = frontier.iter().filter(|(point, _)| watch_owned.contains(*point))
 		.map(|(_, out)| out.value.to_sat()).sum::<u64>();
-	assert_eq!(watch_total + fees, 200_000);
+	assert_eq!(watch_total + fees.checked_sub(allocation_fees).unwrap(), 200_000);
 	for (point, output) in &frontier {
 		if output.value == Amount::ZERO { continue; }
 		let actual = core.get_tx_out(&point.txid, point.vout, Some(true)).unwrap().unwrap();
@@ -305,6 +309,9 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(sat(500_000))
 		.cfg(|config| { config.expiry_payouts = true;
+			// Leave a deterministic window to check stale payout status after
+			// invalidation before captaind's upstream sync loop sees the lower tip.
+			config.sync_manager_block_poll_interval = Duration::from_secs(5);
 			config.vtxo_lifetime = BlockDelta::new(32);
 			config.vtxopool.vtxo_lifetime = BlockDelta::new(32);
 			// Issuance requires two targets. After one receive the deficit is
@@ -335,6 +342,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let provider = ctx.bark_sdk("provider", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	provider.stop_daemon_wait().await.unwrap();
 	let provider_destination = provider.fallback_script();
+	let provider_mailbox = provider.mailbox_identifier().as_pubkey().serialize().to_vec();
 	assert_eq!(provider.balance().await.unwrap().spendable, sat(0));
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	recipient.stop_daemon_wait().await.unwrap();
@@ -362,7 +370,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		_ = &mut payment => panic!("payment completed before prepare pause"),
 		_ = tokio::time::sleep(Duration::from_secs(30)) => panic!("receive grants did not prepare"),
 	}
-	let (original, writer) = db.write(async |tx| {
+	let (original, writer, status_key) = db.write(async |tx| {
 		// This existing PostgreSQL scheduling barrier changes no financial row.
 		tx.batch_execute("SET LOCAL lock_timeout='5s'; LOCK TABLE virtual_transaction IN SHARE MODE").await?;
 		let blocker = tx.query_one("SELECT pg_backend_pid()", &[]).await?.get::<_, i32>(0);
@@ -403,11 +411,14 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(original.promised.policy(), address.policy());
 		assert_eq!(original.promised.user_pubkey(), recipient_key);
 		assert_ne!(original.source.user_pubkey(), recipient_key);
-		// The provider bound the grant to its own claim key and the invoice to
-		// the recipient: two distinct keys, and only the recipient is paid.
+		// The provider's grant and recorded claim have distinct owners.
 		let subscription = tx.get_htlc_subscription_by_payment_hash(hash).await?.unwrap();
 		assert_eq!(subscription.claim_pubkey, Some(original.source.user_pubkey()));
-		assert_eq!(subscription.claim_destination_user_pubkey, Some(recipient_key));
+		assert_eq!(original.output_mailbox.to_string(), recipient_mailbox);
+		let grant_mailbox = tx.query_one("SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1",
+			&[&original.source.id().to_string()]).await?.get::<_, String>(0);
+		assert_eq!(grant_mailbox, provider.mailbox_identifier().as_pubkey().to_string(),
+			"the recorded claim must not rewrite the provider grant's birth owner");
 		assert!(original.source.has_all_witnesses(), "the grant itself was signed before the interruption");
 		let funding = ctx.bitcoind().await_transaction(original.source.chain_anchor().txid).await;
 		original.source.validate(&funding).unwrap();
@@ -419,6 +430,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		// Abort the only explicit provider action; no provider clone survives.
 		claim.abort();
 		let _ = claim.await;
+		let status_key = provider.get_vtxo_key(&original.source).await?;
 		drop(provider);
 		let _ = proxy.stop.send(());
 		unchanged(&original, &original_binding(&db, hash).await);
@@ -426,7 +438,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);
 		assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
 		srv.stop().await.unwrap();
-		Ok((original, writer))
+		Ok((original, writer, status_key))
 	}).await.unwrap();
 	tokio::time::timeout(Duration::from_secs(15), async {
 		loop {
@@ -530,7 +542,8 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 					if output.script_pubkey == destination { assert_eq!(output.value, sat(98_000)); }
 					else { assert!(output.script_pubkey == operator_script || output.is_p2a_fee_anchor()); }
 				}
-				assert_eq!(input_value, parent.output.iter().map(|out| out.value).sum::<Amount>());
+				assert!(input_value > parent.output.iter().map(|out| out.value).sum::<Amount>(),
+					"direct payout must pay its mining fee inline");
 				candidates.push((true, parent));
 			}
 			let core = ctx.bitcoind().sync_client();
@@ -551,6 +564,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 					let previous = core.get_raw_transaction(&point.txid, None).unwrap();
 					assert_eq!(previous.output[point.vout as usize], *expected);
 				}
+				if is_payout { break 'publication required; }
 				let anchors = required.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor())
 					.map(|(vout, out)| { assert_eq!(out.value, Amount::ZERO); OutPoint::new(txid, vout as u32) }).collect::<Vec<_>>();
 				assert_eq!(anchors.len(), 1);
@@ -569,7 +583,6 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 					previous.output[input.previous_output.vout as usize].value
 				}).sum::<Amount>();
 				assert!(input_value > child.output.iter().map(|out| out.value).sum::<Amount>());
-				if is_payout { break 'publication required; }
 				prefix_ready = true;
 				break;
 			}
@@ -599,7 +612,7 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 		parent_inputs += previous.output[input.previous_output.vout as usize].value;
 	}
-	assert_eq!(parent_inputs, parent.output.iter().map(|out| out.value).sum::<Amount>());
+	assert!(parent_inputs > parent.output.iter().map(|out| out.value).sum::<Amount>());
 	assert_eq!(parent_inputs, payout_input_value(&parent));
 	let confirmed = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(confirmed).await;
@@ -663,30 +676,44 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	let history = returned.history().await.unwrap();
 	assert!(history.is_empty(), "an unseen right does not manufacture an Ark coin, receipt or debit");
 	let bitcoin = returned.onchain().unwrap();
-	assert_eq!(bitcoin.read().await.balance().await, sat(98_000),
-		"the original recipient's Bitcoin wallet discovers the actual canonical payout");
+	assert_eq!(bitcoin.read().await.balance().await, sat(0));
+	let payout_dir = ctx.datadir.join("recipient-payout-wallet");
+	let mut recovered = PayoutWallet::restore(&seed.to_seed(""), bitcoin::Network::Regtest, &payout_dir).unwrap();
+	assert_eq!(recovered.script(), &destination);
+	recovered.rescan(ctx.bitcoind()).unwrap();
+	recovered.confirmed_payout(payout, sat(98_000)).unwrap();
 	for _ in 0..2 {
 		returned.sync_fallback_payouts().await.unwrap();
 		returned.sync_onchain().await.unwrap();
-		assert_eq!(bitcoin.read().await.balance().await, sat(98_000));
+		assert_eq!(bitcoin.read().await.balance().await, sat(0));
+		recovered.rescan(ctx.bitcoind()).unwrap();
+		recovered.confirmed_payout(payout, sat(98_000)).unwrap();
 		assert_eq!(returned.history().await.unwrap(), history);
 		assert_eq!(returned.balance().await.unwrap().total(), sat(0));
 	}
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.posts.load(Ordering::SeqCst), 0);
+	let grant_status = srv.get_public_rpc().await.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: original.source.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(original.source.id(), &status_key).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(grant_status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert_eq!(grant_status.owner_mailbox, provider_mailbox);
+	assert!(!grant_status.fallback_committed,
+		"a recipient fallback does not rewrite the provider grant's historical owner");
 
 	srv.watchmand().stop().await.unwrap();
 	let old_view = db.read(async |tx| tx.expiry_view().await).await.unwrap().unwrap();
 	let core = srv.bitcoind().sync_client();
 	let payout_block = core.custom_get_raw_transaction_info(payout.txid, None).unwrap().unwrap().blockhash.unwrap();
+	let mut rpc = srv.get_public_rpc().await;
 	core.invalidate_block(&payout_block).unwrap();
-	assert!(core.get_block_hash(u64::from(old_view.height.to_u32())).is_err());
-	assert_eq!(db.read(async |tx| tx.expiry_view().await).await.unwrap(), Some(old_view));
-	let error = srv.get_public_rpc().await.check_lightning_receive(protos::CheckLightningReceiveRequest {
+	let stale_status = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
 		hash: hash.to_vec(), wait: false,
-	}).await.unwrap_err();
-	assert_eq!(error.code(), tonic::Code::Internal);
+	}).await;
 	core.reconsider_block(&payout_block).unwrap();
+	let error = stale_status.unwrap_err();
+	assert_eq!(error.code(), tonic::Code::Internal);
 	assert_eq!(core.get_block_hash(u64::from(old_view.height.to_u32())).unwrap(), old_view.hash);
 	assert!(core.custom_get_raw_transaction_info(payout.txid, None).unwrap().unwrap().confirmations.unwrap() >= 6);
 	srv.watchmand().start().await.unwrap();
@@ -700,7 +727,9 @@ async fn collected_external_receive_pays_recipient_without_provider() {
 	assert_eq!(native[0].amount_msat.as_ref().unwrap().msat, gross.to_msat());
 	canonical_cut(&ctx, &srv, &db, &boundary, &destination, &provider_destination, payout, &original.source, &operator_pool).await;
 	returned.sync_onchain().await.unwrap();
-	assert_eq!(bitcoin.read().await.balance().await, sat(98_000));
+	assert_eq!(bitcoin.read().await.balance().await, sat(0));
+	recovered.rescan(ctx.bitcoind()).unwrap();
+	recovered.confirmed_payout(payout, sat(98_000)).unwrap();
 	assert!(returned.history().await.unwrap() == history);
 	assert_eq!(gate.claims.load(Ordering::SeqCst), 1);
 	assert_eq!(gate.registrations.load(Ordering::SeqCst), 0);

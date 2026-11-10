@@ -389,12 +389,10 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 }
 
-/// A forwarded receive whose hash settles without a cooperative claim leaves
-/// no claim row naming the recipient. Its grant, still unspent offchain at
-/// expiry, is paid to the recipient bound at invoice time, never to the
-/// provider's grant key.
+/// A settled forwarded receive without a recorded claim still belongs to
+/// the forwarding provider. The invoice destination alone transfers nothing.
 #[tokio::test]
-async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
+async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 	let ctx = TestContext::new("server/settled_forwarded_receive_without_claim").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let payer = Arc::new(lightning.external);
@@ -406,9 +404,7 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let recipient = ctx.bark("recipient", &srv).create().await;
 	let address: ark::Address = recipient.address().await.parse().unwrap();
-	let recipient_key = address.policy().user_pubkey();
 	let recipient_script = recipient.client().await.fallback_script();
-	let recipient_mailbox = recipient.client().await.mailbox_identifier().as_pubkey();
 	let provider_mailbox = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let grant_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let provider_script = ark::fallback::payout_script(provider_mailbox.public_key());
@@ -472,25 +468,25 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
 
-	// Each grant is paid to the recipient, once, and no allocation names the provider.
+	// Each unclaimed grant is paid to its birth owner, not the invoice destination.
 	for grant in &grants {
 		let parent: Transaction = tokio::time::timeout(Duration::from_secs(60), async {
 			loop {
 				if let Some((_, parent)) = super::expiry_test::published_payout(&db, grant.id()).await { break parent; }
 				tokio::time::sleep(poll_interval()).await;
 			}
-		}).await.expect("the settled grant was not paid to its recipient");
+		}).await.expect("the settled grant was not paid to its provider");
 		ctx.bitcoind().await_transaction(parent.compute_txid()).await;
-		assert!(parent.output.iter().any(|out| out.script_pubkey == recipient_script && out.value > Amount::ZERO));
-		assert!(parent.output.iter().all(|out| out.script_pubkey != provider_script));
+		assert!(parent.output.iter().any(|out| out.script_pubkey == provider_script && out.value > Amount::ZERO));
+		assert!(parent.output.iter().all(|out| out.script_pubkey != recipient_script));
 		let owners = db.read(async |tx| Ok(tx.query("SELECT c.user_pubkey, c.owner_mailbox \
 			FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
 			&[&grant.id().to_string()]).await?)).await.unwrap();
 		assert!(!owners.is_empty());
 		for owner in owners {
-			assert_eq!(owner.get::<_, Option<String>>("user_pubkey"), Some(recipient_key.to_string()),
-				"grant {} was allocated to someone other than the recipient", grant.id());
-			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(recipient_mailbox.to_string()));
+			assert_eq!(owner.get::<_, Option<String>>("user_pubkey"), Some(grant_key.public_key().to_string()),
+				"grant {} was allocated to someone other than the provider", grant.id());
+			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()));
 		}
 	}
 	let pending = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
@@ -504,7 +500,7 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 		hash: hash.to_vec(), wait: false,
 	}).await.unwrap().into_inner();
 	assert_eq!(terminal.fallback_spend_state, Some(protos::VtxoSpendState::Spent as i32),
-		"payment-hash status follows the recipient's subscription entitlement");
+		"payment-hash status follows the provider's unclaimed grant entitlement");
 	for grant in &grants {
 		let birth_mailbox = db.read(async |tx| Ok(tx.query_one(
 			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
@@ -516,7 +512,7 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 			attestation: VtxoStatusAttestation::new(grant.id(), &grant_key).serialize(),
 		}).await.unwrap().into_inner();
 		assert_eq!(status.owner_mailbox, provider_mailbox.public_key().serialize().to_vec());
-		assert!(!status.fallback_committed,
-			"provider status must not claim the recipient's fallback payout");
+		assert!(status.fallback_committed,
+			"provider status must report its own grant payout");
 	}
 }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bitcoin::{Amount, Network, OutPoint, Transaction};
+use bitcoin::{Amount, OutPoint, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
@@ -2811,9 +2811,9 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 	assert_eq!(resp.status, protos::LightningReceiveStatus::Canceled as i32);
 }
 
-/// An invoice's admitted recipient cannot be replaced after the HTLC arrives.
+/// The first recorded claim fixes its output and mailbox before registration.
 #[tokio::test]
-async fn server_lightning_receive_claim_destination_is_bound() {
+async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 	require_bark_version!(> "0.5.0");
 	let ctx = TestContext::new("lightningd/server_lightning_receive_claim_destination_bound").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
@@ -2827,19 +2827,28 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	let hash = preimage.compute_payment_hash();
 	let amount = sat(100_000);
 	let net = amount - srv.config().fees.lightning_receive.calculate(amount).unwrap();
-	// A forwarding provider: its own mailbox and grant key, the recipient's address.
+	// Invoice-time destination metadata names the provider; the recorded claim
+	// later chooses a different recipient address.
 	let provider_mailbox = Keypair::from_seckey_slice(&SECP, &[60; 32]).unwrap();
 	let grant_key = Keypair::from_seckey_slice(&SECP, &[61; 32]).unwrap();
 	assert_ne!(grant_key.public_key(), address.policy().user_pubkey());
+	let info = srv.ark_info().await;
+	let provider_address = ark::Address::builder()
+		.testnet(srv.config().network != bitcoin::Network::Bitcoin)
+		.server_pubkey(info.server_pubkey)
+		.policy(VtxoPolicy::new_pubkey(grant_key.public_key()))
+		.mailbox(info.mailbox_pubkey,
+			ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()), &grant_key).unwrap()
+		.into_address().unwrap().to_string();
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 40,
 		mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
 		description: None, expiry_secs: None,
 		claim_destination: Some(protos::VtxoRequest {
-			amount: net.to_sat(), policy: address.policy().serialize(),
+			amount: net.to_sat(), policy: VtxoPolicy::new_pubkey(grant_key.public_key()).serialize(),
 		}),
-		claim_destination_address: Some(address.to_string()),
+		claim_destination_address: Some(provider_address.clone()),
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
 	}).await.unwrap().into_inner().bolt11;
 
@@ -2851,8 +2860,7 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap();
-	// The grant key and the payee are two different keys, both bound.
-	assert_eq!(sub.claim_destination_user_pubkey, Some(address.policy().user_pubkey()));
+	// The grant belongs to the provider until a claim is recorded.
 	assert_eq!(sub.claim_pubkey, Some(grant_key.public_key()));
 	let lowest = sub.lowest_incoming_htlc_expiry.unwrap();
 	let expiry = lowest.saturating_sub(srv.config().htlc_expiry_delta);
@@ -2878,32 +2886,6 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 		.map(|bytes| Vtxo::<Full>::deserialize(&bytes).unwrap()).collect::<Vec<_>>();
 	assert!(!granted.is_empty());
 
-	// The provider cannot redirect the claim to its own key.
-	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
-		granted.clone(), VtxoPolicy::new_pubkey(grant_key.public_key()),
-	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
-	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
-	let info = srv.ark_info().await;
-	let wrong_address = ark::Address::builder()
-		.testnet(srv.config().network != bitcoin::Network::Bitcoin)
-		.server_pubkey(info.server_pubkey)
-		.policy(VtxoPolicy::new_pubkey(grant_key.public_key()))
-		.mailbox(info.mailbox_pubkey,
-			ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()), &grant_key).unwrap()
-		.into_address().unwrap().to_string();
-	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.address = Some(wrong_address.clone());
-	}
-	let bad = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
-		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
-		cosign_request: Some(package),
-	}).await.expect_err("server redirected the invoice's recipient");
-	assert!(bad.message().contains("invoice claim destination"), "{bad}");
-	let still_ready = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
-		.await.unwrap().unwrap();
-	assert_eq!(still_ready.status, server::database::ln::LightningHtlcSubscriptionStatus::HtlcsReady);
-	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
-
 	let valid_builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		granted.clone(), address.policy().clone(),
 	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
@@ -2911,6 +2893,36 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 	for output in valid_package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		output.address = Some(address.to_string());
 	}
+	let mut changed_mailbox = valid_package.clone();
+	let (_, recipient_pair) = recipient.client().await.pubkey_keypair(&address.policy().user_pubkey())
+		.await.unwrap().unwrap();
+	let altered_address = ark::Address::builder()
+		.testnet(srv.config().network != bitcoin::Network::Bitcoin)
+		.server_pubkey(info.server_pubkey)
+		.policy(address.policy().clone())
+		.mailbox(info.mailbox_pubkey,
+			ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()), &recipient_pair).unwrap()
+		.into_address().unwrap().to_string();
+	for output in changed_mailbox.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.address = Some(altered_address.clone());
+	}
+	// A committed expiry fence must refuse the claim before the preimage
+	// becomes durable. Remove this synthetic fence to complete the claim.
+	let source_id = granted[0].id().to_string();
+	db.write(async |tx| { tx.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)",
+		&[&source_id]).await?; Ok(()) }).await.unwrap();
+	let decided = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
+		cosign_request: Some(valid_package.clone()),
+	}).await.expect_err("a decided grant released its preimage");
+	assert_eq!(decided.code(), tonic::Code::InvalidArgument, "{decided}");
+	assert_eq!(decided.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "decided_for_fallback");
+	assert!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap().is_none());
+	assert_eq!(db.read(async |tx| Ok(tx.query_one(
+		"SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+	db.write(async |tx| { tx.execute("DELETE FROM expiry_entitlement WHERE vtxo_id=$1",
+		&[&source_id]).await?; Ok(()) }).await.unwrap();
 	let response = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
 		cosign_request: Some(valid_package),
@@ -2922,17 +2934,49 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 		&& v.policy().user_pubkey() == address.policy().user_pubkey() && v.has_all_witnesses()));
 	// The payout engine reads the payee from these rows: one per grant, each
 	// paying the recipient.
-	let claims = db.read(async |tx| Ok(tx.query("SELECT source_vtxo_id, output_vtxo \
+	let claims = db.read(async |tx| Ok(tx.query("SELECT source_vtxo_id, output_vtxo, output_mailbox \
 		FROM expiry_lightning_receive_claim WHERE payment_hash=$1", &[&hash.to_string()]).await?)).await.unwrap();
 	assert_eq!(claims.len(), granted.len());
 	for claim in &claims {
 		assert!(granted.iter().any(|grant| grant.id().to_string() == claim.get::<_, String>("source_vtxo_id")));
 		let output = Vtxo::<Full>::deserialize(claim.get("output_vtxo")).unwrap();
 		assert_eq!(output.policy().user_pubkey(), address.policy().user_pubkey());
+		assert_eq!(claim.get::<_, &str>("output_mailbox"), recipient.client().await.mailbox_identifier().as_pubkey().to_string());
 	}
+	// Reusing the same output bytes with another payout mailbox is refused
+	// before the final coin row exists.
+	let mailbox_refused = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(), cosign_request: Some(changed_mailbox),
+	}).await.expect_err("a retry changed the recorded claim mailbox");
+	assert!(mailbox_refused.message().contains("existing receive output differs from its claim mailbox"), "{mailbox_refused}");
+	// A retry cannot replace the output key either.
+	let retry_builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		granted.clone(), VtxoPolicy::new_pubkey(grant_key.public_key()),
+	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
+	let mut retry = protos::ArkoorPackageCosignRequest::from(retry_builder.cosign_request());
+	for output in retry.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.address = Some(provider_address.clone());
+	}
+	let refused = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
+		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(), cosign_request: Some(retry),
+	}).await.expect_err("a retry changed the recorded claim output");
+	assert!(refused.message().contains("receive claim conflicts"), "{refused}");
 	rpc.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
 		vtxos: outputs.iter().map(|v| v.serialize()).collect(),
 	}).await.expect("the intended output can be registered");
+	let recipient_mailbox = recipient.client().await.mailbox_identifier().as_pubkey().to_string();
+	for output in &outputs {
+		let actual = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&output.id().to_string()],
+		).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(actual, recipient_mailbox);
+	}
+	for grant in &granted {
+		let actual = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
+		).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(actual, provider_mailbox.public_key().to_string());
+	}
 	assert_eq!(db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap().status, server::database::ln::LightningHtlcSubscriptionStatus::Settled);
 	assert!(pay_task.wait_millis(30_000).await.unwrap().is_ok());

@@ -17,6 +17,7 @@ use rand::seq::IteratorRandom;
 
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::arkoor::state::UserGeneratedNonces;
+use ark::address::VtxoDelivery;
 use ark::attestations::{LightningReceiveAttestation, LightningReceiveClaimAttestation};
 use ark::fees::validate_and_subtract_fee;
 use ark::lightning::{Bolt11InvoiceExt, PaymentHash, Preimage};
@@ -796,11 +797,10 @@ async fn claim_lightning_receive_htlcs(
 	info!("Got arkoors from lightning: {}",
 		outputs.iter().map(|v| v.id().to_string()).collect::<Vec<_>>().join(", "));
 
-	// A destination owned by this wallet needs no mailbox delivery: the
-	// outputs are already keyed to one of our pubkeys.
+	// Local delivery requires both the output key and payout mailbox to
+	// belong to this wallet.
 	let external_destination = match recv.claim_destination.as_ref() {
-		Some(destination) => wallet.pubkey_keypair(&destination.policy().user_pubkey())
-			.await.retry()?.is_none(),
+		Some(destination) => !local_claim_destination(wallet, destination).await.retry()?,
 		None => false,
 	};
 	if !external_destination && wallet.properties().await.retry()?.server_payouts == Some(true) {
@@ -887,6 +887,12 @@ async fn deliver_lightning_receive(
 }
 
 async fn finish_fallback_receive(wallet: &Wallet, recv: &LightningReceive) -> anyhow::Result<bool> {
+	if let Some(destination) = recv.claim_destination.as_ref() {
+		if !local_claim_destination(wallet, destination).await? {
+			// Hash-level status says nothing about delivery to another wallet.
+			return Ok(false);
+		}
+	}
 	let Some(status) = wallet.receive_fallback_status(recv.payment_hash, &recv.invoice, &recv.grant_ids).await?
 		else { return Ok(false); };
 	wallet.apply_receive_fallback(recv.payment_hash, &recv.grant_ids, status).await?;
@@ -904,6 +910,21 @@ async fn finish_fallback_receive(wallet: &Wallet, recv: &LightningReceive) -> an
 	wallet.inner.db.record_settled_lightning_receive(recv.payment_hash, recv.payment_preimage,
 		&recv.invoice, amount).await?;
 	Ok(true)
+}
+
+async fn local_claim_destination(wallet: &Wallet, address: &ark::Address) -> anyhow::Result<bool> {
+	let Some((_, keypair)) = wallet.pubkey_keypair(&address.policy().user_pubkey()).await? else {
+		return Ok(false);
+	};
+	let properties = wallet.properties().await?;
+	if properties.server_payouts != Some(true) { return Ok(true); }
+	let server_mailbox = match properties.server_mailbox_pubkey {
+		Some(key) => key,
+		None => wallet.require_ark_info().await?.mailbox_pubkey,
+	};
+	let own_blinded = wallet.mailbox_identifier().to_blinded(server_mailbox, &keypair)?;
+	Ok(matches!(address.delivery(), [VtxoDelivery::ServerMailbox { blinded_id }]
+		if *blinded_id == own_blinded))
 }
 
 async fn deliver_vtxos_to_address(
