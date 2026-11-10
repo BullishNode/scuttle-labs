@@ -82,7 +82,7 @@ async fn fetch_accepted_payment_hashes(
 			hold::list_request::PaymentHashes { payment_hashes },
 		)),
 	};
-	let res = super::unary_rpc(hold_client.list(req)).await?.into_inner();
+	let res = hold_client.list(req).await?.into_inner();
 
 	let mut accepted = HashSet::new();
 	for inv in &res.invoices {
@@ -256,20 +256,18 @@ impl ClnHoldProcess {
 
 		let tip = self.sync_manager.chain_tip().height;
 		for htlc_subscription in htlc_subscriptions {
-			let result = async {
-				let Some(reason) = self.cancel_reason(&htlc_subscription, tip).await? else { return Ok(()); };
-				let Some(_guard) = self.try_lock_subscription(&htlc_subscription).await? else { return Ok(()); };
-				self.cancel_invoice_and_htlc_subscription(
-					&mut hold_client,
-					htlc_subscription.invoice.payment_hash(),
-					&htlc_subscription,
-					reason,
-				).await
-			}.await;
-			if let Err(error) = result {
-				error!(subscription_id = htlc_subscription.id, payment_hash = %htlc_subscription.payment_hash,
-					error = %format!("{error:#}"), "Hold invoice timeout handling failed; will retry independently");
-			}
+			let Some(reason) = self.cancel_reason(&htlc_subscription, tip).await? else {
+				continue;
+			};
+			let Some(_guard) = self.try_lock_subscription(&htlc_subscription).await? else {
+				continue;
+			};
+			self.cancel_invoice_and_htlc_subscription(
+				&mut hold_client,
+				htlc_subscription.invoice.payment_hash(),
+				&htlc_subscription,
+				reason,
+			).await?;
 		}
 
 		Ok(())
@@ -374,7 +372,7 @@ impl ClnHoldProcess {
 				payment_hash.to_byte_array().to_vec(),
 			)),
 		};
-		let res = super::unary_rpc(hold_client.list(req)).await?.into_inner();
+		let res = hold_client.list(req).await?.into_inner();
 
 		let accepted_invoice = match res.invoices.iter().find(|i| i.state == InvoiceState::Accepted as i32) {
 			Some(invoice) => invoice,
@@ -609,9 +607,9 @@ impl ClnHoldProcess {
 		htlc_subscription: &LightningHtlcSubscription,
 		reason: &str,
 	) -> anyhow::Result<()> {
-		super::unary_rpc(hold_client.cancel(hold::CancelRequest {
+		hold_client.cancel(hold::CancelRequest {
 			payment_hash: payment_hash.to_byte_array().to_vec(),
-		})).await?;
+		}).await?;
 
 		slog!(LightningReceiveCanceled,
 			payment_hash: htlc_subscription.payment_hash,

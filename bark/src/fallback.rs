@@ -13,13 +13,6 @@ use ark::{ProtocolEncoding, VtxoPolicy};
 use server_rpc::protos;
 use crate::Wallet;
 
-pub(crate) fn next_key_index(last: Option<u32>) -> anyhow::Result<u32> {
-	let next = last.map(|i| i.checked_add(1).context("vtxo key index exhausted"))
-		.transpose()?.unwrap_or(0);
-	ensure!(next < (1 << 31), "vtxo key index exhausted");
-	Ok(next)
-}
-
 impl Wallet {
 
 	/// Taproot destination of the exact mailbox identity checked at open.

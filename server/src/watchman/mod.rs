@@ -95,7 +95,7 @@ use tracing::{info, trace, warn};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId};
 use ark::vtxo::policy::signing::VtxoSigner;
-use bitcoin_ext::{fee, BlockHeight, BlockRef, TransactionExt, TxStatus, P2TR_DUST};
+use bitcoin_ext::{fee, BlockHeight, BlockRef, TxStatus, P2TR_DUST};
 use bitcoin_ext::bdk::KEYCHAIN;
 use bitcoin_ext::cpfp::MakeCpfpFees;
 use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
@@ -107,7 +107,7 @@ use crate::database::{BlockTable, Db, Tx};
 use crate::fee_estimator::FeeEstimator;
 use crate::system::RuntimeManager;
 use crate::utils::InstrumentedLock;
-use crate::wallet::{BdkWalletExt, PersistedWallet};
+use crate::wallet::PersistedWallet;
 use crate::watchman::policy::ActionContextFetcher;
 
 /// The kind of mempool spend.
@@ -1068,20 +1068,15 @@ impl Watchman {
 				break;
 			}
 
-			match self.db.write(async |t| {
+			if let Err(e) = self.db.write(async |t| {
 				// Normal exit progression competes with payouts for the same
 				// physical backing too. Hold its coin locks through publication.
 				t.lock_unallocated_watchman_inputs(&[vtxo.id()]).await?;
 				self.process_progress_tx(t, &mut wallet, progress_txid, &vtxo, fee_rate).await
 			}).await {
-				Ok(true) => {
-					let _ = wallet.take_staged();
-					crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
-				},
-				Ok(false) => {},
-				Err(e) => slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
+				slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
 					error: format!("{e:#}"),
-				),
+				);
 			}
 		}
 
@@ -1099,7 +1094,7 @@ impl Watchman {
 		txid: Txid,
 		vtxo: &ServerVtxo,
 		fee_rate: FeeRate,
-	) -> anyhow::Result<bool> {
+	) -> anyhow::Result<()> {
 		// Reuse the publication transaction, retaining its source locks without
 		// borrowing another connection from the same pool.
 		let vtx = tx.get_virtual_transaction_by_txid(txid).await?
@@ -1110,32 +1105,17 @@ impl Watchman {
 
 		// Create a CPFP transaction to pay fees for the progress tx
 		//TODO(stevenroose) adapt feerate to how close the deadline is
-		let (anchor, _) = progress_tx.fee_anchor().context("progress tx has no fee anchor")?;
-		let fees = if let Some(child) = bcd::get_mempool_spending_tx(&self.bitcoind, anchor).await? {
-			let (current_package_fee, weight) = payout::mempool_child_fee(&self.bitcoind, child).await?
-				.context("progress fee child left the mempool")?;
-			if current_package_fee >= (progress_tx.weight() + weight) * fee_rate {
-				return Ok(false);
-			}
-			MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
-		} else {
-			MakeCpfpFees::Effective(fee_rate)
-		};
+		let fees = MakeCpfpFees::Effective(fee_rate);
 		let cpfp_tx = wallet.make_signed_p2a_cpfp(&progress_tx, fees)
 			.with_context(|| format!("failed to create CPFP for vtx {}", txid))?;
 
 		// Broadcast the progress tx and CPFP as a package
 		let cpfp_txid = cpfp_tx.compute_txid();
-		let result = bcd::submit_package(&self.bitcoind, &[&progress_tx, &cpfp_tx]).await?;
-		bcd::require_package_acceptance(&result, &[&progress_tx, &cpfp_tx])?;
-		wallet.commit_tx(&cpfp_tx);
-		if let Some(change) = wallet.staged() {
-			tx.store_changeset(wallet.kind(), change).await?;
-		}
+		bcd::submit_package(&self.bitcoind, &[&progress_tx, &cpfp_tx]).await?;
 
 		slog!(ProgressBroadcast, vtxo_id: vtxo.id(), txid, cpfp_txid);
 
-		Ok(true)
+		Ok(())
 	}
 }
 

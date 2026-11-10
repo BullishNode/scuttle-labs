@@ -32,7 +32,7 @@
 //! broadcasts the result without making a backend round-trip.
 
 use std::fmt;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,7 +55,7 @@ use ark::mailbox::MailboxIdentifier;
 use uuid::Uuid;
 
 use crate::Server;
-use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle, unary_rpc};
+use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle};
 use crate::ln::cln::hold::ClnHoldConfig;
 use crate::ln::cln::xpay::ClnXpayConfig;
 use crate::ln::guard::PaymentGuards;
@@ -712,9 +712,9 @@ impl LightningManager {
 			let mut hold_client = self.node_by_id(htlc_subscription.lightning_node_id)
 				.context("invoice cannot be settled: node is now offline")?
 				.hold_rpc.context("node doesn't support hold anymore")?;
-			if let Err(err) = unary_rpc(hold_client.settle(hold_plugin::SettleRequest {
+			if let Err(err) = hold_client.settle(hold_plugin::SettleRequest {
 				payment_preimage: preimage.to_vec(),
-			})).await {
+			}).await {
 				// An earlier call can have settled the invoice and then
 				// failed to store it, so a retry finds the HTLCs already
 				// gone. That is the outcome we wanted, not a failure.
@@ -822,8 +822,8 @@ impl LightningManager {
 	///   never got to. It takes the payment hash guard, so it never settles
 	///   an invoice while a cooperative claim settles it.
 	///
-	/// - Retry on failure: retain the failed durable item for another attempt
-	///   after 5 seconds while continuing to read unrelated settlements.
+	/// - Retry on failure: a settlement that fails is retried on the same
+	///   item every 5 seconds until it succeeds, so it is not abandoned.
 	///
 	/// - Backoff: 5s sleep between retries avoids busy-looping when the
 	///   backend or database is persistently unavailable. The preimage is
@@ -843,24 +843,19 @@ async fn run_hold_settler(
 ) {
 	let _worker = srv.rtmgr.spawn_critical("HoldSettler");
 	tokio::pin!(settlement_stream);
-	let mut retry = VecDeque::<(tokio::time::Instant, super::settler::Settlement)>::new();
 
 	loop {
-		let next_retry = retry.front().map(|(at, _)| *at).unwrap_or_else(tokio::time::Instant::now);
-		let settlement = tokio::select! {
-			item = settlement_stream.next() => match item {
-				Some(item) => item,
-				None => break,
-			},
-			_ = tokio::time::sleep_until(next_retry), if !retry.is_empty() =>
-				retry.pop_front().expect("retry was nonempty").1,
+		let item = tokio::select! {
+			item = settlement_stream.next() => item,
 			_ = srv.rtmgr.shutdown_signal() => return,
 		};
 
-		if !try_settle_hold_invoice(&srv, settlement.hash, settlement.preimage).await {
-			// The WAL remains authoritative across restart; this queue only
-			// schedules the same item's next attempt in the current process.
-			retry.push_back((tokio::time::Instant::now() + Duration::from_secs(5), settlement));
+		let Some(settlement) = item else { break };
+		while !try_settle_hold_invoice(&srv, settlement.hash, settlement.preimage).await {
+			tokio::select! {
+				_ = tokio::time::sleep(Duration::from_secs(5)) => {},
+				_ = srv.rtmgr.shutdown_signal() => return,
+			}
 		}
 	}
 	error!("Hold settler exited: hold invoices will no longer be settled automatically");
@@ -875,11 +870,11 @@ async fn is_hold_invoice_paid(
 	hold_client: &mut hold_plugin::hold_client::HoldClient<tonic::transport::Channel>,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<bool> {
-	let res = unary_rpc(hold_client.list(hold_plugin::ListRequest {
+	let res = hold_client.list(hold_plugin::ListRequest {
 		constraint: Some(hold_plugin::list_request::Constraint::PaymentHash(
 			payment_hash.to_byte_array().to_vec(),
 		)),
-	})).await?.into_inner();
+	}).await?.into_inner();
 
 	Ok(res.invoices.iter().any(|i| i.state == hold_plugin::InvoiceState::Paid as i32))
 }
@@ -1182,27 +1177,6 @@ impl LightningManagerProcess {
 		// Republish the snapshot so the manager's getters see the latest set
 		// of online nodes.
 		self.publish();
-		self.alarm_unreachable_obligations().await;
-	}
-
-	/// Payments and receives stay open while their node is unreachable: only
-	/// that node can tell whether a payment went out or cancel a hold invoice.
-	/// Keep them open and say so on every pass, so a removed or failing node
-	/// is noticed before its obligations reach their expiry.
-	async fn alarm_unreachable_obligations(&self) {
-		let online = self.nodes.values().filter_map(|node| match node.state {
-			NodeState::Online(ref state) => Some(state.id),
-			_ => None,
-		}).collect::<HashSet<_>>();
-		match self.db.read(async |t| t.open_lightning_obligations_by_node().await).await {
-			Ok(nodes) => for (id, attempts, receives) in nodes {
-				if !online.contains(&id) && attempts + receives > 0 {
-					error!("Lightning node {id} is not online but has {attempts} open payment attempts \
-						and {receives} open receives; they stay open until the node is back");
-				}
-			},
-			Err(e) => warn!("Could not count open Lightning obligations per node: {e:#}"),
-		}
 	}
 
 	async fn disable_node(&mut self, uri: &Uri) {

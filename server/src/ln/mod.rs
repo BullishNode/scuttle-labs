@@ -318,7 +318,6 @@ impl Server {
 		// while the payment is validated and handed to the lightning node.
 		let _guard = self.payment_guards.lock(payment_hash).await;
 
-		invoice.check_signature().context("invalid invoice signature")?;
 		let htlc_vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&htlc_vtxo_ids).await).await?;
 		let recorded = self.db.read(async |t|
 			t.is_recorded_lightning_payment(&invoice, payment_amount, &htlc_vtxo_ids).await
@@ -407,11 +406,6 @@ impl Server {
 		if let Some(sub) = self.db.read(async |t|
 			t.get_htlc_subscription_by_payment_hash(payment_hash).await
 		).await? {
-			if let Invoice::Bolt11(invoice) = &invoice {
-				if invoice.is_expired() {
-					return badarg!("invoice has expired");
-				}
-			}
 			validate_intra_ark_payment(&sub, &invoice, payment_amount)?;
 		}
 

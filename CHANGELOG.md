@@ -215,8 +215,6 @@ Below is a more detailed summary for each version.
     [#2609](https://gitlab.com/ark-bitcoin/bark/-/merge_requests/2609)
 
 - `bark`
-  - Split large Arkoor mailbox deliveries into posts of at most 100 coins,
-    and finish a send only after one delivery route accepts every post.
   - Round registration no longer locks the input VTXOs
     Joining a round only records the intent; an interactive participation locks
     its inputs once a round attempt starts. Interrupting `bark refresh` while it

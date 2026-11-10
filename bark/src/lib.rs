@@ -1048,7 +1048,7 @@ impl Wallet {
 	pub async fn peek_next_keypair(&self) -> anyhow::Result<(Keypair, u32)> {
 		let last_revealed = self.inner.db.get_last_vtxo_key_index().await?;
 
-		let index = fallback::next_key_index(last_revealed)?;
+		let index = last_revealed.map(|i| i + 1).unwrap_or(u32::MIN);
 		let keypair = self.inner.seed.derive_vtxo_keypair(index);
 
 		Ok((keypair, index))
@@ -1124,8 +1124,8 @@ impl Wallet {
 		}
 
 		// We should derive unrevealed keys, so we add one to the last key index.
-		let start_idx = fallback::next_key_index(self.inner.db.get_last_vtxo_key_index().await?)?;
-		let mut frontier = start_idx.saturating_add(gap_limit).min((1 << 31) - 1);
+		let start_idx = self.inner.db.get_last_vtxo_key_index().await?.map(|i| i + 1).unwrap_or(0);
+		let mut frontier = start_idx.saturating_add(gap_limit);
 		let mut idx = start_idx;
 		let mut gap = Vec::<(u32, PublicKey)>::new();
 		while idx <= frontier && !unrevealed.is_empty() {
@@ -1141,7 +1141,7 @@ impl Wallet {
 
 				// `frontier` is the last index the scan tests. This index matched,
 				// so the next run of unused indices starts at idx + 1.
-				frontier = idx.saturating_add(1).saturating_add(gap_limit).min((1 << 31) - 1);
+				frontier = idx.saturating_add(1).saturating_add(gap_limit);
 			} else {
 				gap.push((idx, pubkey));
 			}

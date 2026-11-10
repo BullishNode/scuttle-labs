@@ -262,14 +262,10 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	assert_ne!(srv.native_child().await.unwrap(),old_child);
 	let (guard_tx,mut guard_rx) = tokio::sync::mpsc::unbounded_channel();
 	let expected_guard = format!("source settlement does not permit failure of payment attempt {}",attempt.id);
-	let subscription_id=sub.id;
-	let hash_string=hash.to_string();
 	srv.add_stdout_handler(move |line:&str| {
 		if let Ok(record) = server_log::parse_record(line) {
-			if record.message == "Hold invoice timeout handling failed; will retry independently"
-				&& record.extra.get("subscription_id").and_then(|v|v.as_i64()) == Some(subscription_id)
-				&& record.extra.get("payment_hash").and_then(|v|v.as_str()) == Some(hash_string.as_str())
-				&& record.extra.get("error").and_then(|v|v.as_str()).is_some_and(|error|error.contains(&expected_guard)) {
+			if record.message.starts_with("htlc subscription processing failed:")
+				&& record.message.contains(&expected_guard) {
 				let _ = guard_tx.send(()); return true;
 			}
 		}

@@ -17,7 +17,6 @@ pub(crate) mod hold;
 pub(crate) mod xpay;
 
 use std::str::FromStr;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,18 +46,6 @@ type ClnGrpcClient = NodeClient<Channel>;
 
 /// How long connecting to a node and asking its info may take.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Bound short native reads/settles within the existing 60s processing
-/// requirement. A failed settle plus its paid-state read take at most 20s
-/// of native waiting; the existing queue then retries the durable preimage.
-/// This is not the live Xpay retry budget or a streaming-call deadline.
-pub(super) async fn unary_rpc<T>(
-	request: impl Future<Output = Result<T, tonic::Status>>,
-) -> Result<T, tonic::Status> {
-	tokio::time::timeout(Duration::from_secs(10), request).await.unwrap_or_else(|_| {
-		Err(tonic::Status::deadline_exceeded("native unary RPC timed out; outcome remains unknown"))
-	})
-}
 
 /// Cheap, cloneable command handle to a running node.
 ///

@@ -1389,7 +1389,6 @@ async fn persist_round(
 			&state.interactive_participants,
 			&owner_bindings).await?;
 
-		let mut notifications = Vec::new();
 		// Post VTXOs to mailboxes for wallet recovery support.
 		// This is done after the round is persisted so VTXOs exist in the DB.
 		// Skip adding VTXOs which have None for their unblinded_mailbox_id.
@@ -1403,7 +1402,7 @@ async fn persist_round(
 			match t.store_round_participation_in_mailbox(*mailbox_id, unlock_hash).await {
 				Ok(checkpoint) => {
 					if let Some(cp) = checkpoint {
-						notifications.push((*mailbox_id, cp));
+						srv.mailbox_manager.notify(*mailbox_id, cp);
 					}
 					trace!("Posted round VTXO {} to mailbox", vtxo.id());
 				},
@@ -1414,12 +1413,8 @@ async fn persist_round(
 			}
 		}
 
-		Ok(notifications)
-	}).await.map(|notifications| {
-		for (mailbox, checkpoint) in notifications {
-			srv.mailbox_manager.notify(mailbox, checkpoint);
-		}
-	});
+		Ok(())
+	}).await;
 
 	telemetry::set_round_step_duration(round_step);
 

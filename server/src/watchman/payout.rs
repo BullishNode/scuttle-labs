@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::Context;
-use bitcoin::{Amount, FeeRate, Sequence, Transaction, Txid, Weight};
+use bitcoin::{Amount, FeeRate, Sequence, Transaction, Weight};
 use bitcoin::psbt;
 use bitcoin::sighash;
 use bitcoin_ext::TxStatus;
@@ -11,7 +11,6 @@ use bitcoin_ext::TxOutExt;
 use tracing::warn;
 
 use crate::bitcoind as bcd;
-use crate::bitcoind::BitcoindErrorExt;
 use crate::wallet::BdkWalletExt;
 use crate::wallet::PersistedWallet;
 use bitcoin_ext::BlockRef;
@@ -21,25 +20,6 @@ use ark::{ServerVtxoPolicy, VtxoPolicy};
 use ark::vtxo::policy::signing::VtxoSigner;
 
 use super::{saturating_add_feerates, Watchman};
-
-/// Fee information for upstream's signed exit progression CPFP child.
-pub(super) async fn mempool_child_fee(
-	client: &bitcoind_async_client::Client, txid: Txid,
-) -> anyhow::Result<Option<(Amount, Weight)>> {
-	#[derive(Debug, serde::Deserialize)]
-	struct Entry { fees: Fees, weight: u64 }
-	#[derive(Debug, serde::Deserialize)]
-	struct Fees {
-		#[serde(with = "bitcoin::amount::serde::as_btc")]
-		base: Amount,
-	}
-	let entry: Entry = match client.call_raw("getmempoolentry", &[bcd::json_arg(txid)?]).await {
-		Ok(entry) => entry,
-		Err(error) if error.is_not_found() => return Ok(None),
-		Err(error) => return Err(error.into()),
-	};
-	Ok(Some((entry.fees.base, Weight::from_wu(entry.weight))))
-}
 
 impl Watchman {
 	/// Sweep server coins and pay expired customer coins.
