@@ -95,7 +95,7 @@ message HandshakeResponse {
 	// displayed to the user.
 	optional string psa = 3;
 	// Identifies the Scuttle payout protocol without changing numeric negotiation.
-	optional string protocol_version_label = 4;
+	optional string protocol_label = 4;
 }
 
 message ArkInfo {
@@ -315,7 +315,7 @@ message BoardCosignRequest {
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
 	reserved 7;
-	optional bytes mailbox_id = 8;
+	optional bytes owner_mailbox = 8;
 }
 
 message BoardCosignResponse {
@@ -339,6 +339,8 @@ message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
 	reserved 3;
+	// Recipient's full address for a forwarded Lightning receive.
+	optional string ark_address = 4;
 }
 
 message ArkoorDestination {
@@ -346,7 +348,7 @@ message ArkoorDestination {
 	bytes policy = 2;
 	reserved 3;
 	optional string address = 4;
-	optional bytes mailbox_id = 5;
+	reserved 5;
 }
 
 message ArkoorCosignRequest {
@@ -441,9 +443,7 @@ message StartLightningReceiveRequest {
 	optional bytes claim_pubkey = 7;
 	// Point-in-time check for an explicit recipient before invoice creation.
 	VtxoRequest claim_destination = 8;
-	// Full recipient address for a forwarded receive. The ordinary mailbox_id
-	// above belongs to the invoice provider and is only for notifications.
-	optional string claim_destination_address = 9;
+	reserved 9;
 }
 
 message StartLightningReceiveResponse {

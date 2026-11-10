@@ -423,7 +423,6 @@ async fn isolated_hold_failures(check_requeue: bool) {
 		payment_hash: expired_hash.to_vec(), amount_sat: 1_000, min_cltv_delta: 58,
 		expiry_secs: Some(30), claim_destination: None, mailbox_id: None, description: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 	let arrived = Arc::new(tokio::sync::Notify::new());
 	let release = Arc::new(tokio::sync::Notify::new());
@@ -1647,7 +1646,7 @@ impl RawHtlcSend {
 	) -> RawHtlcSend {
 		let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 		let vtxos = cosign_htlc_send_to_pubkey(
-			ctx, srv, client, input_ids, keypair.public_key(), payment_hash,
+			ctx, srv, client, input_ids, keypair.public_key(), Some(&keypair), payment_hash,
 			ark::mailbox::MailboxIdentifier::from_pubkey(keypair.public_key()),
 		).await;
 
@@ -2043,7 +2042,6 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 		mailbox_id: payout.then(|| ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key()).serialize()),
 		description: None, expiry_secs: None,
 		claim_pubkey: payout.then(|| key.public_key().serialize().to_vec()),
-		claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 	let paying = {
 		let eve_ln = eve_ln.clone();
@@ -2071,9 +2069,19 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 		grants, VtxoPolicy::new_pubkey(key.public_key()),
 	).unwrap().generate_user_nonces(&keys).unwrap();
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let address = if payout {
+		let info = srv.ark_info().await;
+		Some(ark::Address::builder()
+			.testnet(srv.config().network != bitcoin::Network::Bitcoin)
+			.server_pubkey(info.server_pubkey)
+			.policy(VtxoPolicy::new_pubkey(key.public_key()))
+			.mailbox(info.mailbox_pubkey,
+				ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key()), &key).unwrap()
+			.into_address().unwrap().to_string())
+	} else { None };
 	for output in package.parts.iter_mut().flat_map(|part|
 		part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		if payout { output.mailbox_id = Some(ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key()).serialize()); }
+		output.address = address.clone();
 	}
 	rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
@@ -2284,7 +2292,7 @@ async fn unfunded_htlc_revocation_keeps_receive() {
 
 	let refund_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let htlcs = cosign_htlc_send_to_pubkey(
-		&ctx, &srv, &attacker_client, &input_ids, refund_key.public_key(), payment_hash,
+		&ctx, &srv, &attacker_client, &input_ids, refund_key.public_key(), Some(&refund_key), payment_hash,
 		ark::mailbox::MailboxIdentifier::from_pubkey(refund_key.public_key()),
 	).await;
 	attacker_client.register_vtxo_transactions_with_server(&htlcs).await.unwrap();
@@ -2331,7 +2339,7 @@ async fn refuse_htlc_send_vtxo_posted_to_arkoor_mailbox() {
 
 	let lightning = ctx.new_lightning_setup("lightningd").await;
 	let srv = ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
-		cfg.expiry_payouts = true;
+		cfg.expiry_payouts = false;
 	}).create().await;
 
 	// The victim only ever hands out an Ark address.
@@ -2354,7 +2362,7 @@ async fn refuse_htlc_send_vtxo_posted_to_arkoor_mailbox() {
 		sha256::Hash::hash(b"attacker invoice").to_byte_array(),
 	);
 	let htlc_vtxos = cosign_htlc_send_to_pubkey(
-		&ctx, &srv, &attacker_client, &input_ids, victim_pubkey, payment_hash,
+		&ctx, &srv, &attacker_client, &input_ids, victim_pubkey, None, payment_hash,
 		ark::mailbox::MailboxIdentifier::from_pubkey(attacker_mailbox.public_key()),
 	).await;
 	assert!(!htlc_vtxos.is_empty());
@@ -2680,7 +2688,6 @@ async fn rejected_accepted_invoice_releases_held_htlcs() {
 		expiry_secs: None,
 		claim_pubkey: None,
 		claim_destination: None,
-		claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 	let invoice_delta = Bolt11Invoice::from_str(&bolt11).unwrap().min_final_cltv_expiry_delta();
 
@@ -2792,7 +2799,6 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	}).await.unwrap();
 
 	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
@@ -2832,9 +2838,9 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 		description: None, expiry_secs: None,
 		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(),
+			ark_address: Some(address.to_string()),
 		}),
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
-		claim_destination_address: Some(address.to_string()),
 	}).await.unwrap().into_inner().bolt11;
 
 	let payer = lightning.external;
@@ -2877,8 +2883,16 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 		granted.clone(), VtxoPolicy::new_pubkey(grant_key.public_key()),
 	).unwrap().generate_user_nonces(&[grant_key]).unwrap();
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let info = srv.ark_info().await;
+	let wrong_address = ark::Address::builder()
+		.testnet(srv.config().network != bitcoin::Network::Bitcoin)
+		.server_pubkey(info.server_pubkey)
+		.policy(VtxoPolicy::new_pubkey(grant_key.public_key()))
+		.mailbox(info.mailbox_pubkey,
+			ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()), &grant_key).unwrap()
+		.into_address().unwrap().to_string();
 	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.mailbox_id = Some(provider_mailbox.public_key().serialize().to_vec());
+		output.address = Some(wrong_address.clone());
 	}
 	let bad = rpc.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: hash.to_vec(), payment_preimage: preimage.to_vec(),
@@ -2944,7 +2958,7 @@ async fn server_claim_lightning_receive_is_idempotent(
 	let checked = Arc::new(AtomicBool::new(false));
 	let proxy = srv.start_proxy_no_mailbox(CheckClaim {
 		db,
-		other_mailbox: other,
+		other_mailbox: other, other_address: None,
 		hold: _lightning.internal.hold_client().await, native_payment: false, checked: checked.clone(),
 		prepare_wallet: None, prepare_checked: Arc::new(AtomicBool::new(false)),
 	}).await;
@@ -3009,7 +3023,6 @@ async fn start_keyless_receive(srv: &Captaind, amount: Amount) -> KeylessReceive
 		expiry_secs: None,
 		claim_pubkey: None,
 		claim_destination: None,
-		claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 	KeylessReceive { invoice, payment_hash }
 }
@@ -3266,7 +3279,6 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 			description: None,
 			expiry_secs: None,
 			claim_pubkey: None,
-			claim_destination_address: None,
 		})
 		.await
 		.expect("start receive failed")
@@ -3402,7 +3414,6 @@ async fn settled_hash_cannot_fund_new_receive() {
 			description: None,
 			expiry_secs: None,
 			claim_pubkey: None,
-			claim_destination_address: None,
 		})
 		.await
 		.expect_err("receive for an already-settled hash must be refused");
@@ -3439,7 +3450,6 @@ async fn prepare_lightning_claim_requires_the_claim_key() {
 		expiry_secs: None,
 		claim_pubkey: Some(claim_key.public_key().serialize().to_vec()),
 		claim_destination: None,
-		claim_destination_address: None,
 	};
 	let invoice = rpc.start_lightning_receive(start(&claim_key)).await.unwrap().into_inner().bolt11;
 	// starting it again returns the same receive, but not for another key
@@ -3560,7 +3570,6 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	}).await.expect("receive should be allowed while H is unsettled").into_inner().bolt11;
 
 	let pay_receive = {
@@ -3671,7 +3680,6 @@ async fn intra_ark_payment_refused_while_same_hash_send_is_open() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	}).await.expect("receive should be allowed while H is unsettled").into_inner().bolt11;
 
 	let err = payer.try_pay_lightning(&receive_invoice, None, false).await
@@ -4240,7 +4248,7 @@ async fn check_lightning_receive_poll_interval_fallback() {
 
 	// Create a hold invoice on the server.
 	let resp = srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None,
 	).await.unwrap();
 
 	// Create a disconnected receiver: the sender is kept alive so
@@ -4293,7 +4301,7 @@ async fn check_lightning_receive_ignores_other_payment_updates() {
 	let preimage = ark::lightning::Preimage::from(rand::random::<[u8; 32]>());
 	let payment_hash = preimage.compute_payment_hash();
 	srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None,
 	).await.unwrap();
 
 	let (update_tx, mut update_rx) = tokio::sync::broadcast::channel::<PaymentHash>(16);
@@ -4363,7 +4371,6 @@ async fn refuse_receive_with_unlock_hash_as_payment_hash() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	}).await.expect_err("must refuse a payment hash that is an existing unlock hash");
 	assert_eq!(err.code(), tonic::Code::InvalidArgument);
 	assert!(err.message().contains("unlock hash"), "unexpected error: {err:?}");
@@ -4401,7 +4408,6 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 		payment_hash: old_hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
 		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	});
 	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS - 1);
 	let refusal = raw.start_lightning_receive(old_request).await.expect_err("an older protocol must not create a fresh invoice");
@@ -4413,17 +4419,17 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	// invoice creation, same-hash replay and expiry-validation assertions.
 
 	let mut rpc = srv.get_public_rpc().await;
+	let claim_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut start_for = async |payment_hash: PaymentHash, expiry_secs: Option<u64>| {
 		rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 			claim_destination: None,
 			payment_hash: payment_hash.to_vec(),
 			amount_sat: 10_000,
 			min_cltv_delta: 8,
-			mailbox_id: None,
+			mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(claim_key.public_key()).serialize()),
 			description: None,
 			expiry_secs,
-			claim_pubkey: None,
-			claim_destination_address: None,
+			claim_pubkey: Some(claim_key.public_key().serialize().to_vec()),
 		}).await.map(|r| Bolt11Invoice::from_str(&r.into_inner().bolt11).unwrap())
 	};
 
@@ -4452,6 +4458,40 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 
 	let err = start(Some(0)).await.expect_err("must refuse an invoice that is born expired");
 	assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+/// A payout-disabled server retains upstream's Created-invoice retry rule:
+/// an omitted claim key or a changed notification mailbox does not replace
+/// the existing invoice, while an explicit different claim key is refused.
+#[tokio::test]
+async fn payout_disabled_created_receive_retry_keeps_upstream_optional_fields() {
+	let ctx = TestContext::new("server/payout_disabled_receive_retry").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.expiry_payouts = false).create().await;
+	let key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let hash = ark::lightning::Preimage::random().compute_payment_hash();
+	let request = |claim_key: Option<&Keypair>, mailbox: &Keypair, expiry_secs| {
+		protos::StartLightningReceiveRequest {
+			payment_hash: hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
+			mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(mailbox.public_key()).serialize()),
+			description: None, expiry_secs,
+			claim_pubkey: claim_key.map(|key| key.public_key().serialize().to_vec()),
+			claim_destination: None,
+		}
+	};
+	let mut rpc = srv.get_public_rpc().await;
+	let invoice = rpc.start_lightning_receive(request(Some(&key), &key, Some(600)))
+		.await.unwrap().into_inner().bolt11;
+	assert_eq!(rpc.start_lightning_receive(request(None, &other, None))
+		.await.unwrap().into_inner().bolt11, invoice);
+	assert_eq!(rpc.start_lightning_receive(request(Some(&key), &other, Some(600)))
+		.await.unwrap().into_inner().bolt11, invoice);
+	let refusal = rpc.start_lightning_receive(request(Some(&other), &other, Some(600)))
+		.await.expect_err("an explicit changed claim key must be refused");
+	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
+	assert!(refusal.message().contains("different claim key"), "{refusal}");
 }
 
 /// A lightning send whose payment hash is an existing hArk unlock hash must
@@ -4740,7 +4780,6 @@ async fn prevent_double_pay_via_canceled_subscription_and_inflight_xpay() {
 			description: None,
 			expiry_secs: None,
 			claim_pubkey: None,
-			claim_destination_address: None,
 		}).await.unwrap().into_inner().bolt11;
 
 	// 4. Pay invoice-2 from Eve's node. The HTLC is held by the server's
@@ -4865,12 +4904,11 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 
 	let sender_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let htlcs = cosign_htlc_send_to_pubkey(
-		&ctx, &srv, &wallet, &input_ids, sender_key.public_key(), payment_hash,
+		&ctx, &srv, &wallet, &input_ids, sender_key.public_key(), Some(&sender_key), payment_hash,
 		ark::mailbox::MailboxIdentifier::from_pubkey(sender_key.public_key()),
 	).await;
 	wallet.register_vtxo_transactions_with_server(&htlcs).await.unwrap();

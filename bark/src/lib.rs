@@ -750,14 +750,12 @@ impl WalletSeed {
 		Self::new_from_seed(network, &mnemonic.to_seed(""))
 	}
 
-	/// Use the application's mailbox key without changing any Ark child keys.
-	/// Supply the same key on each subsequent open and to the onchain payout
-	/// wallet's descriptor.
+	/// Use the application's mailbox key without changing any Ark child keys or
+	/// bitcoin wallet descriptors. Supply the same key on each subsequent open.
 	///
 	/// The key stays in memory; only its full public identity is persisted. The
-	/// application is responsible for its backup. Opening the Ark wallet then
-	/// requires an onchain wallet that watches `tr(M)`. This does not prove
-	/// control of any unrelated Bitcoin wallet.
+	/// application is responsible for its backup and discovery policy. This does
+	/// not prove control of any unrelated Bitcoin wallet. The payout is `tr(M)`.
 	pub fn with_external_mailbox_keypair(mut self, keypair: Keypair) -> Self {
 		self.external_mailbox = Some(keypair);
 		self
@@ -1409,13 +1407,6 @@ impl Wallet {
 		}
 		let seed = seed;
 		properties.check_mailbox_identity(network, &seed)?;
-		if seed.external_mailbox.is_some() {
-			let onchain = args.onchain.as_ref().context(
-				"external mailbox requires an onchain wallet that watches its payout address")?;
-			let script = ark::fallback::payout_script(seed.to_mailbox_keypair().public_key());
-			ensure!(onchain.read().await.is_mine(&script).await?,
-				"onchain wallet does not watch the external mailbox payout address");
-		}
 		if properties.mailbox_identity.is_none() {
 			if properties.server_payouts.is_none() { db.set_server_payouts(false).await?; }
 			db.set_mailbox_identity(seed.mailbox_identity(network)).await?;

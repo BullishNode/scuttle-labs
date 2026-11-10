@@ -265,6 +265,8 @@ pub enum ConnectError {
 	ProtocolVersionMismatchServerTooOld { client_min: u64, server_max: u64 },
 	#[error("invalid server protocol version range: {server_min}..={server_max}")]
 	InvalidProtocolVersionRange { server_min: u64, server_max: u64 },
+	#[error("payout protocol requires the scuttle-1 server label")]
+	MissingScuttleProtocolLabel,
 	#[error("error getting ark info: {0}")]
 	GetArkInfo(tonic::Status),
 	#[error("invalid ark info from ark server: {0}")]
@@ -588,6 +590,10 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 
 	// Both ranges are valid and overlap, so this is in both.
 	let pver = cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version);
+	if pver == crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS
+		&& handshake.protocol_label.as_deref() != Some("scuttle-1") {
+		return Err(ConnectError::MissingScuttleProtocolLabel);
+	}
 	Ok(pver)
 }
 
@@ -611,9 +617,27 @@ mod tests {
 			min_protocol_version: MAX_PROTOCOL_VERSION,
 			max_protocol_version: MAX_PROTOCOL_VERSION - 1,
 			psa: None,
-			protocol_version_label: None,
+			protocol_label: None,
 		};
 		assert!(matches!(check_handshake(response),
 			Err(ConnectError::InvalidProtocolVersionRange { .. })));
+	}
+
+	#[test]
+	fn payout_handshake_requires_scuttle_label() {
+		let response = protos::HandshakeResponse {
+			min_protocol_version: crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
+			max_protocol_version: crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
+			psa: None,
+			protocol_label: None,
+		};
+		assert!(matches!(check_handshake(response.clone()),
+			Err(ConnectError::MissingScuttleProtocolLabel)));
+		assert!(matches!(check_handshake(protos::HandshakeResponse {
+			protocol_label: Some("other".to_owned()), ..response.clone()
+		}), Err(ConnectError::MissingScuttleProtocolLabel)));
+		assert_eq!(check_handshake(protos::HandshakeResponse {
+			protocol_label: Some("scuttle-1".to_owned()), ..response
+		}).unwrap(), crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
 	}
 }

@@ -438,7 +438,7 @@ async fn board_output_is_bound_to_one_exit_tx() {
 			user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
 		).set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
 		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest {
-			mailbox_id: Some(user.public_key().serialize().to_vec()),
+			owner_mailbox: Some(user.public_key().serialize().to_vec()),
 			amount: amount.to_sat(),
 			utxo: utxo.serialize(),
 			expiry_height: expiry.to_u32(),

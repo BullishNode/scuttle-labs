@@ -1913,6 +1913,12 @@ async fn persist_round_success(
 	debug!("Persisting newly finished round. {} new vtxos, movement ID {:?}",
 		new_vtxos.len(), movement_id,
 	);
+	if wallet.properties().await?.server_payouts == Some(true) {
+		for output in new_vtxos {
+			let key = wallet.get_vtxo_key(output).await?;
+			wallet.fetch_vtxo_status(output.id(), &key).await?;
+		}
+	}
 
 	// we first try all actions that need to happen and only afterwards return errors
 	// so that we achieve maximum success
@@ -2274,6 +2280,7 @@ impl Wallet {
 				protos::VtxoRequest {
 					policy: req.policy.serialize(),
 					amount: req.amount.to_sat(),
+					ark_address: None,
 			})
 			.collect::<Vec<_>>();
 

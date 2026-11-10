@@ -79,9 +79,9 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 		mailbox_id: Some(provider.mailbox_identifier().serialize()), description: None,
 		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(),
+			ark_address: Some(destination.to_string()),
 		}),
 		claim_pubkey: None,
-		claim_destination_address: Some(destination.to_string()),
 	};
 	let postgres = srv.config().postgres.clone();
 	let db = Db::connect(&postgres).await.unwrap();

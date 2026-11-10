@@ -557,6 +557,9 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	}).await.expect("the one genuine recipient refresh must confirm under its existing bound");
 	let live=recipient.spendable_vtxos().await.unwrap(); assert_eq!(live.len(),1);
 	let live=recipient.get_full_vtxo(live[0].id()).await.unwrap();
+	let bindings=db.read(async |tx| tx.coin_owner_mailboxes(&[live.id()]).await).await.unwrap();
+	assert_eq!(bindings.get(&live.id()),Some(&recipient.mailbox_identifier().as_pubkey()),
+		"delegated refresh output must retain the recipient's payout mailbox");
 	assert_eq!(live.amount()+quote,sat(100_000));
 	assert!(live.expiry_height()>a.expiry_height()+BlockDelta::new(7),
 		"the real replacement expiry must cover A expiry+1 and its original six confirmations");

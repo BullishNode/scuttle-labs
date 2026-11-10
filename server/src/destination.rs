@@ -21,13 +21,13 @@ impl DestinationBindings {
 		parts: &[protos::ArkoorCosignRequest], required: bool, network: Network,
 		server_pubkey: PublicKey, server_mailbox_key: &Keypair,
 	) -> anyhow::Result<Self> {
+		if !required { return Ok(Self::default()); }
 		let mut ret = Self::default();
 		for output in parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
 			let policy = VtxoPolicy::deserialize(&output.policy).context("invalid arkoor output policy")?;
 			let key = policy.user_pubkey();
-			let mailbox = match (&output.address, &output.mailbox_id) {
-				(Some(_), Some(_)) => bail!("arkoor output has two payout destinations"),
-				(Some(text), None) => {
+			let mailbox = match &output.address {
+				Some(text) => {
 					let address: ark::Address = text.parse().context("invalid arkoor recipient address")?;
 					if address.is_testnet() != (network != Network::Bitcoin)
 						|| !address.is_for_server(server_pubkey) || address.policy() != &policy {
@@ -40,9 +40,7 @@ impl DestinationBindings {
 					Some(MailboxIdentifier::from_blinded(blinded, key, server_mailbox_key)
 						.context("invalid arkoor recipient mailbox")?.as_pubkey())
 				},
-				(None, Some(bytes)) => Some(MailboxIdentifier::deserialize(bytes)
-					.context("invalid arkoor mailbox")?.as_pubkey()),
-				(None, None) => None,
+				None => None,
 			};
 			if let Some(mailbox) = mailbox {
 				ret.insert(key, mailbox)?;
@@ -54,9 +52,11 @@ impl DestinationBindings {
 	}
 
 	pub(crate) fn insert(&mut self, key: PublicKey, mailbox: PublicKey) -> anyhow::Result<()> {
-		if self.0.insert(key, mailbox).is_some_and(|previous| previous != mailbox) {
-			bail!("output {key} has conflicting payout mailboxes");
+		if let Some(previous) = self.0.get(&key) {
+			if *previous != mailbox { bail!("output {key} has conflicting payout mailboxes"); }
+			return Ok(());
 		}
+		self.0.insert(key, mailbox);
 		Ok(())
 	}
 
@@ -88,6 +88,7 @@ impl DestinationBindings {
 mod tests {
 	use bitcoin::secp256k1::{Secp256k1, SecretKey};
 	use ark::address::VtxoDelivery;
+	use ark::mailbox::BlindedMailboxIdentifier;
 
 	use super::*;
 
@@ -120,5 +121,51 @@ mod tests {
 			&[part(vec![output(&mailbox), output(&other_mailbox)])], true,
 			Network::Signet, server.public_key(), &server,
 		).is_err());
+	}
+
+	#[test]
+	fn bare_mailbox_is_not_an_arkoor_destination() {
+		let secp = Secp256k1::new();
+		let server = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[3; 32]).unwrap());
+		let recipient = Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[4; 32]).unwrap());
+		let part = protos::ArkoorCosignRequest {
+			outputs: vec![protos::ArkoorDestination {
+				policy: VtxoPolicy::new_pubkey(recipient.public_key()).serialize(),
+				..Default::default()
+			}], ..Default::default()
+		};
+		assert!(DestinationBindings::from_arkoor_parts(&[part], true, Network::Signet,
+			server.public_key(), &server).is_err());
+	}
+
+	#[test]
+	fn altered_valid_address_recovers_payer_mailbox_not_recipient() {
+		let secp = Secp256k1::new();
+		let key = |byte| Keypair::from_secret_key(&secp, &SecretKey::from_slice(&[byte; 32]).unwrap());
+		let server = key(3);
+		let recipient_coin = key(4);
+		let recipient_mailbox = key(5);
+		let payer_mailbox = key(6);
+		let policy = VtxoPolicy::new_pubkey(recipient_coin.public_key());
+		let original_blinded = MailboxIdentifier::from_pubkey(recipient_mailbox.public_key())
+			.to_blinded(server.public_key(), &recipient_coin).unwrap();
+		// B' = B + M_payer - M_recipient. The address still has the recipient's P.
+		let changed_point = PublicKey::combine_keys(&[
+			&original_blinded.as_pubkey(), &payer_mailbox.public_key(),
+			&recipient_mailbox.public_key().negate(&secp),
+		]).unwrap();
+		let altered = ark::Address::new(true, server.public_key(), policy.clone(), vec![
+			VtxoDelivery::ServerMailbox { blinded_id: BlindedMailboxIdentifier::from_pubkey(changed_point) },
+		]);
+		let part = protos::ArkoorCosignRequest {
+			outputs: vec![protos::ArkoorDestination {
+				policy: policy.serialize(), address: Some(altered.to_string()),
+				..Default::default()
+			}], ..Default::default()
+		};
+		let found = DestinationBindings::from_arkoor_parts(&[part], true, Network::Signet,
+			server.public_key(), &server).unwrap();
+		assert_eq!(found.mailbox_for(recipient_coin.public_key()), Some(payer_mailbox.public_key()));
+		assert_ne!(found.mailbox_for(recipient_coin.public_key()), Some(recipient_mailbox.public_key()));
 	}
 }

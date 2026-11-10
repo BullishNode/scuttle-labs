@@ -77,7 +77,7 @@ async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair) -
 	let builder = builder.set_funding_details(sat(100_000), Amount::ZERO, point).unwrap().generate_user_nonces();
 	let mut rpc = srv.get_public_rpc().await;
 	let cosign = rpc.request_board_cosign(protos::BoardCosignRequest {
-		mailbox_id: Some(MailboxIdentifier::from_pubkey(owner.mailbox.public_key()).serialize()),
+		owner_mailbox: Some(MailboxIdentifier::from_pubkey(owner.mailbox.public_key()).serialize()),
 		amount: 100_000, utxo: serialize(&point), expiry_height: expiry.into(),
 		user_pubkey: key.public_key().serialize().to_vec(), pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
 		funding_tx: serialize(&funding),
@@ -158,7 +158,8 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for part in &mut request.parts {
 		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
-			output.mailbox_id = Some(MailboxIdentifier::from_pubkey(owner.mailbox.public_key()).serialize());
+			output.address = Some(super::payout_address(&srv, policy.clone(), &owner.key(500),
+				MailboxIdentifier::from_pubkey(owner.mailbox.public_key())).await);
 		}
 	}
 	let response = rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
@@ -181,7 +182,8 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let mut request = protos::ArkoorPackageCosignRequest::from(revoke.cosign_request());
 	for part in &mut request.parts {
 		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
-			output.mailbox_id = Some(MailboxIdentifier::from_pubkey(owner.mailbox.public_key()).serialize());
+			output.address = Some(super::payout_address(&srv, VtxoPolicy::new_pubkey(refund_key.public_key()),
+				&refund_key, MailboxIdentifier::from_pubkey(owner.mailbox.public_key())).await);
 		}
 	}
 	let response = rpc.request_lightning_pay_htlc_revocation(

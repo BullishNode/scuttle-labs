@@ -54,16 +54,6 @@ impl BarkPersister for Dummy {
 		Ok(())
 	}
 
-	#[cfg(feature = "onchain-bdk")]
-	async fn initialize_mailbox_bdk_wallet(&self) -> anyhow::Result<ChangeSet> {
-		Ok(ChangeSet::default())
-	}
-
-	#[cfg(feature = "onchain-bdk")]
-	async fn store_mailbox_bdk_wallet_changeset(&self, _changeset: &ChangeSet) -> anyhow::Result<()> {
-		Ok(())
-	}
-
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
 		Ok(Some(WalletProperties {
 			network: Network::Bitcoin,

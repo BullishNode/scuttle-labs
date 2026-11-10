@@ -20,9 +20,7 @@ use bitcoin::secp256k1::PublicKey;
 use chrono::DateTime;
 use lightning_invoice::Bolt11Invoice;
 use log::debug;
-use rusqlite::{Connection, OptionalExtension};
-#[cfg(feature = "onchain-bdk")]
-use bdk_core::Merge;
+use rusqlite::Connection;
 
 use ark::{Vtxo, VtxoId};
 use ark::lightning::{PaymentHash, Preimage};
@@ -96,37 +94,6 @@ impl BarkPersister for SqliteClient {
 	async fn store_bdk_wallet_changeset(&self, changeset: &bdk_wallet::ChangeSet) -> anyhow::Result<()> {
 	    let mut conn = self.connect()?;
 		bdk_wallet::WalletPersister::persist(&mut conn, changeset)?;
-		Ok(())
-	}
-
-	#[cfg(feature = "onchain-bdk")]
-	async fn initialize_mailbox_bdk_wallet(&self) -> anyhow::Result<bdk_wallet::ChangeSet> {
-		let conn = self.connect()?;
-		let data: Option<String> = conn.query_row(
-			"SELECT changeset FROM bark_mailbox_bdk WHERE id = 1", [], |row| row.get(0),
-		).optional()?;
-		match data {
-			Some(data) => Ok(serde_json::from_str(&data)?),
-			None => Ok(bdk_wallet::ChangeSet::default()),
-		}
-	}
-
-	#[cfg(feature = "onchain-bdk")]
-	async fn store_mailbox_bdk_wallet_changeset(&self, changeset: &bdk_wallet::ChangeSet) -> anyhow::Result<()> {
-		let mut conn = self.connect()?;
-		let tx = conn.transaction()?;
-		let data: Option<String> = tx.query_row(
-			"SELECT changeset FROM bark_mailbox_bdk WHERE id = 1", [], |row| row.get(0),
-		).optional()?;
-		let mut current: bdk_wallet::ChangeSet = match data {
-			Some(data) => serde_json::from_str(&data)?,
-			None => bdk_wallet::ChangeSet::default(),
-		};
-		current.merge(changeset.clone());
-		tx.execute("INSERT INTO bark_mailbox_bdk (id, changeset) VALUES (1, ?1)
-			ON CONFLICT (id) DO UPDATE SET changeset = excluded.changeset",
-			[serde_json::to_string(&current)?])?;
-		tx.commit()?;
 		Ok(())
 	}
 

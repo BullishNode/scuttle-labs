@@ -130,7 +130,7 @@ impl rpc::server::ArkService for Server {
 			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MIN_PROTOCOL_VERSION },
 			max_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MAX_PROTOCOL_VERSION },
 			psa,
-			protocol_version_label: self.config.expiry_payouts.then(|| "scuttle-1".to_owned()),
+			protocol_label: self.config.expiry_payouts.then(|| "scuttle-1".to_owned()),
 		};
 		Ok(tonic::Response::new(ret))
 	}
@@ -429,7 +429,7 @@ impl rpc::server::ArkService for Server {
 
 		let amount = Amount::from_sat(req.amount);
 		let user_pubkey = PublicKey::from_bytes(&req.user_pubkey)?;
-		let owner_mailbox = req.mailbox_id.as_deref()
+		let owner_mailbox = req.owner_mailbox.as_deref()
 			.map(ark::mailbox::MailboxIdentifier::deserialize)
 			.transpose().badarg("invalid board mailbox")?
 			.map(|id| id.as_pubkey());
@@ -719,7 +719,6 @@ impl rpc::server::ArkService for Server {
 			req.expiry_secs.map(Duration::from_secs),
 			claim_pubkey,
 			req.claim_destination,
-			req.claim_destination_address,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp))

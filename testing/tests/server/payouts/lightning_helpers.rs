@@ -6,6 +6,7 @@ async fn cosign_htlc_send_to_pubkey(
 	client: &Wallet,
 	input_ids: &[ark::VtxoId],
 	owner: bitcoin::secp256k1::PublicKey,
+	owner_key: Option<&Keypair>,
 	payment_hash: ark::lightning::PaymentHash,
 	mailbox: MailboxIdentifier,
 ) -> Vec<Vtxo<Full>> {
@@ -21,6 +22,10 @@ async fn cosign_htlc_send_to_pubkey(
 	let htlc_expiry = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	let policy = ark::VtxoPolicy::new_server_htlc_send(owner, payment_hash, htlc_expiry);
 
+	let address = if srv.config().expiry_payouts {
+		Some(super::payout_address(srv, policy.clone(),
+			owner_key.expect("payout-enabled HTLC output needs its coin key"), mailbox).await)
+	} else { None };
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		inputs.clone(), policy,
 	).unwrap().generate_user_nonces(&keypairs).unwrap();
@@ -28,7 +33,7 @@ async fn cosign_htlc_send_to_pubkey(
 	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		assert_eq!(VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey(), owner);
-		output.mailbox_id = Some(mailbox.serialize());
+		output.address = address.clone();
 	}
 	let mut srv_rpc = srv.get_public_rpc().await;
 	let response = srv_rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
@@ -97,6 +102,7 @@ async fn wait_for_attempt_status(
 struct CheckClaim {
 	db: Db,
 	other_mailbox: Keypair,
+	other_address: Option<String>,
 	hold: hold::hold_client::HoldClient<tonic::transport::Channel>,
 	native_payment: bool,
 	checked: Arc<AtomicBool>,
@@ -152,8 +158,6 @@ impl captaind::proxy::ArkRpcProxy for CheckClaim {
 		if self.checked.load(Ordering::SeqCst) {
 			return Ok(upstream.claim_lightning_receive(req).await?.into_inner());
 		}
-		let output = req.cosign_request.as_ref().unwrap().parts.last().unwrap().outputs.last().unwrap();
-		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
 		let hash = PaymentHash::try_from(req.payment_hash.as_slice()).unwrap();
 		let native_request = hold::ListRequest { constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())) };
 		let mut hold = self.hold.clone();
@@ -165,14 +169,14 @@ impl captaind::proxy::ArkRpcProxy for CheckClaim {
 		}
 		let mut invalid = req.clone();
 		invalid.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap()
-			.mailbox_id = Some(vec![0; 3]);
+			.address = Some("invalid-ark-address".to_owned());
 		assert_eq!(upstream.claim_lightning_receive(invalid).await.unwrap_err().code(), tonic::Code::InvalidArgument);
 		assert_eq!(super::expiry_admission::receive_admission_rows(&self.db, hash).await, before);
 		assert_eq!(hold.list(native_request.clone()).await.unwrap().into_inner().invoices, native_before,
 			"a refused claim must leave the native payer's HTLC uncollected");
 		let mut conflict = req.clone();
-		conflict.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap().mailbox_id =
-			Some(MailboxIdentifier::from_pubkey(self.other_mailbox.public_key()).serialize());
+		conflict.cosign_request.as_mut().unwrap().parts.last_mut().unwrap().outputs.last_mut().unwrap().address =
+			Some(self.other_address.clone().unwrap_or_else(|| "different-invalid-ark-address".to_owned()));
 		let _accepted_response = upstream.claim_lightning_receive(req.clone()).await?.into_inner();
 		wait_for_subscription_status(&self.db, hash, "settled").await;
 		let settled_before = super::expiry_admission::receive_admission_rows(&self.db, hash).await;

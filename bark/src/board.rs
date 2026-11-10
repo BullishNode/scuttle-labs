@@ -260,7 +260,7 @@ impl Wallet {
 			.generate_user_nonces();
 
 		let cosign_resp = srv.client.request_board_cosign(protos::BoardCosignRequest {
-			mailbox_id: Some(self.mailbox_identifier().as_pubkey().serialize().to_vec()),
+			owner_mailbox: Some(self.mailbox_identifier().as_pubkey().serialize().to_vec()),
 			amount: amount.to_sat(),
 			utxo: bitcoin::consensus::serialize(&utxo), //TODO(stevenroose) change to own
 			expiry_height: expiry_height.into(),

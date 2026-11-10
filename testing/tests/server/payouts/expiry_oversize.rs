@@ -71,7 +71,9 @@ async fn native_node(
 	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
 		let key = ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
 		if let Some(owner) = owners.iter().find(|owner| owner.key.public_key() == key) {
-			output.mailbox_id = Some(owner.mailbox.serialize());
+			output.address = Some(super::payout_address(srv,
+				ark::VtxoPolicy::deserialize(&output.policy).unwrap(), &owner.key,
+				owner.mailbox).await);
 		}
 	}
 	let response = rpc.request_arkoor_cosign(super::signed_package(srv, &[client], request).await)

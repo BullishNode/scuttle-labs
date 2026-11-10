@@ -9,6 +9,7 @@ use bitcoin::consensus::deserialize;
 use bitcoin::secp256k1::Keypair;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
+use ark::attestations::VtxoStatusAttestation;
 use ark::lightning::PaymentHash;
 use ark::mailbox::MailboxIdentifier;
 use bitcoin_ext::{BlockDelta, BlockHeight, TxOutExt};
@@ -85,6 +86,8 @@ async fn revoke_htlc_vtxos(
 	let revocation_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let revocation_pubkey = revocation_key.public_key();
 	let mailbox = MailboxIdentifier::from_pubkey(revocation_pubkey);
+	let address = super::payout_address(srv, ark::VtxoPolicy::new_pubkey(revocation_pubkey),
+		&revocation_key, mailbox).await;
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		htlc_vtxos,
 		ark::VtxoPolicy::new_pubkey(revocation_pubkey),
@@ -92,7 +95,7 @@ async fn revoke_htlc_vtxos(
 
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.mailbox_id = Some(mailbox.serialize());
+		output.address = Some(address.clone());
 	}
 	let cosign_request = super::signed_package(srv, &[], cosign_request).await;
 

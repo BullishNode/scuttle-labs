@@ -1500,6 +1500,7 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
+				ark_address: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({
@@ -1548,6 +1549,7 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
+				ark_address: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({
@@ -1574,6 +1576,7 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
+				ark_address: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({
@@ -1696,7 +1699,7 @@ async fn reject_overlong_board_cosign() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
-		mailbox_id: Some(user_key.public_key().serialize().to_vec()),
+		owner_mailbox: Some(user_key.public_key().serialize().to_vec()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
 		expiry_height,
@@ -1753,7 +1756,7 @@ async fn request_board_cosign_with_funding_tx(
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
-		mailbox_id: Some(user_key.public_key().serialize().to_vec()),
+		owner_mailbox: Some(user_key.public_key().serialize().to_vec()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
 		expiry_height: tip + ark_info.vtxo_lifetime.to_u32(),
@@ -2599,7 +2602,7 @@ async fn test_register_board() {
 
 	// Request server to cosign the board
 	let cosign_request = protos::BoardCosignRequest {
-		mailbox_id: Some(client_cosign_keypair.public_key().serialize().to_vec()),
+		owner_mailbox: Some(client_cosign_keypair.public_key().serialize().to_vec()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),

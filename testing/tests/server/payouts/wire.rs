@@ -32,7 +32,7 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let version = server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
 	assert_eq!(handshake.min_protocol_version, version);
 	assert_eq!(handshake.max_protocol_version, version);
-	assert_eq!(handshake.protocol_version_label.as_deref(), Some("scuttle-1"));
+	assert_eq!(handshake.protocol_label.as_deref(), Some("scuttle-1"));
 	let missing = public.get_offboard_fee_rate(protos::Empty {}).await.unwrap_err();
 	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
 	assert!(missing.message().contains("pver"));

@@ -9,12 +9,16 @@ async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let address = recipient.new_address().await.unwrap();
 	let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let recipient_key = recipient.pubkey_keypair(&address.policy().user_pubkey()).await
+		.unwrap().expect("issued recipient address has a coin key").1;
+	let other_address = super::payout_address(&srv, address.policy().clone(), &recipient_key,
+		MailboxIdentifier::from_pubkey(other.public_key())).await;
 	let checked = Arc::new(AtomicBool::new(false));
 	let prepare_checked = Arc::new(AtomicBool::new(false));
 	let prepare_wallet = Arc::new(std::sync::OnceLock::new());
 	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
 	let proxy = srv.start_proxy_no_mailbox(CheckClaim { db,
-		other_mailbox: other,
+		other_mailbox: other, other_address: Some(other_address),
 		hold: lightning.internal.hold_client().await, native_payment: true, checked: checked.clone(),
 		prepare_wallet: Some(prepare_wallet.clone()), prepare_checked: prepare_checked.clone() }).await;
 	let provider = ctx.bark_sdk("claimant", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
@@ -57,7 +61,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		expiry_secs: None,
-		claim_destination: None, claim_destination_address: None,
+		claim_destination: None,
 		payment_hash: hash.to_vec(), amount_sat: 90_000, min_cltv_delta: 58,
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
 		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
@@ -81,7 +85,8 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	wait_for_subscription_status(&db, hash, "htlcs-ready").await;
 	let owner = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let owner_mailbox = MailboxIdentifier::from_pubkey(owner.public_key());
-	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(), hash, owner_mailbox).await;
+	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(),
+		Some(&owner), hash, owner_mailbox).await;
 	wallet.register_vtxo_transactions_with_server(&sources).await.unwrap();
 	let refusal = rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
 		protos::InitiateLightningPaymentRequest {
@@ -104,8 +109,10 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 		sources, ark::VtxoPolicy::new_pubkey(owner.public_key()),
 	).unwrap().generate_user_nonces(&keys).unwrap();
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let owner_address = super::payout_address(&srv, ark::VtxoPolicy::new_pubkey(owner.public_key()),
+		&owner, owner_mailbox).await;
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.mailbox_id = Some(owner_mailbox.serialize());
+		output.address = Some(owner_address.clone());
 	}
 	let reply = rpc.request_lightning_pay_htlc_revocation(
 		super::signed_package(&srv, &[&wallet], cosign_request).await,
@@ -149,7 +156,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		expiry_secs: None,
-		claim_destination: None, claim_destination_address: None,
+		claim_destination: None,
 		payment_hash: hash.to_vec(), amount_sat: 100_000, min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
 		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
@@ -185,8 +192,10 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	).unwrap().generate_user_nonces(&[receiver]).unwrap();
 
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let receiver_address = super::payout_address(&srv, ark::VtxoPolicy::new_pubkey(receiver.public_key()),
+		&receiver, MailboxIdentifier::from_pubkey(receiver.public_key())).await;
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.mailbox_id = Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize());
+		output.address = Some(receiver_address.clone());
 	}
 
 	// The backend is unavailable for the settlement call. The request
@@ -417,8 +426,8 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
 		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(),
+			ark_address: Some(address.to_string()),
 		}),
-		claim_destination_address: Some(address.to_string()),
 	}).await.unwrap().into_inner().bolt11;
 	let pay_task = {
 		let payer = payer.clone();
@@ -438,6 +447,13 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 		.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
 	assert!(!grants.is_empty());
 	assert!(grants.iter().all(|grant| grant.user_pubkey() == grant_key.public_key()));
+	for grant in &grants {
+		let birth_mailbox = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
+		).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(birth_mailbox, provider_mailbox.public_key().to_string(),
+			"the grant keeps its provider birth binding");
+	}
 
 	// The preimage reaches the settler without a cooperative claim, which
 	// settles the hold invoice and pays the payer's invoice.
@@ -464,6 +480,7 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 				tokio::time::sleep(poll_interval()).await;
 			}
 		}).await.expect("the settled grant was not paid to its recipient");
+		ctx.bitcoind().await_transaction(parent.compute_txid()).await;
 		assert!(parent.output.iter().any(|out| out.script_pubkey == recipient_script && out.value > Amount::ZERO));
 		assert!(parent.output.iter().all(|out| out.script_pubkey != provider_script));
 		let owners = db.read(async |tx| Ok(tx.query("SELECT c.user_pubkey, c.owner_mailbox \
@@ -475,5 +492,31 @@ async fn settled_forwarded_receive_without_claim_does_not_pay_the_provider() {
 				"grant {} was allocated to someone other than the recipient", grant.id());
 			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(recipient_mailbox.to_string()));
 		}
+	}
+	let pending = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
+		hash: hash.to_vec(), wait: false,
+	}).await.unwrap().into_inner();
+	assert_eq!(pending.fallback_spend_state, Some(protos::VtxoSpendState::FallbackPending as i32));
+	let confirmed = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(confirmed).await;
+	srv.watchmand().wait_for_sync_height(confirmed).await;
+	let terminal = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
+		hash: hash.to_vec(), wait: false,
+	}).await.unwrap().into_inner();
+	assert_eq!(terminal.fallback_spend_state, Some(protos::VtxoSpendState::Spent as i32),
+		"payment-hash status follows the recipient's subscription entitlement");
+	for grant in &grants {
+		let birth_mailbox = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
+		).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(birth_mailbox, provider_mailbox.public_key().to_string(),
+			"recipient payout must not rewrite the grant holder's birth binding");
+		let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+			vtxo_id: grant.id().to_bytes().to_vec(),
+			attestation: VtxoStatusAttestation::new(grant.id(), &grant_key).serialize(),
+		}).await.unwrap().into_inner();
+		assert_eq!(status.owner_mailbox, provider_mailbox.public_key().serialize().to_vec());
+		assert!(!status.fallback_committed,
+			"provider status must not claim the recipient's fallback payout");
 	}
 }

@@ -494,6 +494,7 @@ impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
 		protos::VtxoRequest {
 			amount: v.amount.to_sat(),
 			policy: v.policy.serialize(),
+			ark_address: None,
 		}
 	}
 }
@@ -522,7 +523,6 @@ impl From<ArkoorDestination> for protos::ArkoorDestination {
 	fn from(v: ArkoorDestination) -> Self {
 		Self {
 			address: None,
-			mailbox_id: None,
 			total_amount: v.total_amount.to_sat(),
 			policy: v.policy.serialize(),
 		}
@@ -535,6 +535,7 @@ impl From<SignedVtxoRequest> for protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
 				amount: v.vtxo.amount.to_sat(),
 				policy: v.vtxo.policy.serialize(),
+				ark_address: None,
 			}),
 			cosign_pubkey: v.cosign_pubkey.serialize().to_vec(),
 			public_nonces: v.nonces.iter().map(|n| n.serialize().to_vec()).collect(),

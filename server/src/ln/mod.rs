@@ -672,7 +672,6 @@ impl Server {
 		expiry: Option<Duration>,
 		claim_pubkey: Option<PublicKey>,
 		claim_destination: Option<protos::VtxoRequest>,
-		claim_destination_address: Option<String>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
 
@@ -740,9 +739,6 @@ impl Server {
 			&& (claim_pubkey.is_none() || mailbox_id.is_none()) {
 			return badarg!("default receive requires claim key and mailbox");
 		}
-		if claim_destination.is_none() && claim_destination_address.is_some() {
-			return badarg!("claim destination address has no claim destination");
-		}
 		if let Some(destination) = claim_destination {
 			let policy = VtxoPolicy::deserialize(&destination.policy).badarg("invalid claim destination policy")?;
 			if !matches!(policy, VtxoPolicy::Pubkey(_)) {
@@ -752,7 +748,7 @@ impl Server {
 				return badarg!("claim destination amount differs from receive amount after fees");
 			}
 			if self.config.expiry_payouts {
-				let address: ark::Address = claim_destination_address.as_deref()
+				let address: ark::Address = destination.ark_address.as_deref()
 					.context("forwarded receive requires recipient address")?.parse()
 					.badarg("invalid claim destination address")?;
 				if address.is_testnet() != (self.config.network != bitcoin::Network::Bitcoin)
@@ -776,9 +772,11 @@ impl Server {
 		).await?;
 		if let Some(subscription) = subscription {
 			if subscription.claim_destination_user_pubkey != claim_destination_user_pubkey
-				|| subscription.claim_destination_mailbox_pk != claim_destination_mailbox_pk
-				|| subscription.claim_pubkey != claim_pubkey
-				|| self.db.read(async |t| t.get_lightning_receiver_mailbox_id(payment_hash).await).await? != mailbox_id {
+				|| (self.config.expiry_payouts && (
+					subscription.claim_destination_mailbox_pk != claim_destination_mailbox_pk
+					|| subscription.claim_pubkey != claim_pubkey
+					|| self.db.read(async |t| t.get_lightning_receiver_mailbox_id(payment_hash).await).await? != mailbox_id
+				)) {
 				return badarg!("invoice already exists for another claim destination");
 			}
 			match subscription.status {
@@ -790,6 +788,14 @@ impl Server {
 								with an expiry of {}s, not the requested {}s",
 								payment_hash, existing_expiry.as_secs(), requested.as_secs(),
 							);
+						}
+					}
+					if !self.config.expiry_payouts {
+						if let Some(requested) = claim_pubkey {
+							if subscription.claim_pubkey != Some(requested) {
+								return badarg!("an invoice for payment hash {} already exists \
+									with a different claim key", payment_hash);
+							}
 						}
 					}
 					trace!("Found existing created subscription, returning invoice: {}",

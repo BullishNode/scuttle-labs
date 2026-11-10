@@ -3,29 +3,43 @@ fn test_server_mailbox_key() -> &'static bitcoin::secp256k1::Keypair {
 	KEY.get_or_init(|| bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[251; 32]).unwrap())
 }
 
+async fn payout_address(
+	srv: &Captaind, policy: VtxoPolicy, output_key: &bitcoin::secp256k1::Keypair,
+	mailbox: ark::mailbox::MailboxIdentifier,
+) -> String {
+	let info = srv.ark_info().await;
+	ark::Address::builder()
+		.testnet(srv.config().network != bitcoin::Network::Bitcoin)
+		.server_pubkey(info.server_pubkey)
+		.policy(policy)
+		.mailbox(info.mailbox_pubkey, mailbox, output_key).unwrap()
+		.into_address().unwrap().to_string()
+}
+
 /// Give hand-built outputs the mailbox selected by their creator.
 async fn signed_package(
 	srv: &Captaind, wallets: &[&Wallet], mut package: protos::ArkoorPackageCosignRequest,
 ) -> protos::ArkoorPackageCosignRequest {
 	if !srv.config().expiry_payouts { return package; }
-	let mut mailboxes = std::collections::BTreeMap::new();
+	let mut addresses = std::collections::BTreeMap::new();
 	for output in package.parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
-		if output.address.is_some() || output.mailbox_id.is_some() { continue; }
-		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
-		if mailboxes.contains_key(&key) { continue; }
-		let mut mailbox = None;
+		if output.address.is_some() { continue; }
+		let policy = VtxoPolicy::deserialize(&output.policy).unwrap();
+		let key = policy.user_pubkey();
+		if addresses.contains_key(&policy.serialize()) { continue; }
+		let mut owner = None;
 		for wallet in wallets {
-			if wallet.pubkey_keypair(&key).await.unwrap().is_some() {
-				mailbox = Some(wallet.mailbox_identifier());
+			if let Some((_, keypair)) = wallet.pubkey_keypair(&key).await.unwrap() {
+				owner = Some((keypair, wallet.mailbox_identifier()));
 				break;
 			}
 		}
-		mailboxes.insert(key, mailbox.unwrap_or_else(|| panic!("hand-built output {key} needs its mailbox")));
+		let (keypair, mailbox) = owner.unwrap_or_else(|| panic!("hand-built output {key} needs its keypair"));
+		addresses.insert(policy.serialize(), payout_address(srv, policy, &keypair, mailbox).await);
 	}
 	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		if output.address.is_some() || output.mailbox_id.is_some() { continue; }
-		let key = VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey();
-		output.mailbox_id = Some(mailboxes[&key].serialize());
+		if output.address.is_some() { continue; }
+		output.address = Some(addresses[&output.policy].clone());
 	}
 	package
 }

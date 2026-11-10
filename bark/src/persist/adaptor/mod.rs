@@ -119,8 +119,6 @@ pub mod partition {
 
 	// Retired registration/receipt formats. Never reuse these partitions.
 	pub const LEGACY_SCUTTLE: std::ops::RangeInclusive<u8> = 18..=21;
-	/// Separate BDK state for the fixed mailbox payout script.
-	pub const MAILBOX_BDK_CHANGESET: u8 = 22;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -537,22 +535,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None,
 			&current,
 		)?;
-		self.inner.write().await.put(record).await
-	}
-
-	#[cfg(feature = "onchain-bdk")]
-	async fn initialize_mailbox_bdk_wallet(&self) -> anyhow::Result<ChangeSet> {
-		match self.inner.read().await.get(partition::MAILBOX_BDK_CHANGESET, &[]).await? {
-			Some(record) => record.to_data(),
-			None => Ok(ChangeSet::default()),
-		}
-	}
-
-	#[cfg(feature = "onchain-bdk")]
-	async fn store_mailbox_bdk_wallet_changeset(&self, changeset: &ChangeSet) -> anyhow::Result<()> {
-		let mut current = self.initialize_mailbox_bdk_wallet().await?;
-		current.merge(changeset.clone());
-		let record = Record::from_data(partition::MAILBOX_BDK_CHANGESET, &[], None, &current)?;
 		self.inner.write().await.put(record).await
 	}
 
@@ -1280,18 +1262,6 @@ mod tests {
 		assert_eq!(query.partition, 0);
 		assert_eq!(query.limit, Some(10));
 		assert_eq!(query.range, ..);
-	}
-
-	#[cfg(feature = "onchain-bdk")]
-	#[tokio::test]
-	async fn mailbox_wallet_state_does_not_overlap_movement_action() {
-		let db = StorageAdaptorWrapper::new(MemoryStorageAdaptor::new());
-		let subsystem = MovementSubsystem { name: "test".into(), kind: "test".into() };
-		let id = db.create_new_movement(MovementStatus::Pending, &subsystem,
-			chrono::Local::now(), Some("")).await.unwrap();
-		db.store_mailbox_bdk_wallet_changeset(&ChangeSet::default()).await.unwrap();
-		assert_eq!(db.get_movement_id_by_action("").await.unwrap(), Some(id));
-		let _ = db.initialize_mailbox_bdk_wallet().await.unwrap();
 	}
 
 	async fn setup(_test: &str) -> ((), StorageAdaptorWrapper<MemoryStorageAdaptor>) {

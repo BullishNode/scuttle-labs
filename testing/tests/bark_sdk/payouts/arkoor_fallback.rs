@@ -15,6 +15,54 @@ async fn send_to_address_without_server_mailbox_is_refused() {
 	assert_eq!(assert_balance_consistent(&sender, false).await.spendable, sat(400_000));
 }
 
+/// An altered but valid address can bind the recipient's coin key to the
+/// payer's mailbox. The recipient must refuse that coin even with its id.
+#[tokio::test]
+async fn altered_address_is_not_credited_by_attested_recovery() {
+	let ctx = TestContext::new("bark_sdk/altered_address_attested_recovery_refusal").await;
+	let srv = ctx.captaind("server").cfg(|cfg| cfg.expiry_payouts = true).create().await;
+	let sender = ctx.bark_sdk("sender", &srv).boarded(sat(400_000))
+		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	let recipient = ctx.bark_sdk("recipient", &srv)
+		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	sender.stop_daemon_wait().await.unwrap();
+	recipient.stop_daemon_wait().await.unwrap();
+	let address = recipient.new_address().await.unwrap();
+	let [VtxoDelivery::ServerMailbox { blinded_id }] = address.delivery() else {
+		panic!("recipient address must carry one mailbox")
+	};
+	let changed_point = PublicKey::combine_keys(&[
+		&blinded_id.as_pubkey(), &sender.mailbox_identifier().as_pubkey(),
+		&recipient.mailbox_identifier().as_pubkey().negate(&ark::SECP),
+	]).unwrap();
+	let altered = ark::Address::new(address.is_testnet(), address.ark_id(),
+		address.policy().clone(), vec![VtxoDelivery::ServerMailbox {
+			blinded_id: BlindedMailboxIdentifier::from_pubkey(changed_point),
+		}]);
+	sender.send_arkoor_payment(&altered, sat(100_000)).await.unwrap();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let rows = db.read(async |tx| Ok(tx.query("SELECT vtxo_id, policy FROM vtxo", &[]).await?))
+		.await.unwrap();
+	let id = rows.iter().find_map(|row| {
+		let policy = ark::ServerVtxoPolicy::deserialize(row.get::<_, &[u8]>("policy")).ok()?;
+		(policy.user_pubkey() == Some(address.policy().user_pubkey()))
+			.then(|| row.get::<_, &str>("vtxo_id").parse::<ark::VtxoId>().unwrap())
+	}).expect("server stored recipient-keyed coin");
+	let (_, key) = recipient.pubkey_keypair(&address.policy().user_pubkey()).await.unwrap().unwrap();
+	let mut rpc = srv.get_public_rpc().await;
+	let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: id.to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(id, &key).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.owner_mailbox, sender.mailbox_identifier().serialize());
+	assert_ne!(status.owner_mailbox, recipient.mailbox_identifier().serialize());
+	recipient.sync_mailbox().await.unwrap();
+	assert!(recipient.spendable_vtxos().await.unwrap().is_empty());
+	let error = recipient.recover_vtxos([id], None).await.unwrap_err();
+	assert!(error.to_string().contains("ownership"), "{error:#}");
+	assert!(recipient.spendable_vtxos().await.unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn offline_addresses_receive_split_and_isolated_outputs() {
 	let ctx = TestContext::new("bark_sdk/offline_addresses_split_isolated").await;
@@ -139,7 +187,6 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 	let first = requests.first().unwrap(); let replay = requests.last().unwrap();
 	assert_eq!(first.parts.len(), replay.parts.len());
 	let own_mailbox = reopened.properties().await.unwrap().mailbox_identity.unwrap().public_key;
-	let own_mailbox_bytes = own_mailbox.serialize();
 	let mut reconstructed_own_destination = false;
 	let recipient_address = address.to_string();
 	for (a, b) in first.parts.iter().zip(&replay.parts) {
@@ -149,15 +196,18 @@ async fn accepted_arkoor_reply_loss_reopens_and_resigns_the_same_payment() {
 			for (old, new) in old.iter().zip(new) {
 				assert_eq!(old.total_amount, new.total_amount); assert_eq!(old.policy, new.policy);
 				assert_eq!(old.address, new.address);
-				assert_eq!(old.mailbox_id, new.mailbox_id);
 				let key = VtxoPolicy::deserialize(&old.policy).unwrap().user_pubkey();
 				if key == address.policy().user_pubkey() {
 					assert_eq!(new.address.as_deref(), Some(recipient_address.as_str()),
 						"copied recipient address remains authoritative");
-					assert!(new.mailbox_id.is_none());
 				} else {
-					assert_eq!(new.mailbox_id.as_deref(), Some(own_mailbox_bytes.as_slice()));
-					assert!(new.address.is_none());
+					let own: ark::Address = new.address.as_deref().unwrap().parse().unwrap();
+					assert_eq!(own.policy(), &VtxoPolicy::deserialize(&new.policy).unwrap());
+					let [VtxoDelivery::ServerMailbox { blinded_id }] = own.delivery() else {
+						panic!("self output has no upstream mailbox")
+					};
+					assert_eq!(ark::mailbox::MailboxIdentifier::from_blinded(*blinded_id,
+						key, &srv.mailbox_keypair()).unwrap().as_pubkey(), own_mailbox);
 					reconstructed_own_destination = true;
 				}
 			}
