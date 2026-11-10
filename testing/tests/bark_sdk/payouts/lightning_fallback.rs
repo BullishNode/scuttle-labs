@@ -378,7 +378,7 @@ async fn pay_hold_refused_while_sender_absent() {
 			srv.wait_for_sync_height(expired).await;
 			srv.watchmand().wait_for_sync_height(expired).await;
 			let db = Db::connect(&srv.config().postgres).await.unwrap();
-			let (parent, child) = tokio::time::timeout(Duration::from_secs(60), async {
+			let parent = tokio::time::timeout(Duration::from_secs(60), async {
 				// Confirm only real signed prefixes when the ordinary watchman publishes them,
 				// then honor its configured grace before expecting the next signed step.
 				let mut pending_prefixes = source.transactions().map(|step| {
@@ -400,7 +400,10 @@ async fn pay_hold_refused_while_sender_absent() {
 					).await?)).await.unwrap();
 					if let Some(row) = row {
 						let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
-						if let Some(child) = native_payout_child(&ctx, &parent, source.expiry_height()).await { break (parent, child); }
+						let visible = bitcoin_ext::rpc::BitcoinRpcExt::custom_get_raw_transaction_info(
+							&ctx.bitcoind().sync_client(), parent.compute_txid(), None,
+						).unwrap().is_some();
+						if visible { break parent; }
 					}
 					let core = ctx.bitcoind().sync_client();
 					if let Some(txid) = core.get_raw_mempool().unwrap().into_iter().find(|txid| pending_prefixes.contains(txid)) {
@@ -422,26 +425,29 @@ async fn pay_hold_refused_while_sender_absent() {
 				}
 			}).await.expect("absent sender must reach an actual background HTLC refund");
 			assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-			assert_eq!(ctx.bitcoind().await_transaction(child.compute_txid()).await, child);
 			let source_path = std::iter::once(source.chain_anchor()).chain(source.transactions().map(|step|
 				OutPoint::new(step.tx.compute_txid(), step.output_idx as u32))).collect::<std::collections::BTreeSet<_>>();
 			assert!(parent.input.iter().any(|input| source_path.contains(&input.previous_output)),
 				"the actual refund parent must spend this signed HTLC's backing path");
-			let anchor = parent.output.iter().enumerate().find(|(_, output)| output.is_p2a_fee_anchor()).unwrap();
-			assert!(child.input.iter().any(|input| input.previous_output == OutPoint::new(parent.compute_txid(), anchor.0 as u32)));
 			let mut parent_inputs = bitcoin::Amount::ZERO;
 			for input in &parent.input {
 				let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 				parent_inputs += previous.output[input.previous_output.vout as usize].value;
 			}
-			assert_eq!(parent_inputs, parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>());
-			let mut child_inputs = bitcoin::Amount::ZERO;
-			for input in &child.input {
-				let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
-				child_inputs += previous.output[input.previous_output.vout as usize].value;
-			}
-			let child_fee = child_inputs - child.output.iter().map(|output| output.value).sum::<bitcoin::Amount>();
-			assert!(child_fee > bitcoin::Amount::ZERO);
+			let parent_outputs = parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>();
+			let miner_fee = parent_inputs.checked_sub(parent_outputs).expect("payout cannot create value");
+			assert!(miner_fee > bitcoin::Amount::ZERO, "direct payout must pay its miner fee inline");
+			let owner_script = registration.clone();
+			let operator_script = srv.watchmand().config().sweep_address.clone().unwrap()
+				.require_network(Network::Regtest).unwrap().script_pubkey();
+			assert!(parent.output.iter().all(|output|
+				output.script_pubkey == owner_script || output.script_pubkey == operator_script));
+			let owner_value = parent.output.iter().filter(|output| output.script_pubkey == owner_script)
+				.map(|output| output.value).sum::<bitcoin::Amount>();
+			let operator_value = parent.output.iter().filter(|output| output.script_pubkey == operator_script)
+				.map(|output| output.value).sum::<bitcoin::Amount>();
+			assert_eq!(owner_value, board - ark_testing::sat(3_000));
+			assert_eq!(operator_value + miner_fee, ark_testing::sat(3_000));
 
 			let reopened = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic),
 				config.clone(), OpenWalletArgs { datadir: Some(ctx.datadir.join("absent_refund")),
@@ -474,12 +480,10 @@ async fn pay_hold_refused_while_sender_absent() {
 			srv.wait_for_sync_height(confirmed).await;
 			srv.watchmand().wait_for_sync_height(confirmed).await;
 			let core = ctx.bitcoind().sync_client();
-			for txid in [parent.compute_txid(), child.compute_txid()] {
-				let chain: serde_json::Value = core.call("getrawtransaction", &[
-					serde_json::json!(txid.to_string()), serde_json::json!(true),
-				]).unwrap();
-				assert!(chain["confirmations"].as_u64().unwrap() >= 6);
-			}
+			let chain: serde_json::Value = core.call("getrawtransaction", &[
+				serde_json::json!(parent.compute_txid().to_string()), serde_json::json!(true),
+			]).unwrap();
+			assert!(chain["confirmations"].as_u64().unwrap() >= 6);
 			for _ in 0..2 {
 				let reopened = Wallet::open(Network::Regtest, WalletSeed::new_from_mnemonic(Network::Regtest, &mnemonic),
 					config.clone(), OpenWalletArgs { datadir: Some(ctx.datadir.join("absent_refund")),

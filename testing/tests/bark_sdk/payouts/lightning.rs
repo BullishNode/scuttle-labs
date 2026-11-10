@@ -6,7 +6,7 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use ark::lightning::{PaymentHash, Preimage};
-use bitcoin_ext::{BlockDelta, TxOutExt};
+use bitcoin_ext::BlockDelta;
 use ark_testing::{TestContext, btc, util::{FutureExt, poll_interval}};
 use ark_testing::balance::assert_balance_consistent;
 
