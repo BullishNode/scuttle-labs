@@ -302,10 +302,10 @@ async fn direct_large_payout() {
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner.mailbox.as_pubkey().to_string());
 		assert_eq!(row.get::<_, String>("user_pubkey"), owner.key.public_key().to_string());
 	}
-	let splits = db.read(async |tx| Ok(tx.query_one(
-		"SELECT COUNT(*) FROM expiry_split_request", &[],
-	).await?.get::<_, i64>(0))).await.unwrap();
-	assert_eq!(splits, 0, "direct payout must not create fork expiry splits");
+	let no_split_table = db.read(async |tx| Ok(tx.query_one(
+		"SELECT to_regclass('expiry_split_request') IS NULL", &[],
+	).await?.get::<_, bool>(0))).await.unwrap();
+	assert!(no_split_table, "the fresh payout schema must have no expiry split path");
 	let confirmed = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(confirmed).await;
 	srv.watchmand().wait_for_sync_height(confirmed).await;

@@ -377,14 +377,15 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		}
 	}.wait_millis(10_000).await;
 	let final_state = db.read(async |tx| Ok(tx.query_one("SELECT \
-		(SELECT COUNT(*) FROM expiry_split_request s JOIN vtxo v ON v.vtxo_id=s.vtxo_id WHERE v.anchor_point=$1) AS splits, \
+		(SELECT to_regclass('expiry_split_request') IS NULL) AS no_split_table, \
 		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1 AND c.disposition<>'operator') AS customers, \
 		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$2 AND a.status='confirmed') AS allocations",
 		&[&root.to_string(), &grant.id().to_string()],
 	).await?)).await.unwrap();
-	for field in ["splits", "customers"] { assert_eq!(final_state.get::<_, i64>(field), 0, "{field}"); }
+	assert!(final_state.get::<_, bool>("no_split_table"));
+	assert_eq!(final_state.get::<_, i64>("customers"), 0);
 	assert_eq!(final_state.get::<_, i64>("allocations"), 1);
 	assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 }

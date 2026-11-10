@@ -2,7 +2,7 @@
 
 Set `expiry_payouts` before creating the server database. Run captaind and
 watchmand against that database and fund the operator fee wallet. A payout
-server advertises `scuttle-1` and protocol version 6. Existing payout-off
+server advertises `scuttle-1` and numeric protocol version 5. Existing payout-off
 databases remain in upstream mode.
 
 Watchmand leaves a node containing an unresolved obligation untouched. Once

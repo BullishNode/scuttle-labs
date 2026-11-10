@@ -1,8 +1,9 @@
 # Scuttle expiry payouts
 
 `expiry_payouts` is fixed when the server database is created. A payout server
-advertises `scuttle-1` and requires protocol version 6. With payouts disabled,
-the server retains the upstream protocol range.
+advertises `scuttle-1` and requires numeric protocol version 5. The label is
+the payout-mode gate; version 5 alone does not identify a Scuttle server. With
+payouts disabled, the server retains the upstream protocol range.
 
 ## Owner binding
 

@@ -19,11 +19,12 @@ async fn assert_pending_root_is_untouched(
 		(SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1) AS entitlements, \
 		(SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1) AS fences, \
 		(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=$2) AS allocations, \
-		(SELECT COUNT(*) FROM expiry_split_request WHERE vtxo_id=$2) AS splits, \
+		(SELECT to_regclass('expiry_split_request') IS NULL) AS no_split_table, \
 		(SELECT COUNT(*) FROM lightning_payment_attempt_htlc_vtxo WHERE vtxo_id=$1) AS attempts",
 		&[&htlc.to_string(), &VtxoId::from(root).to_string()],
 	).await?)).await.unwrap();
-	for field in ["entitlements", "fences", "allocations", "splits", "attempts"] {
+	assert!(row.get::<_, bool>("no_split_table"));
+	for field in ["entitlements", "fences", "allocations", "attempts"] {
 		assert_eq!(row.get::<_, i64>(field), 0,
 			"the unresolved tree must remain pending before its HTLC deadline: {field}");
 	}

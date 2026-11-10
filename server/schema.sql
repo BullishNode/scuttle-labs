@@ -833,8 +833,8 @@ CREATE TABLE public.expiry_allocation_coin (
     fee_sat bigint NOT NULL,
     payout_sat bigint NOT NULL,
     forfeited_sat bigint NOT NULL,
-    evidence jsonb NOT NULL,
     subsidy_sat bigint DEFAULT 0 NOT NULL,
+    evidence jsonb NOT NULL,
     CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND (user_pubkey IS NOT NULL) AND (spk IS NOT NULL) AND ((gross_sat + subsidy_sat) = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0) AND (subsidy_sat = 0)))),
     CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
     CONSTRAINT expiry_allocation_coin_fee_sat_check CHECK ((fee_sat >= 0)),
@@ -1058,17 +1058,6 @@ CREATE TABLE public.expiry_lightning_receive_claim (
     output_vtxo bytea NOT NULL,
     output_mailbox text,
     CONSTRAINT expiry_lightning_receive_claim_output_mailbox_check CHECK (((output_mailbox IS NULL) OR (length(output_mailbox) = 66)))
-);
-
-
---
--- Name: expiry_split_request; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.expiry_split_request (
-    vtxo_id text NOT NULL,
-    progress_txid text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
 );
 
 
@@ -1635,20 +1624,6 @@ CREATE SEQUENCE public.offboards_id_seq
 --
 
 ALTER SEQUENCE public.offboards_id_seq OWNED BY public.offboards.id;
-
-
---
--- Name: owner_key; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.owner_key (
-    user_pubkey text NOT NULL,
-    mailbox_pk text NOT NULL,
-    blinded_id text NOT NULL,
-    CONSTRAINT owner_key_blinded_id_check CHECK ((length(blinded_id) = 66)),
-    CONSTRAINT owner_key_mailbox_pk_check CHECK ((length(mailbox_pk) = 66)),
-    CONSTRAINT owner_key_user_pubkey_check CHECK ((length(user_pubkey) = 66))
-);
 
 
 --
@@ -2750,14 +2725,6 @@ ALTER TABLE ONLY public.expiry_payout_attempt
 
 
 --
--- Name: expiry_split_request expiry_split_request_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_split_request
-    ADD CONSTRAINT expiry_split_request_pkey PRIMARY KEY (vtxo_id);
-
-
---
 -- Name: expiry_terminal_claim expiry_terminal_claim_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2899,14 +2866,6 @@ ALTER TABLE ONLY public.nursery_tx
 
 ALTER TABLE ONLY public.offboards
     ADD CONSTRAINT offboards_pkey PRIMARY KEY (id);
-
-
---
--- Name: owner_key owner_key_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.owner_key
-    ADD CONSTRAINT owner_key_pkey PRIMARY KEY (user_pubkey);
 
 
 --
@@ -3554,14 +3513,6 @@ ALTER TABLE ONLY public.expiry_lightning_receive_claim
 
 ALTER TABLE ONLY public.expiry_payout_attempt
     ADD CONSTRAINT expiry_payout_attempt_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
-
-
---
--- Name: expiry_split_request expiry_split_request_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_split_request
-    ADD CONSTRAINT expiry_split_request_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
 
 
 --

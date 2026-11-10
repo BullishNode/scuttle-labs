@@ -78,10 +78,10 @@ async fn expiry_payout_native_board_fee_seed_restore_and_confirmed_spend() {
 	let (allocation, parent) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 
-			let split_count = db.read(async |t| Ok(t.query_one(
-				"SELECT COUNT(*) FROM expiry_split_request", &[],
-			).await?.get::<_, i64>(0))).await.unwrap();
-			assert_eq!(split_count, 0, "unresolved ownership must not progress a board into a user-only leaf");
+			let no_split_table = db.read(async |t| Ok(t.query_one(
+				"SELECT to_regclass('expiry_split_request') IS NULL", &[],
+			).await?.get::<_, bool>(0))).await.unwrap();
+			assert!(no_split_table, "unresolved ownership must not use an expiry split path");
 			if let Some((id, parent)) = super::expiry_test::published_payout(&db, source.id()).await {
 				break (id, parent);
 			}
