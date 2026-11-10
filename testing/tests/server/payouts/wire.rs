@@ -20,7 +20,8 @@ async fn fail_attempt_requires_admin_auth() {
 	assert!(String::from_utf8_lossy(&output.stderr).contains("unknown Lightning payment attempt"));
 }
 
-/// Payout-on operations require the new version, and operator methods are not public.
+/// Payout-on operations use the upstream numeric version and an explicit
+/// Scuttle label. Operator methods are not public.
 #[tokio::test]
 async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let ctx = TestContext::new("server/scuttle_wire_epoch_and_operator_listener").await;
@@ -29,14 +30,14 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let handshake = public.handshake(protos::HandshakeRequest {
 		bark_version: Some(server_rpc::BARK_CRATE_VERSION.to_owned()),
 	}).await.unwrap().into_inner();
-	let version = server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
+	let version = server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
 	assert_eq!(handshake.min_protocol_version, version);
 	assert_eq!(handshake.max_protocol_version, version);
 	assert_eq!(handshake.protocol_label.as_deref(), Some("scuttle-1"));
 	let missing = public.get_offboard_fee_rate(protos::Empty {}).await.unwrap_err();
 	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
 	assert!(missing.message().contains("pver"));
-	for old in [4, 5, 7, version - 1, version + 1] {
+	for old in [4, 6, 7] {
 		let mut request = tonic::Request::new(protos::Empty {});
 		request.set_pver(old);
 		let error = public.get_offboard_fee_rate(request).await.unwrap_err();

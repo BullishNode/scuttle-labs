@@ -672,6 +672,7 @@ impl Server {
 		expiry: Option<Duration>,
 		claim_pubkey: Option<PublicKey>,
 		claim_destination: Option<protos::VtxoRequest>,
+		claim_destination_address: Option<String>,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
 
@@ -739,6 +740,9 @@ impl Server {
 			&& (claim_pubkey.is_none() || mailbox_id.is_none()) {
 			return badarg!("default receive requires claim key and mailbox");
 		}
+		if claim_destination.is_none() && claim_destination_address.is_some() {
+			return badarg!("claim destination address has no claim destination");
+		}
 		if let Some(destination) = claim_destination {
 			let policy = VtxoPolicy::deserialize(&destination.policy).badarg("invalid claim destination policy")?;
 			if !matches!(policy, VtxoPolicy::Pubkey(_)) {
@@ -748,7 +752,7 @@ impl Server {
 				return badarg!("claim destination amount differs from receive amount after fees");
 			}
 			if self.config.expiry_payouts {
-				let address: ark::Address = destination.ark_address.as_deref()
+				let address: ark::Address = claim_destination_address.as_deref()
 					.context("forwarded receive requires recipient address")?.parse()
 					.badarg("invalid claim destination address")?;
 				if address.is_testnet() != (self.config.network != bitcoin::Network::Bitcoin)

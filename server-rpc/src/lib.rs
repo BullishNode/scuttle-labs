@@ -122,7 +122,7 @@ pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
 /// The maximum protocol version supported by the client.
 ///
 /// For info on protocol versions, see [server_rpc](crate) module documentation.
-pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS;
+pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
 
 /// The bark client version sent in HandshakeRequest. Exposed so
 /// alternate callers (e.g. integration tests) send the same string a

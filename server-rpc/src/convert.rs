@@ -494,7 +494,6 @@ impl<'a> From<&'a VtxoRequest> for protos::VtxoRequest {
 		protos::VtxoRequest {
 			amount: v.amount.to_sat(),
 			policy: v.policy.serialize(),
-			ark_address: None,
 		}
 	}
 }
@@ -535,7 +534,6 @@ impl From<SignedVtxoRequest> for protos::SignedVtxoRequest {
 			vtxo: Some(protos::VtxoRequest {
 				amount: v.vtxo.amount.to_sat(),
 				policy: v.vtxo.policy.serialize(),
-				ark_address: None,
 			}),
 			cosign_pubkey: v.cosign_pubkey.serialize().to_vec(),
 			public_nonces: v.nonces.iter().map(|n| n.serialize().to_vec()).collect(),

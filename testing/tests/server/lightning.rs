@@ -421,7 +421,7 @@ async fn isolated_hold_failures(check_requeue: bool) {
 	let expired_hash = ark::lightning::Preimage::random().compute_payment_hash();
 	let unpaid = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		payment_hash: expired_hash.to_vec(), amount_sat: 1_000, min_cltv_delta: 58,
-		expiry_secs: Some(30), claim_destination: None, mailbox_id: None, description: None,
+		expiry_secs: Some(30), claim_destination: None, claim_destination_address: None, mailbox_id: None, description: None,
 		claim_pubkey: None,
 	}).await.unwrap().into_inner().bolt11;
 	let arrived = Arc::new(tokio::sync::Notify::new());
@@ -2037,7 +2037,7 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 	let key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut rpc = srv.get_public_rpc().await;
 	let second = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, payment_hash: hash.to_vec(), amount_sat: 100_000,
+		claim_destination: None, claim_destination_address: None, payment_hash: hash.to_vec(), amount_sat: 100_000,
 		min_cltv_delta: 6,
 		mailbox_id: payout.then(|| ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key()).serialize()),
 		description: None, expiry_secs: None,
@@ -2687,7 +2687,7 @@ async fn rejected_accepted_invoice_releases_held_htlcs() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 	let invoice_delta = Bolt11Invoice::from_str(&bolt11).unwrap().min_final_cltv_expiry_delta();
 
@@ -2791,7 +2791,7 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 	let payment_hash = ark::lightning::Preimage::random().compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;
 	rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(1).to_sat(),
 		min_cltv_delta: 6,
@@ -2838,8 +2838,8 @@ async fn server_lightning_receive_claim_destination_is_bound() {
 		description: None, expiry_secs: None,
 		claim_destination: Some(protos::VtxoRequest {
 			amount: net.to_sat(), policy: address.policy().serialize(),
-			ark_address: Some(address.to_string()),
 		}),
+		claim_destination_address: Some(address.to_string()),
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
 	}).await.unwrap().into_inner().bolt11;
 
@@ -3022,7 +3022,7 @@ async fn start_keyless_receive(srv: &Captaind, amount: Amount) -> KeylessReceive
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 	}).await.unwrap().into_inner().bolt11;
 	KeylessReceive { invoice, payment_hash }
 }
@@ -3271,7 +3271,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None,
+			claim_destination: None, claim_destination_address: None,
 			payment_hash: payment_hash.as_ref().to_vec(),
 			amount_sat: btc(1).to_sat(),
 			min_cltv_delta,
@@ -3406,7 +3406,7 @@ async fn settled_hash_cannot_fund_new_receive() {
 	// The same hash must now be refused for a receive.
 	let err = srv.get_public_rpc().await
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None,
+			claim_destination: None, claim_destination_address: None,
 			payment_hash: payment_hash.as_ref().to_vec(),
 			amount_sat: btc(1).to_sat(),
 			min_cltv_delta: 6,
@@ -3449,7 +3449,7 @@ async fn prepare_lightning_claim_requires_the_claim_key() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: Some(claim_key.public_key().serialize().to_vec()),
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 	};
 	let invoice = rpc.start_lightning_receive(start(&claim_key)).await.unwrap().into_inner().bolt11;
 	// starting it again returns the same receive, but not for another key
@@ -3562,7 +3562,7 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 	// it so the subscription is Accepted.
 	let mut rpc = srv.get_public_rpc().await;
 	let receive_invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(1).to_sat(),
 		min_cltv_delta: 6,
@@ -3672,7 +3672,7 @@ async fn intra_ark_payment_refused_while_same_hash_send_is_open() {
 	// A receive for H is allowed: H is not settled.
 	let mut rpc = srv.get_public_rpc().await;
 	let receive_invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(0.5).to_sat(),
 		min_cltv_delta: 6,
@@ -4248,7 +4248,7 @@ async fn check_lightning_receive_poll_interval_fallback() {
 
 	// Create a hold invoice on the server.
 	let resp = srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None, None,
 	).await.unwrap();
 
 	// Create a disconnected receiver: the sender is kept alive so
@@ -4301,7 +4301,7 @@ async fn check_lightning_receive_ignores_other_payment_updates() {
 	let preimage = ark::lightning::Preimage::from(rand::random::<[u8; 32]>());
 	let payment_hash = preimage.compute_payment_hash();
 	srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None, None,
 	).await.unwrap();
 
 	let (update_tx, mut update_rx) = tokio::sync::broadcast::channel::<PaymentHash>(16);
@@ -4363,7 +4363,7 @@ async fn refuse_receive_with_unlock_hash_as_payment_hash() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let err = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: 10_000,
 		min_cltv_delta: 8,
@@ -4406,10 +4406,10 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	let mut raw = server_rpc::ArkServiceClient::new(channel);
 	let mut old_request = tonic::Request::new(protos::StartLightningReceiveRequest {
 		payment_hash: old_hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
-		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None,
+		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None, claim_destination_address: None,
 		claim_pubkey: None,
 	});
-	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS - 1);
+	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES - 1);
 	let refusal = raw.start_lightning_receive(old_request).await.expect_err("an older protocol must not create a fresh invoice");
 	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
 	assert_eq!(refusal.message(), "unsupported protocol version", "unexpected refusal: {refusal}");
@@ -4422,7 +4422,7 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	let claim_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut start_for = async |payment_hash: PaymentHash, expiry_secs: Option<u64>| {
 		rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None,
+			claim_destination: None, claim_destination_address: None,
 			payment_hash: payment_hash.to_vec(),
 			amount_sat: 10_000,
 			min_cltv_delta: 8,
@@ -4478,7 +4478,7 @@ async fn payout_disabled_created_receive_retry_keeps_upstream_optional_fields() 
 			mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(mailbox.public_key()).serialize()),
 			description: None, expiry_secs,
 			claim_pubkey: claim_key.map(|key| key.public_key().serialize().to_vec()),
-			claim_destination: None,
+			claim_destination: None, claim_destination_address: None,
 		}
 	};
 	let mut rpc = srv.get_public_rpc().await;
@@ -4772,7 +4772,7 @@ async fn prevent_double_pay_via_canceled_subscription_and_inflight_xpay() {
 	// 3. Register a server receive with the same payment hash H.
 	let invoice_2 = srv.get_public_rpc().await
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None,
+			claim_destination: None, claim_destination_address: None,
 			payment_hash: payment_hash.to_byte_array().to_vec(),
 			amount_sat: amount.to_sat(),
 			min_cltv_delta: 6,
@@ -4896,7 +4896,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	let payment_hash = preimage.compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None,
+		claim_destination: None, claim_destination_address: None,
 		payment_hash: payment_hash.to_vec(),
 		amount_sat: 100_000,
 		min_cltv_delta: 18,
@@ -5472,7 +5472,7 @@ async fn zero_part_and_cold_restart_refund() {
 			let mut observe = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
 				attempt_id: attempt.id, native_cold_restart_confirmed: false,
 			});
-			server_rpc::RequestExt::set_pver(&mut observe, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
+			server_rpc::RequestExt::set_pver(&mut observe, server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES);
 			assert_eq!(operator.reconcile_lightning_attempt(observe).await.unwrap().into_inner().status, held.status.to_string());
 			assert_eq!(db.read(async |t| Ok(t.query_one("SELECT row_to_json(a)::TEXT FROM lightning_payment_attempt a WHERE id=$1",
 				&[&attempt.id]).await?.get::<_, String>(0))).await.unwrap(), original_attempt);
@@ -5494,7 +5494,7 @@ async fn zero_part_and_cold_restart_refund() {
 					let mut request = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
 						attempt_id: attempt.id, native_cold_restart_confirmed: true,
 					});
-					server_rpc::RequestExt::set_pver(&mut request, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
+					server_rpc::RequestExt::set_pver(&mut request, server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES);
 					match operator.reconcile_lightning_attempt(request).await {
 						Ok(response) => { assert_eq!(response.into_inner().status, "failed"); break; },
 						Err(error) if error.code() == tonic::Code::Internal => tokio::time::sleep(poll_interval()).await,
@@ -5541,7 +5541,7 @@ async fn zero_part_and_cold_restart_refund() {
 		let mut repeat = tonic::Request::new(protos::ReconcileLightningAttemptRequest {
 			attempt_id: attempt.id, native_cold_restart_confirmed: orphan,
 		});
-		server_rpc::RequestExt::set_pver(&mut repeat, server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
+		server_rpc::RequestExt::set_pver(&mut repeat, server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES);
 		assert_eq!(operator.reconcile_lightning_attempt(repeat).await.unwrap().into_inner().status, "failed");
 		Box::pin(wallet.check_lightning_payment(hash, true)).await.unwrap();
 		assert_eq!(wallet.history().await.unwrap(), history);

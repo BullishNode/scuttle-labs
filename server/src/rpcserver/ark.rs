@@ -127,8 +127,8 @@ impl rpc::server::ArkService for Server {
 		};
 
 		let ret = protos::HandshakeResponse {
-			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MIN_PROTOCOL_VERSION },
-			max_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS } else { MAX_PROTOCOL_VERSION },
+			min_protocol_version: if self.config.expiry_payouts { rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES } else { MIN_PROTOCOL_VERSION },
+			max_protocol_version: MAX_PROTOCOL_VERSION,
 			psa,
 			protocol_label: self.config.expiry_payouts.then(|| "scuttle-1".to_owned()),
 		};
@@ -719,6 +719,7 @@ impl rpc::server::ArkService for Server {
 			req.expiry_secs.map(Duration::from_secs),
 			claim_pubkey,
 			req.claim_destination,
+			req.claim_destination_address,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp))

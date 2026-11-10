@@ -192,7 +192,7 @@ impl Wallet {
 		}
 
 		check_delivery(address.delivery())?;
-		if srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS {
+		if srv.scuttle_payouts().await {
 			if !matches!(address.delivery(), [VtxoDelivery::ServerMailbox { .. }]) {
 				return Err(ArkoorAddressError::RecipientMustUpdate);
 			}

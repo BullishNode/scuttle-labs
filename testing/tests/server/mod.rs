@@ -1500,7 +1500,6 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
-				ark_address: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({
@@ -1549,7 +1548,6 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
-				ark_address: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({
@@ -1576,7 +1574,6 @@ async fn bad_round_input() {
 			vtxo: Some(protos::VtxoRequest {
 				amount: vtxo_req.vtxo.amount.to_sat(),
 				policy: vtxo_req.vtxo.policy.serialize(),
-				ark_address: None,
 			}),
 			cosign_pubkey: vtxo_req.cosign_pubkey.serialize().to_vec(),
 			public_nonces: iter::repeat({

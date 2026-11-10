@@ -339,8 +339,6 @@ message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
 	reserved 3;
-	// Recipient's full address for a forwarded Lightning receive.
-	optional string ark_address = 4;
 }
 
 message ArkoorDestination {
@@ -443,7 +441,9 @@ message StartLightningReceiveRequest {
 	optional bytes claim_pubkey = 7;
 	// Point-in-time check for an explicit recipient before invoice creation.
 	VtxoRequest claim_destination = 8;
-	reserved 9;
+	// Full recipient address for a forwarded receive. The mailbox_id above
+	// belongs to the invoice provider and is only for notifications.
+	optional string claim_destination_address = 9;
 }
 
 message StartLightningReceiveResponse {

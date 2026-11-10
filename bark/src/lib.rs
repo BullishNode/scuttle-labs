@@ -1302,7 +1302,7 @@ impl Wallet {
 				let ark_info = conn.ark_info().await;
 				match check_ark_info_safe(&ark_info, config.vtxo_exit_margin) {
 					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey),
-						Some(conn.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS)),
+						Some(conn.scuttle_payouts().await)),
 					Err(err) if allow_unreachable_server => {
 						warn!("server-advertised ArkInfo is unsafe, \
 							treating as unavailable: {:#}", err);
@@ -1606,7 +1606,7 @@ impl Wallet {
 
 		let ark_info = conn.ark_info().await;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-		self.check_and_store_server_keys(&ark_info, conn.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS).await?;
+		self.check_and_store_server_keys(&ark_info, conn.scuttle_payouts().await).await?;
 
 		Ok((conn, ark_info))
 	}
@@ -1627,7 +1627,7 @@ impl Wallet {
 		let ark_info = srv.ark_info().await;
 		ark_info.fees.validate().context("invalid fee schedule")?;
 		check_ark_info_safe(&ark_info, self.inner.config.vtxo_exit_margin)?;
-		self.check_and_store_server_keys(&ark_info, srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS).await?;
+		self.check_and_store_server_keys(&ark_info, srv.scuttle_payouts().await).await?;
 
 		Ok(())
 	}

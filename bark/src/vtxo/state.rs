@@ -54,6 +54,8 @@ pub enum VtxoLockHolder {
 	Movement { id: MovementId },
 	/// An arkoor mailbox payment awaiting server registration.
 	MailboxReceive,
+	/// A completed round output retained until its payout owner is attested.
+	RoundPayoutCheck,
 }
 
 impl From<MovementId> for VtxoLockHolder {

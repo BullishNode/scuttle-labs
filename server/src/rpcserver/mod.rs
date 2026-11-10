@@ -230,11 +230,12 @@ impl ReceiverExt for oneshot::Receiver<anyhow::Error> {
 	}
 }
 
-/// Validate the ordinary range, or require joint ownership in payout-on mode.
+/// Payout mode uses the same numeric wire version as upstream. The handshake
+/// label identifies its additional destination and ownership requirements.
 fn validate_pver<T>(req: &tonic::Request<T>, expiry_payouts: bool) -> Result<u64, tonic::Status> {
 	let pver = req.pver()?;
 	let range = if expiry_payouts {
-		pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS..=pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS
+		pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES..=pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES
 	} else { MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION };
 	if !range.contains(&pver) {
 		return Err(tonic::Status::invalid_argument("unsupported protocol version"));

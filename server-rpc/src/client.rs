@@ -265,8 +265,8 @@ pub enum ConnectError {
 	ProtocolVersionMismatchServerTooOld { client_min: u64, server_max: u64 },
 	#[error("invalid server protocol version range: {server_min}..={server_max}")]
 	InvalidProtocolVersionRange { server_min: u64, server_max: u64 },
-	#[error("payout protocol requires the scuttle-1 server label")]
-	MissingScuttleProtocolLabel,
+	#[error("server protocol changed during this connection")]
+	ProtocolLabelChanged,
 	#[error("error getting ark info: {0}")]
 	GetArkInfo(tonic::Status),
 	#[error("invalid ark info from ark server: {0}")]
@@ -349,13 +349,15 @@ pub struct ServerInfo {
 	///
 	/// For info on protocol versions, see [server_rpc](crate) module documentation.
 	pub pver: u64,
+	/// Additional protocol behavior advertised without changing numeric negotiation.
+	pub protocol_label: Option<String>,
 	/// Server-side configuration and network parameters returned after connection.
 	pub info: ArkInfo,
 }
 
 impl ServerInfo {
-	pub fn new(pver: u64, info: ArkInfo) -> Self {
-		Self { pver, info }
+	pub fn new(pver: u64, protocol_label: Option<String>, info: ArkInfo) -> Self {
+		Self { pver, protocol_label, info }
 	}
 }
 
@@ -486,7 +488,7 @@ impl ServerConnection {
 		let handshake = handshake_client.handshake(Self::handshake_req()).await
 			.map_err(ConnectError::Handshake)?.into_inner();
 
-		let pver = check_handshake(handshake)?;
+		let (pver, protocol_label) = check_handshake(handshake)?;
 		interceptor.pver = Some(pver);
 
 		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
@@ -497,7 +499,7 @@ impl ServerConnection {
 		let mailbox_client = mailbox::MailboxServiceClient::with_interceptor(transport, interceptor)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
-		let info = Arc::new(RwLock::new(ServerInfo::new(pver, info)));
+		let info = Arc::new(RwLock::new(ServerInfo::new(pver, protocol_label, info)));
 		Ok(ServerConnection {
 			info,
 			client,
@@ -528,12 +530,21 @@ impl ServerConnection {
 		let mut client = self.client.clone();
 		let handshake = client.handshake(Self::handshake_req()).await
 			.map_err(ConnectError::Handshake)?.into_inner();
-		check_handshake(handshake)?;
+		let (pver, protocol_label) = check_handshake(handshake)?;
+		let info = self.info.read().await;
+		if pver != info.pver || protocol_label != info.protocol_label {
+			return Err(ConnectError::ProtocolLabelChanged);
+		}
 		Ok(())
 	}
 
 	/// Protocol version selected by the existing handshake.
 	pub async fn protocol_version(&self) -> u64 { self.info.read().await.pver }
+
+	/// Whether this server advertises Scuttle's payout protocol.
+	pub async fn scuttle_payouts(&self) -> bool {
+		self.info.read().await.protocol_label.as_deref() == Some("scuttle-1")
+	}
 
 	/// Returns the cached [ArkInfo].
 	pub async fn ark_info(&self) -> ArkInfo {
@@ -567,7 +578,7 @@ impl<I: Interceptor> ArkServiceClientExt for ArkServiceClient<InterceptedService
 	}
 }
 
-fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectError> {
+fn check_handshake(handshake: protos::HandshakeResponse) -> Result<(u64, Option<String>), ConnectError> {
 	if let Some(ref msg) = handshake.psa {
 		warn!("Message from Ark server: \"{}\"", msg);
 	}
@@ -590,11 +601,7 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 
 	// Both ranges are valid and overlap, so this is in both.
 	let pver = cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version);
-	if pver == crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS
-		&& handshake.protocol_label.as_deref() != Some("scuttle-1") {
-		return Err(ConnectError::MissingScuttleProtocolLabel);
-	}
-	Ok(pver)
+	Ok((pver, handshake.protocol_label))
 }
 
 #[cfg(test)]
@@ -624,20 +631,14 @@ mod tests {
 	}
 
 	#[test]
-	fn payout_handshake_requires_scuttle_label() {
+	fn payout_handshake_uses_upstream_numeric_version_with_scuttle_label() {
 		let response = protos::HandshakeResponse {
-			min_protocol_version: crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
-			max_protocol_version: crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS,
+			min_protocol_version: crate::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
+			max_protocol_version: crate::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
 			psa: None,
-			protocol_label: None,
+			protocol_label: Some("scuttle-1".to_owned()),
 		};
-		assert!(matches!(check_handshake(response.clone()),
-			Err(ConnectError::MissingScuttleProtocolLabel)));
-		assert!(matches!(check_handshake(protos::HandshakeResponse {
-			protocol_label: Some("other".to_owned()), ..response.clone()
-		}), Err(ConnectError::MissingScuttleProtocolLabel)));
-		assert_eq!(check_handshake(protos::HandshakeResponse {
-			protocol_label: Some("scuttle-1".to_owned()), ..response
-		}).unwrap(), crate::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS);
+		assert_eq!(check_handshake(response).unwrap(), (crate::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
+			Some("scuttle-1".to_owned())));
 	}
 }

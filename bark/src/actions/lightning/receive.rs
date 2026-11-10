@@ -363,7 +363,6 @@ pub(crate) async fn start_lightning_receive(
 	let destination = claim_destination.as_ref().map(|destination| {
 		protos::VtxoRequest {
 			amount: net_amount.to_sat(), policy: destination.policy().serialize(),
-			ark_address: Some(destination.to_string()),
 		}
 	});
 
@@ -405,6 +404,7 @@ pub(crate) async fn start_lightning_receive(
 		expiry_secs: expiry.map(|e| e.as_secs()),
 		claim_pubkey: Some(claim_keypair.public_key().serialize().to_vec()),
 		claim_destination: destination,
+		claim_destination_address: claim_destination.as_ref().map(ToString::to_string),
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();

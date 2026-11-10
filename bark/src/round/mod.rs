@@ -1913,12 +1913,7 @@ async fn persist_round_success(
 	debug!("Persisting newly finished round. {} new vtxos, movement ID {:?}",
 		new_vtxos.len(), movement_id,
 	);
-	if wallet.properties().await?.server_payouts == Some(true) {
-		for output in new_vtxos {
-			let key = wallet.get_vtxo_key(output).await?;
-			wallet.fetch_vtxo_status(output.id(), &key).await?;
-		}
-	}
+	let verify_payout_owner = wallet.properties().await?.server_payouts == Some(true);
 
 	// we first try all actions that need to happen and only afterwards return errors
 	// so that we achieve maximum success
@@ -1931,8 +1926,11 @@ async fn persist_round_success(
 	let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 	let spent_result = wallet.inner.db.steal_lock_to_spent(&input_ids).await
 		.context("failed to mark input VTXOs as spent");
-	let store_result = wallet.store_spendable_vtxos(new_vtxos).await
-		.context("failed to store new VTXOs");
+	let store_result = if verify_payout_owner {
+		wallet.store_locked_vtxos(new_vtxos, Some(VtxoLockHolder::RoundPayoutCheck)).await
+	} else {
+		wallet.store_spendable_vtxos(new_vtxos).await
+	}.context("failed to store new VTXOs");
 	let update_result = if let Some(mid) = movement_id {
 		wallet.inner.movements.finish_movement_with_update(
 			mid,
@@ -1948,6 +1946,13 @@ async fn persist_round_success(
 	store_result?;
 	spent_result?;
 	update_result?;
+	if verify_payout_owner {
+		for output in new_vtxos {
+			if let Err(error) = wallet.release_verified_round_output(output).await {
+				warn!("Round output {} remains locked pending payout-owner verification: {error:#}", output.id());
+			}
+		}
+	}
 
 	Ok(())
 }
@@ -2280,7 +2285,6 @@ impl Wallet {
 				protos::VtxoRequest {
 					policy: req.policy.serialize(),
 					amount: req.amount.to_sat(),
-					ark_address: None,
 			})
 			.collect::<Vec<_>>();
 

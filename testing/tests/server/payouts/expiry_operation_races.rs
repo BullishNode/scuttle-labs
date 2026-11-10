@@ -675,4 +675,12 @@ async fn mixed_terminal_offboard_retires_after_lower_id_ordinary_spend_and_fallb
 	assert_eq!(recipient.balance().await.unwrap().summary(),recipient_balance);
 	assert_eq!(gate.calls.load(Ordering::SeqCst),2,"no new finish or replay of the unfinished transaction");
 	assert_eq!(confirmed.to_u32(),height.to_u32()+6);
+	// A round output retained after a status-RPC interruption becomes
+	// spendable on the next authenticated sync without replaying the round.
+	recipient.set_vtxo_states([live.id()], &VtxoState::Locked {
+		holder: Some(VtxoLockHolder::RoundPayoutCheck),
+	}, &[bark::vtxo::VtxoStateKind::Spendable]).await.unwrap();
+	assert!(recipient.spendable_vtxos().await.unwrap().is_empty());
+	recipient.sync_fallback_payouts().await.unwrap();
+	assert_eq!(recipient.spendable_vtxos().await.unwrap()[0].id(), live.id());
 }
