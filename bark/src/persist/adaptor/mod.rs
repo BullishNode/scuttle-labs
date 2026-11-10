@@ -79,6 +79,7 @@ use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 use crate::{WalletProperties, WalletVtxo};
 
+
 pub mod partition {
 	pub const PROPERTIES: u8 = 0;
 	#[allow(unused)]

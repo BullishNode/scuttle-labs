@@ -1001,6 +1001,7 @@ impl Server {
 			let stored = self.db.read(async |t| t.get_user_vtxo_by_id(vtxo_id).await).await
 				.context(vtxo_id)
 				.badarg("vtxo not found in database")?;
+			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			// Check vtxo is fully signed
 			if !vtxo.has_all_witnesses() {
@@ -1023,8 +1024,6 @@ impl Server {
 			vtxo.validate(&anchor_tx)
 				.context(vtxo_id)
 				.badarg("vtxo validation failed")?;
-
-			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			self.check_registration_inputs_not_exited(vtxo).await?;
 

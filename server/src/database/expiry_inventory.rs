@@ -28,15 +28,12 @@ pub struct BackingSnapshot {
 
 const SNAPSHOT: &str = "
 WITH RECURSIVE current_branch AS (
-	SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in,policy_type FROM vtxo
+	SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in FROM vtxo
 	WHERE $2<>0 AND vtxo_id=ANY($1)
 	UNION
-	SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in,v.policy_type
+	SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
 	FROM vtxo v JOIN current_branch p ON v.vtxo_txid=p.oor_spent_txid
-	WHERE ($2=2 OR (p.spent_in_round IS NULL AND p.offboarded_in IS NULL))
-		AND ($2<>2 OR p.vtxo_id=ANY($1) OR p.policy_type NOT IN (
-			'server-owned','expiry','checkpoint','hark-leaf-v1','hark-leaf',
-			'server-htlc-receive-v1','server-htlc-receive'))
+	WHERE p.spent_in_round IS NULL AND p.offboarded_in IS NULL
 )
 SELECT vtxo_id,anchor_point,id,vtxo,expiry,exit_delta,policy,server_pubkey,amount,
 	oor_spent_txid,spent_in_round,offboarded_in,
@@ -54,10 +51,6 @@ impl Tx<'_> {
 
 	pub async fn backing_subtree_snapshot(&self, roots: &[ServerVtxo]) -> anyhow::Result<BackingSnapshot> {
 		self.read_backing_snapshot(roots, 1).await
-	}
-
-	pub async fn backing_recovery_snapshot(&self, root: &ServerVtxo) -> anyhow::Result<BackingSnapshot> {
-		self.read_backing_snapshot(std::slice::from_ref(root), 2).await
 	}
 
 	async fn read_backing_snapshot(&self, roots: &[ServerVtxo], scope: i32) -> anyhow::Result<BackingSnapshot> {

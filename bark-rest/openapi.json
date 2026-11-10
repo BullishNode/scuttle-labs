@@ -1625,7 +1625,7 @@
           "lightning"
         ],
         "summary": "Create a BOLT11 invoice for an Ark address",
-        "description": "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. With expiry payouts enabled, the address must carry a joint owner link. The server verifies the link and preserves the recipient's immutable coin-to-mailbox binding. Missing or invalid ownership at expiry leaves that customer's bitcoin held instead of assigning it to the provider or operator. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
+        "description": "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. With expiry payouts enabled, the server binds the recipient output to the mailbox blinded in the supplied Ark address. The recipient wallet must verify the signed coin and its authenticated owner mailbox before crediting the receive. Missing or unresolved ownership at expiry leaves that customer's bitcoin held. The invoice expires after `expiry_secs` if given, otherwise after the Ark server's invoice expiry, which is also the longest it accepts.",
         "operationId": "generate_invoice_for_address",
         "requestBody": {
           "content": {

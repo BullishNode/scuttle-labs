@@ -119,6 +119,6 @@ mod tests {
 	fn customer_coin_owner_trigger_exempts_the_round_padding_policy() {
 		let policy = ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE));
 		let literal = format!("decode('{}', 'hex')", policy.serialize().as_hex());
-		assert!(include_str!("migrations/V78__expiry_payouts.sql").contains(&literal), "{literal}");
+		assert!(include_str!("migrations/V79__expiry_payouts.sql").contains(&literal), "{literal}");
 	}
 }

@@ -703,10 +703,6 @@ impl WalletProperties {
 		ensure!(self.network == network, "mailbox wallet is for a different network");
 		ensure!(self.mailbox_identity.is_some() || self.server_payouts != Some(true),
 			"payout wallet is missing its original mailbox identity");
-		if self.mailbox_identity.is_none() {
-			ensure!(seed.to_mailbox_keypair().public_key() == seed.mailbox.public_key(),
-				"legacy wallet mailbox key differs from its seed");
-		}
 		if let Some(identity) = &self.mailbox_identity {
 			ensure!(*identity == seed.mailbox_identity(network),
 				"mailbox key is missing or differs from the wallet identity");
@@ -1382,20 +1378,10 @@ impl Wallet {
 				.context("failed to instantiate platform default persister")?
 		};
 
-		// Decode the current coin/operation formats once at open, before any
-		// property or server-key write. Do not put this full-record read on
-		// read_properties, which is also used in ordinary payment processing.
-		let coins = db.get_all_vtxos().await?;
-		ensure!(coins.iter().all(|coin| coin.fallback_status.is_none()
-			|| matches!(coin.state, crate::vtxo::VtxoState::Spent | crate::vtxo::VtxoState::Exited)),
-			"legacy fallback reservations require a fresh wallet store");
-		let actions = db.get_all_wallet_action_checkpoints().await?.len();
 		let mut created_now = false;
 		let properties = if let Some(p) = db.read_properties().await? {
 			p
 		} else if args.create_if_not_exists {
-			ensure!(coins.is_empty() && actions == 0,
-				"partial wallet state requires a fresh store");
 			Self::create(
 				network, &seed, &config, &*db, &*lock_manager, args.create_without_server,
 			).await.context("error creating new wallet")?;
@@ -2864,8 +2850,6 @@ mod tests {
 			bitcoin::bip32::ChildNumber::from_hardened_idx(0).unwrap(), 0.into(), 0.into()];
 		let bip86 = root.derive_priv(&super::SECP, &bip86_path).unwrap().to_keypair(&super::SECP);
 		assert_ne!(seed().to_mailbox_keypair().public_key(), bip86.public_key());
-		let other = bitcoin::secp256k1::Keypair::from_seckey_slice(&super::SECP, &[1; 32]).unwrap();
-		assert!(props.check_mailbox_identity(Network::Regtest, &seed().with_external_mailbox_keypair(other)).is_err());
 	}
 
 	#[cfg(feature = "sqlite")]

@@ -533,7 +533,7 @@ pub async fn execute_vtxo_tree_update(
 	}
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 
-	Ok(inserted.len() as u64)
+	Ok(inserted)
 }
 
 async fn do_provide_signatures(
@@ -619,13 +619,13 @@ async fn upsert_virtual_transactions(
 async fn insert_vtxos(
 	tx: &tokio_postgres::Transaction<'_>,
 	vi: &VtxoInserts,
-) -> anyhow::Result<Vec<String>> {
-	if vi.is_empty() { return Ok(Vec::new()) }
+) -> anyhow::Result<u64> {
+	if vi.is_empty() { return Ok(0) }
 	// ON CONFLICT DO NOTHING just continues if the vtxo already exists. For
 	// rows inserted via `insert_oor_spent_vtxos`, we then validate that the
 	// existing row's oor_spent_txid actually matches — otherwise the insert
 	// would silently authorize a double-spend.
-	let inserted = tx.query("
+	let inserted = tx.execute("
 		INSERT INTO vtxo (
 			vtxo_id, vtxo_txid, vtxo, expiry, exit_delta, policy_type, policy,
 			server_pubkey, amount, anchor_point,
@@ -638,7 +638,6 @@ async fn insert_vtxos(
 			UNNEST($12::text[]), NOW(), NOW()
 		)
 		ON CONFLICT DO NOTHING
-		RETURNING vtxo_id
 	", &[
 		&vi.vtxo_ids, &vi.vtxo_txids, &vi.data, &vi.expiry,
 		&vi.exit_deltas, &vi.policy_types, &vi.policies, &vi.server_pubkeys,
@@ -658,7 +657,7 @@ async fn insert_vtxos(
 		let vtxo_id: &str = row.get("vtxo_id");
 		bail!("vtxo {} is already spent", vtxo_id);
 	}
-	Ok(inserted.into_iter().map(|row| row.get("vtxo_id")).collect())
+	Ok(inserted)
 }
 
 async fn apply_vtxo_updates(

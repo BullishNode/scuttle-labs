@@ -258,6 +258,7 @@ macro_rules! unavailable {
 		Err($crate::anyhow::Error::from($crate::error::Unavailable::new(format!($($arg)*))))
 	};
 }
+pub(crate) use unavailable;
 
 
 /// Extension trait for adding bark-server-specific error info.
