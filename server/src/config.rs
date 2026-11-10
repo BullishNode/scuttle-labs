@@ -454,8 +454,7 @@ pub struct Config {
 	/// The maximum number of messages we return to mailbox queries.
 	///
 	/// A message holds a whole batch post, so a page can carry more rows
-	/// than this. The read and subscription endpoints cap this at eight
-	/// checkpoints to keep a response within Bark's decoding limit.
+	/// than this.
 	#[serde(alias = "read_mailbox_max_items")]
 	pub max_read_mailbox_items: usize,
 

@@ -299,21 +299,6 @@ impl Server {
 				Ok((psbt, inputs))
 			},
 		).await.context("failed to build offboard tx")?;
-		let onchain_fee = match offboard_tx.fee() {
-			Ok(fee) => fee,
-			Err(e) => {
-				wallet.mark_output_keys_unused(&offboard_tx.unsigned_tx);
-				return Err(e).context("failed to calculate offboard tx fee");
-			},
-		};
-		if onchain_fee > fee {
-			wallet.mark_output_keys_unused(&offboard_tx.unsigned_tx);
-			return badarg!(
-				"offboard needs {} miner fee but client pays only {}; retry with a higher fee or after wallet consolidation",
-				onchain_fee, fee,
-			);
-		}
-
 		// Abandoned sessions lock their inputs until they expire, so cap what
 		// they lock together to keep funds for rounds and other users. One
 		// session may always lock what it needs, however few coins we have.
@@ -341,6 +326,10 @@ impl Server {
 		};
 
 		let offboard_txid = offboard_tx.unsigned_tx.compute_txid();
+		let onchain_fee = offboard_tx.fee().unwrap_or_else(|e| {
+			warn!("Error getting fee from offboard tx PSBT: {:#}", e);
+			Amount::ZERO
+		});
 		let server_fee = SignedAmount::try_from(fee).expect("fee can't overflow")
 			- SignedAmount::try_from(onchain_fee).expect("onchain fee can't overflow");
 		slog!(PreparedOffboard, offboard_txid, input_vtxos, net_amount, gross_amount, onchain_fee,
@@ -495,8 +484,10 @@ impl Server {
 		).badarg("invalid partial forfeit signatures")?;
 
 		let mut wallet_guard = self.rounds_wallet.lock().await;
-		let onchain_fee = state.offboard_tx.fee()
-			.context("failed to calculate prepared offboard tx fee")?;
+		let onchain_fee = state.offboard_tx.fee().unwrap_or_else(|e| {
+			warn!("Error getting fee from offboard tx PSBT: {:#}", e);
+			Amount::ZERO
+		});
 		let signed_tx = wallet_guard.finish_tx(state.offboard_tx)
 			.context("error signing offboard tx")?;
 
