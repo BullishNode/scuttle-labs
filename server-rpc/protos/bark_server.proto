@@ -437,11 +437,7 @@ message StartLightningReceiveRequest {
 	// The key the HTLC-recv VTXOs will be locked to. When set, the claim can
 	// only be prepared with this key and a claim_attestation signed by it.
 	optional bytes claim_pubkey = 7;
-	// Point-in-time check for an explicit recipient before invoice creation.
-	VtxoRequest claim_destination = 8;
-	// Full recipient address for a forwarded receive. The mailbox_id above
-	// belongs to the invoice provider and is only for notifications.
-	optional string claim_destination_address = 9;
+	reserved 8, 9;
 }
 
 message StartLightningReceiveResponse {

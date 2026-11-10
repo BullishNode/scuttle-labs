@@ -797,15 +797,12 @@ mod test {
 		let old = UpstreamReceive { expiry_secs: Some(60) };
 		let new = protos::StartLightningReceiveRequest::decode(old.encode_to_vec().as_slice()).unwrap();
 		assert_eq!(new.expiry_secs, Some(60));
-		assert!(new.claim_destination.is_none());
 		let new = protos::StartLightningReceiveRequest {
-			expiry_secs: Some(90), claim_destination: Some(protos::VtxoRequest::default()),
+			expiry_secs: Some(90),
 			..Default::default()
 		};
 		let old = UpstreamReceive::decode(new.encode_to_vec().as_slice()).unwrap();
 		assert_eq!(old.expiry_secs, Some(90));
-		let decoded = protos::StartLightningReceiveRequest::decode(new.encode_to_vec().as_slice()).unwrap();
-		assert!(decoded.claim_destination.is_some());
 	}
 
 	#[test]

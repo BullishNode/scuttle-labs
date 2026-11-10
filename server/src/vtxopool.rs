@@ -366,9 +366,6 @@ impl VtxoPool {
 		// This ensures we spend the smallest vtxos first and
 		// we don't have any vtxo that serves as change
 		input_vtxos.sort_by(|v1, v2| v1.amount().cmp(&v2.amount()));
-		ensure!(input_vtxos.iter().all(|v| v.expiry_height() > srv.chain_tip().height),
-			"pool coin expired before the new Lightning grant");
-
 		// Validate that the inputs are still usable and unlocked
 		let _vtxo_guard = srv.vtxos_in_flux.try_lock(&input_ids).map_err(|e| {
 			anyhow::anyhow!("some VTXO is already locked by another process: {}", e.id)

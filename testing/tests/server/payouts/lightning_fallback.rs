@@ -61,7 +61,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		expiry_secs: None,
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: hash.to_vec(), amount_sat: 90_000, min_cltv_delta: 58,
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
 		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
@@ -156,7 +156,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		expiry_secs: None,
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: hash.to_vec(), amount_sat: 100_000, min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
 		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
@@ -412,7 +412,6 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 	let preimage = ark::lightning::Preimage::random();
 	let hash = preimage.compute_payment_hash();
 	let amount = sat(100_000);
-	let net = amount - srv.config().fees.lightning_receive.calculate(amount).unwrap();
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(),
@@ -420,10 +419,6 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
 		description: None, expiry_secs: None,
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
-		claim_destination: Some(protos::VtxoRequest {
-			amount: net.to_sat(), policy: address.policy().serialize(),
-		}),
-		claim_destination_address: Some(address.to_string()),
 	}).await.unwrap().into_inner().bolt11;
 	let pay_task = {
 		let payer = payer.clone();

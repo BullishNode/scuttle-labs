@@ -67,10 +67,14 @@ async fn forwarded_receive_to_address_survives_barkd_restart() {
 	assert!(!coins.is_empty());
 	assert_eq!(coins.iter().map(|coin| coin.vtxo.amount).sum::<Amount>(), amount);
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
-		.await.unwrap().unwrap();
-	assert_eq!(sub.claim_destination_user_pubkey, Some(recipient_key));
-	assert_eq!(sub.claim_destination_mailbox_pk, Some(recipient_mailbox.as_pubkey()));
+	let claims = db.read(async |tx| Ok(tx.query("SELECT output_vtxo,output_mailbox \
+		FROM expiry_lightning_receive_claim WHERE payment_hash=$1", &[&hash.to_string()]).await?)).await.unwrap();
+	assert!(!claims.is_empty());
+	for claim in claims {
+		let output = Vtxo::<Full>::deserialize(claim.get("output_vtxo")).unwrap();
+		assert_eq!(output.user_pubkey(), recipient_key);
+		assert_eq!(claim.get::<_, &str>("output_mailbox"), recipient_mailbox.as_pubkey().to_string());
+	}
 	for coin in coins {
 		assert_eq!(coin.vtxo.user_pubkey, recipient_key);
 		assert_eq!(db.read(async |tx| tx.coin_owner_mailboxes(&[coin.vtxo.id]).await).await.unwrap()

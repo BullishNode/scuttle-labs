@@ -1353,11 +1353,7 @@ CREATE TABLE public.lightning_htlc_subscription (
     final_amount_msat bigint,
     receiver_mailbox_id text,
     user_agent text,
-    claim_destination_user_pubkey text,
-    claim_destination_mailbox_pk text,
-    claim_pubkey text,
-    CONSTRAINT lightning_htlc_subscription_claim_destination_mailbox_pk_check CHECK (((claim_destination_mailbox_pk IS NULL) OR (length(claim_destination_mailbox_pk) = 66))),
-    CONSTRAINT lightning_htlc_subscription_claim_destination_user_pubkey_check CHECK (((claim_destination_user_pubkey IS NULL) OR (length(claim_destination_user_pubkey) = 66)))
+    claim_pubkey text
 );
 
 

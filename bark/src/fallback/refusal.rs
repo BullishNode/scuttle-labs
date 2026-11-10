@@ -7,8 +7,6 @@ pub enum FallbackRefusal {
 	DecidedForFallback,
 	#[error("This coin expired. Refresh it first, then send.")]
 	ExpiredNewLightning,
-	#[error("The output key is already linked to another mailbox.")]
-	ConflictingOwnerBinding,
 	#[error("Recipient must provide an upstream-format server mailbox address.")]
 	RecipientMustUpdate,
 }
@@ -18,7 +16,6 @@ impl FallbackRefusal {
 		match self {
 			Self::DecidedForFallback => "decided_for_fallback",
 			Self::ExpiredNewLightning => "expired_new_lightning",
-			Self::ConflictingOwnerBinding => "conflicting_owner_binding",
 			Self::RecipientMustUpdate => "recipient_must_update",
 		}
 	}
@@ -30,7 +27,6 @@ impl FallbackRefusal {
 		match status.metadata().get("abandon-reason")?.to_str().ok()? {
 			"decided_for_fallback" => Some(Self::DecidedForFallback),
 			"expired_new_lightning" => Some(Self::ExpiredNewLightning),
-			"conflicting_owner_binding" => Some(Self::ConflictingOwnerBinding),
 			"recipient_must_update" => Some(Self::RecipientMustUpdate),
 			_ => None,
 		}
@@ -69,7 +65,6 @@ mod tests {
 	#[test]
 	fn typed_anyhow_context_without_tonic_is_classified() {
 		for refusal in [FallbackRefusal::DecidedForFallback, FallbackRefusal::ExpiredNewLightning,
-			FallbackRefusal::ConflictingOwnerBinding,
 			FallbackRefusal::RecipientMustUpdate] {
 			let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
 				.context(refusal).context("outer action context");
@@ -82,7 +77,6 @@ mod tests {
 	#[test]
 	fn metadata_alone_selects_the_typed_refusal_and_preserves_original_status() {
 		for refusal in [FallbackRefusal::DecidedForFallback, FallbackRefusal::ExpiredNewLightning,
-			FallbackRefusal::ConflictingOwnerBinding,
 			FallbackRefusal::RecipientMustUpdate] {
 			let mut status = tonic::Status::invalid_argument("server diagnostic text can change");
 			status.metadata_mut().insert("abandon-reason", refusal.code().parse().unwrap());

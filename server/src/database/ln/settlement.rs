@@ -65,16 +65,24 @@ impl Tx<'_> {
 				JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
 				WHERE l.vtxo_id=v.vtxo_id AND a.payment_hash=$2 AND a.status='succeeded')) \
 			OR (h.direction='outgoing' AND EXISTS(SELECT 1 FROM lightning_htlc_subscription s \
-				WHERE s.id=v.lightning_htlc_subscription_id AND s.payment_hash=$2 AND s.status='settled'))) AS funded \
+				WHERE s.id=v.lightning_htlc_subscription_id AND s.payment_hash=$2 AND s.status='settled'))) AS funded, \
+			EXISTS(SELECT 1 FROM lightning_payment_attempt a \
+				WHERE a.payment_hash=$2 AND a.status='succeeded') AS hash_succeeded, \
+			EXISTS(SELECT 1 FROM lightning_payment_attempt a \
+				JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
+				WHERE l.vtxo_id=v.vtxo_id AND a.payment_hash=$2 \
+				AND a.status IN ('requested','submitted')) AS source_open \
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1",
 			&[&source.to_string(), &hash.to_string()]).await? else { return Ok(SourceSettlement::Unknown); };
 		if row.get::<_, &str>("payment_hash") != hash.to_string()
 			|| !matches!(row.get::<_, &str>("direction"), "incoming" | "outgoing") {
 			return Ok(SourceSettlement::Unknown);
 		}
-		Ok(match (preimage.is_some(), row.get::<_, bool>("funded")) {
-			(true, true) => SourceSettlement::Funded,
-			(false, false) => SourceSettlement::NotSettled,
+		Ok(match (preimage.is_some(), row.get::<_, bool>("funded"),
+			row.get::<_, bool>("hash_succeeded"), row.get::<_, bool>("source_open"),
+			row.get::<_, &str>("direction")) {
+			(true, true, _, _, _) => SourceSettlement::Funded,
+			(false, false, _, _, _) | (true, false, true, false, "incoming") => SourceSettlement::NotSettled,
 			_ => SourceSettlement::Unknown,
 		})
 	}

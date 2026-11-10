@@ -609,8 +609,6 @@ impl LightningManager {
 		description: Option<String>,
 		receiver_mailbox_id: Option<MailboxIdentifier>,
 		claim_pubkey: Option<PublicKey>,
-		claim_destination_user_pubkey: Option<PublicKey>,
-		claim_destination_mailbox_pk: Option<PublicKey>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let node = self.hold_active_node().context("no active hold-compatible cln node")?;
 		let mut hold_client = node.hold_rpc.clone().expect("hold-active node has hold_rpc");
@@ -648,7 +646,7 @@ impl LightningManager {
 		let stored = self.db.write(async |t| {
 			t.store_generated_lightning_receive(
 				node.id, &invoice, amount.to_msat(), receiver_mailbox_id.as_ref(),
-				claim_pubkey, claim_destination_user_pubkey, claim_destination_mailbox_pk,
+				claim_pubkey,
 				user_agent.as_deref(),
 			).await?;
 			hold_db::create_hold(&**t, &new_hold).await

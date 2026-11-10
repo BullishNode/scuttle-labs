@@ -158,8 +158,9 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 		.payment_secret(PaymentSecret([42; 32])).current_timestamp()
 		.min_final_cltv_expiry_delta(18).amount_milli_satoshis(10_000_000)
 		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
+	let mailbox = ark::mailbox::MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
 	let subscription = db.write(async |t| {
-		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, None, None, None, None, None).await?;
+		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, Some(&mailbox), Some(key), None).await?;
 		Ok(t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id)
 	}).await.unwrap();
 	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
@@ -187,6 +188,11 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 		&[&attempts[0]]).await?)).await.unwrap();
 	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
 	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
+	// Once the other source's success accounts for the invoice, a terminal
+	// failed source can be returned to its owner. An open attempt cannot.
+	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET status='failed',updated_at=NOW() WHERE id=$1",
+		&[&attempts[1]]).await?)).await.unwrap();
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::NotSettled);
 	let without_wal: anyhow::Result<()> = db.write(async |t| {
 		t.execute("DELETE FROM htlc_settlement WHERE payment_hash=$1", &[&hash.to_string()]).await?;
 		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Unknown);
@@ -199,7 +205,7 @@ async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
 	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
 		LightningHtlcSubscriptionStatus::Settled, None, None).await).await.unwrap();
 	assert_eq!(predicate(ids[2]).await, SourceSettlement::Funded);
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
+	assert_eq!(predicate(ids[1]).await, SourceSettlement::NotSettled);
 	assert_eq!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap(), None);
 	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement WHERE payment_hash=$1",
 		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);

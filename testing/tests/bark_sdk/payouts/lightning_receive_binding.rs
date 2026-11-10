@@ -2,50 +2,13 @@
 
 use std::time::Duration;
 use ark::attestations::LightningReceiveClaimAttestation;
-use ark::address::VtxoDelivery;
-use ark::mailbox::MailboxIdentifier;
-use ark::lightning::{PaymentHash, Preimage};
-use ark::{ProtocolEncoding, VtxoPolicy, SECP};
+use ark::lightning::PaymentHash;
+use ark::{ProtocolEncoding, SECP};
 use ark_testing::{btc, sat, TestContext};
-use ark_testing::daemon::captaind::ArkClient;
-use ark_testing::daemon::lightningd::Lightningd;
 use bark::actions::lightning::receive::LightningReceiveState;
 use bitcoin::secp256k1::Keypair;
-use cln_rpc::plugins::hold;
 use server::database::Db;
 use server_rpc::protos;
-
-async fn assert_receive_start_refused(
-	rpc: &mut ArkClient, db: &Db, node: &Lightningd,
-	request: protos::StartLightningReceiveRequest, expected_message: &str,
-) {
-	let hash = PaymentHash::try_from(request.payment_hash.as_slice()).unwrap();
-	let snapshot = async || db.read(async |tx| {
-		let subscription = tx.query("SELECT status::TEXT, updated_at::TEXT, invoice, \
-			claim_destination_user_pubkey, claim_destination_mailbox_pk \
-			FROM lightning_htlc_subscription WHERE payment_hash=$1", &[&hash.to_string()]).await?
-			.into_iter().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1), r.get::<_, String>(2),
-				r.get::<_, Option<String>>(3), r.get::<_, Option<String>>(4))).collect::<Vec<_>>();
-		let counts = tx.query_one("SELECT \
-			(SELECT COUNT(*) FROM htlc_settlement WHERE payment_hash=$1), \
-			(SELECT COUNT(*) FROM htlc_vtxo WHERE payment_hash=$1), \
-			(SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE payment_hash=$1)", &[&hash.to_string()]).await?;
-		Ok((subscription, counts.get::<_, i64>(0), counts.get::<_, i64>(1), counts.get::<_, i64>(2)))
-	}).await.unwrap();
-	let before = snapshot().await;
-	let mut hold = node.hold_client().await;
-	let native_before = hold.list(hold::ListRequest {
-		constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())),
-	}).await.unwrap().into_inner().invoices;
-	let error = rpc.start_lightning_receive(request).await.unwrap_err();
-	assert_eq!(error.code(), tonic::Code::InvalidArgument);
-	assert!(error.message().contains(expected_message), "{error}");
-	assert_eq!(snapshot().await, before, "refusal must preserve the exact receive and output binding state");
-	let native_after = hold.list(hold::ListRequest {
-		constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())),
-	}).await.unwrap().into_inner().invoices;
-	assert_eq!(native_after, native_before, "refusal must not create or alter a native hold invoice");
-}
 
 #[tokio::test]
 async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
@@ -60,54 +23,24 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	let address = recipient.new_address().await.unwrap();
 	let recipient_key = address.policy().user_pubkey();
 	assert_ne!(provider.mailbox_identifier(), recipient.mailbox_identifier());
-	let server = srv.mailbox_keypair();
 	let server_pubkey = srv.ark_info().await.server_pubkey;
-	let recipient_pair = recipient.peek_keypair(0).await.unwrap();
-	assert_eq!(recipient_pair.public_key(), recipient_key);
 	let other = Keypair::from_seckey_slice(&SECP, &[73; 32]).unwrap();
-	let other_blinded = MailboxIdentifier::from_pubkey(other.public_key())
-		.to_blinded(server.public_key(), &recipient_pair).unwrap();
-	let changed_mailbox_address = ark::Address::new(true, server_pubkey,
-		address.policy().clone(), vec![VtxoDelivery::ServerMailbox { blinded_id: other_blinded }]);
 	let wrong_server_address = ark::Address::new(true, other.public_key(),
 		address.policy().clone(), address.delivery().to_vec());
 	let amount = sat(50_000);
-	let net = amount - srv.ark_info().await.fees.lightning_receive.calculate(amount).unwrap();
-	let request = |hash: PaymentHash, destination: &ark::Address| protos::StartLightningReceiveRequest {
-		expiry_secs: None,
-		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 18,
-		mailbox_id: Some(provider.mailbox_identifier().serialize()), description: None,
-		claim_destination: Some(protos::VtxoRequest {
-			amount: net.to_sat(), policy: address.policy().serialize(),
-		}),
-		claim_destination_address: Some(destination.to_string()),
-		claim_pubkey: None,
-	};
-	let postgres = srv.config().postgres.clone();
-	let db = Db::connect(&postgres).await.unwrap();
-	let mut rpc = srv.get_public_rpc().await;
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		request(Preimage::random().compute_payment_hash(), &wrong_server_address),
-		"claim destination address differs").await;
-	let mut wrong_amount = request(Preimage::random().compute_payment_hash(), &address);
-	wrong_amount.claim_destination.as_mut().unwrap().amount += 1;
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal, wrong_amount,
-		"claim destination amount differs").await;
-
+	assert!(provider.bolt11_invoice_for_address(amount, wrong_server_address, None, None).await.is_err(),
+		"the wallet must reject an address for another server before issuing an invoice");
+	assert_ne!(server_pubkey, other.public_key());
 	let invoice = provider.bolt11_invoice_for_address(amount, address.clone(), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
-	let claim_pubkey = sub.claim_pubkey.expect("SDK receive has a claim key").serialize().to_vec();
-	// A Created-invoice retry still checks the supplied destination first.
-	let mut changed_retry = request(hash, &changed_mailbox_address);
-	changed_retry.claim_pubkey = Some(claim_pubkey.clone());
-	assert_receive_start_refused(&mut rpc, &db, &lightning.internal,
-		changed_retry, "invoice already exists for another claim destination").await;
-	let mut exact_retry = request(hash, &address);
-	exact_retry.claim_pubkey = Some(claim_pubkey);
-	assert_eq!(rpc.start_lightning_receive(exact_retry).await.unwrap().into_inner().bolt11, invoice.to_string());
-	assert_eq!(sub.claim_destination_user_pubkey, Some(recipient_key));
-	assert_eq!(sub.claim_destination_mailbox_pk, Some(recipient.mailbox_identifier().as_pubkey()));
+	assert!(sub.claim_pubkey.is_some(), "SDK receive must bind its claim key");
+	assert_eq!(db.read(async |tx| tx.get_lightning_receiver_mailbox_id(hash).await).await.unwrap(),
+		Some(provider.mailbox_identifier()), "the grant belongs to the provider until a final claim");
+	assert_eq!(db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE payment_hash=$1",
+		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
+	let mut rpc = srv.get_public_rpc().await;
 	lightning.sync().await;
 	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {
 		tokio::join!(
@@ -136,6 +69,18 @@ async fn receive_binding_normal_external_claim_keeps_the_actual_recipient() {
 	}).await.expect("normal receive did not complete");
 	paid.expect("external payment failed");
 	assert!(matches!(claimed.unwrap(), LightningReceiveState::Settled(_)));
+	let claims = db.read(async |tx| Ok(tx.query("SELECT source_vtxo_id,output_vtxo,output_mailbox \
+		FROM expiry_lightning_receive_claim WHERE payment_hash=$1", &[&hash.to_string()]).await?)).await.unwrap();
+	assert!(!claims.is_empty(), "the completed claim must bind its actual outputs");
+	for claim in &claims {
+		let output = ark::Vtxo::<ark::vtxo::Full>::deserialize(claim.get("output_vtxo")).unwrap();
+		assert_eq!(output.user_pubkey(), recipient_key);
+		assert_eq!(claim.get::<_, &str>("output_mailbox"), recipient.mailbox_identifier().as_pubkey().to_string());
+		let provider_owner = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1",
+			&[&claim.get::<_, &str>("source_vtxo_id")]).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(provider_owner, provider.mailbox_identifier().as_pubkey().to_string());
+	}
 	recipient.sync().await;
 	let coins = recipient.spendable_vtxos().await.unwrap();
 	assert!(!coins.is_empty(), "normal delivery must give the recipient its signed coins");
@@ -168,7 +113,6 @@ async fn receive_binding_self_receive_is_bound_to_the_wallet_key() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let sub = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await).await.unwrap().unwrap();
 	let claim_key = sub.claim_pubkey.expect("the wallet binds its receive to a claim key");
-	assert_eq!(sub.claim_destination_user_pubkey, None);
 	let mut rpc = srv.get_public_rpc().await;
 	lightning.sync().await;
 	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {

@@ -233,10 +233,6 @@ pub struct LightningHtlcSubscription {
 	pub id: i64,
 	pub lightning_node_id: LightningNodeId,
 	pub payment_hash: PaymentHash,
-	/// Explicit recipient selected when the invoice was issued.
-	pub claim_destination_user_pubkey: Option<bitcoin::secp256k1::PublicKey>,
-	/// Payout mailbox of an explicit forwarded recipient, not the invoice provider.
-	pub claim_destination_mailbox_pk: Option<bitcoin::secp256k1::PublicKey>,
 	pub invoice: Bolt11Invoice,
 	pub status: LightningHtlcSubscriptionStatus,
 	pub lowest_incoming_htlc_expiry: Option<BlockHeight>,
@@ -270,10 +266,6 @@ impl <'a>TryFrom<&'a Row> for LightningHtlcSubscription {
 			lightning_node_id: row.get("lightning_node_id"),
 			payment_hash: PaymentHash::from_str(row.get::<_, &str>("payment_hash"))
 				.context("error decoding payment hash from db")?,
-			claim_destination_user_pubkey: row.get::<_, Option<&str>>("claim_destination_user_pubkey")
-				.map(str::parse).transpose()?,
-			claim_destination_mailbox_pk: row.get::<_, Option<&str>>("claim_destination_mailbox_pk")
-				.map(str::parse).transpose()?,
 			invoice: invoice,
 			status: row.get("status"),
 			lowest_incoming_htlc_expiry: row.get::<_, Option<i64>>("lowest_incoming_htlc_expiry")

@@ -730,8 +730,6 @@ impl rpc::server::ArkService for Server {
 			req.description,
 			req.expiry_secs.map(Duration::from_secs),
 			claim_pubkey,
-			req.claim_destination,
-			req.claim_destination_address,
 		).await.to_status()?;
 
 		Ok(tonic::Response::new(resp))

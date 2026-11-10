@@ -513,7 +513,7 @@ async fn reject_revocation_when_settled_but_status_regressed() {
 
 	assert_eq!(status.code(), tonic::Code::InvalidArgument);
 	assert!(
-		status.message().contains("source settlement provenance is unknown"),
+		status.message().contains("invoice has already been paid"),
 		"unexpected server response: {status:?}",
 	);
 	assert!(
@@ -1879,7 +1879,7 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 	let key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut rpc = srv.get_public_rpc().await;
 	let second = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, claim_destination_address: None, payment_hash: hash.to_vec(), amount_sat: 100_000,
+		 payment_hash: hash.to_vec(), amount_sat: 100_000,
 		min_cltv_delta: 6,
 		mailbox_id: payout.then(|| ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key()).serialize()),
 		description: None, expiry_secs: None,
@@ -2529,7 +2529,7 @@ async fn rejected_accepted_invoice_releases_held_htlcs() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination: None, claim_destination_address: None,
+
 	}).await.unwrap().into_inner().bolt11;
 	let invoice_delta = Bolt11Invoice::from_str(&bolt11).unwrap().min_final_cltv_expiry_delta();
 
@@ -2633,7 +2633,7 @@ async fn check_lightning_receive_returns_on_canceled_subscription() {
 	let payment_hash = ark::lightning::Preimage::random().compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;
 	rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(1).to_sat(),
 		min_cltv_delta: 6,
@@ -2669,8 +2669,8 @@ async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 	let hash = preimage.compute_payment_hash();
 	let amount = sat(100_000);
 	let net = amount - srv.config().fees.lightning_receive.calculate(amount).unwrap();
-	// Invoice-time destination metadata names the provider; the recorded claim
-	// later chooses a different recipient address.
+	// The grant starts with the provider's mailbox; the recorded claim later
+	// chooses a different recipient address.
 	let provider_mailbox = Keypair::from_seckey_slice(&SECP, &[60; 32]).unwrap();
 	let grant_key = Keypair::from_seckey_slice(&SECP, &[61; 32]).unwrap();
 	assert_ne!(grant_key.public_key(), address.policy().user_pubkey());
@@ -2687,10 +2687,6 @@ async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(), min_cltv_delta: 40,
 		mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
 		description: None, expiry_secs: None,
-		claim_destination: Some(protos::VtxoRequest {
-			amount: net.to_sat(), policy: VtxoPolicy::new_pubkey(grant_key.public_key()).serialize(),
-		}),
-		claim_destination_address: Some(provider_address.clone()),
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
 	}).await.unwrap().into_inner().bolt11;
 
@@ -2908,7 +2904,7 @@ async fn start_keyless_receive(srv: &Captaind, amount: Amount) -> KeylessReceive
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: None,
-		claim_destination: None, claim_destination_address: None,
+
 	}).await.unwrap().into_inner().bolt11;
 	KeylessReceive { invoice, payment_hash }
 }
@@ -3157,7 +3153,7 @@ async fn refuse_receive_claim_after_incoming_htlc_expiry() {
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None, claim_destination_address: None,
+
 			payment_hash: payment_hash.as_ref().to_vec(),
 			amount_sat: btc(1).to_sat(),
 			min_cltv_delta,
@@ -3292,7 +3288,7 @@ async fn settled_hash_cannot_fund_new_receive() {
 	// The same hash must now be refused for a receive.
 	let err = srv.get_public_rpc().await
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None, claim_destination_address: None,
+
 			payment_hash: payment_hash.as_ref().to_vec(),
 			amount_sat: btc(1).to_sat(),
 			min_cltv_delta: 6,
@@ -3335,7 +3331,7 @@ async fn prepare_lightning_claim_requires_the_claim_key() {
 		description: None,
 		expiry_secs: None,
 		claim_pubkey: Some(claim_key.public_key().serialize().to_vec()),
-		claim_destination: None, claim_destination_address: None,
+
 	};
 	let invoice = rpc.start_lightning_receive(start(&claim_key)).await.unwrap().into_inner().bolt11;
 	// starting it again returns the same receive, but not for another key
@@ -3448,7 +3444,7 @@ async fn settled_hash_cannot_be_granted_htlc_recv_vtxos() {
 	// it so the subscription is Accepted.
 	let mut rpc = srv.get_public_rpc().await;
 	let receive_invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(1).to_sat(),
 		min_cltv_delta: 6,
@@ -3558,7 +3554,7 @@ async fn intra_ark_payment_refused_while_same_hash_send_is_open() {
 	// A receive for H is allowed: H is not settled.
 	let mut rpc = srv.get_public_rpc().await;
 	let receive_invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: btc(0.5).to_sat(),
 		min_cltv_delta: 6,
@@ -4134,7 +4130,7 @@ async fn check_lightning_receive_poll_interval_fallback() {
 
 	// Create a hold invoice on the server.
 	let resp = srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None,
 	).await.unwrap();
 
 	// Create a disconnected receiver: the sender is kept alive so
@@ -4187,7 +4183,7 @@ async fn check_lightning_receive_ignores_other_payment_updates() {
 	let preimage = ark::lightning::Preimage::from(rand::random::<[u8; 32]>());
 	let payment_hash = preimage.compute_payment_hash();
 	srv.start_lightning_receive(
-		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None, None, None,
+		payment_hash, btc(1), BlockDelta::new(18), None, None, None, None,
 	).await.unwrap();
 
 	let (update_tx, mut update_rx) = tokio::sync::broadcast::channel::<PaymentHash>(16);
@@ -4249,7 +4245,7 @@ async fn refuse_receive_with_unlock_hash_as_payment_hash() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let err = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: payment_hash.as_ref().to_vec(),
 		amount_sat: 10_000,
 		min_cltv_delta: 8,
@@ -4292,7 +4288,7 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	let mut raw = server_rpc::ArkServiceClient::new(channel);
 	let mut old_request = tonic::Request::new(protos::StartLightningReceiveRequest {
 		payment_hash: old_hash.to_vec(), amount_sat: 10_000, min_cltv_delta: 8,
-		mailbox_id: None, description: None, expiry_secs: Some(600), claim_destination: None, claim_destination_address: None,
+		mailbox_id: None, description: None, expiry_secs: Some(600),
 		claim_pubkey: None,
 	});
 	server_rpc::RequestExt::set_pver(&mut old_request, server_rpc::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES - 1);
@@ -4308,7 +4304,7 @@ async fn invoice_expiry_is_chosen_by_the_client() {
 	let claim_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut start_for = async |payment_hash: PaymentHash, expiry_secs: Option<u64>| {
 		rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None, claim_destination_address: None,
+
 			payment_hash: payment_hash.to_vec(),
 			amount_sat: 10_000,
 			min_cltv_delta: 8,
@@ -4364,7 +4360,7 @@ async fn payout_disabled_created_receive_retry_keeps_upstream_optional_fields() 
 			mailbox_id: Some(ark::mailbox::MailboxIdentifier::from_pubkey(mailbox.public_key()).serialize()),
 			description: None, expiry_secs,
 			claim_pubkey: claim_key.map(|key| key.public_key().serialize().to_vec()),
-			claim_destination: None, claim_destination_address: None,
+
 		}
 	};
 	let mut rpc = srv.get_public_rpc().await;
@@ -4658,7 +4654,7 @@ async fn prevent_double_pay_via_canceled_subscription_and_inflight_xpay() {
 	// 3. Register a server receive with the same payment hash H.
 	let invoice_2 = srv.get_public_rpc().await
 		.start_lightning_receive(protos::StartLightningReceiveRequest {
-			claim_destination: None, claim_destination_address: None,
+
 			payment_hash: payment_hash.to_byte_array().to_vec(),
 			amount_sat: amount.to_sat(),
 			min_cltv_delta: 6,
@@ -4782,7 +4778,7 @@ async fn self_payment_claim_rejected_after_sender_onchain_refund() {
 	let payment_hash = preimage.compute_payment_hash();
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
-		claim_destination: None, claim_destination_address: None,
+
 		payment_hash: payment_hash.to_vec(),
 		amount_sat: 100_000,
 		min_cltv_delta: 18,

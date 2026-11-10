@@ -360,12 +360,7 @@ pub(crate) async fn start_lightning_receive(
 	let config = wallet.config();
 
 	let fee = ark_info.fees.lightning_receive.calculate(amount).context("fee overflowed")?;
-	let net_amount = validate_and_subtract_fee(amount, fee)?;
-	let destination = claim_destination.as_ref().map(|destination| {
-		protos::VtxoRequest {
-			amount: net_amount.to_sat(), policy: destination.policy().serialize(),
-		}
-	});
+	validate_and_subtract_fee(amount, fee)?;
 
 	// User needs to enforce the following delta:
 	// - vtxo exit delta + htlc expiry delta (time to exit the vtxo before the htlc expires)
@@ -404,8 +399,6 @@ pub(crate) async fn start_lightning_receive(
 		description,
 		expiry_secs: expiry.map(|e| e.as_secs()),
 		claim_pubkey: Some(claim_keypair.public_key().serialize().to_vec()),
-		claim_destination: destination,
-		claim_destination_address: claim_destination.as_ref().map(ToString::to_string),
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();

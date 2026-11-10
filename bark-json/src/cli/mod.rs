@@ -788,27 +788,6 @@ mod test {
 	use bitcoin::FeeRate;
 	use super::*;
 
-	#[test]
-	fn ordinary_pending_balance_counts_each_bucket_once() {
-		let balance = Balance {
-			spendable: Amount::from_sat(2_000),
-			needs_refresh: Amount::ZERO,
-			pending_lightning_send: Amount::ZERO,
-			claimable_lightning_receive: Amount::ZERO,
-			pending_in_round: Amount::ZERO,
-			pending_board: Amount::ZERO,
-			pending_arkoor_send: Amount::ZERO,
-			pending_offboard: Amount::from_sat(5_000),
-			pending_exit: Amount::ZERO,
-		};
-		let summary = BalanceSummary::from(&balance);
-		assert_eq!(summary.spendable, Amount::from_sat(2_000));
-		assert_eq!(summary.pending, Amount::from_sat(5_000));
-		assert_eq!(summary.total, Amount::from_sat(7_000));
-		let encoded = serde_json::to_value(&summary).unwrap();
-		assert!(encoded.get("awaiting_settlement_sat").is_none());
-	}
-
 	fn lightning_receive_base_json() -> serde_json::Value {
 		serde_json::json!({
 			"amount_sat": 1000,
