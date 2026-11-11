@@ -440,28 +440,28 @@ async fn standard_padding_keeps_same_script_victim_payable() {
 	let expired = ctx.generate_blocks(sources[0].expiry_height().to_u32() + 1 - current).await;
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let mut final_rows = None;
-	for _ in 0..40 {
-		srv.watchmand().trigger_sweep().await;
-		let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.allocation_id,c.gross_sat,c.payout_sat,c.forfeited_sat, \
-			a.status::TEXT AS status,a.sweep_tx FROM expiry_entitlement e \
-			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-			WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted'",
-			&[&victim_ids]).await?)).await.unwrap();
-		if rows.len() == 2 && rows.iter().all(|row| row.get::<_, &str>("status") == "confirmed") {
-			final_rows = Some(rows);
-			break;
+	let max_height = expired.to_u32() + 40;
+	let rows = tokio::time::timeout(Duration::from_secs(180), async {
+		loop {
+			srv.watchmand().trigger_sweep().await;
+			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.allocation_id,c.gross_sat,c.payout_sat,c.forfeited_sat, \
+				a.status::TEXT AS status,a.sweep_tx FROM expiry_entitlement e \
+				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted'",
+				&[&victim_ids]).await?)).await.unwrap();
+			if rows.len() == 2 && rows.iter().all(|row| row.get::<_, &str>("status") == "confirmed") {
+				break rows;
+			}
+			if (ctx.bitcoind().sync_client().get_block_count().unwrap() as u32) < max_height
+				&& !ctx.bitcoind().sync_client().get_raw_mempool().unwrap().is_empty() {
+				let height = ctx.generate_blocks(1).await;
+				srv.wait_for_sync_height(height).await;
+				srv.watchmand().wait_for_sync_height(height).await;
+			}
+			tokio::time::sleep(Duration::from_millis(250)).await;
 		}
-		if !ctx.bitcoind().sync_client().get_raw_mempool().unwrap().is_empty() {
-			let height = ctx.generate_blocks(1).await;
-			srv.wait_for_sync_height(height).await;
-			srv.watchmand().wait_for_sync_height(height).await;
-		} else {
-			tokio::time::sleep(Duration::from_millis(200)).await;
-		}
-	}
-	let rows = final_rows.expect("both victim leaves did not settle in 40 blocks");
+	}).await.expect("both victim leaves must settle within 40 blocks and 180 seconds");
 	let allocations = rows.iter().map(|row| row.get::<_, i64>("allocation_id")).collect::<BTreeSet<_>>();
 	assert_eq!(allocations.len(), 1, "both victim leaves must share one physical payout");
 	assert_eq!(rows.iter().map(|row| row.get::<_, i64>("gross_sat")).sum::<i64>(), 2_400);

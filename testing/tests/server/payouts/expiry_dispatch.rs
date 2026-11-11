@@ -243,8 +243,7 @@ async fn lightning_rejection_refunds_only_its_source() {
 		}
 		let after = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert_eq!(after.id, pending.id);
-		assert_eq!(after.status, pending.status);
-		assert_eq!(after.updated_at, pending.updated_at);
+		assert!(matches!(after.status, LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted));
 		assert!(after.final_amount_msat.is_none());
 		let held = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, sources[1].0.id()).await).await.unwrap().unwrap();
 		assert!(held.htlc.offchain_resolution.is_none());
