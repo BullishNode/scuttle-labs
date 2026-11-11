@@ -76,8 +76,23 @@ impl FrontierChainListener {
 		}
 	}
 
-	/// Remove a vtxo from the frontier because its output was spent on-chain,
-	/// writing through the given db tx. Returns whether it was in the frontier.
+	/// Remove a vtxo from the frontier because its output was spent on-chain.
+	///
+	/// Returns whether the vtxo was in the frontier.
+	async fn spend(
+		&self,
+		frontier: &mut Frontier,
+		vtxo_id: VtxoId,
+		spent_height: BlockHeight,
+		spent_txid: Txid,
+		witness: &Witness,
+	) -> anyhow::Result<bool> {
+		self.db.write(async |t| {
+			self.spend_in_tx(t, frontier, vtxo_id, spent_height, spent_txid, witness).await
+		}).await
+	}
+
+	/// Like [Self::spend], but writing through the given db tx.
 	pub async fn spend_in_tx(
 		&self,
 		tx: &Tx<'_>,
@@ -324,64 +339,29 @@ impl ChainEventListener for FrontierChainListener {
 			// Check if any unconfirmed VTXOs in frontier have this txid as their funding tx
 			self.confirm_txid(&mut frontier, txid, height).await?;
 
-			let spent = tx.input.iter().filter_map(|input| {
-				let id = VtxoId::from(input.previous_output);
-				let (_, vtxo) = frontier.get(&id)?;
-				Some((id, try_extract_preimage(vtxo, &input.witness),
-					classify_htlc_spend(vtxo, &input.witness)))
-			}).collect::<Vec<_>>();
-			if spent.is_empty() { continue; }
+			// Find vtxos in the frontier that are spent by this tx
+			let mut removed_any = false;
+			for input in &tx.input {
+				if self.spend(
+					&mut frontier, input.previous_output.into(), height, txid, &input.witness,
+				).await? {
+					removed_any = true;
+				}
+			}
 
-			// A block transition must commit its spent sources, newly reachable
-			// children and preimages together. The map is local to this block,
-			// so a failed write is discarded and the next pass reads the DB.
-			let (new_vtxos, notifications) = self.db.write(async |t| {
-				let new_vtxos = t.get_vtxos_by_txid(txid).await?;
-				let ids = spent.iter().map(|(id, _, _)| id.to_string())
-					.chain(new_vtxos.iter().map(|(vtxo, _, _)| vtxo.id().to_string()))
-					.collect::<Vec<_>>();
-				let hashes = spent.iter().filter_map(|(_, preimage, _)|
-					preimage.map(|preimage| preimage.compute_payment_hash().to_string()))
-					.collect::<Vec<_>>();
-				t.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR SHARE", &[]).await?;
-				t.query("SELECT v.vtxo_id FROM vtxo v LEFT JOIN htlc_vtxo h ON h.id=v.id \
-					WHERE v.vtxo_id=ANY($1) OR h.payment_hash=ANY($2) \
-					ORDER BY v.vtxo_id FOR UPDATE OF v", &[&ids, &hashes]).await?;
-				let mut notifications = Vec::new();
-				for &(id, preimage, resolution) in &spent {
-					if let Some(preimage) = preimage {
-						let checkpoint = t.store_htlc_settlement(preimage).await?;
-						notifications.push((checkpoint, preimage.compute_payment_hash()));
-					}
-					t.register_vtxo_spend(id, height, txid).await?;
-					if let Some(resolution) = resolution {
-						htlc_vtxo::set_htlc_vtxo_chain_resolution(t, id, resolution, height).await?;
+			// Find new vtxos originating from this tx and add to frontier;
+			// register_in_tx() skips vtxos already in the frontier, and a vtxo
+			// with a recorded spend was already advanced past (this block
+			// is being replayed), so it must not re-enter the frontier.
+			if removed_any {
+				let new_vtxos = self.db.read(async |t| t.get_vtxos_by_txid(txid).await).await?;
+				for (vtxo, spent_height, _) in new_vtxos {
+					if spent_height.is_none() {
+						self.db.write(async |t| {
+							self.register_in_tx(t, &mut frontier, vtxo, Some(height)).await
+						}).await?;
 					}
 				}
-				for (vtxo, spent_height, _) in &new_vtxos {
-					if spent_height.is_none() && !frontier.contains_key(&vtxo.id()) {
-						t.add_vtxo_to_frontier(vtxo.id()).await?;
-						t.register_vtxo_confirmation(vtxo.id(), height).await?;
-					}
-				}
-				Ok((new_vtxos, notifications))
-			}).await?;
-			for (id, _, resolution) in spent {
-				frontier.remove(&id);
-				if let Some(resolution) = resolution {
-					slog!(HtlcVtxoResolvedOnChain, vtxo_id: id, height,
-						resolution: resolution.as_str().to_owned());
-				}
-			}
-			for (vtxo, spent_height, _) in new_vtxos {
-				let id = vtxo.id();
-				if spent_height.is_none() && !frontier.contains_key(&id) {
-					frontier.insert(id, (Some(height), vtxo));
-					slog!(WatchmanAddedVtxo, id);
-				}
-			}
-			for (checkpoint, hash) in notifications {
-				self.htlc_settler.notify_stored(checkpoint, hash);
 			}
 		}
 
