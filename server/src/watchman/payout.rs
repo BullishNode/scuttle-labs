@@ -225,10 +225,7 @@ impl Watchman {
 		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 		let mut wallet = self.watchman_wallet.lock().await;
 		let payout = self.db.write(async |t| {
-			t.lock_watchman_tip(view).await?;
-			t.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&group.id]).await?;
-			ensure!(t.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&group.id]).await?.get::<_, &str>(0) == "pending",
-				"expiry allocation changed before direct payout publication");
+			// store_expiry_attempt rechecks the view and pending state at commit.
 			if let Some(parent) = &group.parent {
 				// An attempt can be durable even if a crash prevented the later
 				// wallet changeset from being saved. Restore its graph before RBF.

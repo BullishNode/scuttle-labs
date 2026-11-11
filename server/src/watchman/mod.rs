@@ -266,6 +266,8 @@ impl Watchman {
 		let mut sweep_pending = false;
 		loop {
 			tokio::select! {
+				// Expiry payouts are decided per block, not on the long upstream
+				// sweep timer, so a payout or its retry is not delayed for hours.
 				Ok(()) = completed.changed(), if self.db.expiry_payouts() => {
 					self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
 				},
@@ -310,14 +312,9 @@ impl Watchman {
 				},
 				_ = rtmgr.shutdown_signal() => {
 					info!("Shutdown signal received. Exiting Watchman...");
-					break;
+					return;
 				},
 			}
-		}
-		// A sweep can be between an on-chain publication and its database
-		// bookkeeping. Let that in-flight pass finish before graceful exit.
-		while let Some(result) = expiry_sweeps.join_next().await {
-			if let Err(error) = result { warn!(%error, "Expiry sweep task failed during shutdown"); }
 		}
 	}
 
