@@ -581,7 +581,7 @@ impl Server {
 				_ if tip > input_policy.htlc_expiry => {
 					if !attempt.is_self_payment() {
 						if let Ok(Some(refreshed)) = self.lightning_manager
-							.reconcile_lightning_attempt(attempt.id, false).await {
+							.reconcile_lightning_attempt(attempt.id).await {
 							if refreshed.status == LightningPaymentStatus::Succeeded {
 								return badarg!("This lightning payment has completed");
 							}

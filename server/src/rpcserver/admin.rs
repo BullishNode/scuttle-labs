@@ -76,19 +76,6 @@ impl rpc::server::RoundAdminService for Server {
 
 #[async_trait]
 impl rpc::server::LightningAdminService for Server {
-	async fn reconcile_lightning_attempt(
-		&self, req: tonic::Request<protos::ReconcileLightningAttemptRequest>,
-	) -> Result<tonic::Response<protos::ReconcileLightningAttemptResponse>, tonic::Status> {
-		let req = req.into_inner();
-		let id = req.attempt_id;
-		if id <= 0 { return Err(tonic::Status::invalid_argument("attempt_id must be positive")); }
-		let attempt = self.lightning_manager.reconcile_lightning_attempt(id, req.native_cold_restart_confirmed).await.to_status()?
-			.ok_or_else(|| tonic::Status::not_found("unknown Lightning payment attempt"))?;
-		Ok(tonic::Response::new(protos::ReconcileLightningAttemptResponse {
-			attempt_id: attempt.id, payment_hash: attempt.payment_hash.to_vec(), status: attempt.status.to_string(),
-		}))
-	}
-
 	#[tracing::instrument(skip(self, req))]
 	async fn start_lightning_node(
 		&self,

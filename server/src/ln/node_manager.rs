@@ -236,11 +236,8 @@ impl LightningManager {
 		self.node_handles.read().iter().find(|h| h.id == id).cloned()
 	}
 
-	/// Reconcile only this existing external attempt on its recorded online
-	/// node. Missing/offline nodes require re-adding the same node; an operator
-	/// supplies no native outcome and cannot cause a new dispatch here. The
-	/// optional cold-restart assertion is a privileged external lifecycle fact.
-	pub async fn reconcile_lightning_attempt(&self, attempt_id: i64, native_cold_restart_confirmed: bool)
+	/// Check an open external attempt against its recorded node one last time.
+	pub async fn reconcile_lightning_attempt(&self, attempt_id: i64)
 		-> anyhow::Result<Option<LightningPaymentAttempt>>
 	{
 		let Some(attempt) = self.db.read(async |tx|
@@ -249,8 +246,8 @@ impl LightningManager {
 		ensure!(!attempt.is_self_payment(), "intra-Ark attempts resolve through their receive");
 		if !attempt.status.is_final() {
 			let node = self.node_by_id(attempt.lightning_node_id)
-				.context("recorded Lightning node is not online; attempt stays held")?;
-			node.xpay.reconcile_existing_payment_attempt(attempt, native_cold_restart_confirmed).await?;
+				.context("recorded Lightning node is not online")?;
+			node.xpay.sync_payment_attempt_status(attempt).await?;
 		}
 		self.db.read(async |tx| tx.get_lightning_payment_attempt_by_id(attempt_id).await).await
 	}

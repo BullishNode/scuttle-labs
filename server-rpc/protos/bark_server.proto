@@ -314,7 +314,6 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	reserved 7;
 	optional bytes owner_mailbox = 8;
 }
 
@@ -338,7 +337,6 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	reserved 3;
 }
 
 message ArkoorDestination {
@@ -437,7 +435,6 @@ message StartLightningReceiveRequest {
 	// The key the HTLC-recv VTXOs will be locked to. When set, the claim can
 	// only be prepared with this key and a claim_attestation signed by it.
 	optional bytes claim_pubkey = 7;
-	reserved 8, 9;
 }
 
 message StartLightningReceiveResponse {
@@ -460,7 +457,6 @@ message PrepareLightningReceiveClaimRequest {
 	// Signature by user_pubkey over the payment hash and htlc_recv_expiry,
 	// required when the receive was started with a claim_pubkey.
 	optional bytes claim_attestation = 6;
-	reserved 7;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -719,21 +715,7 @@ service RoundAdminService {
 	rpc TriggerRound(core.Empty) returns (core.Empty) {}
 }
 
-message ReconcileLightningAttemptRequest {
-	int64 attempt_id = 1;
-	// Privileged operator confirms complete same-backend CLN/plugin cessation,
-	// restart of its original persistent store and exclusion of new dispatch.
-	bool native_cold_restart_confirmed = 2;
-}
-
-message ReconcileLightningAttemptResponse {
-	int64 attempt_id = 1;
-	bytes payment_hash = 2;
-	string status = 3;
-}
-
 service LightningAdminService {
-	rpc ReconcileLightningAttempt(ReconcileLightningAttemptRequest) returns (ReconcileLightningAttemptResponse) {}
 	rpc StartLightningNode(LightningNodeUri) returns (core.Empty) {}
 	rpc StopLightningNode(LightningNodeUri) returns (core.Empty) {}
 }

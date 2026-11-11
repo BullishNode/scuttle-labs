@@ -41,8 +41,8 @@ use super::ClnGrpcClient;
 use super::super::payment_handler::PaymentAttemptHandler;
 
 
-/// How long an attempt may wait for xpay to answer before an attempt still
-/// `Requested`, with no record in CLN, is reported for the operator.
+/// How long an attempt may wait for xpay to answer. xpay always answers, so an
+/// attempt still `Requested` after this, with no record in CLN, never reached it.
 const XPAY_ANSWER_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Shared client for sending xpay RPCs and reconciling payment status against CLN.
@@ -102,14 +102,10 @@ impl ClnXpayClient {
 		// Only place CLN says whether the route was pruned on cost or on delay.
 		// A route it never found leaves no `listpays` record either, so
 		// dropping this loses the reason entirely.
-		let result = call_xpay(
+		let pay_error = match call_xpay(
 			&mut rpc, &invoice, payment_amount, max_routing_fee, max_cltv_expiry_delta, retry_for,
 			label,
-		).await;
-		// xpay gives up with these codes without having sent a part.
-		let zero_part = result.as_ref().err().and_then(native_xpay_error_code)
-			.is_some_and(|code| matches!(code, 205 | 206 | 207));
-		let pay_error = match result {
+		).await {
 			Ok(preimage) => {
 				// Record the settlement now: the attempt is finished by the
 				// reconciliation below or the monitor, which can both fail,
@@ -151,12 +147,7 @@ impl ClnXpayClient {
 
 		match attempt_res {
 			Ok(Some(attempt)) => {
-				let res = if zero_part {
-					self.fail_without_parts(attempt, pay_error.as_deref()).await
-				} else {
-					self.sync_payment_attempt_status(attempt).await
-				};
-				if let Err(e) = res {
+				if let Err(e) = self.sync_payment_attempt_status(attempt).await {
 					error!("Error syncing payment attempt status: {e:#}");
 				}
 			},
@@ -208,11 +199,10 @@ impl ClnXpayClient {
 	///
 	/// Only the record of the attempt's own xpay call counts: an earlier call
 	/// on the same payment hash says nothing about this one. If CLN has no
-	/// record of the call, the attempt stays open: a failed attempt refunds its
-	/// sender, which must not happen while CLN may still pay. Only
-	/// [`Self::fail_without_parts`] fails such an attempt. If CLN
-	/// reports a different status than the DB, the DB is updated (unless the DB
-	/// status is already final, which is logged as an error). Sends on
+	/// record of the call, the attempt is failed once xpay answered, or once it
+	/// waited [`XPAY_ANSWER_TIMEOUT`] for an answer. If CLN reports a
+	/// different status than the DB, the DB is updated (unless the DB status
+	/// is already final, which is logged as an error). Sends on
 	/// `payment_update_tx` when the status changes.
 	pub async fn sync_payment_attempt_status(
 		&self,
@@ -265,20 +255,18 @@ impl ClnXpayClient {
 						attempt.id, payment_hash,
 					)
 				},
-				// xpay answered with an error that does not prove it sent no
-				// part, so whether CLN can still pay is not established.
+				// xpay answered without sending a part.
 				LightningPaymentStatus::Submitted => {
-					error!("Lightning payment attempt ({}): xpay answered but CLN has no \
-						record for payment hash {}, holding it", attempt.id, payment_hash,
-					);
+					self.payment_handler().process_payment_attempt(
+						&self.settler, &attempt, LightningPaymentStatus::Failed, error, None, None,
+					).await?;
 				},
-				// xpay never answered and CLN may still be routing the call.
 				LightningPaymentStatus::Requested
 					if attempt.created_at + XPAY_ANSWER_TIMEOUT < Local::now() =>
 				{
-					error!("Lightning payment attempt ({}): no answer from xpay and no \
-						record in CLN for payment hash {}, holding it", attempt.id, payment_hash,
-					);
+					self.payment_handler().process_payment_attempt(
+						&self.settler, &attempt, LightningPaymentStatus::Failed, error, None, None,
+					).await?;
 				},
 				// xpay may not have sent a part yet.
 				LightningPaymentStatus::Requested => {
@@ -348,56 +336,6 @@ impl ClnXpayClient {
 		}
 
 		Ok(())
-	}
-
-	/// Reconciles an attempt for the operator. An attempt that CLN has no
-	/// record of is failed only once the operator confirmed that the node was
-	/// cold restarted, so no xpay call of it still runs.
-	pub async fn reconcile_existing_payment_attempt(
-		&self,
-		attempt: LightningPaymentAttempt,
-		native_cold_restart_confirmed: bool,
-	) -> anyhow::Result<()> {
-		ensure!(!attempt.is_self_payment(), "intra-Ark attempts resolve through their receive");
-		if native_cold_restart_confirmed {
-			let reason = "the operator confirmed a cold restart of the node and CLN has no record of the call";
-			return self.fail_without_parts(attempt, Some(reason)).await;
-		}
-		self.sync_payment_attempt_status(attempt).await
-	}
-
-	/// Fails an attempt of which CLN holds no part, once neither its own call
-	/// nor any other payment on its hash has a pending or paid part. Anything
-	/// else is left to [`Self::sync_payment_attempt_status`].
-	async fn fail_without_parts(
-		&self,
-		attempt: LightningPaymentAttempt,
-		error: Option<&str>,
-	) -> anyhow::Result<()> {
-		let payment_hash = attempt.payment_hash;
-		let pays = self.rpc.clone().list_pays(cln_rpc::ListpaysRequest {
-			bolt11: None, payment_hash: Some(payment_hash.to_vec()),
-			status: None, index: None, limit: None, start: None,
-		}).await.context("Could not fetch cln payments")?.into_inner().pays;
-		let label = self.db
-			.read(async |t| xpay::get_xpays_by_payment_hash(&**t, payment_hash).await).await?
-			.into_iter()
-			.find(|x| x.status == ClnXpayStatus::Pending)
-			.and_then(|x| x.label);
-		if pays.iter().any(|p| label.is_none() || p.label == label || p.status() != ListpaysPaysStatus::Failed) {
-			return self.sync_payment_attempt_status(attempt).await;
-		}
-		let parts = self.rpc.clone().list_send_pays(cln_rpc::ListsendpaysRequest {
-			payment_hash: Some(payment_hash.to_vec()), ..Default::default()
-		}).await.context("Could not fetch cln parts")?.into_inner().payments;
-		if parts.iter().any(|part| part.payment_preimage.is_some()
-			|| part.status() != cln_rpc::listsendpays_payments::ListsendpaysPaymentsStatus::Failed)
-		{
-			return self.sync_payment_attempt_status(attempt).await;
-		}
-		self.payment_handler().process_payment_attempt(
-			&self.settler, &attempt, LightningPaymentStatus::Failed, error, None, None,
-		).await
 	}
 }
 
@@ -596,21 +534,6 @@ impl ClnXpayProcess {
 			}
 		}
 	}
-}
-
-/// The code of xpay's own error answer. cln-grpc 26.06 words it as
-/// `Error calling method Xpay: RpcError { code: Some(..), message: .., data: None }`;
-/// anything else, including a transport error, has no code.
-fn native_xpay_error_code(error: &anyhow::Error) -> Option<i32> {
-	let status = error.downcast_ref::<tonic::Status>()?;
-	if status.code() != tonic::Code::Unknown { return None; }
-	let rest = status.message().strip_prefix("Error calling method Xpay: RpcError { code: Some(")?;
-	let (code, rest) = rest.split_once("), message: ")?;
-	let parsed: i32 = code.parse().ok()?;
-	if code != parsed.to_string() { return None; }
-	let message = rest.strip_suffix(", data: None }")?;
-	serde_json::from_str::<String>(message).ok()?;
-	Some(parsed)
 }
 
 /// Whether lightningd itself answered with an error, meaning xpay has stopped

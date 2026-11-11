@@ -115,15 +115,6 @@ enum Command {
 
 #[derive(clap::Subcommand)]
 enum RpcCommand {
-	/// Observe an existing Lightning attempt on its recorded online node.
-	#[command()]
-	ReconcileLightningAttempt {
-		attempt_id: i64,
-		/// Confirm the whole original CLN/plugin process group was stopped/reaped,
-		/// its same persistent backend restarted, and new dispatch excluded.
-		#[arg(long)]
-		native_cold_restart_confirmed: bool,
-	},
 	/// Report server wallet status
 	#[command()]
 	Wallet,
@@ -692,18 +683,6 @@ async fn run_rpc(addr: &str, cmd: RpcCommand) -> anyhow::Result<()> {
 	debug!("Query admin rpc-endpoint at {}", endpoint);
 
 	match cmd {
-		RpcCommand::ReconcileLightningAttempt { attempt_id, native_cold_restart_confirmed } => {
-			let mut rpc = rpc::admin::LightningAdminServiceClient::connect(endpoint)
-				.await.context("failed to connect to operator rpc")?;
-			let request = protos::ReconcileLightningAttemptRequest { attempt_id, native_cold_restart_confirmed };
-			let response = rpc.reconcile_lightning_attempt(request).await?.into_inner();
-			serde_json::to_writer_pretty(std::io::stdout(), &serde_json::json!({
-				"attempt_id": response.attempt_id,
-				"payment_hash": ark::lightning::PaymentHash::from_slice(&response.payment_hash)?.to_string(),
-				"status": response.status,
-			}))?;
-			println!();
-		},
 		RpcCommand::Wallet => {
 			let mut rpc = rpc::admin::WalletAdminServiceClient::connect(endpoint)
 				.await.context("failed to connect to rpc")?;

@@ -1,27 +1,9 @@
 use server_rpc::{protos, RequestExt};
-use ark_testing::{Captaind, TestContext};
+use ark_testing::TestContext;
 use server::database::Db;
 
-/// Operator reconciliation is only available on the private admin listener.
-#[tokio::test]
-async fn fail_attempt_requires_admin_auth() {
-	let ctx = TestContext::new("server/fail_attempt_requires_admin_auth").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|cfg| cfg.expiry_payouts = true).create().await;
-	let request = || protos::ReconcileLightningAttemptRequest { attempt_id: i64::MAX, native_cold_restart_confirmed: false };
-	let mut public = server_rpc::admin::LightningAdminServiceClient::connect(srv.ark_url()).await.unwrap();
-	assert_eq!(public.reconcile_lightning_attempt(request()).await.unwrap_err().code(), tonic::Code::Unimplemented);
-	let address = srv.config().rpc.admin_address.unwrap().to_string();
-	let mut admin = server_rpc::admin::LightningAdminServiceClient::connect(format!("http://{address}")).await.unwrap();
-
-	assert_eq!(admin.reconcile_lightning_attempt(request()).await.unwrap_err().code(), tonic::Code::NotFound);
-	let output = Captaind::base_cmd().env("RUST_LOG", "off")
-		.args(["rpc", "--addr", &address, "reconcile-lightning-attempt", &i64::MAX.to_string()]).output().await.unwrap();
-	assert!(!output.status.success());
-	assert!(String::from_utf8_lossy(&output.stderr).contains("unknown Lightning payment attempt"));
-}
-
 /// Payout-on operations use the upstream numeric version and an explicit
-/// Scuttle label. Operator methods are not public.
+/// Scuttle label.
 #[tokio::test]
 async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let ctx = TestContext::new("server/scuttle_wire_epoch_and_operator_listener").await;
@@ -56,16 +38,6 @@ async fn scuttle_wire_epoch_and_operator_listener_are_explicit() {
 	let error = mailbox.read_mailbox(request).await.unwrap_err();
 	assert_eq!(error.code(), tonic::Code::InvalidArgument);
 	assert!(error.message().contains("unsupported protocol"));
-
-	let mut public_operator = server_rpc::admin::LightningAdminServiceClient::connect(srv.ark_url()).await.unwrap();
-	let mut request = tonic::Request::new(protos::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false });
-	request.set_pver(version);
-	assert_eq!(public_operator.reconcile_lightning_attempt(request).await.unwrap_err().code(), tonic::Code::Unimplemented);
-	let address = format!("http://{}", srv.config().rpc.admin_address.unwrap());
-	let mut operator = server_rpc::admin::LightningAdminServiceClient::connect(address).await.unwrap();
-	let error = operator.reconcile_lightning_attempt(protos::ReconcileLightningAttemptRequest { attempt_id: 0, native_cold_restart_confirmed: false }).await.unwrap_err();
-	assert_eq!(error.code(), tonic::Code::InvalidArgument);
-	assert_eq!(error.message(), "attempt_id must be positive");
 
 	// The next process configuration cannot change this store's payout mode.
 	let server_pubkey = srv.ark_info().await.server_pubkey;
