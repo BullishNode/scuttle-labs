@@ -184,7 +184,7 @@ impl Tx<'_> {
 					continue;
 				}
 			}
-				let ownership = self.propose_expiry_ownership(fact, view.height, Some(view.height)).await?;
+				let ownership = self.propose_expiry_ownership(fact, view.height).await?;
 				let payee = match &ownership.disposition {
 					OwnershipDisposition::Customer { .. } => match self.derived_expiry_owner(&ownership).await? {
 						super::expiry_attribution::Attribution::Owned { mailbox_pk, spk } => Some(VerifiedPayee { mailbox: mailbox_pk, script: spk }),
@@ -258,7 +258,7 @@ impl Tx<'_> {
 			for coin in lightning {
 				let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == coin.ownership.id)
 					.context("expiry coin left its branch")?;
-				ensure!(self.propose_expiry_ownership(fact, view.height, Some(view.height)).await? == coin.ownership,
+				ensure!(self.propose_expiry_ownership(fact, view.height).await? == coin.ownership,
 					"expiry Lightning facts changed during analysis");
 			}
 		}

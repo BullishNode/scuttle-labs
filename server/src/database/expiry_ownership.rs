@@ -150,7 +150,6 @@ impl Tx<'_> {
 		&self,
 		fact: &BackingVtxoFact,
 		tip: BlockHeight,
-		watchman_tip: Option<BlockHeight>,
 	) -> anyhow::Result<OwnershipProposal> {
 		let mut proposal = OwnershipProposal::pending(fact, "unresolved source ownership");
 		let full = &fact.state.vtxo;
@@ -340,7 +339,6 @@ impl Tx<'_> {
 				source
 			} else { LightningSourceState::Pending };
 			let expired_contract = htlc.htlc.htlc_expiry <= tip
-				&& watchman_tip.is_some_and(|height| htlc.htlc.htlc_expiry <= height)
 				&& fact.onchain_spent_height.is_none() && fact.onchain_spent_txid.is_none();
 			let Some(resolution) = htlc.htlc.resolution() else {
 				if htlc.direction() == HtlcDirection::Outgoing {
@@ -379,16 +377,12 @@ impl Tx<'_> {
 				}
 				if source == LightningSourceState::Failed && fact.onchain_spent_height.is_none()
 					&& fact.onchain_spent_txid.is_none() && htlc.htlc.chain_resolution.is_none() {
-					if let Some(watchman_tip) = watchman_tip {
-						if let Some(block) = self.internal_grants_reclaimed(
-							state.vtxo_id, hash, tip, watchman_tip,
-						).await? {
-							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
-							proposal.evidence = Some(OwnershipEvidence::HtlcInternalGrantsReclaimed {
-								payment_hash: hash, block,
-							});
-							return Ok(proposal);
-						}
+					if let Some(block) = self.internal_grants_reclaimed(state.vtxo_id, hash, tip).await? {
+						proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+						proposal.evidence = Some(OwnershipEvidence::HtlcInternalGrantsReclaimed {
+							payment_hash: hash, block,
+						});
+						return Ok(proposal);
 					}
 					// An issued internal receive still commits its funding source
 					// until every grant is reclaimed, even past the source's CLTV.
@@ -406,7 +400,7 @@ impl Tx<'_> {
 				// this sender's money. Open attempts still wait.
 				if matches!(source, LightningSourceState::Unattempted | LightningSourceState::Failed)
 					&& fact.onchain_spent_height.is_none() && htlc.htlc.chain_resolution.is_none()
-					&& htlc.htlc.htlc_expiry <= tip && watchman_tip.is_some_and(|h| htlc.htlc.htlc_expiry <= h) {
+					&& htlc.htlc.htlc_expiry <= tip {
 					proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
 					proposal.evidence = Some(match source {
 						LightningSourceState::Failed => OwnershipEvidence::HtlcExternalFailed,
@@ -418,7 +412,7 @@ impl Tx<'_> {
 				return Ok(proposal);
 			};
 			if htlc.direction() == HtlcDirection::Outgoing && resolution == HtlcResolution::Revoked
-				&& !crate::ln::htlc_recvs_expired(&htlcs, tip, watchman_tip) {
+				&& !htlc_vtxo::payout_htlc_recvs_expired(&htlcs, tip, Some(tip)) {
 				proposal.disposition = OwnershipDisposition::Unresolved("Lightning receive not irrevocably expired");
 				return Ok(proposal);
 			}

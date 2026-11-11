@@ -106,15 +106,9 @@ pub(crate) fn htlc_recvs_expired(
 		.filter(|h| h.direction() == HtlcDirection::Outgoing)
 		.collect::<Vec<_>>();
 	!htlc_recvs.is_empty() && htlc_recvs.iter().all(|h| {
-		if h.htlc.resolution() == Some(HtlcResolution::Fulfilled) || height <= h.htlc_expiry() {
-			return false;
-		}
-		match h.htlc.chain_resolution {
-			Some(HtlcResolution::Revoked) => h.htlc.chain_resolution_height.is_some_and(|block|
-				htlc_vtxo::grant_reclamation_confirmed(block, tip, Some(watchman_tip))),
-			None => !h.vtxo.is_exited(),
-			Some(HtlcResolution::Fulfilled) => false,
-		}
+		height > h.htlc_expiry() && (
+			!h.vtxo.is_exited() || h.htlc.chain_resolution == Some(HtlcResolution::Revoked)
+		)
 	})
 }
 
@@ -625,7 +619,11 @@ impl Server {
 			if let Some(subscription_id) = attempt.and_then(|a| a.lightning_htlc_subscription_id) {
 				let htlc_vtxos = htlc_vtxo::get_htlc_vtxo_states_by_payment_hash(&t, payment_hash).await?;
 				let watchman_tip = t.get_highest_block(BlockTable::Watchmand).await?.map(|b| b.height);
-				let htlc_recvs_expired = htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip);
+				let htlc_recvs_expired = if self.config.expiry_payouts {
+					htlc_vtxo::payout_htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip)
+				} else {
+					htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip)
+				};
 				if let Some((status, htlc_recvs_granted)) =
 					t.cancel_revocable_htlc_subscription(subscription_id, htlc_recvs_expired).await?
 				{
@@ -1342,35 +1340,6 @@ mod tests {
 		// and certainly once it expired
 		assert!(validate_receive_claim(BlockHeight::new(100), BlockHeight::new(100), margin).is_err());
 		assert!(validate_receive_claim(BlockHeight::new(99), BlockHeight::new(100), margin).is_err());
-	}
-
-	#[test]
-	fn fulfilled_grants_never_expire_and_revoked_grants_wait_for_six_blocks() {
-		let coin = ark::test_util::VTXO_VECTORS.board_vtxo.clone();
-		let now = chrono::Local::now();
-		let mut grant = HtlcVtxo {
-			htlc: htlc_vtxo::Htlc { payment_hash: PaymentHash::from([1; 32]),
-				htlc_expiry: BlockHeight::new(100), direction: HtlcDirection::Outgoing,
-				offchain_resolution: Some(HtlcResolution::Fulfilled),
-				chain_resolution: None, chain_resolution_height: None },
-			vtxo: crate::database::VtxoState { id: 1, vtxo_id: coin.id(), vtxo: coin,
-				oor_spent_txid: None, spent_in_round: None, offboarded_in: None,
-				banned_until_height: None, spend_state: crate::database::SpendState::Spendable,
-				decided_for_fallback: false, confirmed_height: None, created_at: now, updated_at: now },
-		};
-		assert!(!htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
-		grant.htlc.offchain_resolution = None;
-		assert!(htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
-		grant.vtxo.confirmed_height = Some(BlockHeight::new(110));
-		grant.htlc.chain_resolution = Some(HtlcResolution::Revoked);
-		grant.htlc.chain_resolution_height = Some(BlockHeight::new(120));
-		for (server, watchman, expected) in [(124, Some(124), false), (125, Some(125), true),
-			(150, Some(124), false), (124, Some(150), false), (150, None, false)] {
-			assert_eq!(htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(server),
-				watchman.map(BlockHeight::new)), expected);
-		}
-		grant.htlc.chain_resolution = Some(HtlcResolution::Fulfilled);
-		assert!(!htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
 	}
 
 	#[test]

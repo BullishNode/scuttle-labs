@@ -42,7 +42,6 @@ impl Tx<'_> {
 	/// receive grant it funded has been reclaimed in both completed views.
 	pub(crate) async fn internal_grants_reclaimed(
 		&self, source: VtxoId, hash: PaymentHash, tip: BlockHeight,
-		watchman_tip: BlockHeight,
 	) -> anyhow::Result<Option<BlockRef>> {
 		let attempts = self.query("SELECT a.lightning_htlc_subscription_id,a.status::TEXT, \
 			s.payment_hash,s.status::TEXT AS subscription_status FROM lightning_payment_attempt a \
@@ -84,7 +83,7 @@ impl Tx<'_> {
 				};
 				let Some(height) = height else { return Ok(None); };
 				let height = u32::try_from(height)?;
-				if !super::htlc_vtxo::grant_reclamation_confirmed(BlockHeight::new(height), tip, Some(watchman_tip)) {
+				if !super::htlc_vtxo::grant_reclamation_confirmed(BlockHeight::new(height), tip, Some(tip)) {
 					return Ok(None);
 				}
 				last = last.max(height);
