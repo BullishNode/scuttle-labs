@@ -2141,12 +2141,17 @@ impl Wallet {
 	/// Notes:
 	/// - Exits are only synced if we detect onchain activity which has force-exited our VTXO.
 	pub async fn sync(&self) {
-		if let Err(error) = self.refresh_server().await {
-			warn!("Ark server refresh failed: {:#}", error);
+		let payouts = matches!(self.properties().await, Ok(p) if p.server_payouts == Some(true));
+		if payouts {
+			if let Err(error) = self.refresh_server().await {
+				warn!("Ark server refresh failed: {:#}", error);
+			}
 		}
 		self.inner.chain.invalidate_caches().await;
-		if let Err(error) = self.sync_fallback_payouts().await {
-			warn!("Fallback chain checks await sync: {:#}", error);
+		if payouts {
+			if let Err(error) = self.sync_fallback_payouts().await {
+				warn!("Fallback chain checks await sync: {:#}", error);
+			}
 		}
 
 		futures::join!(

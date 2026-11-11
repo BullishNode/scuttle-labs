@@ -281,7 +281,7 @@ impl LightningManager {
 
 		debug!("Sending payment to CLN for invoice: {}", invoice);
 
-		self.start_payment(
+		if let Err(e) = self.start_payment(
 			Box::new(invoice.clone()),
 			payment_amount,
 			max_routing_fee,
@@ -292,8 +292,21 @@ impl LightningManager {
 			attempt_block_height,
 			retry_for,
 			intent_id.as_deref(),
-		).await?;
-		debug!("Bolt11 invoice sent for payment");
+		).await {
+			// Payout mode returns the refusal: Bark adopts a typed fallback
+			// refusal. Otherwise, as upstream, the client sees the failure via
+			// CheckLightningPayment.
+			if self.db.expiry_payouts() {
+				return Err(e);
+			}
+			if e.downcast_ref::<PayInvoiceRace>().is_some() {
+				warn!("Bolt11 payment attempt superseded for invoice: {:#}", e);
+			} else {
+				error!("Error sending bolt11 payment for invoice: {:#}", e);
+			}
+		} else {
+			debug!("Bolt11 invoice sent for payment");
+		}
 
 		Ok(())
 	}
@@ -407,6 +420,14 @@ impl LightningManager {
 							"htlc subscription {} is Created but was not promoted", sub.id,
 						),
 					};
+					if !t.expiry_payouts() {
+						// As upstream, record the refused attempt unlinked; it fails below.
+						let id = t.store_lightning_payment_start(
+							node.id, &invoice, amount, sender_mailbox_id, htlc_vtxo_ids, None,
+							attempt_block_height, user_fee, user_agent.as_deref(), retry_for, None, intent_id,
+						).await?;
+						return Ok(Err((id, error)));
+					}
 					return Err(intra_ark_preflight_refusal(error));
 				}
 			}
@@ -425,8 +446,21 @@ impl LightningManager {
 			if let Some((_, new)) = &new_xpay {
 				xpay::create_xpay(&**t, new).await.context("failed to store the xpay call")?;
 			}
-			Ok(attempt_id)
+			Ok(Ok(attempt_id))
 		}).await?;
+		let attempt_id = match attempt_id {
+			Ok(id) => id,
+			Err((id, error)) => {
+				self.db.write(async |t| {
+					let attempt = t.get_lightning_payment_attempt_by_id(id).await?
+						.context("refused payment attempt disappeared")?;
+					t.update_lightning_payment_attempt_status(&attempt, LightningPaymentStatus::Failed,
+						Some(&format!("{error:#}"))).await?;
+					Ok(())
+				}).await?;
+				return Err(error);
+			},
+		};
 
 		// If there is an existing subscription, it's an intra-Ark lightning
 		// payment so we can directly mark it as accepted, then skip cln payment.
