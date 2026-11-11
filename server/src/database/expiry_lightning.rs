@@ -135,6 +135,8 @@ impl Tx<'_> {
 			.map(|(status, _)| *status).collect::<Vec<_>>();
 		if statuses.is_empty() { return Ok(None); }
 		let state = source_state(statuses);
+		let other_source_paid = attempts.values().any(|(status, sources)|
+			*status == LightningPaymentStatus::Succeeded && sources != &requested);
 		let mut all_funded = true;
 		let mut any_funded = false;
 		let mut unknown = false;
@@ -148,11 +150,13 @@ impl Tx<'_> {
 				},
 			}
 		}
-		// A cached failure cannot refund a source that paid. Conversely, a
-		// same-hash preimage from a disjoint source cannot prove its success.
+		// A cached failure cannot refund a source that paid. A different
+		// successful source cannot prove this one's success, and it prevents
+		// Bark from revoking this source through the now-paid invoice.
 		let state = if unknown { LightningSourceState::Pending }
 			else if all_funded { LightningSourceState::Discharged }
-			else if any_funded || state == LightningSourceState::Discharged { LightningSourceState::Pending }
+			else if any_funded || state == LightningSourceState::Discharged
+				|| (state == LightningSourceState::Failed && other_source_paid) { LightningSourceState::Pending }
 			else { state };
 		Ok(Some(LightningPaymentOutcome { sources: requested, state }))
 	}
