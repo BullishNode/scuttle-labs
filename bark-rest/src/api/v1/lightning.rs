@@ -99,8 +99,8 @@ pub async fn generate_invoice(
 		(status = 409, description = "The server refused the operation or recipient; inspect the stable refusal code", body = error::FallbackRefusalError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning \
-		receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. \
+	description = "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning \
+		receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox. \
 		With expiry payouts enabled, the server binds the recipient output to the mailbox \
 		blinded in the supplied Ark address. The recipient wallet must verify the signed coin \
 		and its authenticated owner mailbox before crediting the receive. Missing or unresolved \

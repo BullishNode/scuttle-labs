@@ -216,9 +216,9 @@ impl MigrationContext {
 		let mut statement = conn.prepare(query).context(ERR_MSG)?;
 		statement.execute([new_version]).context(ERR_MSG)?;
 
-
 		Ok(new_version)
 	}
+
 
 	/// Creates the migrations table if it doesn't exist yet
 	fn create_migrations_table_if_not_exists(&self, conn: &Connection) -> anyhow::Result<()> {
@@ -250,9 +250,9 @@ trait Migration {
 
 	fn summary(&self) -> String {
 		format!("{}->{}:'{}'", self.from_version(), self.to_version(), self.name())
-
 	}
 }
+
 
 #[cfg(test)]
 mod test {

@@ -444,7 +444,6 @@ impl<S: StorageAdaptor> StorageAdaptorWrapper<S> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	async fn init_wallet(&self, properties: &WalletProperties) -> anyhow::Result<()> {
-		let mut lock = self.inner.write().await;
 		let record = Record::from_data(
 			partition::PROPERTIES,
 			// NB: a single set of properties is stored, so no need for primary key
@@ -452,12 +451,11 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None,
 			properties,
 		)?;
-		lock.put(record).await
+		self.inner.write().await.put(record).await
 	}
 
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
-		let lock = self.inner.read().await;
-		match lock.get(partition::PROPERTIES, &[]).await? {
+		match self.inner.read().await.get(partition::PROPERTIES, &[]).await? {
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
@@ -1124,7 +1122,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	) -> anyhow::Result<Option<PaidInvoice>> {
 		match self.inner.read().await
 			.get(partition::PAID_INVOICE, &payment_hash.to_byte_array()).await?
-
 		{
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
@@ -1166,6 +1163,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None => Ok(None),
 		}
 	}
+
 
 	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
 		let record = Record::from_data(

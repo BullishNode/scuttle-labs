@@ -501,7 +501,6 @@ async fn offboard_inputs_terminal(wallet: &Wallet, ids: &[VtxoId]) -> anyhow::Re
 		}
 		let coin = wallet.inner.db.get_wallet_vtxo(*id).await?.context("offboard input disappeared")?;
 		terminal &= coin.state.kind() == VtxoStateKind::Spent;
-
 	}
 	Ok(fallback.then_some(terminal))
 }

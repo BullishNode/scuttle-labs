@@ -91,7 +91,7 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT network,fingerprint,server_pubkey,server_mailbox_pubkey,mailbox_pubkey,server_payouts FROM bark_properties";
+	let query = "SELECT * FROM bark_properties";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -1056,7 +1056,6 @@ pub fn get_all_wallet_action_checkpoints(
 	conn: &Connection,
 ) -> anyhow::Result<Vec<WalletActionCheckpoint>> {
 	let query = "SELECT payload FROM bark_wallet_action_checkpoint ORDER BY created_at ASC";
-
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -1080,6 +1079,7 @@ pub fn remove_wallet_action_checkpoint(
 	Ok(())
 }
 
+
 pub fn record_paid_invoice(
 	conn: &Connection,
 	payment_hash: PaymentHash,
@@ -1093,7 +1093,6 @@ pub fn record_paid_invoice(
 	statement.execute(named_params! {
 		":payment_hash": payment_hash.as_hex().to_string(),
 		":preimage": preimage.as_hex().to_string(),
-
 	})?;
 	Ok(())
 }
@@ -1117,6 +1116,7 @@ pub fn get_paid_invoice(
 	Ok(Some(PaidInvoice { payment_hash, preimage, paid_at }))
 }
 
+
 pub fn record_settled_lightning_receive(
 	conn: &Connection,
 	payment_hash: PaymentHash,
@@ -1139,7 +1139,6 @@ pub fn record_settled_lightning_receive(
 }
 
 pub fn get_settled_lightning_receive(
-
 	conn: &Connection,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<Option<SettledLightningReceive>> {
@@ -1162,6 +1161,7 @@ pub fn get_settled_lightning_receive(
 	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
 	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
 }
+
 
 #[cfg(test)]
 mod test {

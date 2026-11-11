@@ -135,8 +135,9 @@ impl Wallet {
 			return Ok(ids);
 		}
 
-		self.inner.db.store_vtxos(&to_store.iter().map(|(coin, state)| (*coin, state)).collect::<Vec<_>>())
-			.await.context("failed to store imported VTXOs")?;
+		let rows = to_store.iter().map(|(v, s)| (*v, s)).collect::<Vec<_>>();
+		self.inner.db.store_vtxos(&rows).await
+			.context("failed to store imported VTXOs")?;
 		for (id, status) in fallback_statuses { self.inner.db.set_vtxo_fallback_status(id, status).await?; }
 
 		for (vtxo, state) in &to_store {

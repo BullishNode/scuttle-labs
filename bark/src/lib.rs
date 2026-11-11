@@ -430,7 +430,6 @@ pub use self::vtxo::WalletVtxo;
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1397,7 +1396,6 @@ impl Wallet {
 		if properties.fingerprint != fingerprint {
 			bail!("incorrect mnemonic")
 		}
-		let seed = seed;
 		properties.check_mailbox_identity(network, &seed)?;
 		if properties.mailbox_identity.is_none() {
 			if properties.server_payouts.is_none() { db.set_server_payouts(false).await?; }
@@ -1739,7 +1737,6 @@ impl Wallet {
 	pub(crate) async fn fetch_vtxo_statuses(&self, queries: &[(VtxoId, &Keypair)])
 		-> anyhow::Result<HashMap<VtxoId, (VtxoSpendState, bool)>>
 	{
-
 		let mut ret = HashMap::with_capacity(queries.len());
 		if queries.is_empty() {
 			return Ok(ret);
@@ -2058,8 +2055,6 @@ impl Wallet {
 		F: Fn(RoundParticipation) -> Fut,
 		Fut: Future<Output = anyhow::Result<Option<RoundStateId>>>,
 	{
-		// Online maintenance needs the server's depth limit before selecting coins.
-		self.require_server().await?;
 		let mut excluded = HashSet::new();
 		let mut last_refusal = None;
 		for _ in 0..10 {
@@ -2116,8 +2111,6 @@ impl Wallet {
 	///
 	/// Returns a [RoundStatus] if a refresh occurs.
 	pub async fn maintenance_refresh(&self) -> anyhow::Result<Option<RoundStatus>> {
-		// The early empty check also depends on the server's depth limit.
-		self.require_server().await?;
 		if self.get_vtxos_to_refresh().await?.is_empty() {
 			return Ok(None);
 		}

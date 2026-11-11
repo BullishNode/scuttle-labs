@@ -71,13 +71,12 @@ pub struct Balance {
 }
 
 impl Balance {
-	/// The tracked Ark balances. Committed fallback rights have a status;
-	/// actual Bitcoin payouts are accounted for by the Bitcoin wallet.
+	/// The sum of every field: all sats that belong to the wallet.
 	pub fn total(&self) -> Amount {
 		self.spendable + self.needs_refresh + self.pending()
 	}
 
-	/// The sats held by operations: everything except
+	/// The sats held by operations in progress: everything except
 	/// [Balance::spendable] and [Balance::needs_refresh].
 	pub fn pending(&self) -> Amount {
 		self.pending_in_round
@@ -89,7 +88,7 @@ impl Balance {
 			+ self.pending_exit
 	}
 
-	/// Whether an ordinary Ark operation is in progress.
+	/// Whether any sats are held by an operation in progress.
 	pub fn has_pending(&self) -> bool {
 		self.pending() > Amount::ZERO
 	}
@@ -144,9 +143,10 @@ impl Wallet {
 			},
 		};
 
-		let vtxos = self.inner.db.get_vtxos_by_state(&[
-			VtxoStateKind::Spendable, VtxoStateKind::Locked, VtxoStateKind::Exited,
-		]).await?.into_iter().map(|v| (v.id(),v)).collect::<HashMap<_,_>>();
+		// Every VTXO the balance can count, read once.
+		let vtxos = self.inner.db.get_vtxos_by_state(
+			&[VtxoStateKind::Spendable, VtxoStateKind::Locked, VtxoStateKind::Exited],
+		).await?.into_iter().map(|v| (v.id(), v)).collect::<HashMap<_, _>>();
 
 		let mut balance = Balance {
 			spendable: Amount::ZERO,
@@ -170,7 +170,7 @@ impl Wallet {
 			}
 		}
 
-		let mut counted = HashSet::new();
+		let mut counted = HashSet::with_capacity(vtxos.len());
 		for round in self.pending_round_states().await? {
 			let holder = round.state().lock_holder();
 			for input in round.state().locked_pending_inputs() {

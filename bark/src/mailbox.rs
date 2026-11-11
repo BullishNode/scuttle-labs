@@ -518,37 +518,44 @@ impl Wallet {
 		// Redundantly re-register the received vtxos with the server. An
 		// up-to-date sender already does this after cosign, but older
 		// senders may not, so we do it on receive too to make sure the
-		// server has signed_tx rows for our spendable vtxos. A failure
-		// does not discard the signed chain, but the server status below
-		// must confirm spendability before the wallet credits it.
+		// server has signed_tx rows for our spendable vtxos. Any failure
+		// is logged and swallowed: the receive must still proceed so we
+		// don't lose track of the vtxos locally, and later spends will
+		// retry registration if still needed.
 		if let Err(e) = self.register_vtxo_transactions_with_server(&new_vtxos).await {
 			warn!("Failed to register received arkoor vtxo transactions with server: {:#}", e);
 		}
 
-		let mut current = Vec::new();
-		for coin in new_vtxos {
-			let key = self.get_vtxo_key(&coin).await?;
-			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
-			// A delivery may already have paid its recipient onchain before
-			// this wallet first sees the mailbox message. Do not credit it in Ark.
-			if committed || state == protos::VtxoSpendState::Spent {
-				self.store_vtxos([&coin], &VtxoState::Spent).await?;
-				if committed {
-					self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+		// With payouts, the server status must confirm spendability before
+		// the wallet credits a received VTXO.
+		let new_vtxos = if self.properties().await?.server_payouts == Some(true) {
+			let mut current = Vec::new();
+			for coin in new_vtxos {
+				let key = self.get_vtxo_key(&coin).await?;
+				let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
+				// A delivery may already have paid its recipient onchain before
+				// this wallet first sees the mailbox message. Do not credit it in Ark.
+				if committed || state == protos::VtxoSpendState::Spent {
+					self.store_vtxos([&coin], &VtxoState::Spent).await?;
+					if committed {
+						self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+					}
+					continue;
 				}
-				continue;
+				if state != protos::VtxoSpendState::Spendable {
+					warn!("Received arkoor VTXO {} is not spendable on the server ({state:?}); \
+						keeping its signed chain locked", coin.id());
+					self.store_vtxos([&coin], &VtxoState::Locked {
+						holder: Some(VtxoLockHolder::MailboxReceive),
+					}).await?;
+					continue;
+				}
+				current.push(coin);
 			}
-			if state != protos::VtxoSpendState::Spendable {
-				warn!("Received arkoor VTXO {} is not spendable on the server ({state:?}); \
-					keeping its signed chain locked", coin.id());
-				self.store_vtxos([&coin], &VtxoState::Locked {
-					holder: Some(VtxoLockHolder::MailboxReceive),
-				}).await?;
-				continue;
-			}
-			current.push(coin);
-		}
-		let new_vtxos = current;
+			current
+		} else {
+			new_vtxos
+		};
 		if new_vtxos.is_empty() { return Ok(()); }
 		self.credit_received_arkoor_vtxos(&new_vtxos).await
 	}

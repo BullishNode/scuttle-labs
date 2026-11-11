@@ -479,8 +479,11 @@ impl Wallet {
 
 	/// Store owned VTXOs in the state the server reported for them.
 	///
-	/// Ordinary spent history follows upstream trust. Validate recovered bodies;
-	/// fallback commitments are stored Spent and reported as skipped.
+	/// The server's word on the spend state is final, so it is taken before any
+	/// chain lookup: a VTXO it reports spent is stored spent as is, and only a
+	/// VTXO it reports spendable is validated and checked for an exit. Rows are
+	/// written once per state, not once per VTXO. A validated fallback
+	/// commitment is stored spent and reported as skipped.
 	async fn store_recovered_vtxos(
 		&self,
 		report: &mut RecoveryReport,
@@ -524,8 +527,8 @@ impl Wallet {
 		// vtxo as spendable again. A row from an earlier, failed attempt is
 		// forced along.
 		if !spent.is_empty() {
-			self.store_spent_vtxos(spent.iter()).await?;
-			self.mark_vtxos_as_spent(&spent.iter().map(|v| v.id()).collect::<Vec<_>>()).await?;
+			self.store_vtxos(spent.iter(), &VtxoState::Spent).await?;
+			self.mark_vtxos_as_spent(spent.iter().map(|v| v.id())).await?;
 			for vtxo in &spent {
 				debug!("Recovery vtxo {} already spent, skipping", vtxo.id());
 				report.push_skipped(vtxo);
@@ -628,8 +631,7 @@ impl Wallet {
 	/// and no gap limit: the server scans a fixed range of key indices per
 	/// call, and we ask for the next range for as long as the server reports
 	/// that more VTXOs may follow. Each VTXO comes with its body and spend
-	/// state; first storage rechecks status under the wallet lock after chain
-	/// validation. Every index up to the highest
+	/// state, so it needs no further request. Every index up to the highest
 	/// one whose key matches its VTXO is stored as revealed, so the key lookups
 	/// of later scans resolve from the database.
 	///
@@ -638,6 +640,7 @@ impl Wallet {
 		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
 		let payouts = self.properties().await?.server_payouts.context("server payout capability is not known")?;
+
 		let mut start_index = 0u32;
 		let mut cursor_vtxo_id = None;
 		loop {
@@ -653,7 +656,6 @@ impl Wallet {
 				authorization: auth.serialize(),
 				cursor_vtxo_id: cursor_vtxo_id.clone(),
 			};
-
 			let resp = match srv.client.recover_vtxos_by_xpub(req).await {
 				Ok(resp) => resp.into_inner(),
 				Err(status) if status.code() == tonic::Code::Unimplemented => {

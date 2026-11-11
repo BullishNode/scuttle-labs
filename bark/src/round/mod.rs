@@ -1073,7 +1073,6 @@ pub enum RoundFlowState {
 	///
 	/// Persisted before that submission, so a crash in between recovers:
 	/// this record still owns the movement until it is done.
-
 	Redelegating {
 		/// The block height the replacement is scheduled for, if any
 		scheduled_height: Option<BlockHeight>,
@@ -1179,6 +1178,7 @@ async fn start_attempt(
 		.take(participation.outputs.len())
 		.collect::<Vec<(Vec<SecretNonce>, Vec<PublicNonce>)>>();
 
+
 	// The round has now started. We can submit our payment.
 	debug!("Submitting payment request with {} inputs and {} vtxo outputs",
 		participation.inputs.len(), participation.outputs.len(),
@@ -1217,10 +1217,9 @@ async fn start_attempt(
 	wallet.register_vtxo_transactions_with_server(&participation.inputs).await
 		.map_err(HarkForfeitError::Err)?;
 
-	let requests = signed_reqs.into_iter().map(Into::into).collect::<Vec<protos::SignedVtxoRequest>>();
 	let resp = srv.client.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: input_vtxos,
-		vtxo_requests: requests,
+		vtxo_requests: signed_reqs.into_iter().map(Into::into).collect(),
 		#[allow(deprecated)]
 		offboard_requests: vec![],
 		unblinded_mailbox_id: Some(unblinded_mailbox_id.serialize()),
@@ -2142,10 +2141,13 @@ impl Wallet {
 		participation: RoundParticipation,
 		movement_kind: Option<RoundMovement>,
 	) -> anyhow::Result<StoredRoundState> {
-		for output in &participation.outputs {
-			let key = output.policy.user_pubkey();
-			ensure!(self.pubkey_keypair(&key).await?.is_some(),
-				"keypair {} not found for requested round output", key);
+		// Payout mode binds every output to this wallet's mailbox.
+		if self.properties().await?.server_payouts == Some(true) {
+			for output in &participation.outputs {
+				let key = output.policy.user_pubkey();
+				ensure!(self.pubkey_keypair(&key).await?.is_some(),
+					"keypair {} not found for requested round output", key);
+			}
 		}
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 
@@ -2202,10 +2204,13 @@ impl Wallet {
 		// Pending participations over the same inputs stand: the server drops
 		// the ones it holds when it stores this submission, and they notice
 		// on their next sync.
-		for output in &participation.outputs {
-			let key = output.policy.user_pubkey();
-			ensure!(self.pubkey_keypair(&key).await?.is_some(),
-				"keypair {} not found for requested round output", key);
+		// Payout mode binds every output to this wallet's mailbox.
+		if self.properties().await?.server_payouts == Some(true) {
+			for output in &participation.outputs {
+				let key = output.policy.user_pubkey();
+				ensure!(self.pubkey_keypair(&key).await?.is_some(),
+					"keypair {} not found for requested round output", key);
+			}
 		}
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 		self.check_inputs_spendable(&input_ids).await?;

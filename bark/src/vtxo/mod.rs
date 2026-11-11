@@ -371,8 +371,9 @@ impl Wallet {
 	}
 
 	/// Ask the server for the status of `vtxo_id` and move the wallet's vtxo along
-	/// with it. An ordinary spendable reply keeps a locally spent vtxo spent.
-	/// A fallback commitment is also retired to ordinary Spent.
+	/// with it. Adoption only ever moves a vtxo towards spent or in-flight
+	/// resolution: a vtxo the wallet has as spent stays spent, even when the server
+	/// reports it spendable. A fallback commitment is retired to ordinary spent.
 	///
 	/// A locked vtxo is left alone and the server isn't asked at all: returns
 	/// `Ok(None)`. Unlock the vtxo first if you want its status adopted.

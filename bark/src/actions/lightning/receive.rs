@@ -37,7 +37,7 @@ use crate::movement::update::MovementUpdate;
 use crate::movement::{MovementDestination, MovementId, MovementStatus};
 use crate::persist::models::SettledLightningReceive;
 use crate::subsystem::{LightningMovement, LightningReceiveMovement, Subsystem};
-use crate::vtxo::{validate_vtxo_tree_params, VtxoLockHolder};
+use crate::vtxo::{validate_vtxo_tree_params, VtxoLockHolder, VtxoState};
 
 const LN_RECV_NAMESPACE: &str = "ln_recv";
 
@@ -97,11 +97,11 @@ pub struct LightningReceive {
 	#[serde(default)]
 	pub grant_ids: Vec<VtxoId>,
 }
+
 impl LightningReceive {
 	pub fn id(&self) -> WalletActionId {
 		ln_recv_action_id(self.payment_hash)
 	}
-
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -398,7 +398,6 @@ pub(crate) async fn start_lightning_receive(
 		description,
 		expiry_secs: expiry.map(|e| e.as_secs()),
 		claim_pubkey: Some(claim_keypair.public_key().serialize().to_vec()),
-
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();
@@ -416,6 +415,7 @@ pub(crate) async fn start_lightning_receive(
 			);
 		}
 	}
+
 
 	Ok(LightningReceive {
 		invoice,
@@ -796,6 +796,7 @@ async fn claim_lightning_receive_htlcs(
 		Some(destination) => !local_claim_destination(wallet, destination).await.retry()?,
 		None => false,
 	};
+
 	if external_destination {
 		wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await.retry()?;
 		outputs.sort_unstable();
@@ -811,7 +812,7 @@ async fn claim_lightning_receive_htlcs(
 	// Spend the inputs first: these two writes can't be atomic, and counting
 	// the receive in neither balance for a moment beats counting it in both.
 	wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await.retry()?;
-	wallet.store_spendable_vtxos(outputs.iter()).await.retry()?;
+	wallet.store_vtxos(&outputs, &VtxoState::Spendable).await.retry()?;
 
 	// Write the permanent settled record before finishing the movement:
 	// finishing dispatches the `MovementUpdated` notification, and a

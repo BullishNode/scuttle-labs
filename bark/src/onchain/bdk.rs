@@ -328,11 +328,7 @@ impl OnchainWallet {
 		};
 		let signers = wallet.build_signers(desc).context("error building wallet signers")?;
 
-		let mut ret = Self { inner: wallet, signers, db };
-		ret.inner.reveal_addresses_to(KeychainKind::External, 0).for_each(drop);
-		ret.inner.mark_used(KeychainKind::External, 0);
-		ret.persist().await?;
-		Ok(ret)
+		Ok(Self { inner: wallet, signers, db })
 	}
 }
 
