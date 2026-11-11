@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bitcoin::{Amount, OutPoint, Transaction};
+use bitcoin::{Amount, Transaction};
 use bitcoin::consensus::deserialize;
 use bitcoin::hashes::{sha256, Hash};
 use bitcoin::hex::DisplayHex;
@@ -36,7 +36,7 @@ use server::vtxopool::VtxoTarget;
 use ark_testing::{Bark, Captaind, TestContext, btc, lightning_test, require_bark_version, sat};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
 use ark_testing::context::LightningPaymentSetup;
-use ark_testing::daemon::captaind::{self, ArkClient, WalletAdminClient};
+use ark_testing::daemon::captaind::{self, ArkClient};
 use ark_testing::util::{poll_interval, wait_timeout, FutureExt, ToAltString};
 use ark_testing::exit::complete_exit;
 use bitcoin_ext::AmountExt;
@@ -855,19 +855,7 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 	}).create().await;
 	ctx.fund_captaind(&srv, btc(10)).await;
 	srv.wait_for_vtxopool(&ctx).await;
-	// Separate operator-only capital: the existing 10,000-sat CPFP floor.
-	// The payer's 3 BTC funding and 2 BTC board below are unchanged.
-	let fee_address = srv.watchmand().wait_wallet_address().await;
 	let operator_script = srv.watchmand().config().sweep_address.clone().unwrap().assume_checked().script_pubkey();
-	let sponsor_amount = srv.watchmand().config().watchman.min_cpfp_amount;
-	assert_eq!(sponsor_amount, sat(10_000));
-	let sponsor_txid = ctx.bitcoind().fund_addr(fee_address.clone(), sponsor_amount).await;
-	let sponsor_tx = ctx.bitcoind().await_transaction(sponsor_txid).await;
-	let sponsor_outputs = sponsor_tx.output.iter().enumerate()
-		.filter(|(_, out)| out.script_pubkey == fee_address.script_pubkey()).collect::<Vec<_>>();
-	assert_eq!(sponsor_outputs.len(), 1);
-	assert_eq!(sponsor_outputs[0].1.value, sponsor_amount);
-	let sponsor = OutPoint::new(sponsor_txid, sponsor_outputs[0].0 as u32);
 	let funded = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(funded).await;
 	srv.watchmand().wait_for_sync_height(funded).await;
@@ -1007,7 +995,7 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 	let height = core.get_block_count().unwrap() as u32;
 	ctx.generate_blocks(grant_expiry.to_u32().saturating_sub(height)).await;
 	// Observe native publication; never replay or fabricate a grant spend.
-	let fee_change = async {
+	async {
 		loop {
 			let point = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
 			srv.wait_for_sync_height(point.height).await;
@@ -1018,24 +1006,29 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 			}).await.unwrap();
 			if !rebuilt { tokio::time::sleep(Duration::from_millis(50)).await; continue; }
 			let rows = db.read(async |t| Ok(t.query(
-				"SELECT DISTINCT e.vtxo_id,a.sweep_tx,a.sweep_txid,a.status='confirmed' AS confirmed \
+				"SELECT DISTINCT e.vtxo_id,a.sweep_tx,a.sweep_txid,p.fee_sat,a.status='confirmed' AS confirmed \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				JOIN expiry_payout_attempt p ON p.allocation_id=a.id AND p.txid=a.sweep_txid \
 				WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.broadcast_at IS NOT NULL",
 				&[&grant_ids],
 			).await?)).await.unwrap();
 			let mut covered = HashSet::new();
-			let mut fee_change = HashSet::new();
 			let mut deep = true;
 			for row in rows {
 				let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 				deep &= row.get::<_, bool>("confirmed");
-				let Some((child, child_fee)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) else { deep = false; continue; };
 				assert_eq!(parent.compute_txid().to_string(), row.get::<_, String>("sweep_txid"));
+				assert_eq!(parent.version.0, 2);
+				assert!(parent.input.iter().any(|input| input.sequence.to_consensus_u32() <= 0xFFFFFFFD));
 				let granted_id = row.get::<_, String>("vtxo_id");
 				let granted = grants.iter().find(|grant| grant.id().to_string() == granted_id).unwrap();
-				assert!(parent.input.iter().any(|input| input.previous_output == granted.chain_anchor()),
+				let root_input = parent.input.iter().find(|input| input.previous_output == granted.chain_anchor());
+				assert!(root_input.is_some(),
 					"the actual parent must close this precise grant's backing root");
+				let clause = ark::tree::signed::expiry_clause(granted.server_pubkey(), granted.expiry_height());
+				assert!(root_input.unwrap().witness.taproot_leaf_script().is_some_and(|script|
+					script.version == bitcoin::taproot::LeafVersion::TapScript && script.script == clause.as_script()));
 				// This fixture has only operator pool coins in the expired tree.
 				assert!(parent.input.iter().all(|input| grants.iter().any(|v| v.chain_anchor() == input.previous_output)));
 				let mut value = Amount::ZERO;
@@ -1043,35 +1036,19 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 					let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 					value += previous.output[input.previous_output.vout as usize].value;
 				}
-				assert_eq!(parent.output.iter().map(|out| out.value).sum::<Amount>(), value, "operator parent must take no payer fee");
-				assert!(parent.output.iter().filter(|out| out.value > Amount::ZERO).all(|out| out.script_pubkey == operator_script));
-				let anchors = parent.output.iter().enumerate().filter(|(_, out)| out.script_pubkey == *bitcoin_ext::fee::P2A_SCRIPT).collect::<Vec<_>>();
-				assert_eq!(anchors.len(), 1);
-				let anchor = OutPoint::new(parent.compute_txid(), anchors[0].0 as u32);
-				assert_eq!(anchors[0].1.value, Amount::ZERO);
-				assert_eq!(child.input.len(), 2);
-				assert_eq!(child.input.iter().map(|input| input.previous_output).collect::<HashSet<_>>(), HashSet::from([anchor, sponsor]));
-				let anchor_input = child.input.iter().find(|input| input.previous_output == anchor).unwrap();
-				assert!(anchor_input.witness.is_empty() && anchor_input.script_sig.is_empty());
-				assert!(!child.input.iter().find(|input| input.previous_output == sponsor).unwrap().witness.is_empty());
-				let fee = sponsor_amount.checked_sub(child.output.iter().map(|out| out.value).sum::<Amount>()).unwrap();
+				assert!(parent.output.iter().all(|out| out.script_pubkey == operator_script));
+				let fee = value.checked_sub(parent.output.iter().map(|out| out.value).sum::<Amount>()).unwrap();
 				assert!(fee > Amount::ZERO);
-				for (vout, output) in child.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO) {
-					fee_change.insert(OutPoint::new(child.compute_txid(), vout as u32));
-					assert!(output.value < sponsor_amount);
-				}
-				assert_eq!(fee.to_sat(), u64::try_from(child_fee).unwrap());
+				assert_eq!(fee.to_sat(), u64::try_from(row.get::<_, i64>("fee_sat")).unwrap());
 				let Some(parent_info) = core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap() else { deep = false; continue; };
-				let Some(child_info) = core.custom_get_raw_transaction_info(child.compute_txid(), None).unwrap() else { deep = false; continue; };
 				assert_eq!(deserialize::<Transaction>(&parent_info.hex).unwrap(), parent);
-				assert_eq!(deserialize::<Transaction>(&child_info.hex).unwrap(), child);
 				covered.insert(granted_id);
-				if parent_info.confirmations.unwrap_or(0) < 6 || child_info.confirmations.unwrap_or(0) < 6 {
+				if parent_info.confirmations.unwrap_or(0) < 6 {
 					deep = false;
 					ctx.generate_blocks(6).await;
 				}
 			}
-			if covered.len() == grants.len() && deep { break fee_change; }
+			if covered.len() == grants.len() && deep { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}.wait_millis(30_000).await;
@@ -1080,11 +1057,6 @@ async fn intra_ark_granted_receive_canceled_after_htlc_recv_expiry() {
 		assert!(core.get_tx_out(&grant.chain_anchor().txid, grant.chain_anchor().vout, Some(true)).unwrap().is_none(),
 			"no recipient grant backing root may remain live after canonical operator recovery");
 	}
-	let mut admin = WalletAdminClient::connect(format!("http://{}", srv.watchmand().config().admin_address.unwrap())).await.unwrap();
-	let watchman_coins = admin.wallet_status(protos::Empty {}).await.unwrap().into_inner().watchman.unwrap()
-		.confirmed_utxos.into_iter().map(|point| OutPoint::from_str(&point).unwrap()).collect::<HashSet<_>>();
-	assert!(!fee_change.is_empty());
-	assert!(fee_change.is_subset(&watchman_coins), "all unused operator fee capital must remain watchman-owned");
 	// The own attempt is Failed; the SDK must still complete the real signed refund.
 	let before_refund = srv.get_public_rpc().await.check_lightning_payment(protos::CheckLightningPaymentRequest {
 		hash: payment_hash.to_vec(), wait: false, htlc_vtxo_ids: payer_htlc_vtxo_ids.clone(),
