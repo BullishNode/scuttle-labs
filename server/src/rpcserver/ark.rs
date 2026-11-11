@@ -39,7 +39,7 @@ use ark::vtxo::policy::check_block_height;
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
 use server_rpc::{self as rpc, protos, TryFromBytes};
 use crate::database::SpendState;
-use crate::database::expiry_payout::FallbackOutcome;
+use crate::database::expiry_payout::{FallbackOutcome, FallbackReceipt};
 
 use crate::database::rounds::StoredRoundOutput;
 use crate::recovery::NB_NORMAL_CHILDREN;
@@ -94,6 +94,14 @@ fn fallback_spend_state(state: protos::VtxoSpendState,
 	}
 }
 
+fn fallback_payout(receipt: &FallbackReceipt) -> protos::FallbackPayout {
+	protos::FallbackPayout {
+		gross_sat: receipt.gross.to_sat(),
+		fee_sat: receipt.fee.to_sat(),
+		payout_sat: receipt.payout.to_sat(),
+	}
+}
+
 async fn unregistered_board_rpc_status(
 	server: &Server, id: VtxoId, attestation: &VtxoStatusAttestation,
 ) -> Result<Option<protos::GetVtxoStatusResponse>, tonic::Status> {
@@ -111,9 +119,10 @@ async fn unregistered_board_rpc_status(
 	let state = if board.onchain_spent { protos::VtxoSpendState::Spent }
 		else { protos::VtxoSpendState::Unregistered };
 	Ok(Some(protos::GetVtxoStatusResponse {
-		spend_state: fallback_spend_state(state, outcomes.get(&board.root)) as i32,
+		spend_state: fallback_spend_state(state, outcomes.get(&board.root).map(|r| &r.outcome)) as i32,
 		owner_mailbox: board.mailbox.serialize().to_vec(),
 		fallback_committed: outcomes.contains_key(&board.root),
+		fallback_payout: outcomes.get(&board.root).map(fallback_payout),
 	}))
 }
 
@@ -251,9 +260,10 @@ impl rpc::server::ArkService for Server {
 		};
 
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
-			spend_state: fallback_spend_state(spend_state, outcomes.get(&id)) as i32,
+			spend_state: fallback_spend_state(spend_state, outcomes.get(&id).map(|r| &r.outcome)) as i32,
 			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 			fallback_committed: outcomes.contains_key(&id),
+			fallback_payout: outcomes.get(&id).map(fallback_payout),
 		}))
 	}
 
@@ -348,6 +358,7 @@ impl rpc::server::ArkService for Server {
 						vtxo_id: id.to_bytes().to_vec(), spend_state: status.spend_state,
 						owner_mailbox: status.owner_mailbox,
 						fallback_committed: status.fallback_committed,
+						fallback_payout: status.fallback_payout,
 					});
 					continue;
 				}
@@ -362,9 +373,10 @@ impl rpc::server::ArkService for Server {
 
 			vtxos.push(protos::VtxoStatus {
 				vtxo_id: id.to_bytes().to_vec(),
-				spend_state: fallback_spend_state(*spend_state, outcomes.get(&id)) as i32,
+				spend_state: fallback_spend_state(*spend_state, outcomes.get(&id).map(|r| &r.outcome)) as i32,
 				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
 				fallback_committed: outcomes.contains_key(&id),
+				fallback_payout: outcomes.get(&id).map(fallback_payout),
 			});
 		}
 
@@ -440,7 +452,7 @@ impl rpc::server::ArkService for Server {
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
 				spend_state: fallback_spend_state(client_spend_state(v.spend_state,
-					fallback.contains(&v.vtxo.id()))?, outcomes.get(&v.vtxo.id())) as i32,
+					fallback.contains(&v.vtxo.id()))?, outcomes.get(&v.vtxo.id()).map(|r| &r.outcome)) as i32,
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
 				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),

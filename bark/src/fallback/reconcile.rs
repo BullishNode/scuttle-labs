@@ -10,7 +10,7 @@ use lightning_invoice::Bolt11Invoice;
 use server_rpc::protos::{self, VtxoSpendState};
 use server_rpc::StatusExt;
 use crate::Wallet;
-use crate::vtxo::FallbackStatus;
+use crate::vtxo::{FallbackPayout, FallbackStatus};
 
 impl TryFrom<VtxoSpendState> for FallbackStatus {
 	type Error = anyhow::Error;
@@ -25,6 +25,34 @@ impl TryFrom<VtxoSpendState> for FallbackStatus {
 }
 
 impl Wallet {
+	/// Ask the server what it decided for this coin's expiry payout: its
+	/// status, the coin value, the fallback fee and the payout to the wallet's
+	/// fallback address. Returns `None` while no payout has been decided.
+	///
+	/// This is the server's report. Confirm the payout on-chain at `address`
+	/// before counting it as received.
+	pub async fn fallback_payout(&self, vtxo_id: VtxoId) -> anyhow::Result<Option<FallbackPayout>> {
+		let coin = self.get_vtxo_by_id(vtxo_id).await?;
+		let key = self.get_vtxo_key(&coin.vtxo).await?;
+		let (mut srv, _) = self.require_server().await?;
+		let response = srv.client.get_vtxo_status(protos::GetVtxoStatusRequest {
+			vtxo_id: vtxo_id.to_bytes().to_vec(),
+			attestation: VtxoStatusAttestation::new(vtxo_id, &key).serialize(),
+		}).await?.into_inner();
+		let Some(amounts) = response.fallback_payout else { return Ok(None); };
+		let state = VtxoSpendState::try_from(response.spend_state).context("unknown fallback status")?;
+		let mailbox = PublicKey::from_slice(&response.owner_mailbox)?;
+		ensure!(mailbox == self.mailbox_keypair().public_key(), "fallback payout belongs to another mailbox");
+		let network = self.properties().await?.network;
+		Ok(Some(FallbackPayout {
+			status: FallbackStatus::try_from(state)?,
+			gross: bitcoin::Amount::from_sat(amounts.gross_sat),
+			fee: bitcoin::Amount::from_sat(amounts.fee_sat),
+			payout: bitcoin::Amount::from_sat(amounts.payout_sat),
+			address: bitcoin::Address::from_script(&ark::fallback::payout_script(mailbox), network)?,
+		}))
+	}
+
 	pub(crate) async fn receive_fallback_status(&self, hash: PaymentHash, invoice: &Bolt11Invoice, grants: &[VtxoId])
 		-> anyhow::Result<Option<FallbackStatus>>
 	{

@@ -202,6 +202,10 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap().state, bark::vtxo::VtxoState::Spent);
 		assert!(owner.vtxos().await.unwrap().is_empty());
 		assert_eq!(owner.get_vtxo_by_id(id).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
+		let payout = owner.fallback_payout(id).await.unwrap().expect("a decided coin reports its payout");
+		assert_eq!((payout.status, payout.gross, payout.fee, payout.payout),
+			(bark::vtxo::FallbackStatus::Spent, gross, fee, gross - fee));
+		assert_eq!(payout.address.script_pubkey(), *expected_script);
 		let before_refresh = owner.history().await.unwrap();
 		assert!(!before_refresh.iter().any(|movement| movement.subsystem.name == "scuttle.fallback"),
 			"Bitcoin settlement must not synthesize a second Ark movement");

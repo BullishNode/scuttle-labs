@@ -4,7 +4,7 @@ mod signing;
 mod state;
 
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
-pub use self::state::{FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+pub use self::state::{FallbackPayout, FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;

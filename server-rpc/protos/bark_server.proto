@@ -235,6 +235,17 @@ message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
 	bytes owner_mailbox = 2;
 	bool fallback_committed = 3;
+	optional FallbackPayout fallback_payout = 4;
+}
+
+// Amounts the server decided for a coin's expiry payout to `tr(owner_mailbox)`.
+message FallbackPayout {
+	// The coin value taken from Ark.
+	uint64 gross_sat = 1;
+	// The fallback fee withheld from it.
+	uint64 fee_sat = 2;
+	// The amount paid on-chain; zero when the fee consumed the coin.
+	uint64 payout_sat = 3;
 }
 
 message VtxoStatusQuery {
@@ -253,6 +264,7 @@ message VtxoStatus {
 	VtxoSpendState spend_state = 2;
 	bytes owner_mailbox = 3;
 	bool fallback_committed = 4;
+	optional FallbackPayout fallback_payout = 5;
 }
 
 message GetVtxosStatusByIdsResponse {

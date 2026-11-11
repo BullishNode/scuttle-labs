@@ -24,6 +24,7 @@ pub(crate) struct FallbackClaim {
 	pub user_pubkey: PublicKey,
 	pub owner_mailbox: PublicKey,
 	pub gross: Amount,
+	pub fee: Amount,
 	pub payout: Amount,
 	pub confirmed_block: Option<BlockRef>,
 	/// Canonical N6 user discharge, independent of the superseded payout parent.
@@ -57,6 +58,15 @@ pub(crate) enum FallbackOutcome {
 	Pending,
 	Spent,
 	Forfeited,
+}
+
+/// A coin's fallback outcome with the amounts decided for it so far.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FallbackReceipt {
+	pub outcome: FallbackOutcome,
+	pub gross: Amount,
+	pub fee: Amount,
+	pub payout: Amount,
 }
 
 /// A known source cannot retire because only its first paid portion was
@@ -137,7 +147,7 @@ impl Tx<'_> {
 	/// Aggregate direct and stage-selected input-owner portions onto the
 	/// authenticated coin identity. Keep birth ownership separate from payee.
 	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
-		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
+		-> anyhow::Result<BTreeMap<VtxoId, FallbackReceipt>>
 	{
 		if !self.expiry_payouts() { return Ok(BTreeMap::new()); }
 		let claims = self.source_fallback_claims(ids).await?;
@@ -176,9 +186,18 @@ impl Tx<'_> {
 					sum.checked_add(source.vtxo.amount()).context("multi-input receipt principal overflow"))?
 			};
 			let matching = claims.values().filter(|claim| claim.owner_mailbox == *owner
-				&& claim.source_vtxo_ids.iter().any(|source| group.contains(source)));
-			if let Some(outcome) = fallback_outcome(principal, matching)? {
-				outcomes.insert(id, outcome);
+				&& claim.source_vtxo_ids.iter().any(|source| group.contains(source)))
+				.collect::<Vec<_>>();
+			if let Some(outcome) = fallback_outcome(principal, matching.iter().copied())? {
+				let sum = |amount: fn(&FallbackClaim) -> Amount| matching.iter()
+					.try_fold(Amount::ZERO, |sum, claim| sum.checked_add(amount(claim)))
+					.context("fallback receipt amount overflow");
+				outcomes.insert(id, FallbackReceipt {
+					outcome,
+					gross: sum(|claim| claim.gross)?,
+					fee: sum(|claim| claim.fee)?,
+					payout: sum(|claim| claim.payout)?,
+				});
 			}
 		}
 		Ok(outcomes)
@@ -237,7 +256,7 @@ impl Tx<'_> {
 	/// or replace the wallet's independent canonical-chain confirmation check.
 	async fn fallback_claims(&self, ids: &[VtxoId], point: BlockRef) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let rows = self.query("SELECT c.vtxo_id,c.owner_mailbox,c.user_pubkey,c.evidence::TEXT AS evidence,c.gross_sat,c.payout_sat,
+		let rows = self.query("SELECT c.vtxo_id,c.owner_mailbox,c.user_pubkey,c.evidence::TEXT AS evidence,c.gross_sat,c.fee_sat,c.payout_sat,
 			CASE WHEN a.status='confirmed'
 				AND cv.processed_height >= a.confirmed_height+5
 				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
@@ -276,6 +295,7 @@ impl Tx<'_> {
 				user_pubkey: row.get::<_, &str>("user_pubkey").parse()?,
 				owner_mailbox: row.get::<_, &str>("owner_mailbox").parse()?,
 				gross: Amount::from_sat(u64::try_from(row.get::<_, i64>("gross_sat"))?),
+				fee: Amount::from_sat(u64::try_from(row.get::<_, i64>("fee_sat"))?),
 				payout: Amount::from_sat(u64::try_from(row.get::<_, i64>("payout_sat"))?),
 				confirmed_block,
 				user_claimed: row.get("user_claimed"),
@@ -551,7 +571,7 @@ mod tests {
 			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
 			binding_source: None, user_pubkey: key,
 			owner_mailbox: key, gross: Amount::from_sat(40_000),
-			payout: Amount::from_sat(39_000),
+			fee: Amount::from_sat(1_000), payout: Amount::from_sat(39_000),
 			confirmed_block: None, user_claimed: false,
 		};
 		let principal = Amount::from_sat(100_000);
@@ -562,7 +582,7 @@ mod tests {
 		let mut second = FallbackClaim {
 			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), owner_mailbox: key,
 			binding_source: None, user_pubkey: key,
-			gross: Amount::from_sat(60_000), payout: Amount::ZERO,
+			gross: Amount::from_sat(60_000), fee: Amount::from_sat(2_000), payout: Amount::ZERO,
 			confirmed_block: None, user_claimed: false,
 		};
 		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
