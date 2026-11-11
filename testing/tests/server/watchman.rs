@@ -1018,14 +1018,14 @@ async fn watchman_sweeps_exit_after_forfeit() {
 
 	// Clone bark1 before refresh — bark2 retains the stale board vtxo state
 	let bark1_old = bark1.full_clone("bark2").await;
+	// Exit start syncs the wallet, so select the board coin before the round
+	// announces its replacement. Progressing the exit happens after refresh.
+	bark1_old.start_exit_all().await;
 
 	// bark1 refreshes its board vtxo into a round vtxo
 	ctx.refresh_all(&srv, &[&bark1]).await;
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	bark1.sync().await;
-
-	// bark2, holding the stale board vtxo, starts a malicious exit
-	bark1_old.start_exit_all().await;
 
 	// Progress until the exit transaction is confirmed on-chain (AwaitingDelta state).
 	progress_exit_until_awaiting_delta(&ctx, &bark1_old).await;
@@ -1110,6 +1110,9 @@ async fn watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table() {
 
 	// Clone bark1 before refresh — bark2 retains the stale board vtxo state
 	let bark1_old = bark1.full_clone("bark2").await;
+	// Exit start syncs the wallet, so select the board coin before the round
+	// announces its replacement. Progressing the exit happens after refresh.
+	bark1_old.start_exit_all().await;
 
 	// bark1 refreshes its board vtxo into a round vtxo. The hArk round stores
 	// the participation's unlock hash and preimage in round_participation.
@@ -1136,9 +1139,6 @@ async fn watchman_sweeps_forfeit_with_preimage_in_ln_settlement_table() {
 	db.write(async |t| t.store_htlc_settlement(unlock_preimage).await)
 		.await
 		.unwrap();
-
-	// bark1_old, holding the stale board vtxo, starts a malicious exit
-	bark1_old.start_exit_all().await;
 
 	// Progress until the exit transaction is confirmed on-chain (AwaitingDelta state).
 	progress_exit_until_awaiting_delta(&ctx, &bark1_old).await;
