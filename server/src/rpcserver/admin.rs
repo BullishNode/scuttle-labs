@@ -225,6 +225,7 @@ impl rpc::server::BanAdminService for Server {
 		self.db.write(async |t| t.ban_vtxo(vtxo_id, until_height).await).await.to_status()?;
 		Ok(tonic::Response::new(protos::Empty {}))
 	}
+
 	#[tracing::instrument(skip(self, req))]
 	async fn unban_vtxo(
 		&self,
@@ -253,7 +254,6 @@ impl rpc::server::BanAdminService for Server {
 		Ok(tonic::Response::new(protos::ListBannedVtxosResponse { banned_vtxos }))
 	}
 }
-
 
 /// Run the captaind admin gRPC endpoint.
 pub async fn run_rpc_server(srv: Arc<Server>) -> anyhow::Result<()> {

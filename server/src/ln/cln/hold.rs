@@ -680,7 +680,7 @@ impl ClnHoldProcess {
 		// An unrelated outgoing payment sharing the hash is left alone.
 		if let Some(payment_attempt) = payment_attempt {
 			debug!("HTLC subscription canceled with ongoing payment attempt, \
-				marked as failed: {}", payment_attempt.id,
+				marking as failed: {}", payment_attempt.id,
 			);
 			self.payment_handler().notify_payment_failed(&payment_attempt, Some(reason)).await?;
 		} else {

@@ -126,8 +126,8 @@ pub(crate) fn check_max_amount(
 		Some(max) if amount > max => badarg!("{feature} amount exceeds limit of {max}"),
 		_ => Ok(()),
 	}
-
 }
+
 
 /// Return type for the round event RPC stream.
 ///
@@ -614,10 +614,10 @@ impl Server {
 
 	/// The height by which a tx broadcast via the nursery right now is
 	/// expected to confirm.
-
 	fn nursery_confirm_target(&self) -> BlockHeight {
 		self.chain_tip().height + self.config.nursery_confirm_target_blocks
 	}
+
 
 	pub async fn new_onchain_address(&self) -> anyhow::Result<Address> {
 		let mut wallet = self.rounds_wallet.lock().await;
@@ -1020,6 +1020,7 @@ impl Server {
 			let stored = self.db.read(async |t| t.get_user_vtxo_by_id(vtxo_id).await).await
 				.context(vtxo_id)
 				.badarg("vtxo not found in database")?;
+
 			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			// Check vtxo is fully signed

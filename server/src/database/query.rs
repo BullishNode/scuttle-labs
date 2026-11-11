@@ -381,8 +381,7 @@ pub async fn complete_round_participation(
 	}
 
 	let output_rows = tx.query(
-		"SELECT policy, amount, unblinded_mailbox_id FROM round_part_output \
-			WHERE participation_id = $1",
+		"SELECT policy, amount, unblinded_mailbox_id FROM round_part_output WHERE participation_id = $1",
 		&[&part_id],
 	).await?;
 

@@ -41,7 +41,7 @@ use crate::database::block::BlockTable;
 use crate::database::htlc_vtxo::{self, HtlcDirection, HtlcResolution, HtlcVtxo};
 use crate::database::tree::VtxoTreeUpdate;
 use crate::database::ln::{
-	LightningHtlcSubscription, LightningHtlcSubscriptionStatus,
+	LightningHtlcSubscription, LightningHtlcSubscriptionStatus, LightningPaymentStatus,
 };
 use crate::error::ContextExt;
 use crate::destination::DestinationBindings;
@@ -139,13 +139,13 @@ pub(crate) fn validate_intra_ark_payment(
 	if payment_amount < subscription.amount() {
 		return badarg!(
 			"payment amount of {} is less than the invoiced amount of {}",
-
 			payment_amount, subscription.amount(),
 		);
 	}
 
 	Ok(())
 }
+
 
 /// The margin (in blocks) the server requires between the current chain tip
 /// and the lowest incoming HTLC expiry when cosigning a lightning receive
@@ -486,7 +486,6 @@ impl Server {
 				).await.inspect_err(|e| {
 					warn!("Failed to look up attempt for {}: {:#}", payment_hash, e);
 				}).ok().flatten().and_then(|a| a.error);
-
 				let kind = LightningFailureKind::classify(error.as_deref());
 
 				lightning_payment_status::PaymentStatus::Failed(protos::LightningPaymentFailure {
@@ -515,6 +514,7 @@ impl Server {
 		destinations: &DestinationBindings,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		let tip = self.chain_tip().height as BlockHeight;
+		let db = self.db.clone();
 
 		let requested_policy = cosign_request.all_outputs()
 			.all_same(|v| v.policy.clone())
@@ -544,6 +544,7 @@ impl Server {
 		slog!(LightningPayHtlcsRevocationRequested, payment_hash,
 			htlc_vtxo_ids: htlc_vtxo_ids.clone(),
 		);
+
 		if self.htlc_settler.is_settled(payment_hash).await?.is_some() {
 			return badarg!("invoice has already been paid");
 		}
@@ -558,21 +559,19 @@ impl Server {
 		let builder = self.validate_cosign_request(validation, cosign_request)
 			.badarg("invalid cosign request")?;
 
-		// Match upstream's source-bound revocation eligibility. For a
-		// pending external attempt past its HTLC expiry, reconcile its
-		// recorded node outcome one last time. The settlement WAL is also
-		// checked inside the refund transaction below.
-		let attempt = self.db.read(async |t|
+		// The payment these HTLCs were committed to, not another sender's
+		// payment to the same hash.
+		let attempt = db.read(async |t|
 			t.get_latest_payment_attempt_by_htlc_vtxos(&htlc_vtxo_ids).await
 		).await?;
 		if let Some(attempt) = attempt {
-			use crate::database::ln::LightningPaymentStatus;
 			match attempt.status {
 				LightningPaymentStatus::Failed => {},
 				LightningPaymentStatus::Succeeded => {
 					error!("This lightning payment has completed, but no preimage found. Accepting revocation");
 				},
 				_ if tip > input_policy.htlc_expiry => {
+					// Check one last time to see if it completed
 					if !attempt.is_self_payment() {
 						if let Ok(Some(refreshed)) = self.lightning_manager
 							.reconcile_lightning_attempt(attempt.id).await {
@@ -599,9 +598,15 @@ impl Server {
 			.bind_owner_mailboxes(bindings)?;
 		self.db.write(async |t| {
 			t.lock_settlement_sources(payment_hash).await?;
-			// Keep the upstream settlement check in this write transaction so
-			// a preimage cannot race the refund after the early eligibility read.
+			// Re-check the settlement inside the write tx: the early gate and
+			// the eligibility read above both run in their own (read)
+			// transactions, so a payment can settle between them and this write.
+			// `ensure_not_settled` locks out the settlement write and commits
+			// the check atomically with the vtxo-tree update below, so a
+			// settled payment can no longer be refunded (which would
+			// double-pay the sender).
 			t.ensure_not_settled(payment_hash).await?;
+
 			if self.config.expiry_payouts {
 				let owners = t.coin_owner_mailboxes(&htlc_vtxo_ids).await?;
 				let first = htlc_vtxo_ids.first().and_then(|id| owners.get(id))
@@ -765,12 +770,11 @@ impl Server {
 							);
 						}
 					}
-					if !self.config.expiry_payouts {
-						if let Some(requested) = claim_pubkey {
-							if subscription.claim_pubkey != Some(requested) {
-								return badarg!("an invoice for payment hash {} already exists \
-									with a different claim key", payment_hash);
-							}
+					if let Some(requested) = claim_pubkey {
+						if subscription.claim_pubkey != Some(requested) {
+							return badarg!("an invoice for payment hash {} already exists \
+								with a different claim key", payment_hash,
+							);
 						}
 					}
 					trace!("Found existing created subscription, returning invoice: {}",
@@ -1133,7 +1137,6 @@ impl Server {
 			// Idempotent retry of an already-settled claim; the value was
 			// released with the first claim, nothing new is at stake.
 			LightningHtlcSubscriptionStatus::Settled => {},
-
 			_ => return badarg!("payment status in incorrect state: {}", sub.status),
 		}
 		// Only the first claim records the fee; Settled-replay must not.
@@ -1225,6 +1228,7 @@ impl Server {
 		Ok(builder.cosign_response())
 	}
 }
+
 
 #[cfg(test)]
 mod tests {

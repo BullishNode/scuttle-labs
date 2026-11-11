@@ -28,7 +28,6 @@ pub mod intman;
 pub mod ln;
 pub mod nursery;
 pub mod rounds;
-
 pub mod tree;
 pub mod vtxopool;
 pub mod xpay;
@@ -38,6 +37,7 @@ mod query;
 
 pub use self::block::BlockTable;
 pub use self::model::*;
+
 
 use std::borrow::Borrow;
 use std::str::FromStr;
@@ -79,7 +79,7 @@ const NOARG: &[&bool] = &[];
 
 const DEFAULT_DATABASE: &str = "postgres";
 
-/// Advisory lock keys for PostgreSQL transaction and session locks.
+/// Advisory lock keys for `pg_advisory_xact_lock`.
 ///
 /// Each variant maps to a unique lock id. Using an enum avoids
 /// computing `hashtext(...)` at runtime and makes every lock site
@@ -489,7 +489,7 @@ impl<'t> Tx<'t> {
 		&self,
 		update: tree::VtxoTreeUpdate,
 	) -> anyhow::Result<u64> {
-		tree::execute_vtxo_tree_update(self, update).await
+		tree::execute_vtxo_tree_update(&self, update).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -696,6 +696,7 @@ impl<'t> Tx<'t> {
 				MailboxType::ArkoorReceive |
 					MailboxType::RecoveryVtxoId => {},
 			}
+
 			// so now we are in a mailbox type that is multi-row
 			// we check if we have an item ongoing
 			let entry = current_entry.get_or_insert_with(|| MailboxEntry {
@@ -745,7 +746,6 @@ impl<'t> Tx<'t> {
 			telemetry::set_mailbox_get_metric(entry.mailbox_type(), entry.len());
 			res.push(entry);
 		}
-
 
 		Ok(res)
 	}
@@ -1029,7 +1029,7 @@ impl<'t> Tx<'t> {
 				&forfeit_result.connector_vtxos, SpendState::OffboardConnector
 			)
 			.mark_vtxos_offboard_spent(offboard_triples);
-		tree::execute_vtxo_tree_update(self, update).await?;
+		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// register the connector output vtxo directly into the frontier, so
 		// the watchman can sweep it once the input vtxos have expired

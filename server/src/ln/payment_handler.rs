@@ -63,7 +63,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 		let failure = LightningFailureKind::classify(error.or(attempt.error.as_deref()));
 
 		self.post_lightning_send_finished(
-			attempt, None, Some(failure),
+			attempt.id, attempt.payment_hash, None, Some(failure),
 		).await;
 
 		// Attempted amount (not final_amount_msat) so failed/succeeded
@@ -101,11 +101,11 @@ impl<'a> PaymentAttemptHandler<'a> {
 		// Native success is authoritative even when an optimistic status write
 		// loses its race. Its actual attempt provenance and WAL commit together.
 		if let Some(preimage) = preimage {
-			ensure!(
+			debug_assert!(
 				matches!(status, LightningPaymentStatus::Succeeded),
 				"payment is succeeded if preimage is known, not {}", status,
 			);
-			ensure!(
+			debug_assert!(
 				preimage.compute_payment_hash() == attempt.payment_hash,
 				"preimage must match payment hash",
 			);
@@ -169,7 +169,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 
 			if status.is_final() {
 				self.post_lightning_send_finished(
-					attempt, preimage, failure,
+					attempt.id, attempt.payment_hash, preimage, failure,
 				).await;
 			}
 
@@ -212,13 +212,13 @@ impl<'a> PaymentAttemptHandler<'a> {
 	/// Post a lightning send finished notification to the sender's mailbox.
 	async fn post_lightning_send_finished(
 		&self,
-		attempt: &LightningPaymentAttempt,
+		payment_attempt_id: i64,
+		payment_hash: PaymentHash,
 		preimage: Option<Preimage>,
 		failure: Option<LightningFailureKind>,
 	) {
-		let payment_hash = attempt.payment_hash;
 		let mailbox_id = match self.db.read(async |t|
-			t.get_lightning_sender_mailbox_id(attempt.id).await
+			t.get_lightning_sender_mailbox_id(payment_attempt_id).await
 		).await {
 			Ok(Some(id)) => id,
 			Ok(None) => return,

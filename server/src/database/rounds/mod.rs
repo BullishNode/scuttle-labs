@@ -127,7 +127,7 @@ impl<'t> Tx<'t> {
 			.insert_unclaimed_vtxos(signed_tree.output_vtxos().map(ServerVtxo::from))
 			.mark_vtxos_round_spent(input_vtxos.into_iter().map(|id| (id, round_id)))
 			.bind_owner_mailboxes(owner_bindings.iter().copied())?;
-		tree::execute_vtxo_tree_update(self, update).await?;
+		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// register the funding output vtxos directly into the frontier
 		self.add_funding_vtxos_to_frontier(funding_txid, None).await?;
@@ -445,7 +445,7 @@ impl<'t> Tx<'t> {
 		// oor_spent_txid may have been set by set_forfeit_transactions after finish_round.
 		let update = tree::VtxoTreeUpdate::new()
 			.undo_round(round_db_id);
-		tree::execute_vtxo_tree_update(self, update).await?;
+		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// Delete round_part_input and round_part_output before round_participation (FK).
 		let stmt = self.prepare_typed(

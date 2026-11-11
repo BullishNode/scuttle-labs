@@ -523,11 +523,6 @@ impl<'t> Tx<'t> {
 		claim_pubkey: Option<PublicKey>,
 		user_agent: Option<&str>,
 	) -> anyhow::Result<()> {
-	if self.expiry_payouts() {
-		if claim_pubkey.is_none() || receiver_mailbox_id.is_none() {
-			return crate::error::badarg!("receive subscription requires claim key and mailbox");
-		}
-	}
 		let payment_hash = invoice.payment_hash();
 		let mailbox_str = receiver_mailbox_id.map(|id| id.to_string());
 		let claim_pubkey_str = claim_pubkey.map(|k| k.to_string());
@@ -924,12 +919,12 @@ impl<'t> Tx<'t> {
 	/// Retrieve the sender's mailbox ID of a lightning payment attempt.
 	pub async fn get_lightning_sender_mailbox_id(
 		&self,
-		attempt_id: i64,
+		payment_attempt_id: i64,
 	) -> anyhow::Result<Option<ark::mailbox::MailboxIdentifier>> {
 		let stmt = self.prepare(
 			"SELECT sender_mailbox_id FROM lightning_payment_attempt WHERE id = $1"
 		).await?;
-		let row = self.query_opt(&stmt, &[&attempt_id]).await?;
+		let row = self.query_opt(&stmt, &[&payment_attempt_id]).await?;
 
 		match row {
 			Some(row) => {
@@ -1020,7 +1015,7 @@ impl<'t> Tx<'t> {
 	}
 
 	/// Mark only this attempt's linked, spendable sources as consumed.
-	/// Return nonspendable sources left untouched; already-ln-spent is idempotent.
+	/// Return the linked sources left untouched, e.g. already `ln-spent` ones.
 	pub async fn mark_htlc_send_vtxos_ln_spent(
 		&self,
 		attempt_id: i64,
@@ -1042,7 +1037,7 @@ impl<'t> Tx<'t> {
 				RETURNING vtxo.vtxo_id
 			)
 			SELECT vtxo_id FROM found
-			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated) AND spend_state <> 'ln-spent'
+			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated)
 		").await?;
 
 		let rows = self.query(&stmt, &[&attempt_id]).await
@@ -1086,18 +1081,19 @@ impl<'t> Tx<'t> {
 		Ok(())
 	}
 
-	/// Conservative hash-level gate retained alongside the source predicate
-	/// until the source-specific release controls have passed: errors with a
+	/// The sole sanctioned settlement gate for any fund-releasing path
+	/// (revocation, refund, re-issuing sender vtxos): errors with a
 	/// [`BadArgument`](crate::error::BadArgument) if the invoice was already paid.
 	///
 	/// The `htlc_settlement` table is the single source of truth for
 	/// settlement. A preimage here means the payment completed, regardless of
 	/// [`LightningPaymentStatus`]: the node can settle without the status write
-	/// committing (for example a lost optimistic-lock race), so status may read
+	/// committing (a lost optimistic-lock race, or a crash between recording the
+	/// preimage and updating the status), so the status may still read
 	/// `Submitted`/`Failed` for a payment that actually went through. Never gate
 	/// a fund-releasing decision on the status; call this instead.
 	///
-	/// Hold the shared settlement lock INSIDE the write transaction so a
+	/// Call this INSIDE the write transaction that releases the funds so a
 	/// settlement racing between an earlier read-check and the write cannot
 	/// slip through. It takes the `HtlcSettlementWrite` advisory lock.
 	pub async fn ensure_not_settled(

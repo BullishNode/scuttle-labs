@@ -8,9 +8,9 @@
 //! ones: `attempt_expiry` replaces `retry_for` and `htlc_expiry` replaces
 //! `maxdelay`. The conversion happens when we call `xpay`.
 //!
-//! `attempt_expiry` records the original wall retry budget. CLN takes a relative
-//! duration; an elapsed local timestamp does not certify that a remote call
-//! ended or never began. Automatic re-drive is not enabled by this record.
+//! `attempt_expiry` is the one request column every attempt must have: it is
+//! the moment xpay stops retrying, which is what tells a final failure from a
+//! failure xpay may still turn around.
 //!
 //! A row is written in the same transaction as the `lightning_payment_attempt`
 //! it belongs to and ended in the same transaction as that attempt's final

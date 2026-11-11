@@ -74,21 +74,6 @@ async fn failed_external_payout(settle_during_decision: bool) {
 		VtxoPolicy::new_server_htlc_send(key.public_key(), hash, deadline)).await;
 	let id = source.id();
 	lightning.sync().await;
-	let (native_tip, server_tip) = {
-		// This is a genuine older native chain view, not a fake getinfo
-		// response. RPC stays available on the existing authenticated node.
-		assert!(!lightning.internal.bitcoind().sync_client()
-			.call::<bool>("setnetworkactive", &[serde_json::json!(false)]).unwrap());
-		let native_tip = lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner().blockheight;
-		// Use the primary directly: the normal all-node barrier must not wait
-		// for the deliberately disconnected secondary until it is restored.
-		ctx.bitcoind().generate(1).await;
-		let server_tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-		srv.wait_for_sync_height(server_tip).await;
-		assert!(server_tip.to_u32() > native_tip);
-		assert_eq!(lightning.internal.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner().blockheight, native_tip);
-		(native_tip, server_tip)
-	};
 	let dispatched_invoice = invoice.clone();
 	let mut rpc = srv.get_public_rpc().await;
 	let mut xpay_called = srv.subscribe_log::<XpayRpcCalled>();
@@ -151,17 +136,6 @@ async fn failed_external_payout(settle_during_decision: bool) {
 	assert!(!info.version.is_empty());
 	assert_eq!(info.network, srv.config().network.to_string());
 	assert_eq!(row.get::<_, Vec<u8>>("pubkey"), info.id);
-	assert_eq!(info.blockheight, native_tip);
-	let maxdelay = u64::from(called.max_delay);
-	let recorded_deadline = u64::try_from(row.get::<_, Option<i32>>("htlc_expiry").unwrap()).unwrap();
-	assert!(u64::from(server_tip.to_u32()) + maxdelay <= recorded_deadline);
-	assert!(u64::from(native_tip) + maxdelay < recorded_deadline,
-		"a genuinely lagging native tip must not enlarge the relative delay");
-
-	assert!(lightning.internal.bitcoind().sync_client()
-		.call::<bool>("setnetworkactive", &[serde_json::json!(true)]).unwrap());
-	ctx.await_block_count_sync().await;
-	lightning.internal.wait_for_block_sync().await;
 
 	drop(client);
 	let fee_address = srv.watchmand().wait_wallet_address().await;

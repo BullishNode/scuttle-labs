@@ -365,8 +365,8 @@ impl VtxoPool {
 		// We sort the vtxos in order of increasing amounts
 		// This ensures we spend the smallest vtxos first and
 		// we don't have any vtxo that serves as change
-
 		input_vtxos.sort_by(|v1, v2| v1.amount().cmp(&v2.amount()));
+
 		// Validate that the inputs are still usable and unlocked
 		let _vtxo_guard = srv.vtxos_in_flux.try_lock(&input_ids).map_err(|e| {
 			anyhow::anyhow!("some VTXO is already locked by another process: {}", e.id)

@@ -351,24 +351,18 @@ impl LightningManager {
 		// stored, so a payment we cannot make leaves nothing behind.
 		let new_xpay = async {
 			if sub.is_some() { return Ok::<_, anyhow::Error>(None); }
-			// A lagging CLN must not enlarge the route's budget beyond the
-			// processed server tip or the height already bound to this attempt.
-			let server_tip = self.db.read(async |t| t.get_highest_block(database::BlockTable::Captaind).await)
-				.await?.map(|block| block.height).unwrap_or(attempt_block_height);
-			let tip = BlockHeight::new(tip).max(server_tip).max(attempt_block_height);
 			// NB: we don't want a lightning payment to take more time than the
 			// htlc-send expiry leaves us with.
 			let max_cltv_expiry_delta = htlc_send_expiry_height
-				.checked_blocks_since(tip + self.htlc_expiry_delta)
+				.checked_blocks_since(BlockHeight::new(tip) + self.htlc_expiry_delta)
 				.context("HTLC expiry height is too soon to perform a lightning payment")?;
-			ensure!(max_cltv_expiry_delta > 0, "no HTLC delay remains to perform a lightning payment");
 			let max_cltv_expiry_delta = BlockDelta::try_from(max_cltv_expiry_delta)
 				.unwrap_or(BlockDelta::MAX);
 
 			// The absolute form of the relative deadlines the xpay call takes.
 			let attempt_expiry = Local::now() + TimeDelta::from_std(retry_for)
 				.context("retry_for does not fit in a timestamp")?;
-			let htlc_expiry = tip + max_cltv_expiry_delta;
+			let htlc_expiry = BlockHeight::new(tip) + max_cltv_expiry_delta;
 
 			// A unique label ties this call to CLN's own record of it.
 			let label = Uuid::new_v4().to_string();
@@ -817,7 +811,8 @@ impl LightningManager {
 	///   an invoice while a cooperative claim settles it.
 	///
 	/// - Retry on failure: a settlement that fails is retried on the same
-	///   item every 5 seconds until it succeeds, so it is not abandoned.
+	///   item every 5 seconds until it succeeds, so one stuck preimage does
+	///   not advance past unsettled work but never abandons it either.
 	///
 	/// - Backoff: 5s sleep between retries avoids busy-looping when the
 	///   backend or database is persistently unavailable. The preimage is
@@ -845,7 +840,9 @@ async fn run_hold_settler(
 		};
 
 		let Some(settlement) = item else { break };
-		while !try_settle_hold_invoice(&srv, settlement.hash, settlement.preimage).await {
+		let (payment_hash, preimage) = (settlement.hash, settlement.preimage);
+
+		while !try_settle_hold_invoice(&srv, payment_hash, preimage).await {
 			tokio::select! {
 				_ = tokio::time::sleep(Duration::from_secs(5)) => {},
 				_ = srv.rtmgr.shutdown_signal() => return,

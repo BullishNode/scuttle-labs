@@ -96,9 +96,9 @@ use tracing::{info, trace, warn};
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId};
 use ark::vtxo::policy::signing::VtxoSigner;
 use bitcoin_ext::{fee, BlockHeight, BlockRef, TxStatus, P2TR_DUST};
+use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoin_ext::bdk::KEYCHAIN;
 use bitcoin_ext::cpfp::MakeCpfpFees;
-use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 
@@ -1108,7 +1108,7 @@ impl Watchman {
 
 		// Broadcast the progress tx and CPFP as a package
 		let cpfp_txid = cpfp_tx.compute_txid();
-		bcd::submit_package(&self.bitcoind, &[&progress_tx, &cpfp_tx]).await?;
+		bcd::submit_package(&self.bitcoind, &[progress_tx, cpfp_tx]).await?;
 
 		slog!(ProgressBroadcast, vtxo_id: vtxo.id(), txid, cpfp_txid);
 
