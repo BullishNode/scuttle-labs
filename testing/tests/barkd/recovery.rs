@@ -33,6 +33,14 @@ fn partition_recovered(vtxos: Vec<WalletVtxoInfo>) -> (Vec<WalletVtxoInfo>, Vec<
 	(spendable, spent)
 }
 
+fn assert_incomplete_recovery(ctx: &TestContext, name: &str, error: anyhow::Error) {
+	let message = format!("{error:#}");
+	assert!(message.contains("500 Internal Server Error"), "unexpected create error: {message}");
+	let log = std::fs::read_to_string(ctx.datadir.join(name).join("debug.log")).unwrap();
+	assert!(log.contains("seed recovery left VTXOs unaccounted for"),
+		"wallet creation must report the incomplete recovery");
+}
+
 /// A failed xpub lookup cannot produce a successful restore with a misleading
 /// zero balance. The partial wallet is removed so the same seed can be retried.
 #[tokio::test]
@@ -811,14 +819,14 @@ async fn recovered_wallet_finds_mixed_origin_vtxos() {
 	recovered.send(&recipient.ark_address().await, Amount::from_sat(649_443)).await;
 }
 
-/// Recovery tolerates a valid VTXO it cannot own.
+/// Recovery refuses a valid VTXO it cannot own.
 ///
 /// Anyone who knows the mailbox id can post a valid, server-fetchable VTXO we
-/// don't own. Recovery must skip it gracefully — not hang on the key search, not
-/// abort wallet creation — and still recover the VTXOs we *do* own.
+/// don't own. A partial seed restore must fail visibly; the same seed can
+/// still recover its own VTXO through the unmodified server.
 #[tokio::test]
-async fn recovered_wallet_skips_unownable_vtxo() {
-	let ctx = TestContext::new("barkd/recovered_wallet_skips_unownable_vtxo").await;
+async fn recovered_wallet_refuses_unownable_vtxo_then_retries() {
+	let ctx = TestContext::new("barkd/recovered_wallet_refuses_unownable_vtxo_then_retries").await;
 	let srv = ctx.captaind("server").funded(btc(10)).create().await;
 
 	// A foreign wallet boards a VTXO: it's valid and fetchable from the server,
@@ -858,18 +866,20 @@ async fn recovered_wallet_skips_unownable_vtxo() {
 	let proxy = srv.start_proxy_with_mailbox((), InjectForeignId { foreign_id }).await;
 
 	// Recover from our seed, talking to the server through the injecting proxy.
-	let recovered = ctx.barkd("victim_recovered", &srv)
-		.mnemonic(mnemonic)
+	let error = ctx.barkd("victim_recovered", &srv)
+		.mnemonic(mnemonic.clone())
 		.cfg({
 			let addr = proxy.address.clone();
 			move |c| c.server_address = addr
 		})
-		.create().await;
+		.try_create().await.err().expect("foreign VTXO must make seed recovery incomplete");
+	assert_incomplete_recovery(&ctx, "victim_recovered", error);
+	let recovered = ctx.barkd("victim_recovered_retry", &srv)
+		.mnemonic(mnemonic).create().await;
 	recovered.onchain_sync().await;
 	recovered.sync().await;
 
-	// Wallet creation returned (recovery did not hang or abort) and we recovered
-	// exactly our own VTXO; the unownable foreign one was skipped.
+	// A clean retry recovers exactly our own VTXO.
 	let after = recovered.vtxos(Some(true)).await;
 	assert_eq!(after.len(), 1,
 		"recovered wallet should hold only its own VTXO, got {:?}", after);
@@ -878,14 +888,14 @@ async fn recovered_wallet_skips_unownable_vtxo() {
 		"unownable foreign VTXO must not be recovered");
 }
 
-/// Recovery records a vtxo as spendable only when the server says it is.
+/// Recovery refuses to open when the server cannot report spend state.
 ///
 /// The server fails every status request, so recovery has no answer for any
-/// vtxo after its three retries. It must keep them all locked rather than
-/// offer a vtxo that may well be spent as an input.
+/// vtxo after its three retries. It must refuse an incomplete restore rather
+/// than offer a vtxo that may well be spent as an input.
 #[tokio::test]
-async fn recovered_wallet_locks_vtxos_without_a_status() {
-	let ctx = TestContext::new("barkd/recovered_wallet_locks_vtxos_without_a_status").await;
+async fn recovered_wallet_refuses_to_open_without_status() {
+	let ctx = TestContext::new("barkd/recovered_wallet_refuses_to_open_without_status").await;
 	// The xpub lookup carries each VTXO's body and status itself, so it is
 	// turned off to send recovery through the mailbox path under test.
 	let srv = ctx.captaind("server").funded(btc(10))
@@ -913,35 +923,36 @@ async fn recovered_wallet_locks_vtxos_without_a_status() {
 	}
 
 	let proxy = srv.start_proxy_with_mailbox(NoStatus, ()).await;
-	let recovered = ctx.barkd("sender_recovered", &srv)
-		.mnemonic(sender.mnemonic().await)
+	let mnemonic = sender.mnemonic().await;
+	let error = ctx.barkd("sender_recovered", &srv)
+		.mnemonic(mnemonic.clone())
 		.cfg({
 			let addr = proxy.address.clone();
 			move |c| c.server_address = addr
 		})
-		.create().await;
+		.try_create().await.err().expect("missing status must make seed recovery incomplete");
+	assert_incomplete_recovery(&ctx, "sender_recovered", error);
+	let recovered = ctx.barkd("sender_recovered_retry", &srv)
+		.mnemonic(mnemonic).create().await;
 
 	let after = recovered.vtxos(Some(true)).await;
-	assert!(!after.iter().any(|v| v.state == VtxoStateInfo::Spendable),
-		"no vtxo may be spendable without the server saying so, got {:?}", after);
 	for vtxo in &before {
 		let found = after.iter().find(|v| v.vtxo.id == vtxo.vtxo.id)
-			.unwrap_or_else(|| panic!("recovered wallet should hold VTXO {:?}", vtxo.vtxo.id));
-		assert!(matches!(found.state, VtxoStateInfo::Locked { .. }),
-			"a vtxo without a status should be locked, got {:?}", found.state);
+			.unwrap_or_else(|| panic!("clean retry should recover VTXO {:?}", vtxo.vtxo.id));
+		assert_eq!(found.state, vtxo.state, "clean retry should recover the server-reported state");
 	}
 }
 
-/// Recovery stores a VTXO the server reports spent without validating it.
+/// Recovery refuses a corrupt spendable VTXO even if it also sees a spent one.
 ///
 /// The server's word on the spend state is final: a spent VTXO is stored
 /// spent as it comes, and only a VTXO the server calls spendable is
 /// validated. A proxy corrupts every body it serves, so the spent board is
-/// stored spent regardless, while the corrupt change fails validation and is
-/// not stored.
+/// stored spent regardless, while the corrupt change fails validation. The
+/// incomplete restore must not open a partial wallet.
 #[tokio::test]
-async fn recovered_wallet_stores_spent_vtxos_on_the_servers_word() {
-	let ctx = TestContext::new("barkd/recovered_wallet_stores_spent_vtxos_on_the_servers_word").await;
+async fn recovered_wallet_refuses_corrupt_spendable_vtxo_then_retries() {
+	let ctx = TestContext::new("barkd/recovered_wallet_refuses_corrupt_spendable_vtxo_then_retries").await;
 	// The xpub lookup carries each VTXO's body and status itself, so it is
 	// turned off to send recovery through the mailbox path under test.
 	let srv = ctx.captaind("server").funded(btc(10))
@@ -975,29 +986,31 @@ async fn recovered_wallet_stores_spent_vtxos_on_the_servers_word() {
 	}
 
 	let proxy = srv.start_proxy_with_mailbox(ForgeVtxo, ()).await;
-	let recovered = ctx.barkd("sender_recovered", &srv)
-		.mnemonic(sender.mnemonic().await)
+	let mnemonic = sender.mnemonic().await;
+	let error = ctx.barkd("sender_recovered", &srv)
+		.mnemonic(mnemonic.clone())
 		.cfg({
 			let addr = proxy.address.clone();
 			move |c| c.server_address = addr
 		})
-		.create().await;
+		.try_create().await.err().expect("corrupt spendable VTXO must make recovery incomplete");
+	assert_incomplete_recovery(&ctx, "sender_recovered", error);
+	let recovered = ctx.barkd("sender_recovered_retry", &srv)
+		.mnemonic(mnemonic).create().await;
 
-	let (spendable, spent) = partition_recovered(recovered.vtxos(Some(true)).await);
-	assert!(spendable.is_empty(),
-		"a corrupt body the server calls spendable must fail validation, got {:?}", spendable);
+	let (_, spent) = partition_recovered(recovered.vtxos(Some(true)).await);
 	assert!(spent.iter().any(|v| v.vtxo.id == board_id),
-		"the spent board is stored on the server's word, got {:?}", spent);
+		"a clean retry should store the spent board, got {:?}", spent);
 }
 
-/// Recovery skips a VTXO that fails validation.
+/// Recovery refuses to open when a VTXO fails validation.
 ///
 /// A buggy or malicious server could return a VTXO whose owner key we can derive
-/// but whose signatures are invalid. Recovery must validate and skip it rather
-/// than import unspendable junk.
+/// but whose signatures are invalid. Recovery must fail visibly rather than
+/// open with the coin silently missing.
 #[tokio::test]
-async fn recovered_wallet_skips_invalid_vtxo() {
-	let ctx = TestContext::new("barkd/recovered_wallet_skips_invalid_vtxo").await;
+async fn recovered_wallet_refuses_invalid_vtxo_then_retries() {
+	let ctx = TestContext::new("barkd/recovered_wallet_refuses_invalid_vtxo_then_retries").await;
 	// The xpub lookup carries each VTXO's body and status itself, so it is
 	// turned off to send recovery through the mailbox path under test.
 	let srv = ctx.captaind("server").funded(btc(10))
@@ -1006,6 +1019,7 @@ async fn recovered_wallet_skips_invalid_vtxo() {
 
 	let barkd = ctx.barkd("bark", &srv).boarded(sat(100_000)).expose_mnemonic().create().await;
 	let mnemonic = barkd.mnemonic().await;
+	let board_id = barkd.vtxos(None).await[0].vtxo.id;
 
 	// Proxy get_vtxos_by_ids to return our own board VTXO with an invalidated
 	// signature.
@@ -1029,18 +1043,21 @@ async fn recovered_wallet_skips_invalid_vtxo() {
 
 	let proxy = srv.start_proxy_with_mailbox(ForgeVtxo, ()).await;
 
-	let recovered = ctx.barkd("bark_recovered", &srv)
-		.mnemonic(mnemonic)
+	let error = ctx.barkd("bark_recovered", &srv)
+		.mnemonic(mnemonic.clone())
 		.cfg({
 			let addr = proxy.address.clone();
 			move |c| c.server_address = addr
 		})
-		.create().await;
+		.try_create().await.err().expect("invalid VTXO must make recovery incomplete");
+	assert_incomplete_recovery(&ctx, "bark_recovered", error);
+	let recovered = ctx.barkd("bark_recovered_retry", &srv)
+		.mnemonic(mnemonic).create().await;
 	recovered.onchain_sync().await;
 	recovered.sync().await;
 
-	assert!(recovered.vtxos(Some(true)).await.is_empty(),
-		"recovery must skip a VTXO that fails validation");
+	assert!(recovered.vtxos(Some(true)).await.iter().any(|v| v.vtxo.id == board_id),
+		"a clean retry must recover the genuine board VTXO");
 }
 
 /// Recovery tolerates an undecodable id in the recovery mailbox.
@@ -1164,14 +1181,11 @@ async fn recovered_wallet_finds_vtxo_only_within_the_gap_limit() {
 	assert_eq!(before.len(), 1, "recipient should hold the received VTXO");
 	let mnemonic = recipient.mnemonic().await;
 
-	let narrow = ctx.barkd("recovered_narrow", &srv)
+	let error = ctx.barkd("recovered_narrow", &srv)
 		.mnemonic(mnemonic.clone())
 		.cfg(|c| c.vtxo_key_gap_limit = 50)
-		.create().await;
-	narrow.onchain_sync().await;
-	narrow.sync().await;
-	assert!(narrow.vtxos(Some(true)).await.is_empty(),
-		"a VTXO beyond the gap limit must not be recovered");
+		.try_create().await.err().expect("gap-limited recovery must fail visibly");
+	assert_incomplete_recovery(&ctx, "recovered_narrow", error);
 
 	let wide = ctx.barkd("recovered_wide", &srv)
 		.mnemonic(mnemonic)
