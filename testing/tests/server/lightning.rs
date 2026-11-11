@@ -147,7 +147,7 @@ async fn try_request_htlc_revocation(
 		keypairs.push(client.get_vtxo_key(&vtxo).await.unwrap());
 		htlc_vtxos.push(vtxo);
 	}
-	revoke_htlc_vtxos(srv, htlc_vtxos, &keypairs).await
+	revoke_htlc_vtxos(srv, htlc_vtxos, &keypairs, client.mailbox_identifier()).await
 }
 
 /// Send a "claim all" revocation of `htlc_vtxos`, signed with `keypairs`,
@@ -156,17 +156,26 @@ async fn revoke_htlc_vtxos(
 	srv: &Captaind,
 	htlc_vtxos: Vec<Vtxo<Full>>,
 	keypairs: &[Keypair],
+	mailbox: ark::mailbox::MailboxIdentifier,
 ) -> Result<(), tonic::Status> {
 	// Any pubkey works for the revocation output; the tests never claim it.
 	let revocation_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let revocation_pubkey = revocation_key.public_key();
+	let policy = ark::VtxoPolicy::new_pubkey(revocation_pubkey);
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		htlc_vtxos,
-		ark::VtxoPolicy::new_pubkey(revocation_pubkey),
+		policy.clone(),
 	).unwrap().generate_user_nonces(keypairs).unwrap();
 
-	let cosign_request =
-		super::signed_package(srv, &[], protos::ArkoorPackageCosignRequest::from(builder.cosign_request())).await;
+	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	if srv.config().expiry_payouts {
+		let address = super::payout_address(srv, policy, &revocation_key, mailbox).await;
+		for output in cosign_request.parts.iter_mut().flat_map(|part|
+			part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+			assert_eq!(ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey(), revocation_pubkey);
+			output.blinded_mailbox_id = super::blinded_mailbox(&address);
+		}
+	}
 
 	let mut srv_rpc = srv.get_public_rpc().await;
 	srv_rpc.request_lightning_pay_htlc_revocation(cosign_request).await.map(|_| ())
@@ -1486,7 +1495,8 @@ impl RawHtlcSend {
 	}
 
 	async fn revoke(&self, srv: &Captaind) -> Result<(), tonic::Status> {
-		revoke_htlc_vtxos(srv, self.vtxos.clone(), &vec![self.keypair; self.vtxos.len()]).await
+		revoke_htlc_vtxos(srv, self.vtxos.clone(), &vec![self.keypair; self.vtxos.len()],
+			ark::mailbox::MailboxIdentifier::from_pubkey(self.keypair.public_key())).await
 	}
 }
 
@@ -1494,7 +1504,8 @@ impl RawHtlcSend {
 async fn failed_lightning_source_needs_fresh_owner_intent() {
 	let ctx = TestContext::new("server/failed_lightning_source_needs_fresh_owner_intent").await;
 	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).create().await;
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.expiry_payouts = true).create().await;
 	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
 	let inputs = sender.board_and_confirm_and_register(&ctx, sat(300_000)).await;
 	let hash = ark::lightning::Preimage::random().compute_payment_hash();
@@ -5012,7 +5023,8 @@ async fn zero_part_and_cold_restart_refund() {
 	let LightningPaymentSetup { internal, external } = ctx.new_lightning_setup_no_channel("lightningd").await;
 	let node = Arc::new(internal);
 	let original = node.grpc_client().await.getinfo(cln_rpc::GetinfoRequest {}).await.unwrap().into_inner();
-	assert_eq!(original.version, "v26.06.6");
+	assert!(original.version.starts_with("v26.06."),
+		"cold-restart test needs the v26.06 CLN series, got {}", original.version);
 	assert_eq!(original.network, "regtest");
 	let srv = ctx.captaind("server").lightningd(&node).funded(btc(10))
 		.cfg(|cfg| cfg.expiry_payouts = true).create().await;

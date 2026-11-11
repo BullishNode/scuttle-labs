@@ -350,35 +350,40 @@ impl Server {
 		// An exact retry acknowledges existing work even if its node or a new
 		// admission view is now unavailable. It never resubmits the recorded call.
 		if recorded { return Ok(()); }
-		if htlc_vtxo_ids.is_empty() || source_owner_signatures.len() != htlc_vtxo_ids.len() {
-			return badarg!("each Lightning source needs an owner signature");
-		}
-		let mut unique_ids = htlc_vtxo_ids.clone();
-		unique_ids.sort_unstable();
-		unique_ids.dedup();
-		if unique_ids.len() != htlc_vtxo_ids.len() {
-			return badarg!("duplicate Lightning source");
-		}
-		let nonce: [u8; 32] = intent_nonce
-			.ok_or_else(|| badarg_err!("missing Lightning send intent nonce"))?
-			.try_into().map_err(|_| badarg_err!("Lightning send intent nonce must be 32 bytes"))?;
-		let intent = LightningSendIntent::new(
-			nonce, self.server_pubkey, self.config.network, &invoice, payment_amount,
-			&htlc_vtxo_ids, mailbox_id, retry_for_secs,
-		);
-		for (source_id, signature) in htlc_vtxo_ids.iter().zip(&source_owner_signatures) {
-			let vtxo = vtxos.iter().find(|vtxo| vtxo.id() == *source_id)
-				.context("Lightning source is missing")?;
-			let signature = schnorr::Signature::from_slice(signature)
-				.badarg("invalid Lightning source owner signature")?;
-			intent.verify(&signature, vtxo.user_pubkey())
-				.badarg("Lightning source owner signature does not match payment intent")?;
-		}
-		let intent_id = intent.id().to_string();
-		let used = self.db.read(async |t| Ok(t.query_opt(
-			"SELECT 1 FROM lightning_payment_attempt WHERE intent_id=$1", &[&intent_id],
-		).await?.is_some())).await?;
-		if used { return badarg!("Lightning send intent was already used"); }
+		let intent_id = if self.config.expiry_payouts {
+			if htlc_vtxo_ids.is_empty() || source_owner_signatures.len() != htlc_vtxo_ids.len() {
+				return badarg!("each Lightning source needs an owner signature");
+			}
+			let mut unique_ids = htlc_vtxo_ids.clone();
+			unique_ids.sort_unstable();
+			unique_ids.dedup();
+			if unique_ids.len() != htlc_vtxo_ids.len() {
+				return badarg!("duplicate Lightning source");
+			}
+			let nonce: [u8; 32] = intent_nonce
+				.ok_or_else(|| badarg_err!("missing Lightning send intent nonce"))?
+				.try_into().map_err(|_| badarg_err!("Lightning send intent nonce must be 32 bytes"))?;
+			let intent = LightningSendIntent::new(
+				nonce, self.server_pubkey, self.config.network, &invoice, payment_amount,
+				&htlc_vtxo_ids, mailbox_id, retry_for_secs,
+			);
+			for (source_id, signature) in htlc_vtxo_ids.iter().zip(&source_owner_signatures) {
+				let vtxo = vtxos.iter().find(|vtxo| vtxo.id() == *source_id)
+					.context("Lightning source is missing")?;
+				let signature = schnorr::Signature::from_slice(signature)
+					.badarg("invalid Lightning source owner signature")?;
+				intent.verify(&signature, vtxo.user_pubkey())
+					.badarg("Lightning source owner signature does not match payment intent")?;
+			}
+			let intent_id = intent.id().to_string();
+			let used = self.db.read(async |t| Ok(t.query_opt(
+				"SELECT 1 FROM lightning_payment_attempt WHERE intent_id=$1", &[&intent_id],
+			).await?.is_some())).await?;
+			if used { return badarg!("Lightning send intent was already used"); }
+			Some(intent_id)
+		} else {
+			None
+		};
 
 		let mut htlc_vtxo_sum = Amount::ZERO;
 		let mut min_expiry_height = BlockHeight::MAX;
