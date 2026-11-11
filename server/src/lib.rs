@@ -997,8 +997,6 @@ impl Server {
 			let stored = self.db.read(async |t| t.get_user_vtxo_by_id(vtxo_id).await).await
 				.context(vtxo_id)
 				.badarg("vtxo not found in database")?;
-			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
-
 			// Check vtxo is fully signed
 			if !vtxo.has_all_witnesses() {
 				return badarg!("vtxo {} is not fully signed", vtxo_id);
@@ -1020,6 +1018,10 @@ impl Server {
 			vtxo.validate(&anchor_tx)
 				.context(vtxo_id)
 				.badarg("vtxo validation failed")?;
+			// Comparing transaction ids walks the signed chain. Only do so
+			// after validation: the iterator assumes that chain amounts cannot
+			// overflow and panics on an invalid genesis.
+			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			self.check_registration_inputs_not_exited(vtxo).await?;
 
