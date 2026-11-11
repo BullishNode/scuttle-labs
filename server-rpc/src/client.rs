@@ -552,9 +552,6 @@ impl ServerConnection {
 		Ok(())
 	}
 
-	/// Protocol version selected by the existing handshake.
-	pub async fn protocol_version(&self) -> u64 { self.info.read().await.pver }
-
 	/// Whether this server advertises Scuttle's payout protocol.
 	pub async fn scuttle_payouts(&self) -> bool {
 		self.info.read().await.protocol_label.as_deref() == Some(crate::SCUTTLE_PAYOUT_PROTOCOL_LABEL)

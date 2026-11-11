@@ -546,7 +546,10 @@ impl TryFrom<protos::SignedVtxoRequest> for SignedVtxoRequest {
 	fn try_from(v: protos::SignedVtxoRequest) -> Result<Self, Self::Error> {
 		let vtxo = v.vtxo.ok_or("vtxo field missing")?;
 		Ok(SignedVtxoRequest {
-			vtxo: vtxo.try_into()?,
+			vtxo: VtxoRequest {
+				amount: Amount::from_sat(vtxo.amount),
+				policy: VtxoPolicy::from_bytes(&vtxo.policy)?,
+			},
 			cosign_pubkey: PublicKey::from_bytes(&v.cosign_pubkey)?,
 			nonces: v.public_nonces.into_iter()
 				.map(|n| musig::PublicNonce::from_bytes(n))
