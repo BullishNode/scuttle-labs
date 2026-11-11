@@ -294,12 +294,6 @@ impl<'a> BarkdBuilder<'a> {
 		self
 	}
 
-	/// Set the chain birthday for a seed restore.
-	pub fn birthday_height(mut self, height: u32) -> Self {
-		self.birthday_height = Some(height);
-		self
-	}
-
 	/// Enable the `GET /wallet/mnemonic` endpoint, which barkd disables by
 	/// default. Needed by tests that read the seed back out of the daemon.
 	pub fn expose_mnemonic(self) -> Self {
@@ -307,10 +301,6 @@ impl<'a> BarkdBuilder<'a> {
 	}
 
 	pub async fn create(self) -> Barkd {
-		self.try_create().await.expect("failed to create barkd wallet")
-	}
-
-	pub async fn try_create(self) -> anyhow::Result<Barkd> {
 		let (chain_source, bitcoind) = if let Some(electrs) = &self.ctx.electrs {
 			(BarkdChainSource::Esplora(electrs.rest_url()), None)
 		} else {
@@ -341,7 +331,7 @@ impl<'a> BarkdBuilder<'a> {
 		for arg in self.args {
 			daemon.add_arg(arg);
 		}
-		daemon.start().await.context("failed to start barkd")?;
+		daemon.start().await.expect("failed to start barkd");
 
 		let (mnemonic, birthday_height) = match (self.mnemonic, self.birthday_height) {
 			(Some(mnemonic), Some(birthday_height)) => (Some(mnemonic), Some(birthday_height)),
@@ -354,7 +344,7 @@ impl<'a> BarkdBuilder<'a> {
 		};
 
 		daemon.create_wallet_with(mnemonic, birthday_height).await
-			.context("failed to create barkd wallet")?;
+			.expect("failed to create barkd wallet");
 
 		if let Some(amount) = self.board_amount {
 			self.ctx.fund_barkd(&daemon, amount).await;
@@ -374,7 +364,7 @@ impl<'a> BarkdBuilder<'a> {
 			self.ctx.fund_barkd(&daemon, amount).await;
 		}
 
-		Ok(daemon)
+		daemon
 	}
 }
 

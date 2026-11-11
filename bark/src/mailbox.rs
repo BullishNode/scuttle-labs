@@ -35,7 +35,7 @@ use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
-use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, VtxoValidationError};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -341,8 +341,9 @@ impl Wallet {
 
 	/// Turn raw byte arrays into VTXOs, then validate them.
 	///
-	/// Invalid VTXOs are skipped. A chain RPC failure aborts this mailbox
-	/// message so its checkpoint stays unadvanced and the body can be retried.
+	/// This function only returns an error when it cannot process any VTXOs,
+	/// for example when the server is down or the chain tip is unknown.
+	/// No errors are returned for issues on individual VTXOs.
 	async fn process_raw_vtxos(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
@@ -365,15 +366,10 @@ impl Wallet {
 				}
 			};
 
-			match self.validate_vtxo(&vtxo).await {
-				Ok(()) => {},
-				Err(VtxoValidationError::Chain(e)) => return Err(e)
-					.with_context(|| format!("chain lookup failed for received arkoor VTXO {}", vtxo.id())),
-				Err(e) => {
-					error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
-					invalid_vtxos.push(bytes);
-					continue;
-				},
+			if let Err(e) = self.validate_vtxo(&vtxo).await {
+				error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
+				invalid_vtxos.push(bytes);
+				continue;
 			}
 
 			if let Err(e) = check_arkoor_receive_policy(&vtxo, ark_info.server_pubkey) {

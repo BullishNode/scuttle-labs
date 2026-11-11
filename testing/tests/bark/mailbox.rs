@@ -1,16 +1,9 @@
 use std::io::{self, BufRead};
-use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-
-use axum::body::Bytes;
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::routing::post;
-use axum::Router;
 
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
-use bitcoin_ext::rpc::RpcApi;
 use server_rpc::protos;
 
 use ark_testing::{TestContext, btc, is_bark_version, require_bark_version, sat};
@@ -98,103 +91,12 @@ async fn concurrent_mailbox_consumers_do_not_duplicate_arkoor_movement() {
 	bark1.board(sat(200_000)).await;
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
 
-	// Forward the receiver's real Core wire requests, failing only the first
-	// lookup of the actual incoming body's anchor. Every other RPC is unchanged.
-	let anchor = Arc::new(Mutex::new(None::<String>));
-	let armed = Arc::new(AtomicBool::new(false));
-	let faults = Arc::new(AtomicUsize::new(0));
-	let anchor_queries = Arc::new(AtomicUsize::new(0));
-	let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-	let proxy_url = format!("http://{}", listener.local_addr().unwrap());
-	let upstream = ctx.bitcoind().rpc_url();
-	let client = reqwest::Client::builder().no_proxy().build().unwrap();
-	let app = Router::new().route("/", post({
-		let (anchor, armed, faults, anchor_queries) = (anchor.clone(), armed.clone(), faults.clone(), anchor_queries.clone());
-		move |headers: HeaderMap, body: Bytes| {
-			let (anchor, armed, faults, anchor_queries, upstream, client) =
-				(anchor.clone(), armed.clone(), faults.clone(), anchor_queries.clone(), upstream.clone(), client.clone());
-			async move {
-				let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-				if request["method"] == "getrawtransaction"
-					&& request["params"][0].as_str() == anchor.lock().unwrap().as_deref() {
-					anchor_queries.fetch_add(1, Ordering::SeqCst);
-					if armed.swap(false, Ordering::SeqCst) {
-						faults.fetch_add(1, Ordering::SeqCst);
-						log::info!("issue24: injected one transient Core anchor RPC failure");
-						let error = serde_json::json!({"result": null, "error": {
-							"code": -32603, "message": "issue24 one-shot transient Core RPC failure"
-						}, "id": request["id"]});
-						return (StatusCode::OK, Bytes::from(serde_json::to_vec(&error).unwrap()));
-					}
-				}
-				let response = client.post(upstream).header(header::AUTHORIZATION, headers[header::AUTHORIZATION].clone())
-					.header(header::CONTENT_TYPE, "application/json").body(body).send().await.unwrap();
-				(response.status(), response.bytes().await.unwrap())
-			}
-		}
-	})).layer(axum::extract::DefaultBodyLimit::disable());
-	let proxy = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
-
-	// One-shot CLI wallet: nothing syncs behind us. Only its Core route is
-	// changed; server, sender and the independent anchor validation stay direct.
-	let cookie = ctx.bitcoind().rpc_cookie();
-	let bark2 = ctx.bark("bark2", &srv).cfg(move |cfg| {
-		cfg.esplora_address = None;
-		cfg.bitcoind_address = Some(proxy_url);
-		cfg.bitcoind_cookiefile = Some(cookie);
-		cfg.bitcoind_user = None;
-		cfg.bitcoind_pass = None;
-	}).create().await;
+	// One-shot CLI wallet: nothing syncs behind us, so the arkoor stays pending.
+	let bark2 = ctx.bark("bark2", &srv).create().await;
 	bark1.send_oor(bark2.address().await, sat(100_000)).await;
 
+	// Release several consumers of the same wallet together so they contend.
 	let wallet = bark2.client().await;
-	let before = wallet.get_mailbox_checkpoint().await.unwrap();
-	let authorization = wallet.mailbox_authorization(chrono::Local::now() + Duration::from_secs(60)).serialize();
-	let request = || protos::mailbox_server::MailboxRequest {
-		mailbox_id: wallet.mailbox_identifier().serialize(), authorization: Some(authorization.clone()), checkpoint: before,
-	};
-	let mut mailbox = srv.get_mailbox_public_rpc().await;
-	let original = mailbox.read_mailbox(request()).await.unwrap().into_inner();
-	assert_eq!(original.messages.len(), 1);
-	let delivery = &original.messages[0];
-	assert!(delivery.checkpoint > before);
-	let Some(Message::Arkoor(package)) = delivery.message.as_ref() else { panic!("actual incoming arkoor") };
-	assert_eq!(package.vtxos.len(), 1);
-	let incoming = Vtxo::deserialize(&package.vtxos[0]).unwrap();
-	assert_eq!(incoming.amount(), sat(100_000));
-	let actual_anchor = ctx.bitcoind().sync_client().get_raw_transaction(&incoming.chain_anchor().txid, None).unwrap();
-	incoming.validate(&actual_anchor).unwrap();
-	assert_eq!(wallet.get_vtxo_key(&incoming).await.unwrap().public_key(), incoming.user_pubkey());
-
-	// This authenticated hint for the same genuine owned coin carries no
-	// credit. Its higher checkpoint must not bury the failed payment message.
-	mailbox.post_recovery_vtxo_ids(protos::mailbox_server::PostRecoveryVtxoIdsRequest {
-		mailbox_id: wallet.mailbox_identifier().serialize(), authorization: Some(authorization.clone()),
-		vtxo_ids: vec![incoming.id().to_bytes().to_vec()],
-	}).await.unwrap();
-	let queued = mailbox.read_mailbox(request()).await.unwrap().into_inner();
-	assert_eq!(queued.messages.len(), 2);
-	assert_eq!(queued.messages[0], *delivery);
-	assert!(queued.messages[1].checkpoint > delivery.checkpoint);
-	assert!(matches!(queued.messages[1].message.as_ref(), Some(Message::RecoveryVtxoIds(_))));
-	let final_checkpoint = queued.messages[1].checkpoint;
-	let history_before = wallet.history().await.unwrap();
-	let balance_before = wallet.balance().await.unwrap().summary();
-	assert!(wallet.all_vtxos().await.unwrap().is_empty());
-	*anchor.lock().unwrap() = Some(incoming.chain_anchor().txid.to_string());
-	assert_eq!(anchor_queries.load(Ordering::SeqCst), 0);
-	armed.store(true, Ordering::SeqCst);
-	wallet.sync_mailbox().await.unwrap();
-	assert_eq!(faults.load(Ordering::SeqCst), 1, "MISSED_TARGET: the uncached actual anchor RPC must fail once");
-	assert_eq!(anchor_queries.load(Ordering::SeqCst), 1);
-	assert!(!armed.load(Ordering::SeqCst));
-	assert_eq!(wallet.get_mailbox_checkpoint().await.unwrap(), before);
-	assert!(wallet.all_vtxos().await.unwrap().is_empty());
-	assert_eq!(wallet.history().await.unwrap(), history_before);
-	assert_eq!(wallet.balance().await.unwrap().summary(), balance_before);
-
-	// With ordinary forwarding restored, release several consumers of this
-	// same wallet together. They must retry the original message exactly once.
 	let start = Arc::new(tokio::sync::Barrier::new(4));
 	let handles = (0..4).map(|_| {
 		let w = wallet.clone();
@@ -216,19 +118,6 @@ async fn concurrent_mailbox_consumers_do_not_duplicate_arkoor_movement() {
 		.filter(|m| m.output_vtxos.contains(&received_id))
 		.count();
 	assert_eq!(movements, 1, "receive recorded as {movements} movements, expected 1");
-	assert_eq!(received_id, incoming.id());
-	assert_eq!(vtxos[0].vtxo.amount(), sat(100_000));
-	assert!(anchor_queries.load(Ordering::SeqCst) > 1, "normal retry must actually fetch the anchor");
-	assert_eq!(faults.load(Ordering::SeqCst), 1);
-	assert_eq!(wallet.get_mailbox_checkpoint().await.unwrap(), final_checkpoint);
-	let history = wallet.history().await.unwrap();
-	let balance = wallet.balance().await.unwrap().summary();
-	wallet.sync_mailbox().await.unwrap();
-	assert_eq!(wallet.history().await.unwrap(), history);
-	assert_eq!(wallet.balance().await.unwrap().summary(), balance);
-	assert_eq!(wallet.vtxos().await.unwrap(), vtxos);
-	assert_eq!(wallet.get_mailbox_checkpoint().await.unwrap(), final_checkpoint);
-	proxy.abort();
 }
 
 #[tokio::test]

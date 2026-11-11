@@ -69,23 +69,16 @@ async fn import_vtxo_barkd() {
 async fn import_vtxo_gap_limit_barkd() {
 	let ctx = TestContext::new("barkd/import_vtxo_gap_limit_barkd").await;
 
-	// Create the second wallet before the payment. Seed restore now refuses
-	// a known coin beyond its gap limit instead of opening a partial wallet.
+	// Without the server's xpub lookup, seed recovery is bound by the gap
+	// limit, so the recovered wallet below starts empty.
 	let srv = ctx.captaind("server").funded(btc(10))
 		.cfg(|c| c.recovery_xpub_nb_keys = 0)
 		.create().await;
 	let sender = ctx.barkd("sender", &srv).boarded(sat(1_000_000)).create().await;
 	let recipient = ctx.barkd("recipient", &srv).expose_mnemonic().create().await;
-	let recovered = ctx.barkd("recipient_recovered", &srv)
-		.mnemonic(recipient.mnemonic().await)
-		.cfg(|c| {
-			c.vtxo_key_gap_limit = 50;
-			c.daemon_manual_sync = true;
-		})
-		.create().await;
 
 	// Derive 60 addresses, each revealing a fresh key, then receive into the last
-	// one. The other wallet is pinned to a limit that cannot reach it.
+	// one. The recovering wallet below is pinned to a limit that cannot reach it.
 	let mut dest = String::new();
 	for _ in 0..60 {
 		dest = recipient.ark_address().await;
@@ -97,9 +90,15 @@ async fn import_vtxo_gap_limit_barkd() {
 	assert_eq!(vtxos.len(), 1, "recipient should hold the received VTXO");
 	let encoded = recipient.get_vtxo_encoded(&vtxos[0].vtxo.id.to_string()).await;
 
+	// A wallet recovered from the same seed cannot reach the key at a gap limit of
+	// 50, so it starts empty.
+	let recovered = ctx.barkd("recipient_recovered", &srv)
+		.mnemonic(recipient.mnemonic().await)
+		.cfg(|c| c.vtxo_key_gap_limit = 50)
+		.create().await;
 	recovered.onchain_sync().await;
 	assert!(recovered.vtxos(None).await.is_empty(),
-		"manual sync must leave the later payment for import");
+		"recovery must not reach the VTXO at a gap limit of 50");
 
 	// A key the scan cannot reach is the request's own problem, so it must come
 	// back as a 400 rather than a server error.
@@ -128,28 +127,13 @@ async fn import_vtxo_gap_limit_barkd() {
 async fn import_vtxo_skips_status_check_barkd() {
 	let ctx = TestContext::new("barkd/import_vtxo_skips_status_check_barkd").await;
 
-	// Create the importing wallets before the payment so seed restore is
-	// complete; manual sync leaves the later coin for explicit import.
+	// Without the server's xpub lookup, seed recovery is bound by the gap
+	// limit, so the recovered wallets below start empty.
 	let srv = ctx.captaind("server").funded(btc(10))
 		.cfg(|c| c.recovery_xpub_nb_keys = 0)
 		.create().await;
 	let sender = ctx.barkd("sender", &srv).boarded(sat(1_000_000)).create().await;
 	let recipient = ctx.barkd("recipient", &srv).expose_mnemonic().create().await;
-	let mnemonic = recipient.mnemonic().await;
-	let plain = ctx.barkd("recovered_plain", &srv)
-		.mnemonic(mnemonic.clone())
-		.cfg(|c| {
-			c.vtxo_key_gap_limit = 50;
-			c.daemon_manual_sync = true;
-		})
-		.create().await;
-	let skipped = ctx.barkd("recovered_skipped", &srv)
-		.mnemonic(mnemonic)
-		.cfg(|c| {
-			c.vtxo_key_gap_limit = 50;
-			c.daemon_manual_sync = true;
-		})
-		.create().await;
 
 	// Receive past the limit the recovered wallets are pinned to, as in
 	// import_vtxo_gap_limit_barkd, so they hold no row for the vtxo and the
@@ -167,9 +151,15 @@ async fn import_vtxo_skips_status_check_barkd() {
 
 	// Spend it onward, so the server records it as spent.
 	recipient.send(&sender.ark_address().await, sat(50_000)).await;
+	let mnemonic = recipient.mnemonic().await;
+
+	let plain = ctx.barkd("recovered_plain", &srv)
+		.mnemonic(mnemonic.clone())
+		.cfg(|c| c.vtxo_key_gap_limit = 50)
+		.create().await;
 	plain.onchain_sync().await;
 	assert!(plain.vtxos(Some(true)).await.is_empty(),
-		"manual sync must leave the later payment for import");
+		"recovery must not reach the vtxo at a gap limit of 50");
 
 	let mut req = plain.import_vtxo_request(vec![encoded.clone()]);
 	req.gap_limit = Some(100);
@@ -178,9 +168,13 @@ async fn import_vtxo_skips_status_check_barkd() {
 	assert_eq!(imported[0].state, VtxoStateInfo::Spent,
 		"the server reports it spent, so that is what should be recorded");
 
+	let skipped = ctx.barkd("recovered_skipped", &srv)
+		.mnemonic(mnemonic)
+		.cfg(|c| c.vtxo_key_gap_limit = 50)
+		.create().await;
 	skipped.onchain_sync().await;
 	assert!(skipped.vtxos(Some(true)).await.is_empty(),
-		"manual sync must leave the later payment for import");
+		"same precondition: the skipped import must be the thing that stores it");
 
 	let mut req = skipped.import_vtxo_request(vec![encoded]);
 	req.gap_limit = Some(100);
@@ -201,21 +195,14 @@ async fn import_vtxo_skips_status_check_barkd() {
 async fn import_vtxo_partial_barkd() {
 	let ctx = TestContext::new("barkd/import_vtxo_partial_barkd").await;
 
-	// Create the importing wallet before the payment. Restore now refuses a
-	// known coin beyond its gap limit, while manual sync permits this import test.
+	// Without the server's xpub lookup, seed recovery is bound by the gap
+	// limit, so the recovered wallet below starts empty.
 	let srv = ctx.captaind("server").funded(btc(10))
 		.cfg(|c| c.recovery_xpub_nb_keys = 0)
 		.create().await;
 	let sender = ctx.barkd("sender", &srv).boarded(sat(1_000_000)).create().await;
 	let recipient = ctx.barkd("recipient", &srv).expose_mnemonic().create().await;
 	let stranger = ctx.barkd("stranger", &srv).boarded(sat(1_000_000)).create().await;
-	let recovered = ctx.barkd("recovered", &srv)
-		.mnemonic(recipient.mnemonic().await)
-		.cfg(|c| {
-			c.vtxo_key_gap_limit = 50;
-			c.daemon_manual_sync = true;
-		})
-		.create().await;
 
 	// Receive past the limit the recovering wallet is pinned to, so the import has
 	// to do the work rather than short-circuiting on a stored row.
@@ -233,8 +220,15 @@ async fn import_vtxo_partial_barkd() {
 	let theirs = stranger.vtxos(None).await;
 	let theirs_hex = stranger.get_vtxo_encoded(&theirs[0].vtxo.id.to_string()).await.encoded.0;
 
-	// The failed import below reveals the key of `mine`. Manual sync keeps
-	// the daemon's mailbox stream from storing it before the next request.
+	// The failed import below reveals the key of `mine`. Without manual sync, the
+	// daemon's mailbox stream can then store `mine` from the sender's arkoor message.
+	let recovered = ctx.barkd("recovered", &srv)
+		.mnemonic(recipient.mnemonic().await)
+		.cfg(|c| {
+			c.vtxo_key_gap_limit = 50;
+			c.daemon_manual_sync = true;
+		})
+		.create().await;
 	recovered.onchain_sync().await;
 	assert!(recovered.vtxos(Some(true)).await.is_empty(), "the recovered wallet starts empty");
 
