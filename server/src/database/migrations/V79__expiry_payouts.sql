@@ -43,11 +43,8 @@ CREATE TABLE expiry_cancelled_participation (
 CREATE TABLE expiry_allocation (
 	id BIGSERIAL PRIMARY KEY,
 	expiry_height INTEGER NOT NULL CHECK (expiry_height >= 0),
-	sweep_txid TEXT UNIQUE,
-	sweep_tx BYTEA,
 	broadcast_at TIMESTAMPTZ,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-	CHECK ((sweep_txid IS NULL) = (sweep_tx IS NULL))
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE expiry_allocation_input (
@@ -118,8 +115,8 @@ WITH observed AS (
 	GROUP BY a.id
 )
 SELECT a.id,a.expiry_height,
-	CASE WHEN o.confirmed THEN o.confirmed_txid ELSE a.sweep_txid END AS sweep_txid,
-	CASE WHEN o.confirmed THEN winner.signed_tx ELSE a.sweep_tx END AS sweep_tx,
+	CASE WHEN o.confirmed THEN o.confirmed_txid ELSE latest.txid END AS sweep_txid,
+	CASE WHEN o.confirmed THEN winner.signed_tx ELSE latest.signed_tx END AS sweep_tx,
 	a.broadcast_at,a.created_at,
 	CASE WHEN o.confirmed THEN 'confirmed'
 		WHEN o.conflicted OR EXISTS (
@@ -135,6 +132,9 @@ SELECT a.id,a.expiry_height,
 	CASE WHEN o.confirmed THEN b.hash END AS confirmed_hash
 FROM expiry_allocation a JOIN observed o ON o.id=a.id
 LEFT JOIN expiry_payout_attempt winner ON winner.allocation_id=a.id AND winner.txid=o.confirmed_txid
+-- Each stored replacement raises the absolute fee, so the costliest attempt is the latest.
+LEFT JOIN LATERAL (SELECT p.txid,p.signed_tx FROM expiry_payout_attempt p
+	WHERE p.allocation_id=a.id ORDER BY p.fee_sat DESC LIMIT 1) latest ON TRUE
 LEFT JOIN public.watchmand_block b ON b.height=o.height;
 
 -- A collected forwarding receive names its final payee independently of the

@@ -415,7 +415,7 @@ impl Tx<'_> {
 		fee: Amount, operator_spk: &ScriptBuf,
 	) -> anyhow::Result<()> {
 		self.lock_watchman_tip(view).await?;
-		let row = self.query_one("SELECT sweep_txid,sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
+		self.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
 		ensure!(self.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&id]).await?.get::<_, &str>(0) == "pending",
 			"expiry allocation is no longer pending");
 		ensure!(payout.version == bitcoin::transaction::Version::TWO
@@ -455,22 +455,18 @@ impl Tx<'_> {
 		let txid = payout.compute_txid().to_string();
 		let raw = serialize(payout);
 		let fee_sat = i64::try_from(fee.to_sat())?;
-		if let Some(old_txid) = row.get::<_, Option<&str>>("sweep_txid") {
-			let old = self.query_one("SELECT fee_sat FROM expiry_payout_attempt WHERE allocation_id=$1 AND txid=$2",
-				&[&id,&old_txid]).await?;
-			if old_txid == txid {
-				ensure!(row.get::<_, Option<&[u8]>>("sweep_tx") == Some(raw.as_slice())
-					&& old.get::<_, i64>("fee_sat") == fee_sat,
-					"stored direct expiry attempt changed bytes or fee");
-				return Ok(());
-			}
-			ensure!(fee_sat > old.get::<_, i64>("fee_sat"),
-				"direct expiry replacement does not raise the absolute fee");
+		if let Some(same) = self.query_opt("SELECT signed_tx,fee_sat FROM expiry_payout_attempt \
+			WHERE allocation_id=$1 AND txid=$2", &[&id,&txid]).await? {
+			ensure!(same.get::<_, &[u8]>("signed_tx") == raw.as_slice() && same.get::<_, i64>("fee_sat") == fee_sat,
+				"stored direct expiry attempt changed bytes or fee");
+			return Ok(());
 		}
+		let prior_fee = self.query_one("SELECT MAX(fee_sat) FROM expiry_payout_attempt WHERE allocation_id=$1",
+			&[&id]).await?.get::<_, Option<i64>>(0);
+		ensure!(prior_fee.is_none_or(|prior| fee_sat > prior),
+			"direct expiry replacement does not raise the absolute fee");
 		self.execute("INSERT INTO expiry_payout_attempt(allocation_id,txid,signed_tx,fee_sat) \
 			VALUES($1,$2,$3,$4)", &[&id,&txid,&raw,&fee_sat]).await?;
-		self.execute("UPDATE expiry_allocation SET sweep_txid=$2,sweep_tx=$3 WHERE id=$1",
-			&[&id,&txid,&raw]).await?;
 		Ok(())
 	}
 

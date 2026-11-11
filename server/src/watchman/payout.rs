@@ -198,9 +198,8 @@ impl Watchman {
 			let status = bcd::tx_status(&self.bitcoind, prior.compute_txid()).await?;
 			if matches!(status, TxStatus::Confirmed(_)) {
 				self.db.write(async |t| {
-					t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) \
-						WHERE id=$1 AND sweep_txid=$2",
-						&[&group.id,&prior.compute_txid().to_string()]).await?;
+					t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) WHERE id=$1",
+						&[&group.id]).await?;
 					Ok(())
 				}).await?;
 				return Ok(());
@@ -210,9 +209,8 @@ impl Watchman {
 			bump = prior_rate < target;
 			if matches!(status, TxStatus::Mempool) && !bump {
 				self.db.write(async |t| {
-					t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) \
-						WHERE id=$1 AND sweep_txid=$2",
-						&[&group.id,&prior.compute_txid().to_string()]).await?;
+					t.execute("UPDATE expiry_allocation SET broadcast_at=COALESCE(broadcast_at,NOW()) WHERE id=$1",
+						&[&group.id]).await?;
 					Ok(())
 				}).await?;
 				return Ok(());

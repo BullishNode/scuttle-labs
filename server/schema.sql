@@ -811,11 +811,8 @@ ALTER SEQUENCE public.ephemeral_tweak_id_seq OWNED BY public.ephemeral_tweak.id;
 CREATE TABLE public.expiry_allocation (
     id bigint NOT NULL,
     expiry_height integer NOT NULL,
-    sweep_txid text,
-    sweep_tx bytea,
     broadcast_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT expiry_allocation_check CHECK (((sweep_txid IS NULL) = (sweep_tx IS NULL))),
     CONSTRAINT expiry_allocation_expiry_height_check CHECK ((expiry_height >= 0))
 );
 
@@ -971,11 +968,11 @@ CREATE VIEW public.expiry_allocation_state AS
     a.expiry_height,
         CASE
             WHEN o.confirmed THEN o.confirmed_txid
-            ELSE a.sweep_txid
+            ELSE latest.txid
         END AS sweep_txid,
         CASE
             WHEN o.confirmed THEN winner.signed_tx
-            ELSE a.sweep_tx
+            ELSE latest.signed_tx
         END AS sweep_tx,
     a.broadcast_at,
     a.created_at,
@@ -1001,9 +998,15 @@ CREATE VIEW public.expiry_allocation_state AS
             WHEN o.confirmed THEN b.hash
             ELSE NULL::text
         END AS confirmed_hash
-   FROM (((public.expiry_allocation a
+   FROM ((((public.expiry_allocation a
      JOIN observed o ON ((o.id = a.id)))
      LEFT JOIN public.expiry_payout_attempt winner ON (((winner.allocation_id = a.id) AND (winner.txid = o.confirmed_txid))))
+     LEFT JOIN LATERAL ( SELECT p.txid,
+            p.signed_tx
+           FROM public.expiry_payout_attempt p
+          WHERE (p.allocation_id = a.id)
+          ORDER BY p.fee_sat DESC
+         LIMIT 1) latest ON (true))
      LEFT JOIN public.watchmand_block b ON ((b.height = o.height)));
 
 
@@ -2652,14 +2655,6 @@ ALTER TABLE ONLY public.expiry_allocation_input
 
 ALTER TABLE ONLY public.expiry_allocation
     ADD CONSTRAINT expiry_allocation_pkey PRIMARY KEY (id);
-
-
---
--- Name: expiry_allocation expiry_allocation_sweep_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_allocation
-    ADD CONSTRAINT expiry_allocation_sweep_txid_key UNIQUE (sweep_txid);
 
 
 --

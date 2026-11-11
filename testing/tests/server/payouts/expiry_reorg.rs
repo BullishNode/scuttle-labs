@@ -172,7 +172,7 @@ async fn expiry_payout_rbf_keeps_owner_output_and_tracks_confirmed_fee() {
 	let (replacement, recorded_fee) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_one(
-				"SELECT a.sweep_tx,p.fee_sat FROM expiry_allocation a \
+				"SELECT a.sweep_tx,p.fee_sat FROM expiry_allocation_state a \
 				 JOIN expiry_payout_attempt p ON p.allocation_id=a.id AND p.txid=a.sweep_txid \
 				 WHERE a.id=$1", &[&allocation]).await?)).await.unwrap();
 			let candidate: Transaction = deserialize(row.get("sweep_tx")).unwrap();
