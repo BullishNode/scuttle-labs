@@ -6,11 +6,12 @@ use std::time::Duration;
 use futures::StreamExt;
 
 use ark::lightning::PaymentHash;
-use ark_testing::{TestContext, btc, util::FutureExt};
+use ark_testing::{Captaind, TestContext, btc, sat, util::FutureExt};
 use ark_testing::balance::assert_balance_consistent;
+use ark_testing::context::LightningPaymentSetup;
 
-use bark::actions::lightning::receive::LightningReceiveState;
-use bark::movement::MovementStatus;
+use bark::actions::lightning::receive::{LightningReceiveState, Progress};
+use bark::movement::{MovementId, MovementStatus};
 use bark::subsystem::Subsystem;
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
 use bark::onchain::{OnchainWallet, OnchainWalletTrait};

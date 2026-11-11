@@ -191,6 +191,13 @@ pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch)
 	} else {
 		assert_eq!(leaf.group_payout, 0);
 		assert!(epoch.parents.values().all(|parent| parent.output.iter().all(|out| out.script_pubkey != leaf.script)));
+		// The fee consumed the coin, so its confirmed decision is a forfeiture.
+		assert_eq!(wallet.get_vtxo_by_id(leaf.coin.id()).await.unwrap().fallback_status,
+			Some(bark::vtxo::FallbackStatus::Forfeited));
+		let payout = wallet.fallback_payout(leaf.coin.id()).await.unwrap().expect("a decided coin reports its payout");
+		assert_eq!((payout.status, payout.gross, payout.fee, payout.payout),
+			(bark::vtxo::FallbackStatus::Forfeited, leaf.coin.amount(), sat(leaf.fee), Amount::ZERO));
+		assert_eq!(payout.address.script_pubkey(), leaf.script);
 	}
 	assert_eq!(wallet.get_vtxo_by_id(leaf.coin.id()).await.unwrap().state, VtxoState::Spent);
 	assert_eq!(wallet.get_full_vtxo(leaf.coin.id()).await.unwrap().serialize(), leaf.coin.serialize());

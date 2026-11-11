@@ -256,3 +256,44 @@ async fn p2tr_positive_subdust_fee_is_subsidized_to_pay_standard_output() {
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries())).await
 		.expect("three genuine boundaries must fit180seconds without retries");
 }
+
+/// The 2,000-sat floor consumes a whole 1,500-sat coin: the payout has no
+/// output for it, and the server and Bark both report a zero-payout forfeiture.
+#[tokio::test]
+async fn p2tr_fee_consuming_the_whole_coin_is_forfeited() {
+	require_bitcoind_chain_source!();
+	let ctx = TestContext::new("server/expiry_zero_output_forfeited").await;
+	let start = ctx.bitcoind().get_block_count().await;
+	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
+		config.vtxo_lifetime = BlockDelta::new(40);
+		config.vtxo_exit_delta = BlockDelta::new(2);
+	}).watchmand().create()).await;
+	let donor_cli = Box::pin(ctx.bark("sender", &srv)
+		.cfg(|config| config.daemon_manual_sync = true).funded(sat(200_000)).create()).await;
+	let ids = Box::pin(donor_cli.board_and_confirm_and_register(&ctx, sat(100_000))).await;
+	let sender = Box::pin(donor_cli.client()).await;
+	sender.stop_daemon_wait().await.unwrap();
+	let board = ctx.bitcoind().await_transaction(sender.get_full_vtxo(ids[0]).await.unwrap().chain_anchor().txid).await;
+	let app = Box::pin(ctx.bark("recipient", &srv).cfg(|config| config.daemon_manual_sync = true).create()).await;
+	let recipient = Box::pin(app.client()).await;
+	let (coin, _) = Box::pin(receive_boundary(&srv, &sender, &recipient, sat(1_500), &board)).await;
+	let leaf = ExpectedLeaf { coin, mailbox: recipient.mailbox_identifier(), script: recipient.fallback_script(),
+		fee: 1_500, payout: 0, subsidy: 0, forfeited: 0, group_payout: 0 };
+	let history = recipient.history().await.unwrap();
+	for wallet in [&sender, &recipient] { wallet.stop_daemon_wait().await.unwrap(); }
+	drop(sender);
+	drop(recipient);
+	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
+	ctx.generate_blocks(6).await;
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let epoch = Box::pin(confirm_epoch(&ctx, &srv, &db, std::slice::from_ref(&leaf), start, 90, 96)).await;
+	let recipient = Box::pin(app.client()).await;
+	let key = recipient.get_vtxo_key(&leaf.coin).await.unwrap();
+	let status = srv.get_public_rpc().await.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: leaf.coin.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(leaf.coin.id(), &key).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.spend_state, protos::VtxoSpendState::FallbackForfeited as i32);
+	assert_eq!(status.fallback_payout, Some(protos::FallbackPayout { gross_sat: 1_500, fee_sat: 1_500, payout_sat: 0 }));
+	verify_return(&recipient, &[&leaf], &epoch, &history).await;
+}

@@ -80,3 +80,108 @@ async fn receive_claim_reply_loss_is_durable_before_wire_and_recovers_after_reop
 	}
 }
 
+
+/// Refuses every receive claim as decided for fallback and reports a
+/// hash-level `Spent` outcome. With `foreign_owner` set, coin status names
+/// another mailbox as the owner.
+#[derive(Clone)]
+struct DecidedReceive {
+	foreign_owner: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl captaind::proxy::ArkRpcProxy for DecidedReceive {
+	async fn claim_lightning_receive(
+		&self, _upstream: &mut ArkClient, _request: protos::ClaimLightningReceiveRequest,
+	) -> Result<protos::ArkoorPackageCosignResponse, tonic::Status> {
+		let mut refusal = tonic::Status::invalid_argument("receive grant is decided for fallback");
+		refusal.metadata_mut().insert("abandon-reason", "decided_for_fallback".parse().unwrap());
+		Err(refusal)
+	}
+
+	async fn check_lightning_receive(
+		&self, upstream: &mut ArkClient, request: protos::CheckLightningReceiveRequest,
+	) -> Result<protos::CheckLightningReceiveResponse, tonic::Status> {
+		let mut response = upstream.check_lightning_receive(request).await?.into_inner();
+		response.fallback_spend_state = Some(protos::VtxoSpendState::Spent as i32);
+		Ok(response)
+	}
+
+	async fn get_vtxo_status(
+		&self, upstream: &mut ArkClient, request: protos::GetVtxoStatusRequest,
+	) -> Result<protos::GetVtxoStatusResponse, tonic::Status> {
+		let mut response = upstream.get_vtxo_status(request).await?.into_inner();
+		if self.foreign_owner.load(Ordering::SeqCst) {
+			let other = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7; 32]).unwrap();
+			response.owner_mailbox = other.public_key().serialize().to_vec();
+		}
+		Ok(response)
+	}
+}
+
+/// Pay a new receive whose claim the proxy refuses, then drive it as far as it goes.
+async fn decided_receive(
+	srv: &Captaind, lightning: &Arc<LightningPaymentSetup>, wallet: &Wallet, destination: Option<ark::Address>,
+) -> (PaymentHash, anyhow::Result<LightningReceiveState>) {
+	let invoice = wallet.bolt11_invoice_builder().amount(sat(50_000)).claim_destination(destination)
+		.build().await.unwrap();
+	let hash = PaymentHash::from(&invoice);
+	let (payer, bolt11) = (lightning.clone(), invoice.to_string());
+	// The refused claim never settles the hold invoice, so this payment stays in flight.
+	tokio::spawn(async move { payer.external.try_pay_bolt11(bolt11).await });
+	srv.wait_for_lightning_receive_accepted(hash).await;
+	(hash, wallet.try_claim_lightning_receive(hash, true).await)
+}
+
+/// The receive stays parked after disclosing its preimage: its movement is
+/// unfinished, nothing is settled, and its grants have no payout status.
+async fn assert_parked(wallet: &Wallet, hash: PaymentHash, result: anyhow::Result<LightningReceiveState>)
+	-> (MovementId, Vec<ark::VtxoId>)
+{
+	let error = result.expect_err("a hash-level outcome finished the receive");
+	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback), "{error:#}");
+	let LightningReceiveState::InProgress(receive) = wallet.lightning_receive_state(hash).await.unwrap() else {
+		panic!("a hash-level outcome settled the receive");
+	};
+	let Progress::PreimageRevealed(htlcs) = receive.progress else { panic!("unexpected {:?}", receive.progress) };
+	let movement = wallet.history().await.unwrap().into_iter().find(|m| m.id == htlcs.movement_id).unwrap();
+	assert_eq!(movement.status, MovementStatus::Pending);
+	for id in &htlcs.vtxo_ids {
+		assert_eq!(wallet.get_vtxo_by_id(*id).await.unwrap().fallback_status, None);
+	}
+	(htlcs.movement_id, htlcs.vtxo_ids)
+}
+
+/// A hash-level fallback outcome is not a delivery receipt. It finishes a
+/// local receive only after every grant's authenticated status names this
+/// wallet's mailbox, and never finishes a receive forwarded to another wallet.
+#[tokio::test]
+async fn hash_fallback_outcome_finishes_only_an_owned_local_receive() {
+	let ctx = TestContext::new("bark_sdk/hash_fallback_outcome_owned_local_receive").await;
+	let lightning = Arc::new(ctx.new_lightning_setup("lightningd").await);
+	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10))
+		.cfg(|cfg| cfg.expiry_payouts = true).create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let gate = DecidedReceive { foreign_owner: Arc::new(AtomicBool::new(false)) };
+	let proxy = srv.start_proxy_no_mailbox(gate.clone()).await;
+	let wallet = ctx.bark_sdk("receiver", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
+	let recipient = ctx.bark_sdk("recipient", &srv).create().await;
+	lightning.sync().await;
+
+	gate.foreign_owner.store(true, Ordering::SeqCst);
+	let (local, result) = decided_receive(&srv, &lightning, &wallet, None).await;
+	let (movement, grants) = assert_parked(&wallet, local, result).await;
+	// Once the grants are attested as this wallet's, the same outcome finishes it.
+	gate.foreign_owner.store(false, Ordering::SeqCst);
+	assert!(matches!(wallet.try_claim_lightning_receive(local, true).await.unwrap(), LightningReceiveState::Settled(_)));
+	let finished = wallet.history().await.unwrap().into_iter().find(|m| m.id == movement).unwrap();
+	assert_eq!((finished.status, finished.effective_balance), (MovementStatus::Successful, bitcoin::SignedAmount::ZERO));
+	for id in grants {
+		assert_eq!(wallet.get_vtxo_by_id(id).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Spent));
+	}
+
+	// The outcome that finished the owned receive cannot finish a forwarded one.
+	let destination = recipient.new_address().await.unwrap();
+	let (forwarded, result) = decided_receive(&srv, &lightning, &wallet, Some(destination)).await;
+	assert_parked(&wallet, forwarded, result).await;
+}
