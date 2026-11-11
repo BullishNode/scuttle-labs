@@ -865,15 +865,6 @@ impl Watchman {
 		if self.db.expiry_payouts() {
 			self.db.write(async |t| {
 				t.lock_watchman_claim_inputs(vtxos).await?;
-				for vtxo in vtxos.iter().filter(|v| self.db.expiry_payouts() && *v.policy() == ServerVtxoPolicy::ServerOwned) {
-					// Exclude mempool effects so our existing native RBF path can
-					// replace its own claim; canonical consumption always refuses.
-					let output = self.bitcoind.try_get_tx_out(vtxo.point(), false).await?
-						.context("operator collateral is not canonically unspent")?;
-					ensure!(output.confirmations > 0 && output.value == vtxo.amount()
-						&& output.script_pub_key.script()? == vtxo.txout().script_pubkey,
-						"operator collateral differs from its confirmed server-owned output");
-				}
 				bcd::broadcast_tx(&self.bitcoind, &tx).await?;
 				Ok(())
 			}).await?;
