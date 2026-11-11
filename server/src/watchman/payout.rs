@@ -220,7 +220,6 @@ impl Watchman {
 					prior_rate, self.config.incremental_relay_fee));
 			}
 		}
-		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 		let mut wallet = self.watchman_wallet.lock().await;
 		let payout = self.db.write(async |t| {
 			// store_expiry_attempt rechecks the view and pending state at commit.
@@ -255,7 +254,6 @@ impl Watchman {
 		let _ = wallet.take_staged();
 		crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
 		drop(wallet);
-		crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 		if !matches!(bcd::tx_status(&self.bitcoind, payout.compute_txid()).await?, TxStatus::Confirmed(_)) {
 			bcd::broadcast_tx(&self.bitcoind, &payout).await?;
 		}
