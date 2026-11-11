@@ -212,8 +212,8 @@ async fn parse_payment_request() {
 		let fees = uri_parser_bark.estimate_payment_fees(request, None).await;
 		assert_eq!(fees.len(), 1);
 		assert_eq!(fees[0].1, FeeEstimate {
-			gross_amount: amount + Amount::from_sat(1_785),
-			fee: Amount::from_sat(1_785),
+			gross_amount: amount + Amount::from_sat(938),
+			fee: Amount::from_sat(938),
 			net_amount: amount,
 			vtxos_spent: vec![vtxo],
 		});
@@ -342,8 +342,8 @@ async fn parse_payment_request() {
 		let fees = uri_parser_bark.estimate_payment_fees(request, Some(amount)).await;
 		assert_eq!(fees.len(), 1);
 		assert_eq!(fees[0].1, FeeEstimate {
-			gross_amount: amount + Amount::from_sat(1_701),
-			fee: Amount::from_sat(1_701),
+			gross_amount: amount + Amount::from_sat(854),
+			fee: Amount::from_sat(854),
 			net_amount: amount,
 			vtxos_spent: vec![vtxo],
 		});

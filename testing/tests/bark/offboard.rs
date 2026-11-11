@@ -38,7 +38,7 @@ async fn offboard_all() {
 	// We check that all vtxos have been offboarded
 	assert_eq!(Amount::ZERO, bark1.spendable_balance().await);
 
-	let offboard_fee = sat(1_701);
+	let offboard_fee = sat(854);
 	let movements = bark1.history().await;
 	let offb_movement = movements.last().unwrap();
 	assert_eq!(offb_movement.input_vtxos.len(), 3, "all offboard vtxos should be in movement");
@@ -98,7 +98,7 @@ async fn offboard_vtxos() {
 	assert!(updated_vtxos.contains(&vtxos[0].id));
 	assert!(updated_vtxos.contains(&vtxos[2].id));
 
-	let offboard_fee = sat(1_701);
+	let offboard_fee = sat(854);
 	let movements = bark1.history().await;
 	let offb_movement = movements.last().unwrap();
 	assert_eq!(offb_movement.input_vtxos.len(), 1, "only provided vtxo should be offboarded");
@@ -134,7 +134,7 @@ async fn bark_send_onchain() {
 	bark1.send_onchain(&addr, send_amount).await;
 	ctx.generate_blocks(2).await;
 
-	let offboard_fee = sat(1_785);
+	let offboard_fee = sat(938);
 	// bark > 0.6.1 splits change in two
 	let nb_change = if is_bark_version!(> "0.6.1") { 2 } else { 1 };
 	let change_vtxos = bark1.vtxos().await;

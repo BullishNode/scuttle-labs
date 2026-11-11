@@ -667,10 +667,8 @@ async fn max_vtxo_amount() {
 	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
 	bark1.maintain().await;
 	let balance = ctx.bitcoind().get_received_by_address(&address);
-	// Both VTXOs can be offboarded together. The miner fee depends on the
-	// current fee rate and transaction weight, so it is not a fixed amount.
-	assert!(balance >= Amount::from_sat(990_000) && balance < Amount::from_sat(1_000_000),
-		"unexpected offboard balance: {balance}");
+	// The two boarded VTXOs (1_000_000 sat) minus the offboard fees.
+	assert_eq!(balance, Amount::from_sat(999_146));
 }
 
 #[tokio::test]
