@@ -1,19 +1,11 @@
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use bitcoin::secp256k1::{Keypair, rand::thread_rng};
-use bitcoin_ext::AmountExt;
-use futures::future::join_all;
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoPolicy, SECP};
-use ark::lightning::PaymentHash;
-use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
+use ark::mailbox::MailboxIdentifier;
 use ark::test_util::dummy::DummyTestVtxoSpec;
 use ark::vtxo::raw::RawVtxo;
-use server::database::{Db, MailboxPayload};
-use server_rpc::{protos, MAX_NB_MAILBOX_ARKOOR_VTXOS};
-use server_rpc::protos::mailbox_server::mailbox_message::Message;
-use ark_testing::{TestContext, btc, require_bark_version};
-use ark_testing::daemon::captaind;
+use server::database::Db;
+use server_rpc::protos;
+use ark_testing::TestContext;
 use server::database::tree::VtxoTreeUpdate;
 
 /// The arkoor post endpoint is unauthenticated (senders aren't the

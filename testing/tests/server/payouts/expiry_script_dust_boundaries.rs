@@ -13,7 +13,7 @@ use bark::Wallet;
 use bark::movement::{Movement, MovementStatus};
 use bark::vtxo::VtxoState;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
-use bitcoin_ext::{BlockDelta, TxOutExt};
+use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
 use server_rpc::protos;

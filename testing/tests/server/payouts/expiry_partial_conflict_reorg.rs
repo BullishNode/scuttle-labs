@@ -11,7 +11,7 @@ use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::deserialize;
 use bitcoin::hex::DisplayHex;
-use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
+use bitcoin_ext::{BlockDelta, BlockRef};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{BlockTable, Db};
 

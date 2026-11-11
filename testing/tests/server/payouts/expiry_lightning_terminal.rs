@@ -9,7 +9,7 @@ use ark_testing::{btc, sat, TestContext};
 use ark_testing::context::LightningPaymentSetup;
 use bitcoin::Transaction;
 use bitcoin_ext::{AmountExt, BlockDelta, BlockHeight};
-use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
+use bitcoin_ext::rpc::RpcApi;
 use cln_rpc::plugins::hold;
 use server::database::Db;
 use server_log::{ExpiryHoldObserved, XpayRpcCalled, XpayRpcReturned};
@@ -192,115 +192,6 @@ async fn failed_external_payout(settle_during_decision: bool) {
 #[tokio::test]
 async fn expiry_settlement_during_decision_keeps_source_held() {
 	failed_external_payout(true).await;
-}
-
-#[inline(never)]
-fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>> {
-	Box::pin(async move {
-	let name = "server/expiry_internal_zero_grant_timeout";
-	let ctx = TestContext::new(name).await;
-	let lightning = ctx.new_lightning_setup_no_channel("lightningd").await;
-	let builder = ctx.captaind("server").lightningd(&lightning.internal).bitcoind(ctx.bitcoind_arc());
-	let builder = builder.no_vtxo_pool();
-	let srv = builder
-		.funded(btc(10)).cfg(move |cfg| {
-			cfg.expiry_payouts = true;
-			cfg.vtxo_lifetime = BlockDelta::new(400);
-			cfg.receive_htlc_forward_timeout = Duration::from_secs(2);
-			cfg.invoice_check_interval = Duration::from_secs(1);
-		}).watchmand().create().await;
-	let recipient = ctx.bark_sdk("absent-recipient", &srv)
-		.cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	let invoice_amount = 90_000;
-	let invoice = recipient.bolt11_invoice(sat(invoice_amount), None, None).await.unwrap();
-	let hash = PaymentHash::from(&invoice);
-	drop(recipient); // No prepare-claim, claim, revoke or later wallet call.
-	let sender = ctx.bark("absent-sender", &srv).funded(sat(200_000)).create().await;
-	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
-	let client = sender.client().await;
-	let input = client.get_full_vtxo(ids[0]).await.unwrap();
-	let source_expiry = input.expiry_height();
-	assert_eq!(input.amount(), sat(100_000));
-	let key = client.get_vtxo_key(&input).await.unwrap();
-	let destination = client.fallback_script();
-	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
-	let source = super::expiry_send_claim::signed_leaf(&ctx, &srv, &client, input,
-		VtxoPolicy::new_server_htlc_send(key.public_key(), hash, deadline)).await.id();
-	drop(client);
-	lightning.sync().await;
-	let mut rpc = srv.get_public_rpc().await;
-	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
-		protos::InitiateLightningPaymentRequest {
-		invoice: invoice.to_string(), payment_amount_sat: invoice_amount,
-		htlc_vtxo_ids: vec![source.to_bytes().to_vec()], mailbox_id: None, retry_for_secs: Some(5),
-		intent_nonce: None, source_owner_signatures: Vec::new(),
-	}, &key).await).await.unwrap();
-	drop(rpc); // No second prepare, cooperative revoke, claim or wallet return.
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let (attempt, subscription) = tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let row = db.read(async |t| Ok(t.query_opt("SELECT a.id,a.lightning_htlc_subscription_id AS subscription_id FROM lightning_payment_attempt a \
-				JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id AND s.payment_hash=a.payment_hash \
-				WHERE a.payment_hash=$1 AND a.status='failed' AND s.status='canceled'", &[&hash.to_string()]).await?)).await.unwrap();
-			if let Some(row) = row { break (row.get::<_, i64>("id"), row.get::<_, i64>("subscription_id")); }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("normal accepted-setup timeout did not cancel the actual internal subscription");
-	let mut hold = lightning.internal.hold_client().await;
-	let actual = hold.list(hold::ListRequest {
-		constraint: Some(hold::list_request::Constraint::PaymentHash(hash.to_vec())),
-	}).await.unwrap().into_inner();
-	assert!(actual.invoices.iter().any(|i| i.payment_hash == hash.to_vec()
-		&& i.invoice == invoice.to_string() && i.state == hold::InvoiceState::Cancelled as i32));
-	let mut node = lightning.internal.grpc_client().await;
-	assert!(node.list_send_pays(cln_rpc::ListsendpaysRequest {
-		payment_hash: Some(hash.to_vec()), ..Default::default()
-	}).await.unwrap().into_inner().payments.is_empty());
-	let unclaimed = db.read(async |t| Ok(t.query_one("SELECT \
-		(SELECT COUNT(*) FROM vtxo WHERE lightning_htlc_subscription_id=$1) AS grants, \
-		(SELECT COUNT(*) FROM expiry_lightning_receive_claim WHERE subscription_id=$1) AS bindings, \
-		EXISTS(SELECT 1 FROM htlc_settlement WHERE payment_hash=$2) AS wal",
-		&[&subscription,&hash.to_string()]).await?)).await.unwrap();
-	assert_eq!(unclaimed.get::<_, i64>("grants"), 0);
-	assert_eq!(unclaimed.get::<_, i64>("bindings"), 0);
-	assert!(!unclaimed.get::<_, bool>("wal"));
-	let fee_address = srv.watchmand().wait_wallet_address().await;
-	// Each concurrent parent needs its own CONFIRMED fee input at the held tip.
-	let fee_inputs = 1;
-	for _ in 0..fee_inputs {
-		ctx.bitcoind().fund_addr(fee_address.clone(), sat(100_000)).await;
-	}
-	ctx.generate_blocks(2).await;
-	let height = ctx.bitcoind().get_block_count().await as u32;
-	let expired = ctx.generate_blocks(source_expiry.to_u32() + 1 - height).await;
-	srv.wait_for_sync_height(expired).await;
-	srv.watchmand().wait_for_sync_height(expired).await;
-	let parent: Transaction = tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			if let Some((_, parent)) = super::expiry_test::published_payout(&db, source).await { return parent; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("cancelled zero-grant internal funding still requires a returning wallet");
-	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	let (index, paid) = parent.output.iter().enumerate().find(|(_, o)| o.script_pubkey == destination).unwrap();
-	assert_eq!(paid.value, sat(98_000));
-	assert_eq!(parent.output.iter().filter(|o| o.script_pubkey == destination).count(), 1);
-	assert!(super::expiry_test::actual_fee(&ctx, &parent).await > bitcoin::Amount::ZERO);
-	ctx.generate_blocks(6).await;
-	assert!(ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
-	let kept = db.read(async |t| Ok(t.query_one("SELECT \
-		EXISTS(SELECT 1 FROM lightning_payment_attempt WHERE id=$1 AND lightning_htlc_subscription_id=$2) AS funding, \
-		(SELECT COUNT(*) FROM vtxo WHERE lightning_htlc_subscription_id=$2) AS grants, \
-		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-			WHERE e.vtxo_id=$3 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer') AS paid_once",
-		&[&attempt,&subscription,&source.to_string()]).await?)).await.unwrap();
-	assert!(kept.get::<_, bool>("funding"));
-	assert_eq!(kept.get::<_, i64>("grants"), 0);
-	assert_eq!(kept.get::<_, i64>("paid_once"), 1);
-	let original = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, source).await).await.unwrap().unwrap();
-	assert_eq!(original.htlc.resolution(), None, "automatic closure never invents a signed revocation");
-	})
 }
 
 #[tokio::test]
@@ -513,7 +404,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 			let snapshot = t.backing_subtree_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()]).await?;
 			Ok(snapshot.regular.into_iter().find(|fact| fact.state.vtxo_id == source).unwrap())
 		}).await.unwrap();
-		let funding = ctx.bitcoind().await_transaction(incoming[0].chain_anchor().txid).await;
+		let _funding = ctx.bitcoind().await_transaction(incoming[0].chain_anchor().txid).await;
 		let proposal = db.read(async |t| t.propose_expiry_ownership(&fact, height).await).await.unwrap();
 		assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
 		let height = ctx.generate_blocks(1).await;

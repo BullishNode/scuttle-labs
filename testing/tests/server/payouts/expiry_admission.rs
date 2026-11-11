@@ -1,4 +1,4 @@
-pub(super) use super::owner_helpers::{owner_rows, source_rows, vtxo_replay_rows, receive_admission_rows};
+pub(super) use super::owner_helpers::{owner_rows, source_rows, vtxo_replay_rows};
 
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::lightning::PaymentHash;

@@ -1,6 +1,6 @@
 //! Real-size direct expiry payouts. Run the large case explicitly.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
@@ -8,7 +8,6 @@ use ark::mailbox::MailboxIdentifier;
 use ark::vtxo::Full;
 use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, SECP};
 use ark_testing::{sat, Captaind, TestContext};
-use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::daemon::captaind::ArkClient;
 use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut};
 use bitcoin::bip32::{ChildNumber, Xpriv};

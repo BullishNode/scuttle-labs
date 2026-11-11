@@ -27,7 +27,7 @@ async fn failed_lightning_source_needs_fresh_owner_intent() {
 		.build_signed(|message| SECP.sign_ecdsa_recoverable(message, &unknown_key)).unwrap()
 		.to_string();
 	let wallet = sender.client().await;
-	let source = RawHtlcSend::cosign(&ctx, &srv, &wallet, &inputs, hash).await;
+	let source = PayoutRawHtlcSend::cosign(&ctx, &srv, &wallet, &inputs, hash).await;
 	let request = protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 100_000,
 		htlc_vtxo_ids: source.vtxos.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
@@ -42,7 +42,7 @@ async fn failed_lightning_source_needs_fresh_owner_intent() {
 	let signed = ark_testing::lightning::sign_lightning_send_request(&srv, request.clone(), &source.keypair).await;
 	rpc.initiate_lightning_payment(signed.clone()).await.unwrap();
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	wait_for_attempt_status(&db, hash, "failed").await;
+	wait_for_latest_attempt_status(&db, hash, "failed").await;
 
 	let missing = rpc.initiate_lightning_payment(request.clone()).await.unwrap_err();
 	assert_eq!(missing.code(), tonic::Code::InvalidArgument);
@@ -76,7 +76,7 @@ async fn failed_lightning_source_needs_fresh_owner_intent() {
 		&[&hash.to_string()],
 	).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(count, 2, "the owner must still be able to retry a failed send");
-	wait_for_attempt_status(&db, hash, "failed").await;
+	wait_for_latest_attempt_status(&db, hash, "failed").await;
 	source.revoke(&srv).await.expect("failed source remains refundable");
 }
 
@@ -396,4 +396,136 @@ async fn server_lightning_receive_claim_output_mailbox_is_immutable() {
 	assert_eq!(db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap().status, server::database::ln::LightningHtlcSubscriptionStatus::Settled);
 	assert!(pay_task.wait_millis(30_000).await.unwrap().is_ok());
+}
+
+// Payout-mode forms of upstream helpers: they sign the send intent and name
+// each output's payout mailbox.
+/// HTLC-send vtxos that a client cosigned straight through the server RPC,
+/// keyed to a fresh keypair it holds, so a test can initiate and revoke them
+/// for any payment hash.
+struct PayoutRawHtlcSend {
+	keypair: Keypair,
+	vtxos: Vec<Vtxo<Full>>,
+}
+
+impl PayoutRawHtlcSend {
+	/// Lock `input_ids` of `client` into registered HTLC-send vtxos for
+	/// `payment_hash`, without initiating a payment.
+	async fn cosign(
+		ctx: &TestContext,
+		srv: &Captaind,
+		client: &Wallet,
+		input_ids: &[ark::VtxoId],
+		payment_hash: PaymentHash,
+	) -> PayoutRawHtlcSend {
+		let keypair = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+		let vtxos = payout_cosign_htlc_send_to_pubkey(
+			ctx, srv, client, input_ids, keypair.public_key(), Some(&keypair), payment_hash,
+			ark::mailbox::MailboxIdentifier::from_pubkey(keypair.public_key()),
+		).await;
+
+		let mut srv_rpc = srv.get_public_rpc().await;
+		srv_rpc.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
+			vtxos: vtxos.iter().map(|v| v.serialize().to_vec()).collect(),
+		}).await.unwrap();
+
+		PayoutRawHtlcSend { keypair, vtxos }
+	}
+
+	async fn revoke(&self, srv: &Captaind) -> Result<(), tonic::Status> {
+		payout_revoke_htlc_vtxos(srv, self.vtxos.clone(), &vec![self.keypair; self.vtxos.len()],
+			ark::mailbox::MailboxIdentifier::from_pubkey(self.keypair.public_key())).await
+	}
+}
+
+async fn payout_cosign_htlc_send_to_pubkey(
+	ctx: &TestContext,
+	srv: &Captaind,
+	client: &Wallet,
+	input_ids: &[ark::VtxoId],
+	owner: bitcoin::secp256k1::PublicKey,
+	owner_key: Option<&Keypair>,
+	payment_hash: ark::lightning::PaymentHash,
+	mailbox: ark::mailbox::MailboxIdentifier,
+) -> Vec<Vtxo<Full>> {
+	let mut inputs = Vec::with_capacity(input_ids.len());
+	let mut keypairs = Vec::with_capacity(input_ids.len());
+	for id in input_ids {
+		let vtxo = client.get_full_vtxo(*id).await.unwrap();
+		keypairs.push(client.get_vtxo_key(&vtxo).await.unwrap());
+		inputs.push(vtxo);
+	}
+
+	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	let htlc_expiry = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
+	let policy = ark::VtxoPolicy::new_server_htlc_send(owner, payment_hash, htlc_expiry);
+
+	let address = if srv.config().expiry_payouts {
+		Some(crate::payouts::payout_address(srv, policy.clone(),
+			owner_key.expect("payout-enabled HTLC output needs its coin key"), mailbox).await)
+	} else { None };
+	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		inputs.clone(), policy,
+	).unwrap().generate_user_nonces(&keypairs).unwrap();
+
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	for output in package.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		assert_eq!(ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey(), owner);
+		output.blinded_mailbox_id = address.as_deref().map(crate::payouts::blinded_mailbox).unwrap_or_default();
+	}
+	let mut srv_rpc = srv.get_public_rpc().await;
+	let response = srv_rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
+		parts: package.parts,
+	}).await.expect("a valid recipient link allows a gift without making its recipient the input owner")
+		.into_inner();
+
+	let cosign_responses =
+		ark::arkoor::package::ArkoorPackageCosignResponse::try_from(response).unwrap();
+	builder.user_cosign(&keypairs, cosign_responses).unwrap().build_signed_vtxos()
+}
+
+/// Send a "claim all" revocation of `htlc_vtxos`, signed with `keypairs`,
+/// straight to the server.
+async fn payout_revoke_htlc_vtxos(
+	srv: &Captaind,
+	htlc_vtxos: Vec<Vtxo<Full>>,
+	keypairs: &[Keypair],
+	mailbox: ark::mailbox::MailboxIdentifier,
+) -> Result<(), tonic::Status> {
+	// Any pubkey works for the revocation output; the tests never claim it.
+	let revocation_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let revocation_pubkey = revocation_key.public_key();
+	let policy = ark::VtxoPolicy::new_pubkey(revocation_pubkey);
+	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
+		htlc_vtxos,
+		policy.clone(),
+	).unwrap().generate_user_nonces(keypairs).unwrap();
+
+	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	if srv.config().expiry_payouts {
+		let address = crate::payouts::payout_address(srv, policy, &revocation_key, mailbox).await;
+		for output in cosign_request.parts.iter_mut().flat_map(|part|
+			part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+			assert_eq!(ark::VtxoPolicy::deserialize(&output.policy).unwrap().user_pubkey(), revocation_pubkey);
+			output.blinded_mailbox_id = crate::payouts::blinded_mailbox(&address);
+		}
+	}
+
+	let mut srv_rpc = srv.get_public_rpc().await;
+	srv_rpc.request_lightning_pay_htlc_revocation(cosign_request).await.map(|_| ())
+}
+
+/// Waits until the newest payment attempt for `payment_hash` reaches `status`.
+async fn wait_for_latest_attempt_status(db: &Db, payment_hash: ark::lightning::PaymentHash, status: &str) {
+	for _ in 0..50 {
+		let current = db.read(async |t| Ok(t.query_opt(
+			"SELECT status::text FROM lightning_payment_attempt WHERE payment_hash = $1 ORDER BY id DESC LIMIT 1",
+			&[&payment_hash.to_string()],
+		).await?.map(|r| r.get::<_, String>(0)))).await.unwrap();
+		if current.as_deref() == Some(status) {
+			return;
+		}
+		tokio::time::sleep(Duration::from_millis(200)).await;
+	}
+	panic!("payment attempt never reached {status}");
 }

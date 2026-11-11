@@ -1,12 +1,9 @@
 
 
 use ark::ServerVtxo;
-use ark::encode::ProtocolEncoding;
 use ark::test_util::VTXO_VECTORS;
 
 use server::database::{Db, SpendState};
-use server::database::expiry_attribution::Attribution;
-use server::database::expiry_ownership::{OwnershipBindingSource, OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use server::database::tree::VtxoTreeUpdate;
 
 use ark_testing::TestContext;

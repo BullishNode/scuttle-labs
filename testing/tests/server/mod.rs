@@ -1,3 +1,4 @@
+mod payouts;
 mod ban;
 mod blocklist;
 mod block_index;

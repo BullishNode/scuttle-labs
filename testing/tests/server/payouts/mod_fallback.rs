@@ -3,7 +3,7 @@ fn test_server_mailbox_key() -> &'static bitcoin::secp256k1::Keypair {
 	KEY.get_or_init(|| bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[251; 32]).unwrap())
 }
 
-async fn payout_address(
+pub(crate) async fn payout_address(
 	srv: &Captaind, policy: VtxoPolicy, output_key: &bitcoin::secp256k1::Keypair,
 	mailbox: ark::mailbox::MailboxIdentifier,
 ) -> String {
@@ -16,7 +16,7 @@ async fn payout_address(
 		.into_address().unwrap().to_string()
 }
 
-fn blinded_mailbox(address: &str) -> Vec<u8> {
+pub(crate) fn blinded_mailbox(address: &str) -> Vec<u8> {
 	let address: ark::Address = address.parse().unwrap();
 	match address.delivery() {
 		[ark::address::VtxoDelivery::ServerMailbox { blinded_id }] => blinded_id.as_ref().to_vec(),

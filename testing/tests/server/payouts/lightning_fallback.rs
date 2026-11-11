@@ -342,7 +342,7 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 	srv.wait_for_vtxopool(&ctx).await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let recipient = ctx.bark("recipient", &srv).create().await;
-	let address: ark::Address = recipient.address().await.parse().unwrap();
+	let _address: ark::Address = recipient.address().await.parse().unwrap();
 	let recipient_script = recipient.client().await.fallback_script();
 	let provider_mailbox = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let grant_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());

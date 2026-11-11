@@ -1,6 +1,6 @@
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::lightning::PaymentHash;
-use ark::{ProtocolEncoding, VtxoPolicy};
+use ark::VtxoPolicy;
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::protos;
 use server_log::ExpiryHoldObserved;
@@ -55,7 +55,7 @@ async fn held_coin_is_alarmed_before_decision() {
 	let attempts = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap();
 	assert!(attempts.is_none());
 	let root = ark::ServerVtxo::from(input.clone()).to_bare();
-	let funding = db.read(async |t| t.get_virtual_transaction_by_txid(input.chain_anchor().txid).await).await.unwrap().unwrap()
+	let _funding = db.read(async |t| t.get_virtual_transaction_by_txid(input.chain_anchor().txid).await).await.unwrap().unwrap()
 		.signed_tx.unwrap().into_owned();
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();

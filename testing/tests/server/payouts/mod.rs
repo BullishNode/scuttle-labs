@@ -27,7 +27,6 @@ mod lightning;
 mod lightning_dispatch_reply_loss;
 mod lightning_receive_unmaterialized;
 
-use std::str::FromStr;
 use bitcoin::secp256k1::Keypair;
 use ark::{ProtocolEncoding, VtxoPolicy};
 use bark::Wallet;
