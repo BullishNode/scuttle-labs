@@ -26,6 +26,7 @@ use server_rpc::{pver, RequestExt, IN_FLIGHT_INPUTS_METADATA_KEY};
 
 use crate::error::{BadArgument, FallbackRefusal, InFlightInputs, NotFound, RoundCancelledBeforeForfeit, Unavailable, UnusableInputs};
 
+
 /// The minimum protocol version supported by the server.
 ///
 /// For info on protocol versions, see [server_rpc::pver] module documentation.
@@ -201,7 +202,6 @@ where
 	}
 
 	fn not_found<I, V, C>(self, ids: V, context: C) -> Result<T, tonic::Status>
-
 	where
 		V: IntoIterator<Item = I>,
 		I: fmt::Display,
@@ -210,6 +210,7 @@ where
 		crate::error::ContextExt::not_found(self, ids, context).to_status()
 	}
 }
+
 
 #[async_trait]
 trait ReceiverExt {
@@ -231,17 +232,15 @@ impl ReceiverExt for oneshot::Receiver<anyhow::Error> {
 	}
 }
 
-
-/// Payout mode uses the same numeric wire version as upstream. The handshake
-/// label identifies its additional destination and ownership requirements.
-fn validate_pver<T>(req: &tonic::Request<T>, expiry_payouts: bool) -> Result<u64, tonic::Status> {
+/// Get the protocol version sent by the user and check if it's supported.
+#[allow(unused)]
+fn validate_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
 	let pver = req.pver()?;
-	let range = if expiry_payouts {
-		pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES..=pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES
-	} else { MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION };
-	if !range.contains(&pver) {
+
+	if !(MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver) {
 		return Err(tonic::Status::invalid_argument("unsupported protocol version"));
 	}
+
 	Ok(pver)
 }
 
