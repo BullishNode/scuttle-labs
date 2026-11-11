@@ -644,7 +644,9 @@ CREATE TABLE public.board_exit (
     exit_txid text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     owner_mailbox text,
-    CONSTRAINT board_exit_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66)))
+    user_pubkey text,
+    CONSTRAINT board_exit_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66))),
+    CONSTRAINT board_exit_user_pubkey_check CHECK (((user_pubkey IS NULL) OR (length(user_pubkey) = 66)))
 );
 
 
@@ -2976,6 +2978,13 @@ CREATE INDEX arkoor_mailbox_pubkey_ix ON public.arkoor_mailbox USING btree (pubk
 --
 
 CREATE UNIQUE INDEX arkoor_mailbox_vtxo_id_uix ON public.arkoor_mailbox USING btree (vtxo_id);
+
+
+--
+-- Name: board_exit_exit_txid_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX board_exit_exit_txid_idx ON public.board_exit USING btree (exit_txid);
 
 
 --

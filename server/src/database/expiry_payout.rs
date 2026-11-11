@@ -142,7 +142,14 @@ impl Tx<'_> {
 		if !self.expiry_payouts() { return Ok(BTreeMap::new()); }
 		let claims = self.source_fallback_claims(ids).await?;
 		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
-		let owners = self.coin_owner_mailboxes(ids).await?;
+		let mut owners = self.coin_owner_mailboxes(ids).await?;
+		for (id, source) in &sources {
+			if !owners.contains_key(id) && matches!(source.vtxo.policy(), ServerVtxoPolicy::Expiry(_)) {
+				if let Some((_, mailbox)) = self.unregistered_board_owner(*id).await? {
+					owners.insert(*id, mailbox);
+				}
+			}
+		}
 		let mut outcomes = BTreeMap::new();
 		for (id, source) in sources {
 			let Some(owner) = owners.get(&id) else { continue; };
@@ -287,6 +294,10 @@ impl Tx<'_> {
 	async fn fallback_claim_sources(&self, claim: &FallbackClaim) -> anyhow::Result<BTreeSet<VtxoId>> {
 		let mut sources = BTreeSet::new();
 		if self.coin_owner_mailboxes(&[claim.vtxo_id]).await?.get(&claim.vtxo_id) == Some(&claim.owner_mailbox) {
+			sources.insert(claim.vtxo_id);
+		}
+		if self.unregistered_board_owner(claim.vtxo_id).await?
+			== Some((claim.user_pubkey, claim.owner_mailbox)) {
 			sources.insert(claim.vtxo_id);
 		}
 		match &claim.binding_source {

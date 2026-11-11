@@ -64,6 +64,7 @@ fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
 	match evidence {
 		OwnershipEvidence::IrreversibleEntitlement => serde_json::json!({"kind":"irreversible_entitlement"}),
 		OwnershipEvidence::Pubkey => serde_json::json!({"kind":"pubkey"}),
+		OwnershipEvidence::Board => serde_json::json!({"kind":"board"}),
 		OwnershipEvidence::InputOwner => serde_json::json!({"kind":"input_owner"}),
 		OwnershipEvidence::LightningReceiveClaim => serde_json::json!({"kind":"lightning_receive_claim"}),
 		OwnershipEvidence::Pool => serde_json::json!({"kind":"pool"}),
@@ -151,10 +152,15 @@ impl Tx<'_> {
 			let mut valid = true;
 			for fact in &snapshot.regular {
 				if fact.onchain_spent_height.is_some() || fact.onchain_spent_txid.is_some() { valid = false; break; }
-				if let Some(txid) = fact.state.oor_spent_txid.filter(|_| fact.state.offboarded_in.is_none() && fact.state.spent_in_round.is_none()) {
+			if let Some(txid) = fact.state.oor_spent_txid.filter(|_| fact.state.offboarded_in.is_none() && fact.state.spent_in_round.is_none()) {
 					let mut children = snapshot.regular.iter().filter(|child| child.state.vtxo.point().txid == txid);
 					let mut amount = children.try_fold(Amount::ZERO, |sum, child| sum.checked_add(child.state.vtxo.amount())
 						.context("expiry branch amount overflow"))?;
+				// A cosigned board without registration has no stored child. Its
+				// funding root itself is the payable customer obligation.
+				let unregistered_board = amount == Amount::ZERO
+					&& self.unregistered_board_owner(fact.state.vtxo_id).await?.is_some();
+				if !unregistered_board {
 					if amount != fact.state.vtxo.amount() {
 						// A board fee is a value-bearing P2A output, not a child VTXO.
 						// Boards retain the validated Full leaf without making its exit
@@ -177,6 +183,7 @@ impl Tx<'_> {
 					ensure!(amount == fact.state.vtxo.amount(), "expiry branch does not conserve its input");
 					continue;
 				}
+			}
 				let ownership = self.propose_expiry_ownership(fact, view.height, Some(view.height)).await?;
 				let payee = match &ownership.disposition {
 					OwnershipDisposition::Customer { .. } => match self.derived_expiry_owner(&ownership).await? {
@@ -239,7 +246,7 @@ impl Tx<'_> {
 		let (snapshot, current) = self.expiry_branch_state(&roots).await?;
 		ensure!(current == branch, "expiry branch changed during analysis");
 		let lightning = accepted.iter().flat_map(|output| &output.1).filter(|coin| !matches!(coin.ownership.evidence,
-			Some(OwnershipEvidence::Pubkey | OwnershipEvidence::IrreversibleEntitlement | OwnershipEvidence::InputOwner
+			Some(OwnershipEvidence::Pubkey | OwnershipEvidence::Board | OwnershipEvidence::IrreversibleEntitlement | OwnershipEvidence::InputOwner
 				| OwnershipEvidence::Pool | OwnershipEvidence::Padding | OwnershipEvidence::Forfeit
 				| OwnershipEvidence::Offboard | OwnershipEvidence::Exchange { .. }))).collect::<Vec<_>>();
 		if !lightning.is_empty() {

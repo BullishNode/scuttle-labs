@@ -707,9 +707,15 @@ impl Server {
 			// validate funding tx is real
 			// check that any of the inputs is a vtxo
 			self.db.read(async |tx| {
-				// check the funding tx itself first, obviously can't exist
-				if tx.get_virtual_transaction_by_txid(utxo.txid).await?.is_some() {
-					return badarg!("invalid funding tx: known as virtual tx: {}", utxo.txid);
+				// Only a previously bound board output may reuse a funding tx
+				// already recorded by this payout-enabled server.
+				if let Some(known) = tx.get_virtual_transaction_by_txid(utxo.txid).await? {
+					let retry = self.config.expiry_payouts && known.is_funding
+						&& tx.query_opt("SELECT 1 FROM board_exit WHERE funding_outpoint=$1 LIMIT 1",
+							&[&utxo.to_string()]).await?.is_some();
+					if !retry {
+						return badarg!("invalid funding tx: known as virtual tx: {}", utxo.txid);
+					}
 				}
 				for inp in &funding_tx.input {
 					let vtxo_id = inp.previous_output.into();
@@ -761,10 +767,24 @@ impl Server {
 		// before signing, or two signed exits could spend it.
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();
-		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid, owner_mailbox).await).await?;
-		if bound.0 != exit_txid {
-			return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
-		}
+		self.db.write(async |t| {
+			let bound = t.bind_board_exit(utxo, &spk, exit_txid, owner_mailbox, user_pubkey).await?;
+			if bound.0 != exit_txid {
+				return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
+			}
+			if self.config.expiry_payouts {
+				// The funding output is already a customer liability even if the
+				// holder never returns with the signed exit for registration.
+				let root = builder.funding_vtxo();
+				let update = VtxoTreeUpdate::new()
+					.upsert_unsigned_funding_tx(utxo.txid)
+					.upsert_unsigned_tx([exit_txid])
+					.insert_oor_spent_vtxos([(root, exit_txid)]);
+				t.execute_vtxo_tree_update(update).await?;
+				t.add_funding_vtxos_to_frontier(utxo.txid, None).await?;
+			}
+			Ok(())
+		}).await?;
 
 		info!("Cosigning board request for utxo {}", utxo);
 		let resp = builder.server_cosign(self.server_key.leak_ref());
@@ -858,7 +878,7 @@ impl Server {
 		let exit_txid = builder.exit_txid();
 		let inserted = self.db.write(async |t| {
 			// also binds boards cosigned before outputs were bound on cosign
-			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid, None).await?;
+			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid, None, vtxo.user_pubkey()).await?;
 			if bound.0 != exit_txid {
 				return badarg!("board utxo {} is already registered with another exit tx",
 					vtxo.chain_anchor(),

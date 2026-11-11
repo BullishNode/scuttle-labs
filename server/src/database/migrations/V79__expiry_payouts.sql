@@ -21,6 +21,10 @@ ALTER TABLE lightning_payment_attempt
 ALTER TABLE board_exit
 	ADD COLUMN owner_mailbox TEXT
 	CHECK (owner_mailbox IS NULL OR length(owner_mailbox) = 66);
+ALTER TABLE board_exit
+	ADD COLUMN user_pubkey TEXT
+	CHECK (user_pubkey IS NULL OR length(user_pubkey) = 66);
+CREATE INDEX board_exit_exit_txid_idx ON board_exit(exit_txid);
 
 CREATE TABLE expiry_entitlement (
 	id BIGSERIAL PRIMARY KEY,

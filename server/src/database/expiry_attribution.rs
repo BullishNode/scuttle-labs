@@ -70,6 +70,14 @@ impl Tx<'_> {
 			OwnershipBindingSource::Coin(id) => {
 				if *id != ownership.id { return Ok(Attribution::Unresolved); }
 				let coin = self.get_server_vtxo_by_id(*id).await?.vtxo;
+				if matches!(ownership.evidence, Some(super::expiry_ownership::OwnershipEvidence::Board)) {
+					return Ok(match self.unregistered_board_owner(*id).await? {
+						Some((key, mailbox_pk)) if key == *user_pubkey => Attribution::Owned {
+							mailbox_pk, spk: ark::fallback::payout_script(mailbox_pk),
+						},
+						_ => Attribution::Unresolved,
+					});
+				}
 				if !matches!(coin.policy(), ServerVtxoPolicy::User(policy) if policy.user_pubkey() == *user_pubkey) {
 					return Ok(Attribution::Unresolved);
 				}

@@ -385,8 +385,13 @@ impl VtxoStatusAttestation {
 
 	/// Verify the attestation against a VTXO
 	pub fn verify(&self, vtxo: &Vtxo) -> Result<(), secp256k1::Error> {
-		let msg = Self::compute_message(vtxo.id());
-		SECP.verify_schnorr(&self.signature, &msg, &vtxo.user_pubkey().x_only_public_key().0)
+		self.verify_key(vtxo.id(), vtxo.user_pubkey())
+	}
+
+	/// Verify a cosigned board that has not yet been registered as a VTXO.
+	pub fn verify_key(&self, vtxo_id: VtxoId, user_pubkey: PublicKey) -> Result<(), secp256k1::Error> {
+		let msg = Self::compute_message(vtxo_id);
+		SECP.verify_schnorr(&self.signature, &msg, &user_pubkey.x_only_public_key().0)
 	}
 
 	fn compute_message(vtxo_id: VtxoId) -> Message {

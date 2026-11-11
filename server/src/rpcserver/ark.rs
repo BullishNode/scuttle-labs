@@ -94,6 +94,29 @@ fn fallback_spend_state(state: protos::VtxoSpendState,
 	}
 }
 
+async fn unregistered_board_rpc_status(
+	server: &Server, id: VtxoId, attestation: &VtxoStatusAttestation,
+) -> Result<Option<protos::GetVtxoStatusResponse>, tonic::Status> {
+	if !server.config.expiry_payouts { return Ok(None); }
+	let Some((board, outcomes, view)) = server.db.read(async |t| {
+		t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+		let Some(board) = t.unregistered_board_status(id).await? else { return Ok(None); };
+		let outcomes = t.fallback_outcomes(&[board.root]).await?;
+		let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
+		Ok(Some((board, outcomes, view)))
+	}).await.to_status()? else { return Ok(None); };
+	attestation.verify_key(id, board.user_pubkey)
+		.badarg("invalid VTXO status attestation")?;
+	if !outcomes.is_empty() { verify_fallback_status_tip(view, &server.bitcoind).await?; }
+	let state = if board.onchain_spent { protos::VtxoSpendState::Spent }
+		else { protos::VtxoSpendState::Unregistered };
+	Ok(Some(protos::GetVtxoStatusResponse {
+		spend_state: fallback_spend_state(state, outcomes.get(&board.root)) as i32,
+		owner_mailbox: board.mailbox.serialize().to_vec(),
+		fallback_committed: outcomes.contains_key(&board.root),
+	}))
+}
+
 async fn verify_fallback_status_tip(view: Option<BlockRef>, bitcoind: &bitcoind_async_client::Client)
 	-> Result<(), tonic::Status>
 {
@@ -193,6 +216,9 @@ impl rpc::server::ArkService for Server {
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 		let attestation = VtxoStatusAttestation::from_bytes(&req.attestation)?;
+		if let Some(status) = unregistered_board_rpc_status(self, id, &attestation).await? {
+			return Ok(tonic::Response::new(status));
+		}
 
 		let (vtxo_state, fallback, owners, outcomes, view) = self.db.read(async |t| {
 			if t.expiry_payouts() {
@@ -317,6 +343,14 @@ impl rpc::server::ArkService for Server {
 		let mut missing = Vec::new();
 		for (id, attestation) in queries {
 			let Some((user_vtxo, spend_state)) = by_id.get(&id) else {
+				if let Some(status) = unregistered_board_rpc_status(self, id, &attestation).await? {
+					vtxos.push(protos::VtxoStatus {
+						vtxo_id: id.to_bytes().to_vec(), spend_state: status.spend_state,
+						owner_mailbox: status.owner_mailbox,
+						fallback_committed: status.fallback_committed,
+					});
+					continue;
+				}
 				if !missing.contains(&id) {
 					missing.push(id);
 				}

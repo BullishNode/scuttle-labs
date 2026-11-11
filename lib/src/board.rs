@@ -41,6 +41,19 @@ struct ExitData {
 	txid: Txid,
 }
 
+fn funding_vtxo(
+	user_pubkey: PublicKey, server_pubkey: PublicKey, expiry_height: BlockHeight,
+	exit_delta: BlockDelta, amount: Amount, utxo: OutPoint,
+) -> ServerVtxo<Full> {
+	let combined_pubkey = musig::combine_keys([user_pubkey, server_pubkey])
+		.x_only_public_key().0;
+	Vtxo {
+		policy: ServerVtxoPolicy::new_expiry(combined_pubkey), amount,
+		expiry_height, server_pubkey, exit_delta,
+		anchor_point: utxo, point: utxo, genesis: Full { items: vec![] },
+	}
+}
+
 fn compute_exit_data(
 	user_pubkey: PublicKey,
 	server_pubkey: PublicKey,
@@ -329,6 +342,12 @@ impl<S: state::CanSign> BoardBuilder<S> {
 }
 
 impl BoardBuilder<state::ServerCanCosign> {
+	/// The funding root to track before the holder uploads its signed exit.
+	pub fn funding_vtxo(&self) -> ServerVtxo<Full> {
+		funding_vtxo(self.user_pubkey, self.server_pubkey, self.expiry_height,
+			self.exit_delta, self.amount.expect("state invariant"), self.utxo.expect("state invariant"))
+	}
+
 	/// This constructor is to be used by the server with the information provided
 	/// by the user.
 	pub fn new_for_cosign(
@@ -477,22 +496,11 @@ impl BoardBuilder<state::ServerCanBuildVtxos> {
 	/// 1. An expiry VTXO with empty genesis (for server tracking)
 	/// 2. The validated output VTXO
 	pub fn build_server_vtxos(&self) -> Vec<ServerVtxo<Full>> {
-		let combined_pubkey = musig::combine_keys([self.user_pubkey, self.server_pubkey])
-			.x_only_public_key().0;
-
 		let vtxo = self.signed_vtxo.as_ref().expect("state invariant").clone();
 
 		vec![
-			Vtxo {
-				policy: ServerVtxoPolicy::new_expiry(combined_pubkey),
-				amount: self.amount.expect("state invariant"),
-				expiry_height: self.expiry_height,
-				server_pubkey: self.server_pubkey,
-				exit_delta: self.exit_delta,
-				anchor_point: self.utxo.expect("state invariant"),
-				genesis: Full { items: vec![] },
-				point: self.utxo.expect("state invariant"),
-			},
+			funding_vtxo(self.user_pubkey, self.server_pubkey, self.expiry_height,
+				self.exit_delta, self.amount.expect("state invariant"), self.utxo.expect("state invariant")),
 			ServerVtxo::from(vtxo),
 		]
 	}

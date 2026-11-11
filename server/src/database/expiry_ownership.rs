@@ -5,7 +5,7 @@ use bitcoin::Amount;
 use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockHeight, BlockRef};
 
-use ark::VtxoId;
+use ark::{ServerVtxoPolicy, VtxoId};
 use ark::lightning::PaymentHash;
 
 use super::expiry_inventory::BackingVtxoFact;
@@ -35,6 +35,7 @@ pub enum OwnershipBindingSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipEvidence {
 	Pubkey,
+	Board,
 	IrreversibleEntitlement,
 	InputOwner,
 	LightningReceiveClaim,
@@ -73,6 +74,13 @@ pub struct OwnershipProposal {
 	pub settlement_integrity_hold: bool,
 }
 
+pub(crate) struct UnregisteredBoardStatus {
+	pub root: VtxoId,
+	pub user_pubkey: PublicKey,
+	pub mailbox: PublicKey,
+	pub onchain_spent: bool,
+}
+
 impl OwnershipProposal {
 	fn pending(fact: &BackingVtxoFact, reason: &'static str) -> Self {
 		Self {
@@ -86,6 +94,53 @@ impl OwnershipProposal {
 }
 
 impl Tx<'_> {
+	/// A board cosigned before funding was broadcast remains payable even if
+	/// its holder never uploads the completed exit. Registration adds a child;
+	/// that child takes over ownership and disables this root-only decision.
+	pub(crate) async fn unregistered_board_owner(&self, id: VtxoId)
+		-> anyhow::Result<Option<(PublicKey, PublicKey)>>
+	{
+		let Some(row) = self.query_opt("SELECT b.user_pubkey,b.owner_mailbox,b.funding_spk \
+			FROM board_exit b JOIN vtxo v ON v.vtxo_id=b.funding_outpoint \
+			WHERE b.funding_outpoint=$1 AND b.exit_txid=v.oor_spent_txid \
+			AND v.spend_state='spent' AND b.user_pubkey IS NOT NULL \
+			AND b.owner_mailbox IS NOT NULL AND NOT EXISTS (SELECT 1 FROM vtxo child \
+			WHERE child.anchor_point=b.funding_outpoint AND child.vtxo_id<>b.funding_outpoint)",
+			&[&id.to_string()]).await? else { return Ok(None); };
+		let root = self.get_server_vtxo_by_id(id).await?.vtxo;
+		let user_pubkey: PublicKey = row.get::<_, &str>("user_pubkey").parse()?;
+		let combined = ark::musig::combine_keys([user_pubkey, root.server_pubkey()])
+			.x_only_public_key().0;
+		if root.point() != root.chain_anchor()
+			|| root.policy() != &ServerVtxoPolicy::new_expiry(combined)
+			|| root.txout().script_pubkey.as_bytes() != row.get::<_, &[u8]>("funding_spk") {
+			return Ok(None);
+		}
+		Ok(Some((user_pubkey,
+			row.get::<_, &str>("owner_mailbox").parse()?)))
+	}
+
+	pub(crate) async fn unregistered_board_status(&self, id: VtxoId)
+		-> anyhow::Result<Option<UnregisteredBoardStatus>>
+	{
+		if id.to_point().vout != ark::board::BOARD_FUNDING_TX_VTXO_VOUT {
+			return Ok(None);
+		}
+		let rows = self.query("SELECT b.funding_outpoint, \
+			(v.onchain_spent_height IS NOT NULL OR v.onchain_spent_txid IS NOT NULL) AS onchain_spent \
+			FROM board_exit b JOIN vtxo v ON v.vtxo_id=b.funding_outpoint \
+			WHERE b.exit_txid=$1", &[&id.to_point().txid.to_string()]).await?;
+		ensure!(rows.len() <= 1, "board exit txid has conflicting funding outputs");
+		let Some(row) = rows.first() else { return Ok(None); };
+		let root: VtxoId = row.get::<_, &str>("funding_outpoint").parse()?;
+		let Some((user_pubkey, mailbox)) = self.unregistered_board_owner(root).await? else {
+			return Ok(None);
+		};
+		Ok(Some(UnregisteredBoardStatus {
+			root, user_pubkey, mailbox, onchain_spent: row.get("onchain_spent"),
+		}))
+	}
+
 	pub(crate) fn observe_expiry_hold(&self, id: VtxoId, reason: &str) {
 		slog!(ExpiryHoldObserved, vtxo_id: id, reason: reason.to_owned());
 	}
@@ -100,6 +155,11 @@ impl Tx<'_> {
 		let mut proposal = OwnershipProposal::pending(fact, "unresolved source ownership");
 		let full = &fact.state.vtxo;
 		let state = &fact.state;
+		if let Some((user_pubkey, _)) = self.unregistered_board_owner(state.vtxo_id).await? {
+			proposal.disposition = OwnershipDisposition::Customer { user_pubkey };
+			proposal.evidence = Some(OwnershipEvidence::Board);
+			return Ok(proposal);
+		}
 
 		if let Some(txid) = state.offboarded_in {
 			ensure!(self.query_opt("SELECT txid FROM offboards WHERE txid=$1", &[&txid.to_string()]).await?.is_some(),
@@ -132,6 +192,7 @@ impl Tx<'_> {
 				let kind: Option<&str> = row.get("kind");
 				if matches!(kind, Some(
 					"pubkey"
+						| "board"
 						| "input_owner"
 						| "lightning_receive_claim"
 						| "pool"
