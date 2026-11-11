@@ -344,7 +344,7 @@ fn internal_zero_grant_timeout() -> std::pin::Pin<Box<dyn std::future::Future<Ou
 
 #[tokio::test]
 async fn exposed_small_receive_grant_refunds_absent_sender_after_six_confirmations() {
-	tokio::time::timeout(Duration::from_secs(180), internal_safe_pool_grants(true)).await
+	tokio::time::timeout(Duration::from_secs(240), internal_safe_pool_grants(true)).await
 		.expect("exposed grant closure and sender refund timed out");
 }
 

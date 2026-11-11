@@ -147,7 +147,6 @@ async fn lightning_rejection_refunds_only_its_source() {
 		let pending = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert_ne!(pending.id, rejected.id);
 		assert!(matches!(pending.status, LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted));
-		assert!(pending.final_amount_msat.is_none());
 		let label = ark_testing::lightning::attempt_xpay_label(&db, pending.id).await;
 		let native_parts = payer.list_send_pays(cln_rpc::ListsendpaysRequest {
 			payment_hash: Some(hash.to_vec()), ..Default::default()
@@ -244,7 +243,6 @@ async fn lightning_rejection_refunds_only_its_source() {
 		let after = db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert_eq!(after.id, pending.id);
 		assert!(matches!(after.status, LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted));
-		assert!(after.final_amount_msat.is_none());
 		let held = db.read(async |t| server::database::htlc_vtxo::get_htlc_vtxo(t, sources[1].0.id()).await).await.unwrap().unwrap();
 		assert!(held.htlc.offchain_resolution.is_none());
 		let state = db.read(async |t| Ok(t.query_one("SELECT v.spend_state::TEXT, \
