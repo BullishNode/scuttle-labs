@@ -328,8 +328,6 @@ impl Tx<'_> {
 				let settlement = self.source_settlement(hash, state.vtxo_id).await?;
 				let inconsistent = match settlement {
 					SourceSettlement::Unknown => Some("Lightning settlement provenance unknown"),
-					SourceSettlement::Funded if source != LightningSourceState::Discharged
-						&& htlc.htlc.resolution() != Some(HtlcResolution::Fulfilled) => Some("Lightning settlement and source status disagree"),
 					SourceSettlement::NotSettled if source == LightningSourceState::Discharged
 						=> Some("Lightning settlement does not support source success"),
 					_ => None,

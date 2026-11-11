@@ -118,10 +118,6 @@ impl<'a> PaymentAttemptHandler<'a> {
 				t.lock_settlement_sources(attempt.payment_hash).await?;
 				None
 			};
-			if status == LightningPaymentStatus::Failed {
-				t.lock_htlc_settlements().await?;
-				t.ensure_attempt_sources_allow_failure(attempt).await?;
-			}
 			let updated = t.verify_and_update_payment_attempt(
 				attempt, status, payment_error, final_amount_msat
 			).await?;
