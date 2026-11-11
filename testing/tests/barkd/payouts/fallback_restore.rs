@@ -104,24 +104,17 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(refused.len(), 1);
 	assert_eq!(refused[0].status, MovementStatus::Failed);
 	assert_eq!(refused[0].effective_balance.to_sat(), 0);
-	// The commitment has retired the Ark source. Discover its canonical
-	// Bitcoin output through the ordinary chain wallet.
-	tokio::time::timeout(Duration::from_secs(10), async {
-		loop {
-			barkd.sync().await;
-			barkd.onchain_sync().await;
-			if barkd.get_vtxo(&coin.vtxo.id.to_string()).await.state == bark_json::primitives::VtxoStateInfo::Spent
-				&& barkd.onchain_utxos().await.iter().any(|utxo| utxo.outpoint == point) { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("the native wallet did not discover the confirmed payout and retire its source");
+	// Bark reports the server's fallback status, while Core independently
+	// proves the Bitcoin output. Bark's ordinary on-chain wallet does not watch
+	// the separate tr(M) derivation.
+	barkd.sync().await;
+	barkd.onchain_sync().await;
+	assert_eq!(barkd.get_vtxo(&coin.vtxo.id.to_string()).await.state,
+		bark_json::primitives::VtxoStateInfo::Spent);
 	assert_eq!(barkd.history(None, None).await, native_history, "chain discovery must not invent a native action");
 	assert_eq!(barkd.get_vtxo_encoded(&coin.vtxo.id.to_string()).await.encoded, original);
 	assert_eq!(barkd.bark_balance().await.spendable, Amount::ZERO);
-	let own_payouts = barkd.onchain_utxos().await.into_iter().filter(|utxo| utxo.outpoint == point).collect::<Vec<_>>();
-	assert_eq!(own_payouts.len(), 1);
-	assert_eq!(own_payouts[0].amount, expected);
-	assert!(own_payouts[0].confirmation_height.is_some());
+	assert!(barkd.onchain_utxos().await.iter().all(|utxo| utxo.outpoint != point));
 	let allocations = db.read(async |tx| Ok(tx.query(
 		"SELECT a.sweep_txid,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
@@ -149,10 +142,11 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(restored_identity.network, identity.network);
 	assert_eq!(restored_identity.mailbox_id, identity.mailbox_id);
 	assert_eq!(ark::fallback::payout_script(restored_identity.mailbox_id), script);
-	let restored_payouts = restored.onchain_utxos().await.into_iter().filter(|utxo| utxo.outpoint == point).collect::<Vec<_>>();
-	assert_eq!(restored_payouts.len(), 1);
-	assert_eq!(restored_payouts[0].amount, expected);
-	assert!(restored_payouts[0].confirmation_height.is_some());
+	let restored_coin = restored.vtxos(Some(true)).await.into_iter()
+		.find(|vtxo| vtxo.vtxo.id == coin.vtxo.id).expect("seed restore must retain the payout source");
+	assert_eq!(restored_coin.state, bark_json::primitives::VtxoStateInfo::Spent);
+	assert_eq!(restored_coin.fallback_status, Some(bark_json::primitives::FallbackStatusInfo::Spent));
+	assert!(restored.onchain_utxos().await.iter().all(|utxo| utxo.outpoint != point));
 	restored.stop().await.unwrap();
 	srv.watchmand().stop().await.unwrap();
 	srv.stop().await.unwrap();

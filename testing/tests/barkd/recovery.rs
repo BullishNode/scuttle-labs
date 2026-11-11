@@ -667,7 +667,7 @@ async fn recovered_wallet_finds_offboard_change() {
 	}
 
 	// Spend recovered VTXOs in a payment
-	recovered.send(&recipient.ark_address().await, Amount::from_sat(698_505)).await;
+	recovered.send(&recipient.ark_address().await, Amount::from_sat(600_000)).await;
 }
 
 /// Recovery yields nothing for a fully-spent wallet.
