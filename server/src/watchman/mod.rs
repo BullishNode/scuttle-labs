@@ -1065,14 +1065,11 @@ impl Watchman {
 				break;
 			}
 
-			if let Err(e) = self.db.write(async |t| {
-				// Normal exit progression competes with payouts for the same
-				// physical backing too. Hold its coin locks through publication.
-				t.lock_unallocated_watchman_inputs(&[vtxo.id()]).await?;
-				self.process_progress_tx(t, &mut wallet, progress_txid, &vtxo, fee_rate).await
-			}).await {
+			if let Err(e) = self.process_progress_tx(
+				&mut wallet, progress_txid, &vtxo, fee_rate,
+			).await {
 				slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
-					error: format!("{e:#}"),
+					error: e.to_string(),
 				);
 			}
 		}
@@ -1086,15 +1083,13 @@ impl Watchman {
 	/// transaction to pay its fees, then broadcasts them as a package.
 	async fn process_progress_tx(
 		&self,
-		tx: &Tx<'_>,
 		wallet: &mut PersistedWallet,
 		txid: Txid,
 		vtxo: &ServerVtxo,
 		fee_rate: FeeRate,
 	) -> anyhow::Result<()> {
-		// Reuse the publication transaction, retaining its source locks without
-		// borrowing another connection from the same pool.
-		let vtx = tx.get_virtual_transaction_by_txid(txid).await?
+		// Get the progress transaction from the database
+		let vtx = self.db.read(async |t| t.get_virtual_transaction_by_txid(txid).await).await?
 			.context(txid)
 			.context("progress tx not found")?;
 
