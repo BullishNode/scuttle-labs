@@ -36,7 +36,7 @@ use ark::lightning::{
 use ark::tree::signed::{LeafVtxoCosignRequest, UnlockHash, UnlockPreimage};
 use ark::vtxo::Full;
 use ark::vtxo::policy::check_block_height;
-use bitcoin_ext::{BlockDelta, BlockHeight};
+use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
 use server_rpc::{self as rpc, protos, RequestExt, TryFromBytes};
 use crate::database::SpendState;
 use crate::database::expiry_payout::{FallbackOutcome, FallbackReceipt};
@@ -106,14 +106,16 @@ async fn unregistered_board_rpc_status(
 	server: &Server, id: VtxoId, attestation: &VtxoStatusAttestation,
 ) -> Result<Option<protos::GetVtxoStatusResponse>, tonic::Status> {
 	if !server.config.expiry_payouts { return Ok(None); }
-	let Some((board, outcomes)) = server.db.read(async |t| {
+	let Some((board, outcomes, view)) = server.db.read(async |t| {
 		t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 		let Some(board) = t.unregistered_board_status(id).await? else { return Ok(None); };
 		let outcomes = t.fallback_outcomes(&[board.root]).await?;
-		Ok(Some((board, outcomes)))
+		let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
+		Ok(Some((board, outcomes, view)))
 	}).await.to_status()? else { return Ok(None); };
 	attestation.verify_key(id, board.user_pubkey)
 		.badarg("invalid VTXO status attestation")?;
+	if !outcomes.is_empty() { verify_fallback_status_tip(view, &server.bitcoind).await?; }
 	let state = if board.onchain_spent { protos::VtxoSpendState::Spent }
 		else { protos::VtxoSpendState::Unregistered };
 	Ok(Some(protos::GetVtxoStatusResponse {
@@ -122,6 +124,13 @@ async fn unregistered_board_rpc_status(
 		fallback_committed: outcomes.contains_key(&board.root),
 		fallback_payout: outcomes.get(&board.root).map(fallback_payout),
 	}))
+}
+
+async fn verify_fallback_status_tip(view: Option<BlockRef>, bitcoind: &bitcoind_async_client::Client)
+	-> Result<(), tonic::Status>
+{
+	let view = view.ok_or_else(|| tonic::Status::internal("fallback projection has no published watchman tip"))?;
+	crate::database::expiry_chain::verify_expiry_tip(view, bitcoind).await.to_status()
 }
 
 #[async_trait]
@@ -217,7 +226,7 @@ impl rpc::server::ArkService for Server {
 			return Ok(tonic::Response::new(status));
 		}
 
-		let (vtxo_state, fallback, owners, outcomes) = self.db.read(async |t| {
+		let (vtxo_state, fallback, owners, outcomes, view) = self.db.read(async |t| {
 			if t.expiry_payouts() {
 				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 			}
@@ -227,8 +236,10 @@ impl rpc::server::ArkService for Server {
 			let fallback = t.fallback_customer_vtxos(&customer_ids).await?;
 			let owners = t.coin_owner_mailboxes(&[id]).await?;
 			let outcomes = t.fallback_outcomes(&[id]).await?;
-			Ok((state, fallback, owners, outcomes))
+			let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
+			Ok((state, fallback, owners, outcomes, view))
 		}).await.to_status()?;
+		if !outcomes.is_empty() { verify_fallback_status_tip(view, &self.bitcoind).await?; }
 
 		let spend_state = vtxo_state.spend_state;
 		let user_vtxo = match vtxo_state.vtxo.try_into_user_vtxo() {
@@ -306,7 +317,7 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback, owners, outcomes) = self.db.read(async |t| {
+		let (states, fallback, owners, outcomes, view) = self.db.read(async |t| {
 			if t.expiry_payouts() {
 				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 			}
@@ -317,8 +328,10 @@ impl rpc::server::ArkService for Server {
 			let fallback = t.fallback_customer_vtxos(&customer_ids).await?;
 			let owners = t.coin_owner_mailboxes(&ids).await?;
 			let outcomes = t.fallback_outcomes(&ids).await?;
-			Ok((states, fallback, owners, outcomes))
+			let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
+			Ok((states, fallback, owners, outcomes, view))
 		}).await.to_status()?;
+		if !outcomes.is_empty() { verify_fallback_status_tip(view, &self.bitcoind).await?; }
 
 		// An id without a client-visible user vtxo is reported as missing,
 		// not as an error, so one bad id does not cost the client the batch.
@@ -419,15 +432,17 @@ impl rpc::server::ArkService for Server {
 		// server-internal state is left out, as GetVtxoStatus reports it as
 		// not found.
 		let ids = res.vtxos.iter().map(|v| v.vtxo.id()).collect::<Vec<_>>();
-		let (fallback, owners, outcomes) = self.db.read(async |t| {
+		let (fallback, owners, outcomes, view) = self.db.read(async |t| {
 			if t.expiry_payouts() {
 				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 			}
 			let fallback = t.fallback_customer_vtxos(&ids).await?;
 			let owners = t.coin_owner_mailboxes(&ids).await?;
 			let outcomes = t.fallback_outcomes(&ids).await?;
-			Ok((fallback, owners, outcomes))
+			let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
+			Ok((fallback, owners, outcomes, view))
 		}).await.to_status()?;
+		if !outcomes.is_empty() { verify_fallback_status_tip(view, &self.bitcoind).await?; }
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
 				spend_state: fallback_spend_state(client_spend_state(v.spend_state,
@@ -745,12 +760,17 @@ impl rpc::server::ArkService for Server {
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
 
 		let sub = self.check_lightning_receive(payment_hash, req.wait).await.to_status()?;
-		let outcome = self.db.read(async |t| {
+		let (outcome, view) = self.db.read(async |t| {
 			if t.expiry_payouts() {
 				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 			}
-			t.receive_fallback_outcome(&sub).await
+			let outcome = t.receive_fallback_outcome(&sub).await?;
+			let view = if outcome.is_some() { t.expiry_view().await? } else { None };
+			Ok((outcome, view))
 		}).await.to_status()?;
+		if outcome.is_some() {
+			verify_fallback_status_tip(view, &self.bitcoind).await?;
+		}
 		let mut response: protos::CheckLightningReceiveResponse = sub.into();
 		response.fallback_spend_state = outcome.as_ref()
 			.map(|outcome| fallback_spend_state(protos::VtxoSpendState::Unspecified, Some(outcome)) as i32);

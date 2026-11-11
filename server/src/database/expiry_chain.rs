@@ -1,7 +1,14 @@
-//! Read and lock the published watchman tip.
+//! Check the published watchman tip against Bitcoin Core.
 
 use bitcoin_ext::BlockRef;
+use bitcoind_async_client::traits::Reader;
 use super::{BlockTable, Tx};
+
+pub(crate) async fn verify_expiry_tip(point: BlockRef, client: &bitcoind_async_client::Client) -> anyhow::Result<()> {
+	ensure!(client.get_block_hash(point.height.into()).await? == point.hash,
+		"published watchman tip is no longer canonical");
+	Ok(())
+}
 
 impl Tx<'_> {
 	pub async fn expiry_view(&self) -> anyhow::Result<Option<BlockRef>> {

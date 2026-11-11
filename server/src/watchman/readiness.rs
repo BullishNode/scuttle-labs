@@ -24,6 +24,7 @@ impl Watchman {
 				let Some(view) = self.db.read(async |tx| tx.expiry_view().await).await? else {
 					return Ok(());
 				};
+				crate::database::expiry_chain::verify_expiry_tip(view, &self.bitcoind).await?;
 				let group = self.db.read(async |tx| tx.plan_expiry_group(view, roots.to_vec()).await).await?;
 				if let Some(group) = self.db.write(async |tx| tx.commit_expiry_group(view, group).await).await? {
 					info!(allocation_id = group.id, inputs = group.inputs, dropped = group.dropped,
