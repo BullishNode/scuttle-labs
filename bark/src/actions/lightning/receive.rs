@@ -796,18 +796,6 @@ async fn claim_lightning_receive_htlcs(
 		Some(destination) => !local_claim_destination(wallet, destination).await.retry()?,
 		None => false,
 	};
-	if !external_destination && wallet.properties().await.retry()?.server_payouts == Some(true) {
-		for output in &outputs {
-			let key = wallet.get_vtxo_key(output).await.retry()?;
-			let (state, committed) = wallet.fetch_vtxo_status(output.id(), &key).await.retry()?;
-			if committed || state != protos::VtxoSpendState::Spendable {
-				return Err(anyhow::anyhow!(
-					"Lightning claim output is not attested spendable for this mailbox"
-				)).retry();
-			}
-		}
-	}
-
 	if external_destination {
 		wallet.mark_vtxos_as_spent(&htlcs.vtxo_ids).await.retry()?;
 		outputs.sort_unstable();

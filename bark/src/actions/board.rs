@@ -409,10 +409,6 @@ async fn run_register(wallet: &Wallet, board: &Board) -> anyhow::Result<()> {
 	srv.client.register_board_vtxo(protos::BoardVtxoRequest {
 		board_vtxo: vtxo.serialize(),
 	}).await.context("error registering board with the Ark server")?;
-	if wallet.properties().await?.server_payouts == Some(true) {
-		let key = wallet.get_vtxo_key(&vtxo).await?;
-		wallet.fetch_vtxo_status(vtxo.id(), &key).await?;
-	}
 
 	// Release only our own lock: an idempotent re-register must not steal a
 	// lock that another operation has since acquired.
