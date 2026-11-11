@@ -28,6 +28,7 @@ pub mod intman;
 pub mod ln;
 pub mod nursery;
 pub mod rounds;
+
 pub mod tree;
 pub mod vtxopool;
 pub mod xpay;
@@ -695,7 +696,6 @@ impl<'t> Tx<'t> {
 				MailboxType::ArkoorReceive |
 					MailboxType::RecoveryVtxoId => {},
 			}
-
 			// so now we are in a mailbox type that is multi-row
 			// we check if we have an item ongoing
 			let entry = current_entry.get_or_insert_with(|| MailboxEntry {

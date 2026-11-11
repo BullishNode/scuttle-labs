@@ -47,6 +47,8 @@ use crate::error::ContextExt;
 use crate::destination::DestinationBindings;
 use crate::{check_max_amount, telemetry, Server, CAPTAIND_API_KEY};
 
+
+
 /// Validate the client-requested HTLC-recv VTXO expiry leaves at
 /// least `htlc_expiry_delta` blocks of settlement margin below the
 /// inbound Lightning HTLC expiry, both for the request and the
@@ -143,6 +145,7 @@ pub(crate) fn validate_intra_ark_payment(
 	if payment_amount < subscription.amount() {
 		return badarg!(
 			"payment amount of {} is less than the invoiced amount of {}",
+
 			payment_amount, subscription.amount(),
 		);
 	}
@@ -489,6 +492,7 @@ impl Server {
 				).await.inspect_err(|e| {
 					warn!("Failed to look up attempt for {}: {:#}", payment_hash, e);
 				}).ok().flatten().and_then(|a| a.error);
+
 				let kind = LightningFailureKind::classify(error.as_deref());
 
 				lightning_payment_status::PaymentStatus::Failed(protos::LightningPaymentFailure {
@@ -584,7 +588,7 @@ impl Server {
 						}
 					}
 				},
-				_ => return badarg!("This lightning payment is not eligible for revocation yet"),
+				_ => return badarg!("This lightning payment is not eligible for revocation yet")
 			}
 		}
 
@@ -1131,6 +1135,7 @@ impl Server {
 			// Idempotent retry of an already-settled claim; the value was
 			// released with the first claim, nothing new is at stake.
 			LightningHtlcSubscriptionStatus::Settled => {},
+
 			_ => return badarg!("payment status in incorrect state: {}", sub.status),
 		}
 		// Only the first claim records the fee; Settled-replay must not.

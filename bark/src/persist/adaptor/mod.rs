@@ -1124,6 +1124,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	) -> anyhow::Result<Option<PaidInvoice>> {
 		match self.inner.read().await
 			.get(partition::PAID_INVOICE, &payment_hash.to_byte_array()).await?
+
 		{
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),

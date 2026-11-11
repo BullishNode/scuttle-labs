@@ -493,7 +493,6 @@ impl Wallet {
 		let mut locked = Vec::new();
 		for (vtxo, adoption) in vtxos {
 			let id = vtxo.id();
-
 			match adoption {
 				Ok(ServerStatusAdoption::Spendable) => spendable.push(vtxo),
 				Ok(ServerStatusAdoption::Spent) => spent.push(vtxo),
@@ -639,7 +638,6 @@ impl Wallet {
 		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
 		let payouts = self.properties().await?.server_payouts.context("server payout capability is not known")?;
-
 		let mut start_index = 0u32;
 		let mut cursor_vtxo_id = None;
 		loop {

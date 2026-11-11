@@ -1405,11 +1405,11 @@ async fn persist_round(
 						srv.mailbox_manager.notify(*mailbox_id, cp);
 					}
 					trace!("Posted round VTXO {} to mailbox", vtxo.id());
-				},
+				}
 				Err(e) => {
 					// Log but don't fail the round - mailbox delivery is best-effort
 					warn!("Failed to post round VTXO {} to mailbox: {:#}", vtxo.id(), e);
-				},
+				}
 			}
 		}
 

@@ -1056,6 +1056,7 @@ pub fn get_all_wallet_action_checkpoints(
 	conn: &Connection,
 ) -> anyhow::Result<Vec<WalletActionCheckpoint>> {
 	let query = "SELECT payload FROM bark_wallet_action_checkpoint ORDER BY created_at ASC";
+
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -1092,6 +1093,7 @@ pub fn record_paid_invoice(
 	statement.execute(named_params! {
 		":payment_hash": payment_hash.as_hex().to_string(),
 		":preimage": preimage.as_hex().to_string(),
+
 	})?;
 	Ok(())
 }
@@ -1137,6 +1139,7 @@ pub fn record_settled_lightning_receive(
 }
 
 pub fn get_settled_lightning_receive(
+
 	conn: &Connection,
 	payment_hash: PaymentHash,
 ) -> anyhow::Result<Option<SettledLightningReceive>> {

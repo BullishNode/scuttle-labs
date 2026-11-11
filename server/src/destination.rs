@@ -11,6 +11,9 @@ use ark::arkoor::state::ServerCanCosign;
 use ark::mailbox::{BlindedMailboxIdentifier, MailboxIdentifier};
 use server_rpc::protos;
 
+use crate::error::ContextExt;
+use crate::rpcserver::ToStatusResult;
+
 /// Request-scoped destination map. It is never a durable lookup by coin key.
 #[derive(Default)]
 pub(crate) struct DestinationBindings(BTreeMap<PublicKey, PublicKey>);
@@ -21,6 +24,8 @@ impl DestinationBindings {
 		server_mailbox_key: &Keypair,
 	) -> anyhow::Result<Self> {
 		if !required { return Ok(Self::default()); }
+		// Same limit as the request conversion, which runs after this.
+		if parts.len() > server_rpc::MAX_NB_VTXO_IDS { bail!("too many parts in cosign request"); }
 		let mut ret = Self::default();
 		for output in parts.iter().flat_map(|part| part.outputs.iter().chain(&part.isolated_outputs)) {
 			let policy = VtxoPolicy::deserialize(&output.policy).context("invalid arkoor output policy")?;
@@ -68,6 +73,16 @@ impl DestinationBindings {
 			bail!("payout destination names no actual output");
 		}
 		Ok(bindings)
+	}
+}
+
+impl crate::Server {
+	/// Admit the payout mailbox of every output in an arkoor cosign request.
+	pub(crate) fn arkoor_destinations(&self, parts: &[protos::ArkoorCosignRequest])
+		-> Result<DestinationBindings, tonic::Status>
+	{
+		DestinationBindings::from_arkoor_parts(parts, self.config.expiry_payouts, self.mailbox_key.leak_ref())
+			.badarg("invalid payout destination").to_status()
 	}
 }
 

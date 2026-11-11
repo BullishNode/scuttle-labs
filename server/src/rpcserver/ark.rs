@@ -40,7 +40,6 @@ use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
 use server_rpc::{self as rpc, protos, TryFromBytes};
 use crate::database::SpendState;
 use crate::database::expiry_payout::FallbackOutcome;
-use crate::destination::DestinationBindings;
 
 use crate::database::rounds::StoredRoundOutput;
 use crate::recovery::NB_NORMAL_CHILDREN;
@@ -60,6 +59,7 @@ use crate::rpcserver::{
 use crate::round::RoundInput;
 use crate::secret::Secret;
 use crate::rpcserver::macros;
+
 use crate::telemetry;
 
 /// Map an internal [`SpendState`] to the client-facing [`protos::VtxoSpendState`].
@@ -196,8 +196,8 @@ impl rpc::server::ArkService for Server {
 
 		let id = VtxoId::from_bytes(req.vtxo_id)?;
 
-		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await)
-			.await.to_status()?;
+		let vtxo_state = self.db.read(async |t| t.get_server_vtxo_by_id(id).await).await
+			.to_status()?;
 
 		let response = protos::GetVtxoResponse {
 			vtxo: vtxo_state.vtxo.serialize(),
@@ -274,8 +274,8 @@ impl rpc::server::ArkService for Server {
 
 		// Unknown ids are reported, not an error, so one bad id does not
 		// cost the client the whole batch.
-		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await)
-			.await.to_status()?;
+		let found = self.db.read(async |t| t.get_existing_server_vtxos_by_id(&ids).await).await
+			.to_status()?;
 
 		let mut missing = Vec::new();
 		for id in &ids {
@@ -584,12 +584,7 @@ impl rpc::server::ArkService for Server {
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
 		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
-		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
-			macros::badarg!("too many parts in cosign request");
-		}
-		let destinations = DestinationBindings::from_arkoor_parts(
-			&req.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
-		).badarg("invalid payout destination")?;
+		let destinations = self.arkoor_destinations(&req.parts)?;
 		let request = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
@@ -612,12 +607,7 @@ impl rpc::server::ArkService for Server {
 				in order to be able to send Lightning payments.");
 		}
 
-		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
-			macros::badarg!("too many parts in cosign request");
-		}
-		let destinations = DestinationBindings::from_arkoor_parts(
-			&req.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
-		).badarg("invalid payout destination")?;
+		let destinations = self.arkoor_destinations(&req.parts)?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req.clone())
 			.badarg("invalid cosign request")?;
 
@@ -688,12 +678,7 @@ impl rpc::server::ArkService for Server {
 	) -> Result<tonic::Response<protos::ArkoorPackageCosignResponse>, tonic::Status> {
 		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
-		if req.parts.len() > rpc::MAX_NB_VTXO_IDS {
-			macros::badarg!("too many parts in cosign request");
-		}
-		let destinations = DestinationBindings::from_arkoor_parts(
-			&req.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
-		).badarg("invalid payout destination")?;
+		let destinations = self.arkoor_destinations(&req.parts)?;
 		let cosign_requests = ArkoorPackageCosignRequest::try_from(req)
 			.badarg("invalid cosign request")?;
 
@@ -847,9 +832,7 @@ impl rpc::server::ArkService for Server {
 
 		let payment_preimage = Preimage::from_bytes(req.payment_preimage)?;
 		let raw_cosign = req.cosign_request.badarg("cosign request missing")?;
-		let destinations = DestinationBindings::from_arkoor_parts(
-			&raw_cosign.parts, self.config.expiry_payouts, self.mailbox_key.leak_ref(),
-		).badarg("invalid payout destination")?;
+		let destinations = self.arkoor_destinations(&raw_cosign.parts)?;
 		let cosign_request = ArkoorPackageCosignRequest::try_from(raw_cosign)
 			.badarg("invalid cosign request")?;
 

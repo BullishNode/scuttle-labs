@@ -299,6 +299,7 @@ impl Server {
 				Ok((psbt, inputs))
 			},
 		).await.context("failed to build offboard tx")?;
+
 		// Abandoned sessions lock their inputs until they expire, so cap what
 		// they lock together to keep funds for rounds and other users. One
 		// session may always lock what it needs, however few coins we have.

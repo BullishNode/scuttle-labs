@@ -61,6 +61,7 @@ const VTXO_EXPIRY_HEIGHT_BUFFER: BlockDelta = BlockDelta::new(6);
 /// between a recovered wallet and a server claiming excessive fees.
 const MAX_RECOVERED_PARTICIPATION_FEE_PERCENT: u64 = 5;
 
+
 /// Struct to communicate your specific participation for an Ark round.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundParticipation {
@@ -186,6 +187,8 @@ impl fmt::Display for RoundFlowKind {
 /// round attempt until we see another attempt we participated in confirm or
 /// we gain confidence that the failed attempt will never confirm.
 //
+//TODO(stevenroose) move the id in here and have the state persist itself with the wallet
+// to have better control. this way we can touch db before we sent forfeit sigs
 pub struct RoundState {
 	/// Round is fully done
 	pub(crate) done: bool,
@@ -1070,6 +1073,7 @@ pub enum RoundFlowState {
 	///
 	/// Persisted before that submission, so a crash in between recovers:
 	/// this record still owns the movement until it is done.
+
 	Redelegating {
 		/// The block height the replacement is scheduled for, if any
 		scheduled_height: Option<BlockHeight>,

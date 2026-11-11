@@ -646,8 +646,7 @@ impl LightningManager {
 		let stored = self.db.write(async |t| {
 			t.store_generated_lightning_receive(
 				node.id, &invoice, amount.to_msat(), receiver_mailbox_id.as_ref(),
-				claim_pubkey,
-				user_agent.as_deref(),
+				claim_pubkey, user_agent.as_deref(),
 			).await?;
 			hold_db::create_hold(&**t, &new_hold).await
 				.context("failed to store the hold invoice")?;

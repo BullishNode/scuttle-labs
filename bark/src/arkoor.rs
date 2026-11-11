@@ -87,10 +87,12 @@ pub(crate) enum DeliveryOutcome {
 	AllFailed { summary: String },
 }
 
-/// Posts `vtxos` through every typed server-mailbox delivery, in order.
-/// Mailbox posts are idempotent on the server.
+/// Posts `vtxos` to every [`VtxoDelivery::ServerMailbox`] method found in
+/// `delivery`, in order, skipping any other delivery variant. Mailbox posts
+/// are idempotent on the server.
 ///
-/// One delivery method must accept the post before the send completes.
+/// Any-success semantics: one accepted post is enough, since the recipient
+/// only needs the signed chain to arrive once.
 pub(crate) async fn post_arkoor_to_mailboxes(
 	srv: &mut ServerConnection,
 	delivery: &[VtxoDelivery],

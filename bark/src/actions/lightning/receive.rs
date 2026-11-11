@@ -97,7 +97,6 @@ pub struct LightningReceive {
 	#[serde(default)]
 	pub grant_ids: Vec<VtxoId>,
 }
-
 impl LightningReceive {
 	pub fn id(&self) -> WalletActionId {
 		ln_recv_action_id(self.payment_hash)
@@ -399,6 +398,7 @@ pub(crate) async fn start_lightning_receive(
 		description,
 		expiry_secs: expiry.map(|e| e.as_secs()),
 		claim_pubkey: Some(claim_keypair.public_key().serialize().to_vec()),
+
 	};
 
 	let resp = srv.client.start_lightning_receive(req).await?.into_inner();

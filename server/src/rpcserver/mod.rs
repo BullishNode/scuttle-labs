@@ -201,6 +201,7 @@ where
 	}
 
 	fn not_found<I, V, C>(self, ids: V, context: C) -> Result<T, tonic::Status>
+
 	where
 		V: IntoIterator<Item = I>,
 		I: fmt::Display,
@@ -229,6 +230,7 @@ impl ReceiverExt for oneshot::Receiver<anyhow::Error> {
 		Ok(())
 	}
 }
+
 
 /// Payout mode uses the same numeric wire version as upstream. The handshake
 /// label identifies its additional destination and ownership requirements.

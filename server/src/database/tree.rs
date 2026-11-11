@@ -240,7 +240,7 @@ impl VtxoTreeUpdate {
 	}
 
 	// -- vtxo inserts --
-
+	//
 	// Spendable/unclaimed/bare inserts are silent on conflict: re-inserting
 	// the same vtxo_id is a no-op. `insert_oor_spent_vtxos` is stricter —
 	// it bails if an existing row has a different `oor_spent_txid`, so that

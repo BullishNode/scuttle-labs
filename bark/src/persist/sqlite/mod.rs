@@ -12,6 +12,7 @@ mod convert;
 mod migrations;
 mod query;
 
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -35,6 +36,7 @@ use crate::persist::{BarkPersister, RoundStateId, StoredRoundState, Unlocked};
 use crate::persist::models::{PaidInvoice, SettledLightningReceive, StoredExit};
 use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+
 
 /// The default sqlite db file for when no file path was provided
 pub const DEFAULT_DB_FILE: &str = "db.sqlite";

@@ -113,7 +113,6 @@ impl Server {
 			})
 			.collect::<Vec<_>>();
 
-
 		// Output user vtxos go in as `unregistered`. They become spendable
 		// once the sender uploads the signed transaction chain via
 		// register_vtxo_transactions; until then `check_spendable` rejects

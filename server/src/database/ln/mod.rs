@@ -539,8 +539,7 @@ impl<'t> Tx<'t> {
 
 		self.inner_store_lightning_htlc_subscription(
 			node_id, &payment_hash.to_string(), &invoice.to_string(),
-			Some(amount_msat), mailbox_str.as_deref(), claim_pubkey_str.as_deref(),
-			user_agent,
+			Some(amount_msat), mailbox_str.as_deref(), claim_pubkey_str.as_deref(), user_agent,
 		).await?;
 
 		Ok(())
@@ -848,8 +847,7 @@ impl<'t> Tx<'t> {
 		let stmt = self.prepare("
 			SELECT lhs.id, lhs.lightning_node_id, lhs.payment_hash, lhs.invoice,
 				lhs.status, lhs.lowest_incoming_htlc_expiry, lhs.accepted_at, lhs.user_agent,
-				lhs.claim_pubkey,
-				lhs.created_at, lhs.updated_at,
+				lhs.claim_pubkey, lhs.created_at, lhs.updated_at,
 				COALESCE(array_agg(vtxo.vtxo_id::text), ARRAY[]::text[]) AS htlc_vtxos
 			FROM lightning_htlc_subscription lhs
 			LEFT JOIN vtxo ON vtxo.lightning_htlc_subscription_id = lhs.id
@@ -923,14 +921,13 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// Retrieve the sender's mailbox ID for the existing payment attempt.
+	/// Retrieve the sender's mailbox ID of a lightning payment attempt.
 	pub async fn get_lightning_sender_mailbox_id(
 		&self,
 		attempt_id: i64,
 	) -> anyhow::Result<Option<ark::mailbox::MailboxIdentifier>> {
 		let stmt = self.prepare(
-			"SELECT sender_mailbox_id FROM lightning_payment_attempt
-			WHERE id = $1"
+			"SELECT sender_mailbox_id FROM lightning_payment_attempt WHERE id = $1"
 		).await?;
 		let row = self.query_opt(&stmt, &[&attempt_id]).await?;
 

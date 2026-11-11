@@ -484,7 +484,7 @@ compile_error!("`wasm-web` does not support the `bitcoind-rpc` feature");
 const BARK_PURPOSE_INDEX: u32 = 350;
 /// Derivation index used to generate keypairs to sign VTXOs
 const VTXO_KEYS_INDEX: u32 = 0;
-/// Derivation index used to generate keypair for the server mailbox
+/// Derivation index used to generate keypair for the mailbox
 const MAILBOX_KEY_INDEX: u32 = 1;
 /// Derivation index used to generate keypair for the recovery mailbox
 const RECOVERY_MAILBOX_KEY_INDEX: u32 = 2;
@@ -719,26 +719,23 @@ impl WalletProperties {
 pub struct WalletSeed {
 	master: bip32::Xpriv,
 	vtxo: bip32::Xpriv,
-	mailbox: Keypair,
 	external_mailbox: Option<Keypair>,
 }
 
 impl WalletSeed {
 	/// Create a new [WalletSeed] from a given BIP-32 master seed
 	pub fn new_from_seed(network: Network, seed: &[u8; 64]) -> Self {
-		let root = bip32::Xpriv::new_master(network, seed).expect("invalid seed");
 		let bark_path = [ChildNumber::from_hardened_idx(BARK_PURPOSE_INDEX).unwrap()];
-		let master = root.derive_priv(&SECP, &bark_path)
+		let master = bip32::Xpriv::new_master(network, seed)
+			.expect("invalid seed")
+			.derive_priv(&SECP, &bark_path)
 			.expect("purpose is valid");
-		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
-		let mailbox = master.derive_priv(&SECP, &mailbox_path)
-			.expect("mailbox path is valid").to_keypair(&SECP);
 
 		let vtxo_path = [ChildNumber::from_hardened_idx(VTXO_KEYS_INDEX).unwrap()];
 		let vtxo = master.derive_priv(&SECP, &vtxo_path)
 			.expect("vtxo path is valid");
 
-		Self { master, vtxo, mailbox, external_mailbox: None }
+		Self { master, vtxo, external_mailbox: None }
 	}
 
 	/// Create a new [WalletSeed] from a given BIP-39 [Mnemonic]
@@ -771,7 +768,8 @@ impl WalletSeed {
 
 	fn to_mailbox_keypair(&self) -> Keypair {
 		if let Some(keypair) = self.external_mailbox { return keypair; }
-		self.mailbox
+		let mailbox_path = [ChildNumber::from_hardened_idx(MAILBOX_KEY_INDEX).unwrap()];
+		self.master.derive_priv(&SECP, &mailbox_path).unwrap().to_keypair(&SECP)
 	}
 
 	fn to_recovery_mailbox_keypair(&self) -> Keypair {
@@ -1202,6 +1200,8 @@ impl Wallet {
 		let properties = self.properties().await?;
 		let network = properties.network;
 		let keypair = self.peek_keypair(index).await?;
+		let mailbox = self.mailbox_identifier();
+
 
 		let (server_pubkey, mailbox_pubkey) =
 			if let (Some(spk), Some(mpk)) = (properties.server_pubkey, properties.server_mailbox_pubkey) {
@@ -1211,13 +1211,14 @@ impl Wallet {
 				(ark_info.server_pubkey, ark_info.mailbox_pubkey)
 			};
 
-		let builder = ark::Address::builder()
+		Ok(ark::Address::builder()
 			.testnet(network != bitcoin::Network::Bitcoin)
 			.server_pubkey(server_pubkey)
-			.pubkey_policy(keypair.public_key());
-		let builder = builder.mailbox(mailbox_pubkey, self.mailbox_identifier(), &keypair)
-			.context("failed to assign mailbox")?;
-		Ok(builder.into_address().context("failed to build address")?)
+			.pubkey_policy(keypair.public_key())
+			.mailbox(mailbox_pubkey, mailbox, &keypair)
+			.context("failed to assign mailbox")?
+			.into_address()
+			.context("failed to build address")?)
 	}
 
 	/// Generate a new [ark::Address] and returns the index of the key used to create it.
@@ -1299,7 +1300,7 @@ impl Wallet {
 				match check_ark_info_safe(&ark_info, config.vtxo_exit_margin) {
 					Ok(()) => (Some(ark_info.server_pubkey), Some(ark_info.mailbox_pubkey),
 						Some(conn.scuttle_payouts().await)),
-			Err(err) if allow_unreachable_server && !config.require_scuttle_payouts => {
+					Err(err) if allow_unreachable_server && !config.require_scuttle_payouts => {
 						warn!("server-advertised ArkInfo is unsafe, \
 							treating as unavailable: {:#}", err);
 						(None, None, None)

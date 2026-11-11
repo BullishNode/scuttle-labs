@@ -347,7 +347,7 @@ pub struct BalanceSummary {
 	#[serde(rename = "needs_refresh_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub needs_refresh: Amount,
-	/// Sats held by operations: the sum of the `pending_*_sat`
+	/// Sats held by operations in progress: the sum of the `pending_*_sat`
 	/// fields of [Balance]. They either come back as spendable or leave the
 	/// wallet, for example to the on-chain wallet.
 	#[serde(rename = "pending_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -614,7 +614,7 @@ pub struct LightningReceiveInfo {
 	/// The payment hash linked to the lightning receive
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the invoice.
+	/// Lifecycle phase of the receive
 	pub state: LightningReceiveStateKind,
 	/// The invoice string, if known.
 	pub invoice: String,
