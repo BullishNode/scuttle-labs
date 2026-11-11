@@ -75,11 +75,6 @@ pub trait ChainEventListener: Send + Sync {
 	/// connection here can deadlock even with a single listener.
 	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: BlockRef) -> anyhow::Result<()>;
 
-	/// Refresh local caches after rollback SQL commits and releases its
-	/// connection, before replacement blocks or completed-view publication.
-	/// Financial rollback belongs in `on_reorg`, not this cache callback.
-	async fn on_reorg_committed(&self, _block_ref: BlockRef) -> anyhow::Result<()> { Ok(()) }
-
 	/// Called when the mempool has been polled.
 	///
 	/// Contains a complete snapshot of all transaction IDs currently in the
