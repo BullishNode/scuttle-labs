@@ -173,6 +173,21 @@ async fn offline_unregistered_board_is_paid_to_admitted_mailbox() {
 		vtxo_id: coin.id().to_bytes().to_vec(),
 		attestation: VtxoStatusAttestation::new(coin.id(), &owner.key(2)).serialize(),
 	}).await.is_err());
+	// The cosign binding and funding root must survive a captain crash even
+	// though the holder never registers the completed board VTXO.
+	srv.watchmand().stop().await.unwrap();
+	srv.crash_stop().await.unwrap();
+	srv.start().await.unwrap();
+	srv.watchmand().start().await.unwrap();
+	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	srv.wait_for_sync_height(tip).await;
+	srv.watchmand().wait_for_sync_height(tip).await;
+	let mut rpc = srv.get_public_rpc().await;
+	let after_restart = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(), attestation: attestation.clone(),
+	}).await.unwrap().into_inner();
+	assert_eq!(after_restart.spend_state, pending.spend_state);
+	assert_eq!(after_restart.owner_mailbox, pending.owner_mailbox);
 	expire(&ctx, &srv, coin.expiry_height()).await;
 	let parent = tokio::time::timeout(Duration::from_secs(40), async {
 		for _ in 0..20 {
