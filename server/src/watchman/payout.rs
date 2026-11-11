@@ -3,6 +3,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use anyhow::Context;
+use bdk_wallet::error::CreateTxError;
 use bitcoin::{Amount, FeeRate, Sequence, Transaction, Weight};
 use bitcoin::psbt;
 use bitcoin::sighash;
@@ -82,15 +83,14 @@ impl Watchman {
 					input.sequence))
 			}).collect::<anyhow::Result<Vec<_>>>()?;
 		let unspendable = wallet.payout_unspendable_outputs();
+		let reserved = roots.iter().copied()
+			.chain(prior_sponsors.iter().map(|(point, ..)| *point))
+			.chain(unspendable.iter().copied()).collect::<BTreeSet<_>>();
+		let mut available_sponsors = wallet.list_unspent()
+			.filter(|out| out.chain_position.is_confirmed() && !reserved.contains(&out.outpoint))
+			.map(|out| (out.outpoint, out.txout.value)).collect::<Vec<_>>();
+		available_sponsors.sort_by(|a, b| b.1.cmp(&a.1));
 		let mut clauses = Vec::with_capacity(group.inputs.len());
-		let mut builder = wallet.build_tx();
-		builder.version(2)
-			.nlocktime(view.height.to_locktime().context("invalid payout lock height")?)
-			.set_exact_sequence(Sequence::ZERO)
-			.only_witness_utxo()
-			.unspendable(unspendable)
-			.drain_to(self.drain_spk.clone())
-			.fee_rate(target);
 		for root in &group.inputs {
 			let clause = if *root.policy() == ServerVtxoPolicy::ServerOwned {
 				None
@@ -102,20 +102,45 @@ impl Watchman {
 				.unwrap_or(Sequence::ZERO);
 			let witness_size = clause.as_ref().map(|clause| clause.witness_size(root))
 				.unwrap_or(66);
-			builder.add_foreign_utxo_with_sequence(root.point(), psbt::Input {
-				witness_utxo: Some(root.txout()), ..Default::default()
-			}, Weight::from_wu(u64::try_from(witness_size)?), sequence)
-				.context("adding expiry backing to payout")?;
-			clauses.push(clause);
+			clauses.push((clause, Weight::from_wu(u64::try_from(witness_size)?), sequence));
 		}
-		for (outpoint, txout, weight, sequence) in prior_sponsors {
-			builder.add_foreign_utxo_with_sequence(outpoint, psbt::Input {
-				witness_utxo: Some(txout), ..Default::default()
-			}, weight, sequence).context("reusing confirmed watchman fee input")?;
-		}
-		builder.set_recipients(group.payouts.iter()
-			.map(|out| (out.script_pubkey.clone(), out.value)).collect());
-		let mut psbt = builder.finish().context("funding direct expiry payout")?;
+		let mut forced_sponsors = Vec::new();
+		let mut psbt = loop {
+			let mut builder = wallet.build_tx();
+			builder.version(2)
+				.nlocktime(view.height.to_locktime().context("invalid payout lock height")?)
+				.set_exact_sequence(Sequence::ZERO)
+				.only_witness_utxo()
+				.unspendable(unspendable.clone())
+				.drain_to(self.drain_spk.clone())
+				.fee_rate(target);
+			for (root, (_, weight, sequence)) in group.inputs.iter().zip(&clauses) {
+				builder.add_foreign_utxo_with_sequence(root.point(), psbt::Input {
+					witness_utxo: Some(root.txout()), ..Default::default()
+				}, *weight, *sequence).context("adding expiry backing to payout")?;
+			}
+			for (outpoint, txout, weight, sequence) in &prior_sponsors {
+				builder.add_foreign_utxo_with_sequence(*outpoint, psbt::Input {
+					witness_utxo: Some(txout.clone()), ..Default::default()
+				}, *weight, *sequence).context("reusing confirmed watchman fee input")?;
+			}
+			for point in &forced_sponsors {
+				builder.add_utxo(*point).context("adding watchman payout sponsor")?;
+			}
+			builder.set_recipients(group.payouts.iter()
+				.map(|out| (out.script_pubkey.clone(), out.value)).collect());
+			match builder.finish() {
+				Ok(psbt) => break psbt,
+				Err(CreateTxError::CoinSelection(ref missing))
+					if group.payouts.is_empty() && missing.needed == self.drain_spk.minimal_non_dust()
+						&& forced_sponsors.len() < available_sponsors.len() => {
+					// BDK does not select optional inputs when its drain-only output
+					// falls below dust. Supply confirmed fee capital explicitly.
+					forced_sponsors.push(available_sponsors[forced_sponsors.len()].0);
+				},
+				Err(error) => return Err(error).context("funding direct expiry payout"),
+			}
+		};
 		wallet.sign_known_inputs(&mut psbt)?;
 		let prevouts = psbt.inputs.iter().map(|input| input.witness_utxo.clone()
 			.context("direct payout PSBT lacks a witness prevout"))
@@ -129,7 +154,7 @@ impl Watchman {
 		}
 		let prevouts_ref = sighash::Prevouts::All(&prevouts);
 		let mut cache = sighash::SighashCache::new(&mut tx);
-		for (root, clause) in group.inputs.iter().zip(&clauses) {
+		for (root, (clause, _, _)) in group.inputs.iter().zip(&clauses) {
 			let index = cache.transaction().input.iter().position(|input|
 				input.previous_output == root.point())
 				.context("expiry backing disappeared from payout")?;
