@@ -1,4 +1,5 @@
 mod exit;
+mod fallback;
 mod arkoor;
 mod fallback_adoption;
 mod lightning;
