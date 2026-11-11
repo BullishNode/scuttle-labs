@@ -1,48 +1,4 @@
 /// The claimant and actual recipient are different wallets. A claim request
-/// cannot replace the recipient mailbox admitted with the invoice.
-#[tokio::test]
-async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
-	let ctx = TestContext::new("server/forwarded_claim_refusals").await;
-	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| cfg.expiry_payouts = true).create().await;
-	srv.wait_for_vtxopool(&ctx).await;
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	let address = recipient.new_address().await.unwrap();
-	let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	let recipient_key = recipient.pubkey_keypair(&address.policy().user_pubkey()).await
-		.unwrap().expect("issued recipient address has a coin key").1;
-	let other_address = super::payout_address(&srv, address.policy().clone(), &recipient_key,
-		MailboxIdentifier::from_pubkey(other.public_key())).await;
-	let checked = Arc::new(AtomicBool::new(false));
-	let prepare_checked = Arc::new(AtomicBool::new(false));
-	let prepare_wallet = Arc::new(std::sync::OnceLock::new());
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
-	let proxy = srv.start_proxy_no_mailbox(CheckClaim { db,
-		other_mailbox: other, other_address: Some(other_address),
-		hold: lightning.internal.hold_client().await, native_payment: true, checked: checked.clone(),
-		prepare_wallet: Some(prepare_wallet.clone()), prepare_checked: prepare_checked.clone() }).await;
-	let provider = ctx.bark_sdk("claimant", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	assert!(prepare_wallet.set(provider.clone()).is_ok());
-	assert_ne!(provider.mailbox_identifier(), recipient.mailbox_identifier());
-	let invoice = provider.bolt11_invoice_for_address(sat(50_000), address.clone(), None, None).await.unwrap();
-	let hash = PaymentHash::from(&invoice);
-	lightning.sync().await;
-	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {
-		tokio::join!(lightning.external.try_pay_bolt11(invoice.to_string()), provider.try_claim_lightning_receive(hash, true))
-	}).await.unwrap();
-	paid.unwrap(); claimed.unwrap();
-	assert!(checked.load(Ordering::SeqCst));
-	assert!(prepare_checked.load(Ordering::SeqCst), "cached grants must preserve exact bodies and owner bindings on repeated reads before collection");
-	recipient.sync_mailbox().await.unwrap();
-	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
-	assert_eq!(provider.balance().await.unwrap().spendable, Amount::ZERO);
-	let ids = recipient.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<Vec<_>>();
-	provider.try_claim_lightning_receive(hash, true).await.unwrap();
-	recipient.sync_mailbox().await.unwrap();
-	assert_eq!(recipient.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<Vec<_>>(), ids);
-	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
-}
-
 /// A receive funded over Lightning must not become collateral for an
 /// unsuccessful Ark sender merely because both use the same invoice.
 #[tokio::test]

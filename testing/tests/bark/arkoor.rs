@@ -123,7 +123,6 @@ async fn send_arkoor_package() {
 	assert_eq!(vtxo3.amount, sat(20_000));
 }
 
-/// A send can produce more destination coins than one mailbox post accepts.
 #[tokio::test]
 async fn oor_change_split() {
 	require_bark_version!(> "0.6.1");

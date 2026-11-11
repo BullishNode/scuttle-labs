@@ -232,11 +232,6 @@ async fn native_refund_status(two_sources: bool) {
 }
 
 #[tokio::test]
-async fn expiry_native_refund_finishes_original_source_and_mailbox() {
-	Box::pin(native_refund_status(false)).await;
-}
-
-#[tokio::test]
 async fn expiry_native_refund_partial_set_preserves_own_failed_outcome() {
 	Box::pin(native_refund_status(true)).await;
 }

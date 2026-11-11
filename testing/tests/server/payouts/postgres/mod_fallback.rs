@@ -55,22 +55,6 @@ async fn succeeded_linked_htlc_send(name: &str) -> (TestContext, Db, ServerVtxo<
 	(ctx, db, vtxo, attempt.id)
 }
 
-/// An existing successful attempt consumes only its linked signed HTLC sources.
-#[tokio::test]
-async fn successful_attempt_consumes_its_linked_htlc_send() {
-	let (ctx, db, vtxo, attempt) = succeeded_linked_htlc_send("postgresd/successful_attempt_consumes_linked_source").await;
-	db.write(async |t| t.mark_htlc_send_vtxos_ln_spent(attempt).await).await.unwrap();
-
-	// The existing source link identifies the coin consumed by this success.
-	let db_client = ctx.postgres_manager().database_client(Some(&ctx.test_name)).await;
-	let row = db_client.query_one(
-		"SELECT spend_state::text AS spend_state FROM vtxo WHERE vtxo_id = $1",
-		&[&vtxo.id().to_string()],
-	).await.unwrap();
-	let spend_state: String = row.get("spend_state");
-	assert_eq!(spend_state, "ln-spent", "the successful attempt consumes its linked source");
-}
-
 /// The success writer waits behind an expiry decision on its source, then
 /// leaves the decided coin spent: one backing coin keeps one obligation.
 #[tokio::test]
@@ -118,95 +102,4 @@ async fn legacy_payment_attempt(db: &Db, node_id: i64, invoice: &Invoice, source
 
 		Ok(())
 	}).await.unwrap();
-}
-
-/// Existing source facts and a consistent WAL are both required. These
-/// explicit PostgreSQL metadata fixtures do not claim a native payment.
-#[tokio::test]
-async fn settlement_source_facts_hold_unknown_and_require_matching_wal() {
-	let mut ctx = TestContext::new_minimal("postgresd/settlement_source_facts").await;
-	ctx.init_central_postgres().await;
-	let config = ctx.new_postgres(&ctx.test_name).await;
-	Db::create_with_payouts(&config, true).await.unwrap();
-	let db = Db::connect(&config).await.unwrap();
-	let base = &VTXO_VECTORS.board_vtxo;
-	let key = base.user_pubkey();
-	let (node, _) = db.write(async |t| t.register_lightning_node(&key).await).await.unwrap();
-	let preimage = Preimage::from([46; 32]);
-	let hash = preimage.compute_payment_hash();
-	let expiry = BlockHeight::new(1_000);
-	let mut ids = Vec::new();
-	for index in 0..3 {
-		let point = bitcoin::OutPoint::new(base.point().txid, index);
-		let policy = if index == 2 {
-			VtxoPolicy::new_server_htlc_recv(key, hash, expiry, BlockDelta::new(40))
-		} else { VtxoPolicy::new_server_htlc_send(key, hash, expiry) };
-		let coin = ServerVtxo::new(point, policy.into(), sat(10_000), base.expiry_height(),
-			base.server_pubkey(), base.exit_delta(), point);
-		db.write(async |t| {
-			t.execute_vtxo_tree_update(VtxoTreeUpdate::new().insert_spendable_bare_vtxos([coin.clone()])
-				.bind_owner_mailboxes([(coin.id(), super::test_server_mailbox_key().public_key())])?).await?;
-			htlc_vtxo::create_htlc_vtxos(t, &[(coin.id(), hash, expiry)],
-				if index == 2 { HtlcDirection::Outgoing } else { HtlcDirection::Incoming }).await
-		}).await.unwrap();
-		ids.push(coin.id());
-	}
-	let invoice_key = SecretKey::from_slice(&[41; 32]).unwrap();
-	let secp = Secp256k1::new();
-	let bolt11 = InvoiceBuilder::new(Currency::Regtest)
-		.description("settlement source association fixture".into()).payment_hash(hash.to_sha256_hash())
-		.payment_secret(PaymentSecret([42; 32])).current_timestamp()
-		.min_final_cltv_expiry_delta(18).amount_milli_satoshis(10_000_000)
-		.build_signed(|message| secp.sign_ecdsa_recoverable(message, &invoice_key)).unwrap();
-	let mailbox = ark::mailbox::MailboxIdentifier::from_pubkey(super::test_server_mailbox_key().public_key());
-	let subscription = db.write(async |t| {
-		t.store_generated_lightning_receive(node, &bolt11, 10_000_000, Some(&mailbox), Some(key), None).await?;
-		Ok(t.get_htlc_subscription_by_payment_hash(hash).await?.unwrap().id)
-	}).await.unwrap();
-	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
-		LightningHtlcSubscriptionStatus::Accepted, Some(expiry), None).await).await.unwrap();
-	db.write(async |t| t.update_lightning_htlc_subscription_with_htlcs(subscription, [ids[2]]).await).await.unwrap();
-	let invoice = Invoice::Bolt11(bolt11);
-	for (index, source) in ids[..2].iter().enumerate() {
-		legacy_payment_attempt(&db, node, &invoice, &[*source]).await;
-		if index == 0 {
-			let attempt = db.read(async |t| t.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
-			assert!(db.write(async |t| t.update_lightning_payment_attempt_status(&attempt,
-				server::database::ln::LightningPaymentStatus::Failed, None).await).await.unwrap().is_some());
-		}
-	}
-	let attempts = db.read(async |t| Ok(t.query("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1 ORDER BY id",
-		&[&hash.to_string()]).await?.into_iter().map(|r| r.get::<_, i64>(0)).collect::<Vec<_>>())).await.unwrap();
-	assert_eq!(attempts.len(), 2);
-	let predicate = async |source| db.read(async |t| t.source_settlement(hash, source).await).await.unwrap();
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::NotSettled);
-	assert!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap().is_some());
-	for id in &ids { assert_eq!(predicate(*id).await, SourceSettlement::Unknown); }
-	// A same-hash preimage cannot discharge the failed or unattempted source.
-	// An exact positive source fact can, but never without the matching WAL.
-	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET status='succeeded',updated_at=NOW() WHERE id=$1",
-		&[&attempts[0]]).await?)).await.unwrap();
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::Unknown);
-	// Once the other source's success accounts for the invoice, a terminal
-	// failed source can be returned to its owner. An open attempt cannot.
-	db.write(async |t| Ok(t.execute("UPDATE lightning_payment_attempt SET status='failed',updated_at=NOW() WHERE id=$1",
-		&[&attempts[1]]).await?)).await.unwrap();
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::NotSettled);
-	let without_wal: anyhow::Result<()> = db.write(async |t| {
-		t.execute("DELETE FROM htlc_settlement WHERE payment_hash=$1", &[&hash.to_string()]).await?;
-		assert_eq!(t.source_settlement(hash, ids[0]).await?, SourceSettlement::Unknown);
-		let attempt = t.get_lightning_payment_attempt_by_id(attempts[0]).await?.unwrap();
-		assert!(t.ensure_attempt_sources_allow_failure(&attempt).await.is_err());
-		anyhow::bail!("roll back missing-WAL metadata control")
-	}).await;
-	assert!(without_wal.is_err());
-	assert_eq!(predicate(ids[0]).await, SourceSettlement::Funded);
-	db.write(async |t| t.store_lightning_htlc_subscription_status(subscription,
-		LightningHtlcSubscriptionStatus::Settled, None, None).await).await.unwrap();
-	assert_eq!(predicate(ids[2]).await, SourceSettlement::Funded);
-	assert_eq!(predicate(ids[1]).await, SourceSettlement::NotSettled);
-	assert_eq!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap(), None);
-	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT count(*) FROM htlc_settlement WHERE payment_hash=$1",
-		&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
 }

@@ -271,7 +271,7 @@ async fn expiry_cancelled_native_refresh_status_never_releases_preimage() {
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == root.id()).unwrap();
 	let tip = bitcoin_ext::BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, tip, Some(tip)).await).await.unwrap();
+	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, tip).await).await.unwrap();
 	assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Operator));
 	assert!(matches!(proposal.evidence,
 		Some(server::database::expiry_ownership::OwnershipEvidence::Exchange {

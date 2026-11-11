@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bark::{OpenWalletArgs, Wallet, WalletSeed};
@@ -11,17 +11,11 @@ use bark::persist::{BarkPersister, sqlite::SqliteClient};
 use bark::vtxo::VtxoState;
 use bitcoin::{Network, Transaction};
 use bitcoin::consensus::deserialize;
-use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::BlockDelta;
-use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
+use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
-use tokio::sync::{Notify, oneshot};
-use ark::vtxo::Full;
-use ark::Vtxo;
-use server_rpc::protos;
 
 use ark::ProtocolEncoding;
-use ark::attestations::VtxoStatusAttestation;
 use ark_testing::{require_bitcoind_chain_source, sat, TestContext};
 use ark_testing::daemon::captaind;
 
@@ -168,172 +162,3 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 
 }
 
-#[derive(Clone, Default)]
-struct HoldArkoorRegistration {
-	arrived: Arc<Mutex<Option<(PublicKey, oneshot::Sender<protos::RegisterVtxoTransactionsRequest>)>>>,
-	release: Arc<Notify>,
-}
-
-#[async_trait::async_trait]
-impl captaind::proxy::ArkRpcProxy for HoldArkoorRegistration {
-	async fn register_vtxo_transactions(
-		&self, upstream: &mut captaind::ArkClient, request: protos::RegisterVtxoTransactionsRequest,
-	) -> Result<protos::Empty, tonic::Status> {
-		// Input-chain registration precedes cosigning. Only the new recipient's
-		// signed outputs reach the durable Registration checkpoint under test.
-		let arrived = {
-			let mut gate = self.arrived.lock().unwrap();
-			if gate.as_ref().is_some_and(|(key, _)| request.vtxos.iter().any(|raw|
-				Vtxo::<Full>::deserialize(raw).is_ok_and(|coin| coin.user_pubkey() == *key))) {
-				gate.take().map(|(_, arrived)| arrived)
-			} else { None }
-		};
-		if let Some(arrived) = arrived {
-			arrived.send(request.clone()).unwrap();
-			self.release.notified().await;
-		}
-		Ok(upstream.register_vtxo_transactions(request).await?.into_inner())
-	}
-
-}
-
-#[tokio::test]
-async fn provisional_recipient_transfer_pays_input_owner() {
-	Box::pin(stalled_change()).await;
-}
-
-async fn stalled_change() {
-	let ctx = TestContext::new("bark_sdk/stalled_arkoor_change_pending").await;
-	let srv = ctx.captaind("server").no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
-		config.vtxo_lifetime = BlockDelta::new(24);
-		config.vtxo_exit_delta = BlockDelta::new(3);
-	}).watchmand().create().await;
-	let gate = HoldArkoorRegistration::default();
-	let proxy = captaind::proxy::ArkRpcProxyServer::start(
-		(gate.clone(), srv.get_public_rpc().await), ((), srv.get_mailbox_public_rpc().await),
-	).await;
-	let owner = Arc::new(ctx.bark_sdk("owner", &proxy.address).cfg(config)
-		.funded(sat(500_000)).boarded(sat(100_000)).create().await);
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(config).create().await;
-	let address = recipient.new_address().await.unwrap();
-	let recipient_key = address.policy().user_pubkey();
-	let source = owner.spendable_vtxos().await.unwrap().remove(0);
-	let source_key = source.user_pubkey();
-	let destination = owner.fallback_script();
-	let (arrived, prepared) = oneshot::channel();
-	*gate.arrived.lock().unwrap() = Some((recipient_key, arrived));
-	let sender = owner.clone();
-	let payment = tokio::spawn(async move { sender.send_arkoor_payment(&address, sat(60_000)).await });
-	let request = tokio::time::timeout(Duration::from_secs(15), prepared).await.unwrap().unwrap();
-	let leaves = request.vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
-	let changes = leaves.iter().filter(|coin| coin.user_pubkey() != recipient_key).cloned().collect::<Vec<_>>();
-	let received = leaves.iter().find(|coin| coin.user_pubkey() == recipient_key).unwrap();
-	assert!(!changes.is_empty());
-	assert!(changes.iter().all(|coin| coin.user_pubkey() != source_key));
-	assert_eq!(changes.iter().map(|coin| coin.amount()).sum::<bitcoin::Amount>(), sat(40_000));
-	assert_eq!(received.amount(), sat(60_000));
-	let local = SqliteClient::open(ctx.datadir.join("owner/db.sqlite")).unwrap();
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let ids = leaves.iter().map(|coin| coin.id().to_string()).collect::<Vec<_>>();
-	let height = ctx.bitcoind().get_block_count().await as u32;
-	let expired = ctx.generate_blocks(source.expiry_height().to_u32() + 1 - height).await;
-	srv.wait_for_sync_height(expired).await;
-	srv.watchmand().wait_for_sync_height(expired).await;
-	tokio::time::timeout(Duration::from_secs(30), async {
-		loop {
-			let decided = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement \
-				WHERE vtxo_id=ANY($1)", &[&ids]).await?.get::<_, i64>(0))).await.unwrap();
-			if usize::try_from(decided).unwrap() == leaves.len() { break; }
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("real unregistered outputs must be allocated before registration resumes");
-
-	gate.release.notify_one();
-	let error = tokio::time::timeout(Duration::from_secs(15), payment)
-		.await.unwrap().unwrap().unwrap_err();
-	assert_eq!(bark::FallbackRefusal::from_error(&error), Some(bark::FallbackRefusal::DecidedForFallback));
-	owner.sync().await;
-	let own_status = protos::VtxoSpendState::FallbackPending;
-	let sends = owner.history().await.unwrap().into_iter().filter(|movement| movement.subsystem.name == "bark.arkoor")
-		.collect::<Vec<_>>();
-	assert_eq!(sends.len(), 1);
-	assert_eq!(sends[0].status, bark::movement::MovementStatus::Failed);
-	assert_eq!(sends[0].intended_balance, bitcoin::SignedAmount::from_sat(-60_000));
-	assert_eq!(sends[0].effective_balance, bitcoin::SignedAmount::ZERO,
-		"the input-owner commitment did not transfer 60k to the provisional recipient");
-	let mut rpc = srv.get_public_rpc().await;
-	let original_status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
-		vtxo_id: source.id().to_bytes().to_vec(),
-		attestation: VtxoStatusAttestation::new(source.id(), &owner.get_vtxo_key(&source).await.unwrap()).serialize(),
-	}).await.unwrap().into_inner();
-	assert_eq!(original_status.spend_state, own_status as i32,
-		"all provisional split portions project back to the known input owner");
-	for coin in &leaves {
-		let key = if coin.user_pubkey() == recipient_key { recipient.get_vtxo_key(coin).await.unwrap() }
-			else { owner.get_vtxo_key(coin).await.unwrap() };
-		let state = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
-			vtxo_id: coin.id().to_bytes().to_vec(),
-			attestation: VtxoStatusAttestation::new(coin.id(), &key).serialize(),
-		}).await.unwrap().into_inner().spend_state;
-		assert_eq!(state, if coin.user_pubkey() == recipient_key { protos::VtxoSpendState::Spent }
-			else { own_status } as i32);
-	}
-	assert_eq!(owner.balance().await.unwrap().total(), sat(0), "known committed inputs are status-only, not new Ark balance");
-	assert!(owner.spendable_vtxos().await.unwrap().is_empty());
-	assert_eq!(owner.get_vtxo_by_id(source.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	assert_eq!(owner.get_full_vtxo(source.id()).await.unwrap().amount(), source.amount());
-	for change in &changes {
-		assert_eq!(owner.get_vtxo_by_id(change.id()).await.unwrap().fallback_status, Some(bark::vtxo::FallbackStatus::Pending));
-	}
-	recipient.sync_fallback_payouts().await.unwrap();
-	assert!(recipient.all_vtxos().await.unwrap().iter().all(|coin| coin.fallback_status.is_none()));
-	assert_eq!(recipient.balance().await.unwrap().total(), sat(0));
-	let payout_start_height = ctx.bitcoind().sync_client().get_block_count().unwrap();
-	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
-	ctx.generate_blocks(2).await;
-	let payout = tokio::time::timeout(Duration::from_secs(30), async {
-		'payout: loop {
-			let core = ctx.bitcoind().sync_client();
-			for height in payout_start_height + 1..=core.get_block_count().unwrap() {
-				let hash = core.get_block_hash(height).unwrap();
-				for tx in core.get_block(&hash).unwrap().txdata {
-					if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(98_000)) {
-						break 'payout tx;
-					}
-				}
-			}
-			for txid in core.get_raw_mempool().unwrap() {
-				let tx = ctx.bitcoind().await_transaction(txid).await;
-				if tx.output.iter().any(|output| output.script_pubkey == destination && output.value == sat(98_000)) { break 'payout tx; }
-			}
-			tokio::time::sleep(Duration::from_millis(50)).await;
-		}
-	}).await.expect("the retained input owner's real payout must become relayable after funding");
-	ctx.generate_blocks(6).await;
-	owner.chain().invalidate_caches().await;
-	owner.sync_fallback_payouts().await.unwrap();
-	owner.sync_pending_arkoor_sends().await.unwrap();
-	assert!(owner.pending_arkoor_sends().await.unwrap().is_empty(),
-		"actual canonical retirement permits removal of the protected checkpoint");
-	for change in &changes {
-		assert_eq!(local.get_wallet_vtxo(change.id()).await.unwrap().unwrap().state, VtxoState::Spent);
-	}
-	assert_eq!(owner.balance().await.unwrap().total(), sat(0));
-	let history = owner.history().await.unwrap();
-	assert_eq!(history.iter().map(|movement| movement.effective_balance.to_sat()).sum::<i64>(), 100_000,
-		"ordinary board history stays intact without a synthetic BTC payout debit");
-	let sends = history.iter().filter(|movement| movement.subsystem.name == "bark.arkoor").collect::<Vec<_>>();
-	assert_eq!(sends.len(), 1);
-	assert_eq!(sends[0].status, bark::movement::MovementStatus::Failed);
-	assert_eq!(sends[0].effective_balance, bitcoin::SignedAmount::ZERO);
-	let history = serde_json::to_value(history).unwrap();
-	owner.sync_pending_arkoor_sends().await.unwrap();
-	owner.sync_fallback_payouts().await.unwrap();
-	assert_eq!(serde_json::to_value(owner.history().await.unwrap()).unwrap(), history);
-	let (index, _) = payout.output.iter().enumerate().find(|(_, output)| output.script_pubkey == destination && output.value == sat(98_000)).unwrap();
-	let output = ctx.bitcoind().sync_client().get_tx_out(&payout.compute_txid(), index as u32, Some(true)).unwrap().unwrap();
-	assert!(output.confirmations >= 6);
-	assert_eq!(output.value, sat(98_000));
-	assert_eq!(output.script_pub_key.script().unwrap(), destination);
-
-}

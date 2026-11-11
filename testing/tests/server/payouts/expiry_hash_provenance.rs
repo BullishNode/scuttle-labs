@@ -89,7 +89,7 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 	for (index, (input, _key)) in sources.iter().enumerate() {
 		let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
 		let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[index]).unwrap();
-		let proposal = db.read(async |t| t.propose_expiry_ownership(fact, height, Some(height)).await).await.unwrap();
+		let proposal = db.read(async |t| t.propose_expiry_ownership(fact, height).await).await.unwrap();
 		if index == 0 {
 			assert_eq!(proposal.disposition, OwnershipDisposition::Operator, "the source that actually funded the paid invoice is discharged");
 			assert_eq!(db.read(async |t| t.source_settlement(hash, grants[0]).await).await.unwrap(),
@@ -103,7 +103,7 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 					&[&grants[0].to_string()]).await?;
 				Ok(())
 			}).await.unwrap();
-			let held = db.read(async |t| t.propose_expiry_ownership(fact, height, Some(height)).await).await.unwrap();
+			let held = db.read(async |t| t.propose_expiry_ownership(fact, height).await).await.unwrap();
 			assert!(matches!(held.disposition, OwnershipDisposition::Unresolved(_)));
 			assert!(held.settlement_integrity_hold, "cached Failed cannot authorize a paid-source refund or operator allocation");
 			db.write(async |t| {
@@ -168,7 +168,7 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 	srv.watchmand().wait_for_sync_height(expired).await;
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[ark::ServerVtxo::from(sources[1].0.clone()).to_bare()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[1]).unwrap();
-	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, expired, Some(expired)).await).await.unwrap();
+	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, expired).await).await.unwrap();
 	assert_eq!(proposal.disposition, OwnershipDisposition::Customer { user_pubkey: sources[1].1.public_key() });
 	assert!(!proposal.settlement_integrity_hold);
 	assert_eq!(db.read(async |t| t.source_settlement(hash, grants[1]).await).await.unwrap(),

@@ -59,7 +59,7 @@ async fn held_coin_is_alarmed_before_decision() {
 		.signed_tx.unwrap().into_owned();
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
-	let pending = db.read(async |t| t.propose_expiry_ownership(fact, expired, Some(expired)).await).await.unwrap();
+	let pending = db.read(async |t| t.propose_expiry_ownership(fact, expired).await).await.unwrap();
 	assert!(matches!(pending.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
@@ -75,7 +75,7 @@ async fn held_coin_is_alarmed_before_decision() {
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
-	let ready = db.read(async |t| t.propose_expiry_ownership(fact, tip, Some(tip)).await).await.unwrap();
+	let ready = db.read(async |t| t.propose_expiry_ownership(fact, tip).await).await.unwrap();
 	assert!(matches!(ready.disposition,
 		server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey, .. }
 			if user_pubkey == key.public_key()

@@ -12,6 +12,5 @@ mod bitcoind;
 mod lightning;
 mod lock_helpers;
 mod pid_lock;
-mod payout_wallet;
 mod tip_watcher;
 mod wallet_ext;

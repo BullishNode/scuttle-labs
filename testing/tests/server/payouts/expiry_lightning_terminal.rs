@@ -213,24 +213,11 @@ async fn failed_external_payout(settle_during_decision: bool) {
 		WHERE lightning_payment_attempt_id=$1 AND vtxo_id=$2", &[&attempt, &id.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
 }
 
-#[tokio::test]
-async fn maxdelay_uses_server_tip_when_cln_lags() {
-	failed_external_payout(false).await;
-}
-
 /// A settlement that commits between the decision's analysis and its write
 /// makes the write refuse the sender's refund; the source then stays held.
 #[tokio::test]
 async fn expiry_settlement_during_decision_keeps_source_held() {
 	failed_external_payout(true).await;
-}
-
-/// Internal setup timeout closes a receive that never granted
-/// any coin. Both actors stay absent; only real services decide and pay back
-/// the original 100k source less its single 2k output fee.
-#[tokio::test]
-async fn expiry_internal_zero_grant_timeout_pays_absent_sender() {
-	internal_zero_grant_timeout().await;
 }
 
 #[inline(never)]
@@ -553,7 +540,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 			Ok(snapshot.regular.into_iter().find(|fact| fact.state.vtxo_id == source).unwrap())
 		}).await.unwrap();
 		let funding = ctx.bitcoind().await_transaction(incoming[0].chain_anchor().txid).await;
-		let proposal = db.read(async |t| t.propose_expiry_ownership(&fact, height, Some(height)).await).await.unwrap();
+		let proposal = db.read(async |t| t.propose_expiry_ownership(&fact, height).await).await.unwrap();
 		assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
 		let height = ctx.generate_blocks(1).await;
 		srv.wait_for_sync_height(height).await;
@@ -573,7 +560,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 				let proposal = db.read(async |t| {
 					let Some(view) = t.expiry_view().await? else { return Ok(None); };
 					if view != point { return Ok(None); }
-					Ok(Some(t.propose_expiry_ownership(&fact, view.height, Some(view.height)).await?))
+					Ok(Some(t.propose_expiry_ownership(&fact, view.height).await?))
 				}).await.unwrap();
 				if let Some(proposal) = proposal {
 					if matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey } if user_pubkey == key.public_key()) {

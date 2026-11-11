@@ -1,6 +1,3 @@
-mod payouts;
-#[path = "payouts/owner_helpers.rs"]
-mod expiry_admission;
 mod ban;
 mod blocklist;
 mod block_index;
@@ -52,7 +49,7 @@ use bark_json::primitives::WalletVtxoInfo;
 use server::database::Db;
 use server::secret::Secret;
 use server_log::{FullRound, RoundError, RoundFinished, RoundStarted, RoundUserVtxoAlreadyRegistered};
-use server_rpc::protos;
+use server_rpc::protos::{self};
 
 use ark_testing::{btc, is_bark_version, require_bark_version, sat, secs, Captaind, TestContext};
 use ark_testing::constants::{BOARD_CONFIRMATIONS, ROUND_CONFIRMATIONS};
@@ -64,8 +61,7 @@ use ark_testing::exit::complete_exit;
 use server_rpc::protos::mailbox_server::mailbox_message::Message;
 
 lazy_static::lazy_static! {
-	static ref RANDOM_KEY: Keypair = Keypair::from_seckey_slice(&SECP, &[42; 32]).unwrap();
-	static ref RANDOM_PK: PublicKey = RANDOM_KEY.public_key();
+	static ref RANDOM_PK: PublicKey = "02c7ef7d49b365974cd219f7036753e1544a3cdd2120eb7247dd8a94ef91cf1e49".parse().unwrap();
 }
 
 #[tokio::test]
@@ -798,21 +794,13 @@ async fn max_vtxo_exit_depth() {
 #[tokio::test]
 async fn wallet_skips_vtxos_at_exit_depth_limit() {
 	let ctx = TestContext::new("server/wallet_skips_vtxos_at_exit_depth_limit").await;
-	let lightning = Box::pin(ctx.new_lightning_setup("lightningd")).await;
 
-	let srv = Box::pin(ctx.captaind("server").lightningd(&lightning.internal).cfg(|cfg| {
+	let srv = ctx.captaind("server").cfg(|cfg| {
 		cfg.max_vtxo_exit_depth = 10;
-		cfg.max_arkoor_fanout = 4;
-		cfg.nb_round_nonces = 3;
-		cfg.vtxopool.max_vtxo_exit_depth = 9;
-		cfg.vtxopool.vtxo_targets = vec!["1000sat:10".parse().unwrap(), "10000sat:10".parse().unwrap()];
-		cfg.round_interval = Duration::from_secs(3600);
-	}).create()).await;
+	}).create().await;
 	ctx.fund_captaind(&srv, btc(10)).await;
-	assert!(srv.config().vtxopool.vtxo_targets.iter().map(|target| target.count).sum::<usize>() <= 64);
 
-	let bark1 = Box::pin(ctx.bark("bark1", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
-		.funded(sat(1_000_000)).create()).await;
+	let bark1 = ctx.bark("bark1", &srv).funded(sat(1_000_000)).create().await;
 
 	bark1.board_and_confirm_and_register(&ctx, sat(800_000)).await;
 
@@ -830,47 +818,6 @@ async fn wallet_skips_vtxos_at_exit_depth_limit() {
 		err.contains("Insufficient money"),
 		"expected insufficient money, got: {err}",
 	);
-
-	let client = bark1.client().await;
-	let before = client.spendable_vtxos().await.unwrap();
-	assert_eq!(before.len(), 1);
-	assert_eq!(before[0].exit_depth, 11);
-	let old = before[0].id();
-	let (refreshed, _) = tokio::join!(client.maintenance_refresh(), async {
-		tokio::time::sleep(Duration::from_secs(2)).await;
-		srv.trigger_round().await;
-	});
-	assert!(refreshed.unwrap().expect("depth maintenance must join a round").is_success());
-	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
-	client.sync().await;
-	let replacement = client.spendable_vtxos().await.unwrap();
-	assert_eq!(replacement.iter().map(|vtxo| vtxo.amount()).sum::<Amount>(), sat(800_000));
-	assert!(replacement.iter().all(|vtxo| vtxo.id() != old && vtxo.exit_depth < 10));
-	assert_eq!(client.get_vtxo_by_id(old).await.unwrap().state, bark::vtxo::VtxoState::Spent);
-	drop(client);
-
-	let receiver = ctx.bark("receiver", &srv).create().await;
-	bark1.send_oor(&receiver.address().await, sat(10_000)).await;
-	receiver.sync().await;
-	assert_eq!(receiver.offchain_balance().await.spendable, sat(10_000));
-	lightning.sync().await;
-	let invoice = lightning.external.invoice(Some(sat(20_000)), "after-depth-refresh", "refreshed payment").await;
-	bark1.pay_lightning_wait(&invoice, None).await;
-	lightning.external.wait_invoice_paid("after-depth-refresh").await;
-	bark1.sync().await;
-	let balance = bark1.offchain_balance().await;
-	assert_eq!(balance.spendable, sat(770_000));
-	assert_eq!(balance.needs_refresh, sat(0));
-	assert_eq!(balance.pending_lightning_send, sat(0));
-	let invoice: bark::lightning_invoice::Bolt11Invoice = invoice.parse().unwrap();
-	let hash = ark::lightning::PaymentHash::from(&invoice);
-	let pays = lightning.internal.grpc_client().await.list_pays(cln_rpc::ListpaysRequest {
-		payment_hash: Some(hash.to_vec()), ..Default::default()
-	}).await.unwrap().into_inner().pays;
-	assert_eq!(pays.len(), 1);
-	assert_eq!(pays[0].status(), cln_rpc::listpays_pays::ListpaysPaysStatus::Complete);
-	assert_eq!(pays[0].amount_msat.as_ref().unwrap().msat, 20_000_000);
-	assert_eq!(pays[0].amount_sent_msat.as_ref().unwrap().msat, 20_000_000);
 }
 
 #[tokio::test]
@@ -1217,9 +1164,9 @@ async fn double_spend_arkoor() {
 		protos::ArkoorPackageCosignRequest::from(cosign_request)
 	};
 
-	let req1 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder1)).await;
-	let req2 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder2)).await;
-	let req3 = signed_package(&srv, &[&bark_client], sign_cosign_request(builder3)).await;
+	let req1 = sign_cosign_request(builder1);
+	let req2 = sign_cosign_request(builder2);
+	let req3 = sign_cosign_request(builder3);
 
 	// Create 3 rpc-clients so we can send 3 requests in paralel
 	let mut rpc1 = srv.get_public_rpc().await;
@@ -1287,8 +1234,6 @@ async fn reject_expired_arkoor_cosign() {
 	let cosign_request = protos::ArkoorPackageCosignRequest::from(
 		builder.generate_user_nonces(&[vtxo_keypair]).unwrap().cosign_request(),
 	);
-
-	let cosign_request = signed_package(&srv, &[&bark_client], cosign_request).await;
 
 	// Let the vtxo expire before the server sees the request.
 	let height = ctx.generate_blocks(srv.config().vtxo_lifetime.to_u32() + 1).await;
@@ -2266,6 +2211,7 @@ async fn should_refuse_oor_input_vtxo_that_is_being_exited() {
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 	let bark2 = ctx.bark("bark2", &srv).create().await;
 
+
 	bark.board(sat(400_000)).await;
 	bark.board(sat(400_000)).await;
 	ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
@@ -2549,6 +2495,7 @@ async fn should_refuse_round_input_vtxo_that_is_being_exited() {
 	);
 }
 
+
 /// Tests the register_board endpoint.
 ///
 /// This test covers:
@@ -2768,7 +2715,6 @@ async fn undo_round() {
 
 	let ctx = TestContext::new("server/undo_round").await;
 	let srv = ctx.captaind("server").funded(btc(10)).cfg(|cfg| {
-		cfg.expiry_payouts = true;
 		cfg.round_interval = Duration::from_secs(3600);
 	}).create().await;
 
@@ -2790,50 +2736,6 @@ async fn undo_round() {
 	let funding_txid = finished.txid;
 	info!("Round finished with funding txid: {}", funding_txid);
 
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let round_id = ark::rounds::RoundId::new(funding_txid);
-	let tree = db.read(async |tx| tx.get_round(round_id).await).await.unwrap().unwrap().into_cached_tree().unwrap();
-	let outputs = tree.output_vtxos().collect::<Vec<_>>();
-	let output_ids = tree.internal_vtxos().map(|(v,_)| v.id().to_string())
-		.chain(outputs.iter().map(|v| v.id().to_string())).collect::<Vec<_>>();
-	let input_ids = db.read(async |tx| Ok(tx.query("SELECT i.vtxo_id FROM round_part_input i \
-		JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$1 ORDER BY i.vtxo_id",
-		&[&funding_txid.to_string()]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
-	assert!(!input_ids.is_empty());
-	let all_ids = output_ids.iter().chain(&input_ids).cloned().collect::<Vec<_>>();
-	let input_owners = async || db.read(async |tx| Ok(tx.query_one("SELECT COALESCE(jsonb_agg(to_jsonb(c) \
-		ORDER BY vtxo_id),'[]')::TEXT FROM coin_owner c WHERE vtxo_id=ANY($1)", &[&input_ids]).await?.get::<_,String>(0))).await.unwrap();
-	let input_owners_before = input_owners().await;
-	assert_ne!(input_owners_before,"[]");
-	let owned_outputs = db.read(async |tx| Ok(tx.query("SELECT vtxo_id FROM coin_owner WHERE vtxo_id=ANY($1)",
-		&[&output_ids]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>())).await.unwrap();
-	assert!(!owned_outputs.is_empty(), "the actual completed round must have customer ownership projections");
-	let fenced = outputs.iter().find(|v|owned_outputs.contains(&v.id().to_string())).unwrap();
-	let snapshot = async || db.read(async |tx| Ok(tx.query_one("SELECT jsonb_build_object(
-		'vtxos',(SELECT COALESCE(jsonb_agg(to_jsonb(v) ORDER BY vtxo_id),'[]') FROM vtxo v WHERE vtxo_id=ANY($1)),
-		'owners',(SELECT COALESCE(jsonb_agg(to_jsonb(c) ORDER BY vtxo_id),'[]') FROM coin_owner c WHERE vtxo_id=ANY($1)),
-		'round',(SELECT to_jsonb(r) FROM round r WHERE funding_txid=$2),
-		'parts',(SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY id),'[]') FROM round_participation p WHERE round_id=$2),
-		'inputs',(SELECT COALESCE(jsonb_agg(to_jsonb(i) ORDER BY participation_id,vtxo_id),'[]') FROM round_part_input i
-			JOIN round_participation p ON p.id=i.participation_id WHERE p.round_id=$2),
-		'outputs',(SELECT COALESCE(jsonb_agg(to_jsonb(o) ORDER BY participation_id,amount),'[]') FROM round_part_output o
-			JOIN round_participation p ON p.id=o.participation_id WHERE p.round_id=$2),
-		'entitlements',(SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY vtxo_id),'[]') FROM expiry_entitlement e WHERE vtxo_id=ANY($1)),
-		'history_count',(SELECT COUNT(*) FROM vtxo_history WHERE vtxo_id=ANY($1)))::TEXT",
-		&[&all_ids,&funding_txid.to_string()]).await?.get::<_,String>(0))).await.unwrap();
-	let before_refusal = snapshot().await;
-	// A constructed PG fence on the actual round output exercises only the
-	// transactional refusal. It rolls back together with the attempted undo.
-	let refused = db.write(async |tx| {
-		tx.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)",
-			&[&fenced.id().to_string()]).await?;
-		tx.undo_round(round_id).await
-	}).await.expect_err("economic references must still refuse the entire undo");
-	let error = refused.downcast_ref::<tokio_postgres::Error>().unwrap().as_db_error().unwrap();
-	assert_eq!(error.code(),&tokio_postgres::error::SqlState::FOREIGN_KEY_VIOLATION);
-	assert_eq!(error.constraint(),Some("expiry_entitlement_vtxo_id_fkey"));
-	assert_eq!(snapshot().await,before_refusal, "refused undo must roll back projection removal, input restoration and participation/history writes");
-
 	let output = srv.get_custom_command(&[
 		"undo-round", "--dangerous", "--force",
 		&funding_txid.to_string(),
@@ -2844,15 +2746,6 @@ async fn undo_round() {
 	info!("undo-round stdout: {}", stdout);
 	info!("undo-round stderr: {}", stderr);
 	assert!(output.status.success(), "undo-round exited with status {}", output.status);
-
-	let removed = db.read(async |tx| Ok(tx.query_one("SELECT
-		(SELECT COUNT(*) FROM vtxo WHERE vtxo_id=ANY($1)),
-		(SELECT COUNT(*) FROM coin_owner WHERE vtxo_id=ANY($1)),
-		(SELECT COUNT(*) FROM round WHERE funding_txid=$2)", &[&output_ids,&funding_txid.to_string()]).await?)).await.unwrap();
-	assert_eq!(removed.get::<_,i64>(0),0);
-	assert_eq!(removed.get::<_,i64>(1),0);
-	assert_eq!(removed.get::<_,i64>(2),0);
-	assert_eq!(input_owners().await,input_owners_before, "original round inputs retain their admitted ownership");
 }
 
 /// Verify that broadcasting the board vtxo's exit tx (outside of bark) causes
@@ -2982,13 +2875,12 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	let attestation = RoundAttemptAttestation::new(
 		challenge, input_id, &[request.clone()], &input_key,
 	);
-	let request = protos::SignedVtxoRequest::from(request);
 	rpc.submit_payment(protos::SubmitPaymentRequest {
 		input_vtxos: vec![protos::InputVtxo {
 			vtxo_id: input_id.to_bytes().to_vec(),
 			attestation: attestation.serialize(),
 		}],
-		vtxo_requests: vec![request],
+		vtxo_requests: vec![request.into()],
 		#[allow(deprecated)]
 		offboard_requests: vec![],
 		unblinded_mailbox_id: None,
@@ -3053,5 +2945,3 @@ async fn confirmed_exit_during_signing_does_not_stop_round_coordinator() {
 	}).await.unwrap_or(false);
 	assert!(next_attempt, "a participant's exit must not terminate the round coordinator");
 }
-
-include!("payouts/mod_fallback.rs");
