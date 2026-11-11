@@ -22,14 +22,13 @@ pub struct BackingVtxoFact {
 
 
 pub struct BackingSnapshot {
-	pub roots: Vec<ServerVtxo>,
 	pub regular: Vec<BackingVtxoFact>,
 }
 
 const SNAPSHOT: &str = "
 WITH RECURSIVE current_branch AS (
 	SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in FROM vtxo
-	WHERE $2<>0 AND vtxo_id=ANY($1)
+	WHERE vtxo_id=ANY($1)
 	UNION
 	SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
 	FROM vtxo v JOIN current_branch p ON v.vtxo_txid=p.oor_spent_txid
@@ -40,23 +39,13 @@ SELECT vtxo_id,anchor_point,id,vtxo,expiry,exit_delta,policy,server_pubkey,amoun
 	banned_until_height,confirmed_height,spend_state::TEXT,created_at,updated_at,
 	EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=v.vtxo_id) AS decided_for_fallback,
 	onchain_spent_height,onchain_spent_txid,lightning_htlc_subscription_id
-FROM vtxo v WHERE ($2=0 AND anchor_point=ANY($1))
-	OR ($2<>0 AND vtxo_id IN (SELECT vtxo_id FROM current_branch))
+FROM vtxo v WHERE vtxo_id IN (SELECT vtxo_id FROM current_branch)
 ORDER BY vtxo_id";
 
 impl Tx<'_> {
-	pub async fn backing_snapshot(&self, roots: &[ServerVtxo]) -> anyhow::Result<BackingSnapshot> {
-		self.read_backing_snapshot(roots, 0).await
-	}
-
 	pub async fn backing_subtree_snapshot(&self, roots: &[ServerVtxo]) -> anyhow::Result<BackingSnapshot> {
-		self.read_backing_snapshot(roots, 1).await
-	}
-
-	async fn read_backing_snapshot(&self, roots: &[ServerVtxo], scope: i32) -> anyhow::Result<BackingSnapshot> {
-		let selected = roots.iter().map(|root| if scope == 0 { root.chain_anchor().to_string() } else { root.id().to_string() })
-			.collect::<Vec<_>>();
-		let rows = self.query(SNAPSHOT, &[&selected, &scope]).await?;
+		let selected = roots.iter().map(|root| root.id().to_string()).collect::<Vec<_>>();
+		let rows = self.query(SNAPSHOT, &[&selected]).await?;
 		let mut regular = Vec::with_capacity(rows.len());
 		for row in rows {
 			let onchain_spent_height = optional_height(&row, "onchain_spent_height")?;
@@ -67,7 +56,7 @@ impl Tx<'_> {
 			regular.push(BackingVtxoFact { state, full_vtxo, onchain_spent_height, onchain_spent_txid,
 				lightning_htlc_subscription_id });
 		}
-		Ok(BackingSnapshot { roots: roots.to_vec(), regular })
+		Ok(BackingSnapshot { regular })
 	}
 }
 

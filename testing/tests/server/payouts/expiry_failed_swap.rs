@@ -208,7 +208,7 @@ async fn failed_swap_during_restart() {
 	let before_deadline = ctx.generate_blocks(input.expiry_height().to_u32() + 1 - height).await;
 	assert!(before_deadline < deadline);
 	wait_rebuilt(&db, server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap()).await;
-	let snapshot = db.read(async |tx| tx.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
+	let snapshot = db.read(async |tx| tx.backing_subtree_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == source).unwrap();
 	let proposal = db.read(async |tx| tx.propose_expiry_ownership(fact, before_deadline, Some(before_deadline)).await).await.unwrap();
 	assert!(matches!(proposal.disposition, OwnershipDisposition::Unresolved(_)));

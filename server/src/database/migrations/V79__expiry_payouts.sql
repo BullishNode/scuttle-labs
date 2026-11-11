@@ -22,8 +22,6 @@ ALTER TABLE board_exit
 	ADD COLUMN owner_mailbox TEXT
 	CHECK (owner_mailbox IS NULL OR length(owner_mailbox) = 66);
 
-CREATE INDEX expiry_vtxo_anchor_point_ix ON vtxo (anchor_point, vtxo_id);
-
 CREATE TABLE expiry_entitlement (
 	id BIGSERIAL PRIMARY KEY,
 	vtxo_id TEXT NOT NULL UNIQUE REFERENCES vtxo(vtxo_id),

@@ -3021,13 +3021,6 @@ CREATE INDEX cln_xpay_pending_ix ON public.cln_xpay USING btree (lightning_node_
 
 
 --
--- Name: expiry_vtxo_anchor_point_ix; Type: INDEX; Schema: public; Owner: -
---
-
-CREATE INDEX expiry_vtxo_anchor_point_ix ON public.vtxo USING btree (anchor_point, vtxo_id);
-
-
---
 -- Name: htlc_settlement_payment_hash_ix; Type: INDEX; Schema: public; Owner: -
 --
 

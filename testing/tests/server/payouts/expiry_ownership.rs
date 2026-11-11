@@ -57,7 +57,7 @@ async fn held_coin_is_alarmed_before_decision() {
 	let root = ark::ServerVtxo::from(input.clone()).to_bare();
 	let funding = db.read(async |t| t.get_virtual_transaction_by_txid(input.chain_anchor().txid).await).await.unwrap().unwrap()
 		.signed_tx.unwrap().into_owned();
-	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()]).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
 	let pending = db.read(async |t| t.propose_expiry_ownership(fact, expired, Some(expired)).await).await.unwrap();
 	assert!(matches!(pending.disposition, server::database::expiry_ownership::OwnershipDisposition::Unresolved(_)));
@@ -73,7 +73,7 @@ async fn held_coin_is_alarmed_before_decision() {
 
 	let tip = ctx.generate_blocks(deadline.to_u32() + 1 - expired.to_u32()).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
-	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()]).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
 	let ready = db.read(async |t| t.propose_expiry_ownership(fact, tip, Some(tip)).await).await.unwrap();
 	assert!(matches!(ready.disposition,

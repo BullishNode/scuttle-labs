@@ -87,7 +87,7 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 	srv.wait_for_sync_height(height).await;
 	srv.watchmand().wait_for_sync_height(height).await;
 	for (index, (input, _key)) in sources.iter().enumerate() {
-		let snapshot = db.read(async |t| t.backing_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
+		let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[ark::ServerVtxo::from(input.clone()).to_bare()]).await).await.unwrap();
 		let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[index]).unwrap();
 		let proposal = db.read(async |t| t.propose_expiry_ownership(fact, height, Some(height)).await).await.unwrap();
 		if index == 0 {
@@ -166,7 +166,7 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 	let expired = ctx.generate_blocks(deadline.to_u32() + 1 - current).await;
 	srv.wait_for_sync_height(expired).await;
 	srv.watchmand().wait_for_sync_height(expired).await;
-	let snapshot = db.read(async |t| t.backing_snapshot(&[ark::ServerVtxo::from(sources[1].0.clone()).to_bare()]).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[ark::ServerVtxo::from(sources[1].0.clone()).to_bare()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[1]).unwrap();
 	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, expired, Some(expired)).await).await.unwrap();
 	assert_eq!(proposal.disposition, OwnershipDisposition::Customer { user_pubkey: sources[1].1.public_key() });

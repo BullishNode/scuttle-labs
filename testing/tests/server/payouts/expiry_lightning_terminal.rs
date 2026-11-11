@@ -549,7 +549,7 @@ fn internal_safe_pool_grants(expose_small_grant: bool)
 			 WHERE e.vtxo_id = $1 AND c.disposition = 'customer'",
 			&[&source.to_string()]).await?)).await.unwrap().is_none(), "sender refund must wait for six grant confirmations");
 		let fact = db.read(async |t| {
-			let snapshot = t.backing_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()]).await?;
+			let snapshot = t.backing_subtree_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()]).await?;
 			Ok(snapshot.regular.into_iter().find(|fact| fact.state.vtxo_id == source).unwrap())
 		}).await.unwrap();
 		let funding = ctx.bitcoind().await_transaction(incoming[0].chain_anchor().txid).await;
