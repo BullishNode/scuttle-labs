@@ -82,7 +82,8 @@ async fn assert_physical_cut(
 	assert_eq!(actual_board_fee, board_fee);
 	fee_total += actual_board_fee;
 	let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=c.vtxo_id) AS entitlement_gross,c.disposition,c.owner_mailbox, \
-		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.status,a.confirmed_height,a.confirmed_hash \
+		c.gross_sat,c.fee_sat,c.payout_sat,a.sweep_txid,a.status,a.confirmed_height, \
+		(SELECT hash FROM watchmand_block WHERE height=a.confirmed_height) AS confirmed_hash \
 		FROM expiry_allocation_coin c \
 		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE a.status<>'conflicted' AND c.vtxo_id=ANY($1)", &[&coins]).await?)).await.unwrap();
 	assert_eq!(rows.len(), coins.len());
@@ -96,7 +97,6 @@ async fn assert_physical_cut(
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner_mailbox);
 		assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 		assert_eq!(row.get::<_, i64>("entitlement_gross"), 100_000);
-		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 		assert_eq!(row.get::<_, String>("status"), "confirmed");
 		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(payer.to_string()));
 		assert_eq!(row.get::<_, Option<i64>>("confirmed_height"), Some(i64::from(point.height.to_u32())));

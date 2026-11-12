@@ -166,7 +166,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 				JOIN vtxo v ON v.vtxo_id=c.vtxo_id \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 				WHERE v.anchor_point=$1 AND a.status='confirmed' \
-				AND a.confirmed_height IS NOT NULL AND a.confirmed_hash IS NOT NULL \
+				AND a.confirmed_height IS NOT NULL \
 				AND a.sweep_txid IS NOT NULL", &[&anchor.to_string()],
 			).await?)).await.unwrap();
 			if paid.len() == expected.len() { break; }

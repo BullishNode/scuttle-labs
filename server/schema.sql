@@ -827,13 +827,11 @@ CREATE TABLE public.expiry_allocation_coin (
     gross_sat bigint NOT NULL,
     fee_sat bigint NOT NULL,
     payout_sat bigint NOT NULL,
-    forfeited_sat bigint NOT NULL,
     subsidy_sat bigint DEFAULT 0 NOT NULL,
     replannable boolean NOT NULL,
-    CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND ((gross_sat + subsidy_sat) = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0) AND (subsidy_sat = 0)))),
+    CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND ((gross_sat + subsidy_sat) = (fee_sat + payout_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (subsidy_sat = 0)))),
     CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
     CONSTRAINT expiry_allocation_coin_fee_sat_check CHECK ((fee_sat >= 0)),
-    CONSTRAINT expiry_allocation_coin_forfeited_sat_check CHECK ((forfeited_sat >= 0)),
     CONSTRAINT expiry_allocation_coin_gross_sat_check CHECK ((gross_sat > 0)),
     CONSTRAINT expiry_allocation_coin_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66))),
     CONSTRAINT expiry_allocation_coin_payout_sat_check CHECK ((payout_sat >= 0)),
@@ -932,18 +930,18 @@ CREATE TABLE public.watchmand_block (
 CREATE VIEW public.expiry_allocation_state AS
  WITH observed AS (
          SELECT a_1.id,
-            ((count(i.vtxo_id) > 0) AND bool_and(((v.onchain_spent_txid IS NOT NULL) AND (b_1.height IS NOT NULL) AND (EXISTS ( SELECT 1
+            ((count(i.vtxo_id) > 0) AND bool_and(((v.onchain_spent_txid IS NOT NULL) AND (b.height IS NOT NULL) AND (EXISTS ( SELECT 1
                    FROM public.expiry_payout_attempt p
                   WHERE ((p.allocation_id = a_1.id) AND (p.txid = v.onchain_spent_txid)))))) AND (count(DISTINCT v.onchain_spent_txid) = 1)) AS confirmed,
             (bool_or(((v.onchain_spent_txid IS NOT NULL) AND (NOT (EXISTS ( SELECT 1
                    FROM public.expiry_payout_attempt p
                   WHERE ((p.allocation_id = a_1.id) AND (p.txid = v.onchain_spent_txid))))))) OR (count(DISTINCT v.onchain_spent_txid) > 1)) AS conflicted,
             min(v.onchain_spent_txid) AS confirmed_txid,
-            min(b_1.height) AS height
+            min(b.height) AS height
            FROM (((public.expiry_allocation a_1
              LEFT JOIN public.expiry_allocation_input i ON ((i.allocation_id = a_1.id)))
              LEFT JOIN public.vtxo v ON ((v.vtxo_id = i.vtxo_id)))
-             LEFT JOIN public.watchmand_block b_1 ON ((b_1.height = v.onchain_spent_height)))
+             LEFT JOIN public.watchmand_block b ON ((b.height = v.onchain_spent_height)))
           GROUP BY a_1.id
         )
  SELECT a.id,
@@ -969,12 +967,8 @@ CREATE VIEW public.expiry_allocation_state AS
         CASE
             WHEN o.confirmed THEN o.height
             ELSE NULL::bigint
-        END AS confirmed_height,
-        CASE
-            WHEN o.confirmed THEN b.hash
-            ELSE NULL::text
-        END AS confirmed_hash
-   FROM ((((public.expiry_allocation a
+        END AS confirmed_height
+   FROM (((public.expiry_allocation a
      JOIN observed o ON ((o.id = a.id)))
      LEFT JOIN public.expiry_payout_attempt winner ON (((winner.allocation_id = a.id) AND (winner.txid = o.confirmed_txid))))
      LEFT JOIN LATERAL ( SELECT p.txid,
@@ -982,8 +976,7 @@ CREATE VIEW public.expiry_allocation_state AS
            FROM public.expiry_payout_attempt p
           WHERE (p.allocation_id = a.id)
           ORDER BY p.fee_sat DESC
-         LIMIT 1) latest ON (true))
-     LEFT JOIN public.watchmand_block b ON ((b.height = o.height)));
+         LIMIT 1) latest ON (true));
 
 
 --

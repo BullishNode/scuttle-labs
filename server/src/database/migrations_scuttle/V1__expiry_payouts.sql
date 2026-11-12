@@ -63,15 +63,13 @@ CREATE TABLE expiry_allocation_coin (
 	gross_sat BIGINT NOT NULL CHECK (gross_sat > 0),
 	fee_sat BIGINT NOT NULL CHECK (fee_sat >= 0),
 	payout_sat BIGINT NOT NULL CHECK (payout_sat >= 0),
-	forfeited_sat BIGINT NOT NULL CHECK (forfeited_sat >= 0),
 	subsidy_sat BIGINT NOT NULL DEFAULT 0 CHECK (subsidy_sat >= 0),
 	-- A Lightning decision is planned again after a conflict; others repeat.
 	replannable BOOLEAN NOT NULL,
 	PRIMARY KEY (allocation_id, vtxo_id),
 	CHECK ((disposition = 'customer' AND owner_mailbox IS NOT NULL
-		AND gross_sat + subsidy_sat = fee_sat + payout_sat + forfeited_sat)
-		OR (disposition = 'operator' AND fee_sat = 0 AND payout_sat = 0
-			AND forfeited_sat = 0 AND subsidy_sat = 0))
+		AND gross_sat + subsidy_sat = fee_sat + payout_sat)
+		OR (disposition = 'operator' AND fee_sat = 0 AND payout_sat = 0 AND subsidy_sat = 0))
 );
 CREATE INDEX expiry_allocation_coin_vtxo_id_idx ON expiry_allocation_coin(vtxo_id);
 
@@ -107,14 +105,12 @@ SELECT a.id,a.expiry_height,
 			JOIN observed prior ON prior.id=paid.allocation_id
 			WHERE c.allocation_id=a.id AND prior.confirmed AND prior.id<>a.id)
 		THEN 'conflicted' ELSE 'pending' END AS status,
-	CASE WHEN o.confirmed THEN o.height END AS confirmed_height,
-	CASE WHEN o.confirmed THEN b.hash END AS confirmed_hash
+	CASE WHEN o.confirmed THEN o.height END AS confirmed_height
 FROM expiry_allocation a JOIN observed o ON o.id=a.id
 LEFT JOIN expiry_payout_attempt winner ON winner.allocation_id=a.id AND winner.txid=o.confirmed_txid
 -- Each stored replacement raises the absolute fee, so the costliest attempt is the latest.
 LEFT JOIN LATERAL (SELECT p.txid,p.signed_tx FROM expiry_payout_attempt p
-	WHERE p.allocation_id=a.id ORDER BY p.fee_sat DESC LIMIT 1) latest ON TRUE
-LEFT JOIN public.watchmand_block b ON b.height=o.height;
+	WHERE p.allocation_id=a.id ORDER BY p.fee_sat DESC LIMIT 1) latest ON TRUE;
 
 CREATE TABLE coin_owner (
 	vtxo_id TEXT PRIMARY KEY REFERENCES public.vtxo(vtxo_id),

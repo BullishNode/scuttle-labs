@@ -263,7 +263,7 @@ async fn direct_large_payout() {
 		loop {
 			srv.watchmand().trigger_sweep().await;
 			let rows = db.read(async |tx| Ok(tx.query(
-				"SELECT c.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
+				"SELECT c.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
 				 c.owner_mailbox,a.sweep_tx,a.sweep_txid \
 				 FROM expiry_allocation_coin c \
 				 JOIN expiry_allocation_state a ON a.id=c.allocation_id \
@@ -295,7 +295,6 @@ async fn direct_large_payout() {
 		assert_eq!(row.get::<_, i64>("gross_sat"), LEAF_SAT as i64);
 		assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), (LEAF_SAT - 2_000) as i64);
-		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner.mailbox.as_pubkey().to_string());
 	}
 	let no_split_table = db.read(async |tx| Ok(tx.query_one(

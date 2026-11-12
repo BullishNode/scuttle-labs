@@ -13,7 +13,8 @@ async fn wait_for_confirmation(db: &Db, allocation: i64, point: BlockRef, hash: 
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let ready = db.read(async |t| {
-				let row = t.query_one("SELECT status,confirmed_hash FROM expiry_allocation_state WHERE id=$1", &[&allocation]).await?;
+				let row = t.query_one("SELECT status,(SELECT hash FROM watchmand_block WHERE height=confirmed_height) AS confirmed_hash \
+					FROM expiry_allocation_state WHERE id=$1", &[&allocation]).await?;
 				Ok(t.get_highest_block(BlockTable::Captaind).await? == Some(point)
 					&& t.get_highest_block(BlockTable::Watchmand).await? == Some(point)
 					&& row.get::<_, &str>("status") == "confirmed"
@@ -332,13 +333,12 @@ async fn restart_unfunded_allocation_waits_for_trusted_sponsor_then_pays_owner()
 	assert!(info.confirmations.unwrap_or(0) >= 6);
 	wait_for_confirmation(&db, allocation, tip, info.blockhash.unwrap()).await;
 	let final_row = db.read(async |t| Ok(t.query_one(
-		"SELECT a.sweep_txid,c.fee_sat,c.payout_sat,c.forfeited_sat,c.replannable::TEXT AS facts \
+		"SELECT a.sweep_txid,c.fee_sat,c.payout_sat,c.replannable::TEXT AS facts \
 		 FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		 WHERE a.id=$1 AND c.vtxo_id=$2",
 		 &[&allocation,&entitlement]).await?)).await.unwrap();
 	assert_eq!(final_row.get::<_, String>("sweep_txid"), payout.compute_txid().to_string());
 	assert_eq!(final_row.get::<_, i64>("fee_sat"), 2_000);
 	assert_eq!(final_row.get::<_, i64>("payout_sat"), 98_000);
-	assert_eq!(final_row.get::<_, i64>("forfeited_sat"), 0);
 	assert_eq!(final_row.get::<_, String>("facts"), facts);
 }

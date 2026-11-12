@@ -250,7 +250,7 @@ async fn failed_swap_during_restart() {
 	canonical_direct_payout(&ctx, &parent, &destination, &operator_script).await;
 	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone())]);
 	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid, \
-		c.disposition,c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
+		c.disposition,c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat, \
 		c.vtxo_id \
 		FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		JOIN vtxo v ON v.vtxo_id=c.vtxo_id \
@@ -267,7 +267,6 @@ async fn failed_swap_during_restart() {
 			assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 			assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 			assert_eq!(row.get::<_, i64>("payout_sat"), 98_000);
-			assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 			assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(parent.compute_txid().to_string()));
 			let recorded = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 			assert_eq!(recorded, parent, "the exact rightful payout must be its stored attributed parent");

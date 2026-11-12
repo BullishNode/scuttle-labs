@@ -143,7 +143,7 @@ async fn boundaries() {
 		old.extend(consumed);
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: bindings[index + 1].clone(),
 			fee: 2_000, payout: dust + (index as u64).saturating_sub(1), subsidy: if index == 0 { 1 } else { 0 },
-			forfeited: 0, group_payout: dust + (index as u64).saturating_sub(1) });
+			group_payout: dust + (index as u64).saturating_sub(1) });
 	}
 	let mut change = Vec::new();
 	for coin in sender.spendable_vtxos().await.unwrap() { change.push(sender.get_full_vtxo(coin.id()).await.unwrap()); }
@@ -157,13 +157,12 @@ async fn boundaries() {
 		fee -= charged;
 		let payout = coin.amount().to_sat() - charged;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[0], script: sender_binding.clone(), fee: charged,
-			payout, subsidy: 0, forfeited: 0, group_payout: change_gross - 2_000 });
+			payout, subsidy: 0, group_payout: change_gross - 2_000 });
 	}
 	assert_eq!(fee, 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.coin.amount()).sum::<Amount>(), sat(100_000));
 	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 8_000);
 	assert_eq!(leaves.iter().map(|leaf| leaf.subsidy).sum::<u64>(), 1);
-	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 92_001);
 	balances(&sender, sat(change_gross)).await;
 	for leaf in &leaves {
@@ -278,7 +277,7 @@ async fn p2tr_fee_consuming_the_whole_coin_is_forfeited() {
 	let recipient = Box::pin(app.client()).await;
 	let (coin, _) = Box::pin(receive_boundary(&srv, &sender, &recipient, sat(1_500), &board)).await;
 	let leaf = ExpectedLeaf { coin, mailbox: recipient.mailbox_identifier(), script: recipient.fallback_script(),
-		fee: 1_500, payout: 0, subsidy: 0, forfeited: 0, group_payout: 0 };
+		fee: 1_500, payout: 0, subsidy: 0, group_payout: 0 };
 	let history = recipient.history().await.unwrap();
 	for wallet in [&sender, &recipient] { wallet.stop_daemon_wait().await.unwrap(); }
 	drop(sender);

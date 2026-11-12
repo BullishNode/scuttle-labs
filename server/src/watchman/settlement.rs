@@ -26,7 +26,6 @@ pub(crate) struct LeafAllocation {
 	pub fee: Amount,
 	pub payout: Amount,
 	pub subsidy: Amount,
-	pub forfeited: Amount,
 }
 
 /// Group one root's leaves by output, with stable per-leaf amounts for
@@ -63,7 +62,6 @@ pub(crate) fn allocate(leaves: Vec<CustomerLeaf>) -> anyhow::Result<Vec<LeafAllo
 				id: leaf.id, gross: leaf.amount, fee,
 				payout: if pays { remainder + leaf_subsidy } else { Amount::ZERO },
 				subsidy: leaf_subsidy,
-				forfeited: Amount::ZERO,
 			});
 		}
 		ensure!(remaining_fee == Amount::ZERO, "expiry group fee was not allocated");
@@ -97,7 +95,6 @@ mod tests {
 	fn direct_fee_many_small_leaves_pay_one_non_dust_output() {
 		let script = wpkh();
 		let plan = allocate((0..30).map(|i| leaf(i, 100, &script)).collect()).unwrap();
-		assert!(plan.iter().all(|leaf| leaf.forfeited == Amount::ZERO));
 		assert_eq!(plan.len(), 30);
 		let recipient = &plan;
 		assert_eq!(recipient.iter().map(|leaf| leaf.payout).sum::<Amount>(), Amount::from_sat(1_000));
@@ -123,7 +120,6 @@ mod tests {
 			assert_eq!(subsidized[0].payout.to_sat(), dust);
 			assert_eq!(subsidized[0].fee.to_sat(), 2_000);
 			assert_eq!(subsidized[0].subsidy.to_sat(), 1);
-			assert_eq!(subsidized[0].forfeited, Amount::ZERO);
 		}
 	}
 
@@ -151,8 +147,7 @@ mod tests {
 			let allocations = plan.iter();
 			for a in allocations {
 				assert_eq!(a.gross.to_sat() + a.subsidy.to_sat(),
-					a.fee.to_sat() + a.payout.to_sat() + a.forfeited.to_sat());
-				assert_eq!(a.forfeited, Amount::ZERO);
+					a.fee.to_sat() + a.payout.to_sat());
 			}
 		}
 	}
@@ -167,7 +162,6 @@ mod tests {
 			let separate = allocate(vec![leaf(id, 1_200, &script)]).unwrap();
 			assert!(separate.iter().all(|leaf| leaf.payout == Amount::ZERO));
 			assert_eq!(separate[0].fee.to_sat(), 1_200);
-			assert_eq!(separate[0].forfeited, Amount::ZERO);
 		}
 	}
 
