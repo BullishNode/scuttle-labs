@@ -8,14 +8,15 @@ async fn assert_payouts_once(
 	operator_script: &bitcoin::ScriptBuf,
 	first_height: u64,
 ) {
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk,c.disposition, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,c.owner_mailbox,c.disposition, \
 		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.confirmed_height,a.confirmed_hash,a.sweep_tx \
-		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN vtxo v ON v.vtxo_id=e.vtxo_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+		FROM expiry_allocation_coin c \
+		JOIN vtxo v ON v.vtxo_id=c.vtxo_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		WHERE v.anchor_point=$1", &[&anchor.to_string()],
 	).await?)).await.unwrap();
 	let mut canonical_coins = std::collections::BTreeSet::new();
 	let mut parents = std::collections::BTreeMap::new();
+	let mut fees_by_parent = std::collections::BTreeMap::new();
 	for row in rows {
 		let Some(bytes) = row.get::<_, Option<Vec<u8>>>("sweep_tx") else { continue; };
 		let signed = bitcoin::consensus::deserialize::<bitcoin::Transaction>(&bytes).unwrap();
@@ -25,14 +26,14 @@ async fn assert_payouts_once(
 		assert!(info.confirmations.unwrap() >= 6);
 		assert_eq!(ctx.bitcoind().await_transaction(txid).await, signed);
 		let id = row.get::<_, String>("vtxo_id");
-		let (gross, script, mailbox, key) = expected.get(&id).expect("no other same-root owner may be paid");
+		let (gross, script, mailbox, _) = expected.get(&id).expect("no other same-root owner may be paid");
 		assert!(canonical_coins.insert(id), "one canonical economic discharge per coin");
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, Option<String>>("owner_mailbox").as_ref(), Some(mailbox));
-		assert_eq!(row.get::<_, Option<String>>("user_pubkey").as_ref(), Some(key));
-		assert_eq!(row.get::<_, Option<String>>("spk"), Some(script.to_hex_string()));
+		assert_eq!(&ark::fallback::payout_script(mailbox.parse().unwrap()), script);
 		assert_eq!(row.get::<_, i64>("gross_sat"), gross.to_sat() as i64);
-		let fee = gross.to_sat().div_ceil(100).max(1_000);
+		let fee = gross.to_sat().div_ceil(100).max(2_000);
+		*fees_by_parent.entry(txid).or_insert(sat(0)) += sat(fee);
 		assert_eq!(row.get::<_, i64>("fee_sat"), i64::try_from(fee).unwrap());
 		assert_eq!(row.get::<_, i64>("payout_sat"), i64::try_from(gross.to_sat() - fee).unwrap());
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
@@ -44,7 +45,7 @@ async fn assert_payouts_once(
 		parents.insert(txid, signed);
 	}
 	assert_eq!(canonical_coins, expected.keys().cloned().collect());
-	for signed in parents.values() {
+	for (txid, signed) in &parents {
 		assert!(signed.input.iter().all(|input| source_path.contains(&input.previous_output)),
 			"a payout parent must consume actual known backing, never a hidden donor input");
 		for output in &signed.output {
@@ -56,8 +57,12 @@ async fn assert_payouts_once(
 			let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 			input_value += previous.output[input.previous_output.vout as usize].value;
 		}
-		assert_eq!(input_value, signed.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(),
-			"the signed payout parent may not silently charge another miner fee");
+		let output_value = signed.output.iter().map(|output| output.value).sum::<bitcoin::Amount>();
+		let miner_fee = input_value.checked_sub(output_value).expect("payout cannot create value");
+		let operator_value = signed.output.iter().filter(|output| output.script_pubkey == *operator_script)
+			.map(|output| output.value).sum::<bitcoin::Amount>();
+		assert_eq!(operator_value + miner_fee, fees_by_parent[txid],
+			"the charged customer fees must fund only the operator output and inline miner fee");
 	}
 	let mut transactions = std::collections::BTreeMap::new();
 	let core = ctx.bitcoind().sync_client();

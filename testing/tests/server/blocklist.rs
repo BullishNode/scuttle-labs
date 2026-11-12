@@ -8,6 +8,7 @@ use bitcoincore_rpc::json::CreateRawTransactionInput;
 use ark::{ProtocolEncoding, SECP};
 use bitcoin_ext::BlockHeight;
 use ark_testing::{btc, sat, Captaind, TestContext};
+use ark_testing::daemon::captaind;
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::util::ToAltString;
 use server_log::{BoardAttemptBlockedAddress, WalletReceivedBlockedAddress};
@@ -70,7 +71,6 @@ async fn blocklist_board_cosign_rejected() {
 	let bitcoind = ctx.bitcoind_arc();
 	let srv = ctx.captaind("server").bitcoind(bitcoind).cfg(|cfg| {
 		cfg.bitcoin_address_blocklist = Some(blocklist_path);
-		cfg.require_board_funding_tx = true;
 	}).create().await;
 
 	// Fund the blocked address and confirm it so we have a UTXO to spend.
@@ -88,7 +88,7 @@ async fn blocklist_board_cosign_rejected() {
 		expiry_height,
 		ark_info.server_pubkey,
 		ark_info.vtxo_exit_delta,
-	);
+	).unwrap();
 
 	let funding_script = board_builder.funding_script_pubkey();
 	let (funding_tx, board_utxo) = blocked_board_funding_tx(
@@ -104,7 +104,7 @@ async fn blocklist_board_cosign_rejected() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let err = rpc.request_board_cosign(protos::BoardCosignRequest {
-		owner_proof: Some(super::test_owner_link(&srv, &user_key).await.into()),
+		owner_mailbox: None,
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),
@@ -124,23 +124,20 @@ async fn blocklist_board_cosign_rejected() {
 	assert_eq!(log.amount, board_amount);
 }
 
-/// Reject board registration when the funding tx spends from a blocked address.
-///
-/// Clients too old to send their funding tx get cosigned without a blocklist
-/// check, so registration is the only place left to catch them.
+/// Reject board registration when the funding tx spends from an address blocked after the cosign.
 #[tokio::test]
 async fn blocklist_board_register_rejected() {
 	let ctx = TestContext::new("server/blocklist_board_register_rejected").await;
 
 	let blocked_addr = ctx.bitcoind().get_new_address();
 	let blocklist_path = ctx.datadir.join("blocklist.txt");
-	tokio::fs::write(&blocklist_path, format!("{}\n", blocked_addr)).await.unwrap();
+	tokio::fs::write(&blocklist_path, "").await.unwrap();
 
 	// Share the bitcoind so the server can look up txs via get_raw_transaction_info.
 	let bitcoind = ctx.bitcoind_arc();
-	let srv = ctx.captaind("server").bitcoind(bitcoind).cfg(|cfg| {
-		cfg.bitcoin_address_blocklist = Some(blocklist_path);
-		cfg.require_board_funding_tx = false;
+	let cfg_path = blocklist_path.clone();
+	let srv = ctx.captaind("server").bitcoind(bitcoind).cfg(move |cfg| {
+		cfg.bitcoin_address_blocklist = Some(cfg_path);
 	}).create().await;
 
 	// Fund the blocked address and confirm it so we have a UTXO to spend.
@@ -158,10 +155,10 @@ async fn blocklist_board_register_rejected() {
 		expiry_height,
 		ark_info.server_pubkey,
 		ark_info.vtxo_exit_delta,
-	);
+	).unwrap();
 
 	let funding_script = board_builder.funding_script_pubkey();
-	let (_funding_tx, board_utxo) = blocked_board_funding_tx(
+	let (funding_tx, board_utxo) = blocked_board_funding_tx(
 		&ctx, &srv, &blocked_addr, &funding_script, board_amount,
 	).await;
 
@@ -169,20 +166,22 @@ async fn blocklist_board_register_rejected() {
 		.set_funding_details(board_amount, Amount::ZERO, board_utxo).unwrap()
 		.generate_user_nonces();
 
-	// An old client sends no funding tx, so the cosign has nothing to check.
 	let mut rpc = srv.get_public_rpc().await;
 	let cosign_response = rpc.request_board_cosign(protos::BoardCosignRequest {
-		owner_proof: Some(super::test_owner_link(&srv, &user_key).await.into()),
+		owner_mailbox: None,
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),
 		user_pubkey: user_key.public_key().serialize().to_vec(),
 		pub_nonce: board_builder.user_pub_nonce().serialize().to_vec(),
-		funding_tx: vec![],
+		funding_tx: bitcoin::consensus::serialize(&funding_tx),
 	}).await.unwrap().into_inner();
 
 	let board_cosign: ark::board::BoardCosignResponse = cosign_response.try_into().unwrap();
 	let vtxo = board_builder.build_vtxo(&board_cosign, &user_key).unwrap();
+
+	tokio::fs::write(&blocklist_path, format!("{}\n", blocked_addr)).await.unwrap();
+	srv.get_blocklist_rpc().await.reload_blocklist(protos::Empty {}).await.unwrap();
 
 	// Subscribe to the log BEFORE the request so we don't miss the event.
 	let mut blocked_log_rx = srv.subscribe_log::<BoardAttemptBlockedAddress>();
@@ -201,7 +200,31 @@ async fn blocklist_board_register_rejected() {
 	assert_eq!(log.vtxo, Some(vtxo.id()));
 }
 
-/// Reject offboard requests targeting a blocked address.
+/// Blocks the offboard destination once the offboard is prepared, so its
+/// finish meets the updated blocklist.
+#[derive(Clone)]
+struct BlockAfterPrepare {
+	blocklist_path: std::path::PathBuf,
+	destination: Address,
+	blocklist_rpc: captaind::BlocklistAdminClient,
+}
+
+#[async_trait::async_trait]
+impl captaind::proxy::ArkRpcProxy for BlockAfterPrepare {
+	async fn prepare_offboard(
+		&self, upstream: &mut captaind::ArkClient, req: protos::PrepareOffboardRequest,
+	) -> Result<protos::PrepareOffboardResponse, tonic::Status> {
+		let res = upstream.prepare_offboard(req).await?.into_inner();
+		let mut list = tokio::fs::read_to_string(&self.blocklist_path).await.unwrap();
+		list.push_str(&format!("{}\n", self.destination));
+		tokio::fs::write(&self.blocklist_path, list).await.unwrap();
+		self.blocklist_rpc.clone().reload_blocklist(protos::Empty {}).await?;
+		Ok(res)
+	}
+}
+
+/// Reject offboard requests targeting a blocked address, also when it was
+/// blocked after the offboard was prepared.
 #[tokio::test]
 async fn blocklist_offboard_rejected() {
 	let ctx = TestContext::new("server/blocklist_offboard_rejected").await;
@@ -210,9 +233,10 @@ async fn blocklist_offboard_rejected() {
 	let blocklist_path = ctx.datadir.join("blocklist.txt");
 	tokio::fs::write(&blocklist_path, format!("{}\n", blocked_addr)).await.unwrap();
 
-	let srv = ctx.captaind("server").cfg(|cfg| {
-		cfg.bitcoin_address_blocklist = Some(blocklist_path);
-	}).create().await;
+	let cfg_path = blocklist_path.clone();
+	let srv = ctx.captaind("server").cfg(move |cfg| {
+		cfg.bitcoin_address_blocklist = Some(cfg_path);
+	}).funded(btc(1)).create().await;
 
 	let bark = ctx.bark("bark", &srv).funded(sat(1_000_000)).create().await;
 	bark.board(sat(500_000)).await;
@@ -221,6 +245,17 @@ async fn blocklist_offboard_rejected() {
 
 	let err = bark.try_offboard_all(&blocked_addr).await.unwrap_err().to_alt_string();
 	assert!(err.contains("blocked"), "err: {err}");
+
+	let destination = ctx.bitcoind().get_new_address();
+	let proxy = srv.start_proxy_no_mailbox(BlockAfterPrepare {
+		blocklist_path,
+		destination: destination.clone(),
+		blocklist_rpc: srv.get_blocklist_rpc().await,
+	}).await;
+	bark.set_ark_url(&proxy.address).await;
+	let err = bark.try_offboard_all(&destination).await.unwrap_err().to_alt_string();
+	assert!(err.contains("blocked"), "err: {err}");
+	assert!(!err.contains("could not complete yet"), "err: {err}");
 }
 
 /// Server wallet does not persistently accept funds sent from a blocked address.

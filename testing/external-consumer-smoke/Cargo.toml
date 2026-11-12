@@ -1,0 +1,13 @@
+[package]
+name = "run4-sdk-consumer-smoke"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bitcoin = "0.32"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+bark-wallet = { git = "https://github.com/BullishNode/scuttle", rev = "ad5042ad9606c7dfed60a3d6315a72d1a7506ed7" }
+ark-lib = { git = "https://github.com/BullishNode/scuttle", rev = "ad5042ad9606c7dfed60a3d6315a72d1a7506ed7" }
+
+[workspace]

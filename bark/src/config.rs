@@ -91,6 +91,9 @@ pub const MAX_VTXO_KEY_GAP_LIMIT: u32 = 100_000;
 pub struct Config {
 	/// The address of your ark server.
 	pub server_address: String,
+	/// Require the Scuttle payout protocol before this wallet opens.
+	#[serde(default)]
+	pub require_scuttle_payouts: bool,
 
 	/// An access token used to access a private server.
 	#[deprecated(
@@ -213,7 +216,7 @@ pub struct Config {
 	pub offboard_lost_tx_grace_period_secs: u64,
 
 	/// Daemon sync interval in seconds for periodic tasks (onchain, exits,
-	/// boards, offboards, maintenance, rounds, mailbox).
+	/// boards, offboards, lightning sends, maintenance, rounds, mailbox).
 	///
 	/// Default value: 60
 	pub daemon_sync_interval_secs: u64,
@@ -245,6 +248,19 @@ pub struct Config {
 	///
 	/// Default value: 250
 	pub vtxo_key_gap_limit: u32,
+
+	/// Put this wallet's Ark address in the route hints of its lightning
+	/// invoices, and pay invoices that carry an Ark address on our own
+	/// server with an arkoor instead of over lightning. Both only happen
+	/// when the server allows it.
+	///
+	/// An invoice paid this way is settled on the server and in the
+	/// receiving wallet like one paid over lightning, but the payer gets
+	/// no preimage as proof of payment.
+	///
+	/// Default value: false
+	#[serde(default)]
+	pub lightning_ark_address_hints: bool,
 }
 
 impl Config {
@@ -255,6 +271,7 @@ impl Config {
 		#[allow(deprecated)]
 		let mut ret = Self {
 			server_address: "http://127.0.0.1:3535".to_owned(),
+			require_scuttle_payouts: false,
 			server_access_token: None,
 			user_agent: None,
 			esplora_address: None,
@@ -277,6 +294,7 @@ impl Config {
 			daemon_manual_sync: false,
 			change_vtxo_split_factor: 2,
 			vtxo_key_gap_limit: DEFAULT_VTXO_KEY_GAP_LIMIT,
+			lightning_ark_address_hints: false,
 		};
 
 		if network != Network::Bitcoin {

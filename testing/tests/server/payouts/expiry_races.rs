@@ -20,14 +20,19 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
 	Db::create_with_payouts(&cfg, true).await.unwrap();
 	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let coin = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
-	db.write(async |t| t.upsert_vtxos([&coin]).await).await.unwrap();
+	let mailbox = super::test_server_mailbox_key().public_key();
+	db.write(async |t| t.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+		.insert_spendable_vtxos([coin.clone()])
+		.bind_owner_mailboxes([(coin.id(), mailbox)])?).await).await.unwrap();
 	let txid = Txid::from_byte_array([42; 32]);
 	let writes = [
 		("Lightning grant", VtxoTreeUpdate::new().mark_vtxos_oor_spent([(coin.id(), txid)])),
 		("offboard registration", VtxoTreeUpdate::new().mark_vtxos_offboard_spent([(coin.id(), txid, txid)])),
 		("refresh completion", VtxoTreeUpdate::new().mark_vtxos_round_spent([(coin.id(), 1)])),
+		("round forfeit", VtxoTreeUpdate::new().mark_vtxos_round_forfeited([(coin.id(), txid)])),
+		("round output claim", VtxoTreeUpdate::new().mark_vtxos_claimed([coin.id()])),
+		("registration", VtxoTreeUpdate::new().mark_vtxos_registered([coin.id()])),
 	];
 	for (name, update) in writes {
 		let competing_db = db.clone();
@@ -64,11 +69,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 				}
 				Ok::<_, anyhow::Error>(())
 			}).await.expect("competing writer must reach actual coin lock")?;
-			t.query_one("
-				INSERT INTO expiry_entitlement(vtxo_id)
-				VALUES($1)
-				RETURNING id
-			", &[&coin.id().to_string()]).await?;
+			super::decide_for_fallback(t, &[coin.id().to_string()]).await?;
 			t.execute("
 				UPDATE vtxo
 				SET spend_state = 'spent', updated_at = NOW()
@@ -78,6 +79,8 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 		}).await.unwrap();
 		let error = writer.await.unwrap().expect_err("decision must win after the queued writer wakes");
 		assert!(format!("{error:#}").contains("reserved for expiry recovery"), "{name}: {error:#}");
+		assert!(matches!(error.downcast_ref::<server::FallbackRefusal>(),
+			Some(server::FallbackRefusal::DecidedForFallback(id)) if *id == coin.id()), "{name}: {error:#}");
 		let state = db.read(async |t| t.get_user_vtxos_by_id(&[coin.id()]).await).await.unwrap();
 		assert_eq!(state[0].spend_state, SpendState::Spent);
 		assert_eq!(state[0].offboarded_in, None);
@@ -85,10 +88,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 		assert_eq!(state[0].spent_in_round, None);
 		// Reset this isolated fixture for the next distinct real writer path.
 		db.write(async |t| {
-			t.execute("
-				DELETE
-				FROM expiry_entitlement
-			", &[]).await?;
+			t.batch_execute("DELETE FROM expiry_allocation_coin; DELETE FROM expiry_allocation").await?;
 			t.execute("
 				UPDATE vtxo
 				SET spend_state = 'spendable', updated_at = NOW()
@@ -107,14 +107,16 @@ async fn expiry_cancels_unfinished_exchange_without_freezing_other_tree_inputs()
 	let cfg = ctx.new_postgres(&ctx.test_name).await;
 	Db::create_with_payouts(&cfg, true).await.unwrap();
 	let db = Db::connect(&cfg).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let old = ServerVtxo::from(VTXO_VECTORS.board_vtxo.clone());
 	let other = ServerVtxo::from(VTXO_VECTORS.round1_vtxo.clone());
 	let accepted = ServerVtxo::from(VTXO_VECTORS.round2_vtxo.clone());
+	let mailbox = super::test_server_mailbox_key().public_key();
 	let hash = ark::tree::signed::UnlockHash::hash(&[7; 32]);
 	let accepted_hash = ark::tree::signed::UnlockHash::hash(&[8; 32]);
 	let (pending, binding) = db.write(async |t| {
-		t.upsert_vtxos([&old, &other, &accepted]).await?;
+		t.execute_vtxo_tree_update(VtxoTreeUpdate::new()
+			.insert_spendable_vtxos([old.clone(), other.clone(), accepted.clone()])
+			.bind_owner_mailboxes([(old.id(), mailbox), (other.id(), mailbox), (accepted.id(), mailbox)])?).await?;
 		let pending = t.query_one("
 			INSERT INTO round_participation(unlock_hash, created_at)
 			VALUES($1, NOW())
@@ -165,7 +167,6 @@ async fn expiry_cancelled_native_refresh_status_never_releases_preimage() {
 	let ids = wallet.board_and_confirm_and_register(&ctx, ark_testing::sat(200_000)).await;
 	ctx.refresh_all(&srv, &[&wallet]).await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	super::register_vector_owners(&db).await;
 	let (part, hash, inputs, leaf) = db.read(async |t| {
 		let row = t.query_one("
 			SELECT id, unlock_hash, forfeited_at IS NOT NULL AS forfeited
@@ -260,10 +261,10 @@ async fn expiry_cancelled_native_refresh_status_never_releases_preimage() {
 	assert_eq!(remaining, 0);
 	ctx.bitcoind().await_transaction(leaf.chain_anchor().txid).await;
 	let root = leaf.to_bare();
-	let snapshot = db.read(async |t| t.backing_snapshot(&[root.clone()]).await).await.unwrap();
+	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == root.id()).unwrap();
 	let tip = bitcoin_ext::BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
-	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, tip, Some(tip)).await).await.unwrap();
+	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, tip).await).await.unwrap();
 	assert!(matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Operator));
 	assert!(matches!(proposal.evidence,
 		Some(server::database::expiry_ownership::OwnershipEvidence::Exchange {

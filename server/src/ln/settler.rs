@@ -79,7 +79,7 @@ impl HtlcSettler {
 	}
 
 	/// Record a settlement: write preimage to the WAL table, notify watchers.
-	/// An observation without an authentic source is retained as unknown.
+	/// If this preimage was already recorded, this is a no-op.
 	pub async fn settle(&self, preimage: Preimage) -> anyhow::Result<()> {
 		let checkpoint = self.db.write(async |t| t.store_htlc_settlement(preimage).await).await?;
 		self.notify_stored(checkpoint, preimage.compute_payment_hash());

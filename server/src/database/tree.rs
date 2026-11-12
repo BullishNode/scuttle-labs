@@ -1,11 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, bail};
 
 use bitcoin::{Transaction, Txid};
+use bitcoin::secp256k1::PublicKey;
 use tracing::debug;
 
-use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy};
 use ark::vtxo::{Bare, Full};
 
 use super::model::{SpendState, VirtualTransaction};
@@ -32,10 +33,6 @@ struct OffboardSpendUpdate {
 struct RoundForfeitUpdate {
 	vtxo_id: VtxoId,
 	txid: Txid,
-}
-
-struct UndoRoundUpdate {
-	round_id: i64,
 }
 
 // -- Internal types --
@@ -144,7 +141,6 @@ struct VtxoUpdates {
 	round_spends: Vec<RoundSpendUpdate>,
 	offboard_spends: Vec<OffboardSpendUpdate>,
 	round_forfeits: Vec<RoundForfeitUpdate>,
-	round_unspends: Vec<UndoRoundUpdate>,
 	claims: Vec<VtxoId>,
 	registrations: Vec<VtxoId>,
 }
@@ -157,7 +153,6 @@ impl VtxoUpdates {
 			round_spends: Vec::new(),
 			offboard_spends: Vec::new(),
 			round_forfeits: Vec::new(),
-			round_unspends: Vec::new(),
 			claims: Vec::new(),
 			registrations: Vec::new(),
 		}
@@ -178,6 +173,7 @@ pub struct VtxoTreeUpdate {
 	tx_inserts: Vec<VirtualTransaction<'static>>,
 	vtxo_inserts: VtxoInserts,
 	vtxo_updates: VtxoUpdates,
+	owner_bindings: BTreeMap<VtxoId, PublicKey>,
 }
 
 impl VtxoTreeUpdate {
@@ -186,7 +182,18 @@ impl VtxoTreeUpdate {
 			tx_inserts: Vec::new(),
 			vtxo_inserts: VtxoInserts::new(),
 			vtxo_updates: VtxoUpdates::new(),
+			owner_bindings: BTreeMap::new(),
 		}
+	}
+
+	/// Bind each customer birth to the mailbox admitted for that exact VTXO.
+	pub fn bind_owner_mailboxes(mut self, bindings: impl IntoIterator<Item = (VtxoId, PublicKey)>) -> anyhow::Result<Self> {
+		for (id, mailbox) in bindings {
+			if self.owner_bindings.insert(id, mailbox).is_some_and(|previous| previous != mailbox) {
+				bail!("conflicting mailbox bindings for VTXO {id}");
+			}
+		}
+		Ok(self)
 	}
 
 	// -- virtual tx upserts --
@@ -227,7 +234,7 @@ impl VtxoTreeUpdate {
 	}
 
 	// -- vtxo inserts --
-
+	//
 	// Spendable/unclaimed/bare inserts are silent on conflict: re-inserting
 	// the same vtxo_id is a no-op. `insert_oor_spent_vtxos` is stricter —
 	// it bails if an existing row has a different `oor_spent_txid`, so that
@@ -380,18 +387,6 @@ impl VtxoTreeUpdate {
 		self
 	}
 
-	/// Undo a round spend: set vtxos spent in the given round back to spendable.
-	///
-	/// Clears `spent_in_round` and `oor_spent_txid` (which may have been set
-	/// by a subsequent forfeit recording) and resets `spend_state` to
-	/// `'spendable'`.
-	///
-	/// Idempotent: if no vtxos match the round, nothing happens.
-	pub fn undo_round(mut self, round_id: i64) -> Self {
-		self.vtxo_updates.round_unspends.push(UndoRoundUpdate { round_id });
-		self
-	}
-
 	/// Transition unclaimed vtxos to spendable.
 	///
 	/// Always idempotent: succeeds even if already claimed. Vtxos that
@@ -454,7 +449,6 @@ pub async fn execute_vtxo_tree_update(
 ) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
 	let mut customer_ids = Vec::new();
-	let mut customer_pubkeys = Vec::new();
 	for index in 0..update.vtxo_inserts.vtxo_ids.len() {
 		let state = update.vtxo_inserts.spend_states[index].parse::<SpendState>()?;
 		let customer_birth = match state {
@@ -465,9 +459,12 @@ pub async fn execute_vtxo_tree_update(
 		};
 		if !customer_birth { continue; }
 		let policy = ServerVtxoPolicy::deserialize(&update.vtxo_inserts.policies[index])?;
-		if let Some(key) = policy.user_pubkey() {
+		if state == SpendState::Unclaimed
+			&& policy == ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE)) {
+			continue;
+		}
+		if policy.user_pubkey().is_some() {
 			customer_ids.push(update.vtxo_inserts.vtxo_ids[index].clone());
-			customer_pubkeys.push(key.to_string());
 		}
 	}
 
@@ -486,17 +483,33 @@ pub async fn execute_vtxo_tree_update(
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
 	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
-	// Only actual births get ownership metadata. A replay or a
-	// recovery upload cannot backfill consent or rewrite an existing owner.
-	tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
-		SELECT birth.vtxo_id, owner_key.mailbox_pk
-		FROM UNNEST($1::text[], $2::text[]) AS birth(vtxo_id, user_pubkey)
-		JOIN owner_key ON owner_key.user_pubkey=birth.user_pubkey
-		WHERE birth.vtxo_id=ANY($3)
-		ON CONFLICT (vtxo_id) DO NOTHING", &[&customer_ids, &customer_pubkeys, &inserted]).await?;
+	if tx.expiry_payouts() {
+		let mut mailboxes = Vec::with_capacity(customer_ids.len());
+		for id in &customer_ids {
+			let vtxo_id = id.parse::<VtxoId>()?;
+			let mailbox = update.owner_bindings.get(&vtxo_id)
+				.with_context(|| format!("customer VTXO {id} has no admitted mailbox"))?;
+			mailboxes.push(mailbox.to_string());
+		}
+		if update.owner_bindings.len() != customer_ids.len() {
+			bail!("mailbox binding set differs from customer VTXO births");
+		}
+		tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
+			SELECT * FROM UNNEST($1::text[], $2::text[])
+			ON CONFLICT (vtxo_id) DO NOTHING", &[&customer_ids, &mailboxes]).await?;
+		let rows = tx.query("SELECT vtxo_id, mailbox_pk FROM coin_owner WHERE vtxo_id=ANY($1)", &[&customer_ids]).await?;
+		let stored = rows.into_iter().map(|row|
+			(row.get::<_, String>("vtxo_id"), row.get::<_, String>("mailbox_pk")))
+			.collect::<BTreeMap<_, _>>();
+		for (id, mailbox) in customer_ids.iter().zip(mailboxes.iter()) {
+			if stored.get(id) != Some(mailbox) {
+				bail!("customer VTXO {id} has a conflicting mailbox binding");
+			}
+		}
+	}
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 
-	Ok(inserted.len() as u64)
+	Ok(inserted)
 }
 
 async fn do_provide_signatures(
@@ -582,13 +595,13 @@ async fn upsert_virtual_transactions(
 async fn insert_vtxos(
 	tx: &tokio_postgres::Transaction<'_>,
 	vi: &VtxoInserts,
-) -> anyhow::Result<Vec<String>> {
-	if vi.is_empty() { return Ok(Vec::new()) }
+) -> anyhow::Result<u64> {
+	if vi.is_empty() { return Ok(0) }
 	// ON CONFLICT DO NOTHING just continues if the vtxo already exists. For
 	// rows inserted via `insert_oor_spent_vtxos`, we then validate that the
 	// existing row's oor_spent_txid actually matches — otherwise the insert
 	// would silently authorize a double-spend.
-	let inserted = tx.query("
+	let inserted = tx.execute("
 		INSERT INTO vtxo (
 			vtxo_id, vtxo_txid, vtxo, expiry, exit_delta, policy_type, policy,
 			server_pubkey, amount, anchor_point,
@@ -601,7 +614,6 @@ async fn insert_vtxos(
 			UNNEST($12::text[]), NOW(), NOW()
 		)
 		ON CONFLICT DO NOTHING
-		RETURNING vtxo_id
 	", &[
 		&vi.vtxo_ids, &vi.vtxo_txids, &vi.data, &vi.expiry,
 		&vi.exit_deltas, &vi.policy_types, &vi.policies, &vi.server_pubkeys,
@@ -621,7 +633,7 @@ async fn insert_vtxos(
 		let vtxo_id: &str = row.get("vtxo_id");
 		bail!("vtxo {} is already spent", vtxo_id);
 	}
-	Ok(inserted.into_iter().map(|row| row.get("vtxo_id")).collect())
+	Ok(inserted)
 }
 
 async fn apply_vtxo_updates(
@@ -633,7 +645,6 @@ async fn apply_vtxo_updates(
 	do_round_spend_updates(tx, &vu.round_spends).await?;
 	do_offboard_spend_updates(tx, &vu.offboard_spends).await?;
 	do_round_forfeit_updates(tx, &vu.round_forfeits).await?;
-	do_undo_round_updates(tx, &vu.round_unspends).await?;
 	do_claim_updates(tx, &vu.claims).await?;
 	do_register_updates(tx, &vu.registrations).await?;
 
@@ -826,23 +837,6 @@ async fn do_round_forfeit_updates(
 		}
 		bail!("vtxo not round-spent or already forfeited differently: {}", vtxo_id);
 	}
-	Ok(())
-}
-
-/// Undo a round spend: reset vtxos spent in the given rounds back to spendable.
-/// Idempotent: if no vtxos match, nothing happens.
-async fn do_undo_round_updates(
-	tx: &tokio_postgres::Transaction<'_>,
-	unspends: &[UndoRoundUpdate],
-) -> anyhow::Result<()> {
-	if unspends.is_empty() { return Ok(()) }
-	let round_ids: Vec<i64> = unspends.iter().map(|s| s.round_id).collect();
-	tx.execute("
-		UPDATE vtxo
-		SET spend_state = 'spendable', spent_in_round = NULL, oor_spent_txid = NULL, updated_at = NOW()
-		WHERE spent_in_round = ANY($1::int8[])
-			AND NOT EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id)
-	", &[&round_ids]).await.context("failed to undo round spend on VTXOs")?;
 	Ok(())
 }
 

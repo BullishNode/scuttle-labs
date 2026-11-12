@@ -1,77 +1,55 @@
-# Ownership and expiry payouts
+# Scuttle expiry payouts
 
-Expiry payouts use protocol version 6. A payout server accepts only that
-version. A server with payouts disabled accepts upstream versions 4 through 5.
-The mode is fixed when its database is created. Server and wallet schema
-changes use ordinary migrations.
+`expiry_payouts` is fixed when the server database is created. A payout server
+advertises `scuttle-1` and requires numeric protocol version 5. The label is
+the payout-mode gate; version 5 alone does not identify a Scuttle server. With
+payouts disabled, the server retains the upstream protocol range.
 
-## Owner authorization
+## Owner binding
 
-Each customer VTXO on a payout server has an owner fixed at birth. Address type
-`0x03` carries two signatures: one from the spending key and one from the
-mailbox key. Both authorize the same intent, bound to its version, network,
-server, spending key and blinded mailbox point. The server verifies both
-signatures and retains the first binding. The same spending key cannot be
-rebound to another mailbox.
+Each customer VTXO gets an immutable `coin_owner(vtxo_id, M)` row in its birth
+transaction. Board, round and default Lightning receive requests already carry
+the mailbox key. For each Arkoor output, including change, the payer sends the
+blinded mailbox point `B` from an upstream-format Ark address. The server
+unblinds `B` with that output's spending key `P` and its own mailbox key to
+recover `M`. It rejects a missing or invalid `B` before cosigning. Mailbox
+delivery and authenticated coin status must match the recorded `M`.
 
-A sender copies the recipient's proof for recipient outputs and supplies its
-own proof for change. The submitting wallet does not determine the output's
-owner. Recovery hints do not create ownership. Mailbox delivery must match the
-verified recipient binding.
+The sender of an external payment chooses the recipient address. An altered,
+valid `B` can bind the coin to a different mailbox while leaving `P` unchanged;
+address-only admission does not prove that one seed controls both keys. A
+recipient wallet credits only the signed coin after authenticated status
+attests its own `owner_mailbox`. Missing delivery or status is not acceptance.
 
-The economic operation selects the entitled spending key before the server
-resolves its mailbox key `M`. Ordinary unspent coins use their birth owner.
-An unfinished transfer can owe its input owner; a collected forwarded receive
-owes its admitted destination. Uncertain obligations stay held.
+## Payout and status
 
-The destination is BIP86 `tr(M)`, with no script tree. It is derived from `M`,
-not registered as a separate bitcoin address. The owner proof does not identify
-a person, require a common seed or authorize a bitcoin input. On a payout server, the
-default Bark wallet derives its mailbox from BIP86 account zero at external index
-zero. An application that supplies another mailbox key must back up that private key
-and use its matching BIP86 derivation, discovery and spending account. The stored
-public mailbox identity cannot restore an external private key. An unrelated
-external mailbox cannot be recovered from the Ark seed alone.
+The server decides the economic owner before choosing a payout mailbox. It
+holds an unresolved node until its obligations resolve. A settled but unclaimed
+forwarded Lightning grant still belongs to its provider; a recorded final
+claim can bind its recipient output before that coin is registered.
 
-## Status and wallet state
+A resolved root is spent in one version-2 transaction with owner outputs and
+an operator output for operator-owned value only. Customer outputs pay
+`tr(M)`, the BIP86 Taproot key-path output for the mailbox key. The default
+Bark mailbox key comes from `m/350'/1'` on the Ark seed. The payout fee is the
+higher of 2,000 sat or 1%; the operator may add dust subsidy. An entitlement
+whose fee leaves no standard output is reported as `Forfeited` with its gross,
+fee and payout amounts. Miner fees are paid inline, and replacements keep the
+owner outputs fixed.
 
-The server reports a committed right as pending until all relevant portions
-are terminal. On-chain discharge requires six canonical confirmations. A
-fully covered right with a paid portion reports `Spent`; an entirely forfeited
-right reports `Forfeited`. Partial coverage remains pending.
+A decided coin's status is the upstream `Spent` state plus a `fallback_payout`
+field: `Pending` until the payout is six blocks deep, then `Paid`, or
+`Forfeited` when the fee consumed the coin. The server reports it only to the
+mailbox the coin was born with, and not for a coin its holder put on chain.
+These are operator reports, not proof of Bitcoin receipt. Bark keeps the last
+observed fallback status separately from Ark spendability. A Bitcoin wallet
+must independently find and confirm the exact `tr(M)` output before counting
+it as received.
 
-Bark retires authenticated fallback commitments to ordinary `Spent` immediately.
-An existing emergency exit keeps its `Exited` state. Optional `fallback_status`
-is the last observed display, not a separate claim or balance. Server status
-reflects its last processed block, rather than a new Bitcoin lookup. A later reorg
-can change that display to pending but does not restore Ark spendability.
-Ark consumption therefore does not by itself prove receipt of bitcoin.
+## Lightning uncertainty
 
-The client trusts authenticated server outcomes for Ark state. It does not
-maintain a payout receipt ledger or reconstruct entitlement finality from
-bitcoin outputs. The ordinary bitcoin wallet handles output discovery,
-confirmations, spending and reorgs. An unrelated deposit creates no Ark credit
-and establishes no Lightning result.
-
-Coin status and recovery use ownership authorization. Public body lookups do
-not expose mailbox keys. Hash-only receive status also omits the mailbox key.
-A receive outcome must match the original invoice and complete grant set;
-a forwarding provider must not credit itself with its recipient's payment.
-Missing, foreign or unanswered status does not authorize a refund.
-
-## Lightning continuity
-
-Only the original initiating task calls xpay. An exact retry or monitor does
-not dispatch another payment. A live original zero-part reply with code 205,
-206 or 207 can establish failure only after the existing native identity,
-source and same-hash checks exclude successful, pending or unknown work.
-A stored error or empty lookup cannot recreate that authority.
-
-An ambiguous outcome stays held. Operator resolution uses the private
-administrative interface and evidence about the same persistent native
-backend. A cold-restart assertion means the original daemon and every plugin
-have stopped and been reaped, the same persistent backend has restarted, and
-dispatch was excluded during maintenance. The RPC does not stop Core Lightning
-or prove that assertion. Native success uses the normal preimage settlement
-path. Use unmodified Core Lightning with matching plugins; no Scuttle xpay patch
-or slow-mode setting is required.
+A preimage alone does not establish which send source paid. Failed sources with
+unexplained settlement evidence remain held. Claims, revocations and payout
+decisions use source-specific records and the decided-coin fence. Operators
+must investigate a hold rather than infer failure from elapsed time or an
+empty Lightning lookup.

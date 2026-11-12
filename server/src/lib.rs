@@ -33,11 +33,12 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
-pub mod owner_proof;
+mod destination;
 pub mod recovery;
 mod round;
 pub mod telemetry;
 pub mod utils;
+
 
 use crate::bitcoin_blocklist::BitcoinAddressBlocklist;
 use crate::database::BlockTable;
@@ -45,7 +46,7 @@ use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
-pub use crate::error::{FallbackRefusal, OwnershipRefusal};
+pub use crate::error::FallbackRefusal;
 pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
@@ -68,6 +69,7 @@ use tracing::{info, trace, warn};
 
 use ark::{ProtocolEncoding, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy, VtxoRequest};
 use ark::vtxo::Full;
+use ark::attestations::Challenge;
 use ark::board::BoardBuilder;
 use ark::fees::validate_and_subtract_fee;
 use ark::mailbox::{BlindedMailboxIdentifier, MailboxBlindingError, MailboxIdentifier};
@@ -127,6 +129,7 @@ pub(crate) fn check_max_amount(
 	}
 }
 
+
 /// Return type for the round event RPC stream.
 ///
 /// New subscribers receive the last round event first (if any), allowing
@@ -181,6 +184,15 @@ impl RoundHandle {
 
 	pub fn last_event(&self) -> Option<Arc<RoundEvent>> {
 		self.last_round_event.lock().clone()
+	}
+
+	/// The challenge of the round attempt that is collecting payments,
+	/// or None while no attempt is.
+	pub fn current_attempt_challenge(&self) -> Option<Challenge> {
+		match self.last_round_event.lock().as_deref() {
+			Some(RoundEvent::Attempt(attempt)) => Some(attempt.challenge),
+			_ => None,
+		}
 	}
 }
 
@@ -309,6 +321,7 @@ impl Server {
 			min_board_amount: self.config.min_board_amount,
 			offboard_feerate: self.offboard_feerate(),
 			max_offboard_inputs: 100,
+			max_round_participation_outputs: self.config.max_round_participation_outputs,
 			ln_receive_anti_dos_required: self.config.ln_receive_anti_dos_required,
 			fees: self.config.fees.clone(),
 			max_vtxo_exit_depth: self.config.max_vtxo_exit_depth,
@@ -616,6 +629,7 @@ impl Server {
 		self.chain_tip().height + self.config.nursery_confirm_target_blocks
 	}
 
+
 	pub async fn new_onchain_address(&self) -> anyhow::Result<Address> {
 		let mut wallet = self.rounds_wallet.lock().await;
 		let ret = wallet.reveal_next_address(bdk_wallet::KeychainKind::External).address;
@@ -636,9 +650,9 @@ impl Server {
 		user_pubkey: PublicKey,
 		expiry_height: BlockHeight,
 		utxo: OutPoint,
-		funding_tx: Option<&Transaction>,
+		funding_tx: &Transaction,
 		user_pub_nonce: PublicNonce,
-		owner_links: &crate::owner_proof::OwnerLinks,
+		owner_mailbox: Option<PublicKey>,
 	) -> anyhow::Result<ark::board::BoardCosignResponse> {
 		check_max_amount("board", amount, self.config.max_board_amount)?;
 
@@ -678,67 +692,69 @@ impl Server {
 			);
 		}
 
-		if self.config.require_board_funding_tx {
-			let funding_tx = funding_tx.context("missing funding_tx")?;
+		if funding_tx.input.len() > MAX_NB_BOARD_FUNDING_INPUTS {
+			return badarg!("invalid funding tx: too many inputs (max is {})",
+				MAX_NB_BOARD_FUNDING_INPUTS,
+			);
+		}
 
-			if funding_tx.input.len() > MAX_NB_BOARD_FUNDING_INPUTS {
-				return badarg!("invalid funding tx: too many inputs (max is {})",
-					MAX_NB_BOARD_FUNDING_INPUTS,
-				);
-			}
+		// validate utxo against funding tx
+		if utxo.vout as usize >= funding_tx.output.len() {
+			return badarg!("board outpoint does not match funding tx (vout)");
+		}
+		if utxo.txid != funding_tx.compute_txid() {
+			return badarg!("board outpoint does not match funding tx (txid)");
+		}
+		// The exit tx we cosign commits to `amount` as the funding output's
+		// value, so a funding output paying anything else yields a board
+		// that can neither be registered nor unilaterally exited.
+		let funding_value = funding_tx.output[utxo.vout as usize].value;
+		if funding_value != amount {
+			return badarg!("board amount {} does not match funding tx output value {}",
+				amount, funding_value,
+			);
+		}
 
-			// validate utxo against funding tx
-			if utxo.vout as usize >= funding_tx.output.len() {
-				return badarg!("board outpoint does not match funding tx (vout)");
-			}
-			if utxo.txid != funding_tx.compute_txid() {
-				return badarg!("board outpoint does not match funding tx (txid)");
-			}
-			// The exit tx we cosign commits to `amount` as the funding output's
-			// value, so a funding output paying anything else yields a board
-			// that can neither be registered nor unilaterally exited.
-			let funding_value = funding_tx.output[utxo.vout as usize].value;
-			if funding_value != amount {
-				return badarg!("board amount {} does not match funding tx output value {}",
-					amount, funding_value,
-				);
-			}
-
-			// validate funding tx is real
-			// check that any of the inputs is a vtxo
-			self.db.read(async |tx| {
-				// check the funding tx itself first, obviously can't exist
-				if tx.get_virtual_transaction_by_txid(utxo.txid).await?.is_some() {
+		// validate funding tx is real
+		// check that any of the inputs is a vtxo
+		self.db.read(async |tx| {
+			// Only a previously bound board output may reuse a funding tx
+			// already recorded by this payout-enabled server.
+			if let Some(known) = tx.get_virtual_transaction_by_txid(utxo.txid).await? {
+				let retry = self.config.expiry_payouts && known.is_funding
+					&& tx.query_opt("SELECT 1 FROM board_exit WHERE funding_outpoint=$1 LIMIT 1",
+						&[&utxo.to_string()]).await?.is_some();
+				if !retry {
 					return badarg!("invalid funding tx: known as virtual tx: {}", utxo.txid);
 				}
-				for inp in &funding_tx.input {
-					let vtxo_id = inp.previous_output.into();
-					if tx.try_get_bare_vtxo_by_id(vtxo_id).await?.is_some() {
-						return badarg!("invalid funding tx: input is a VTXO: {}", vtxo_id);
-					}
-				}
-				Ok(())
-			}).await?;
-			// check that all the inputs is known
-			for inp in &funding_tx.input {
-				let txid = inp.previous_output.txid;
-				let status = bcd::tx_status(&self.bitcoind, txid).await?;
-				if !status.is_known() {
-					return badarg!("invalid funding tx: unknown input tx {}", txid);
-				}
 			}
+			let input_ids = funding_tx.input.iter()
+				.map(|i| VtxoId::from(i.previous_output))
+				.collect::<Vec<_>>();
+			if let Some(vtxo_id) = tx.get_existing_vtxos_by_id(&input_ids).await?.into_keys().next() {
+				return badarg!("invalid funding tx: input is a VTXO: {}", vtxo_id);
+			}
+			Ok(())
+		}).await?;
+		// check that all the inputs is known
+		for inp in &funding_tx.input {
+			let txid = inp.previous_output.txid;
+			let status = bcd::tx_status(&self.bitcoind, txid).await?;
+			if !status.is_known() {
+				return badarg!("invalid funding tx: unknown input tx {}", txid);
+			}
+		}
 
-			if let Some(ref list) = self.bitcoin_address_blocklist {
-				let res = list.check_tx(&funding_tx).await;
-				if !res.is_ok() {
-					if let Some(addr) = res.violating_address() {
-						let amount = funding_tx.output[utxo.vout as usize].value;
-						slog!(BoardAttemptBlockedAddress, vtxo: None, amount: amount,
-							address: addr.as_unchecked().clone(),
-						);
-					}
-					res.into_user_result().context("address blocklist check failed")?;
+		if let Some(ref list) = self.bitcoin_address_blocklist {
+			let res = list.check_tx(funding_tx).await;
+			if !res.is_ok() {
+				if let Some(addr) = res.violating_address() {
+					let amount = funding_tx.output[utxo.vout as usize].value;
+					slog!(BoardAttemptBlockedAddress, vtxo: None, amount: amount,
+						address: addr.as_unchecked().clone(),
+					);
 				}
+				res.into_user_result().context("address blocklist check failed")?;
 			}
 		}
 
@@ -753,17 +769,32 @@ impl Server {
 			user_pub_nonce,
 		);
 
-		self.db.write(async |t| owner_links.verify(t, [user_pubkey],
-			self.mailbox_key.leak_ref(), self.config.network).await).await?;
+		if self.config.expiry_payouts && owner_mailbox.is_none() {
+			return badarg!("board output requires a payout mailbox");
+		}
 
 		// Fees and the exit delta can change, so bind the output to one exit
 		// before signing, or two signed exits could spend it.
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();
-		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid).await).await?;
-		if bound != exit_txid {
-			return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
-		}
+		self.db.write(async |t| {
+			let bound = t.bind_board_exit(utxo, &spk, exit_txid, owner_mailbox, user_pubkey).await?;
+			if bound.0 != exit_txid {
+				return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
+			}
+			if self.config.expiry_payouts {
+				// The funding output is already a customer liability even if the
+				// holder never returns with the signed exit for registration.
+				let root = builder.funding_vtxo();
+				let update = VtxoTreeUpdate::new()
+					.upsert_unsigned_funding_tx(utxo.txid)
+					.upsert_unsigned_tx([exit_txid])
+					.insert_oor_spent_vtxos([(root, exit_txid)]);
+				t.execute_vtxo_tree_update(update).await?;
+				t.add_funding_vtxos_to_frontier(utxo.txid, None).await?;
+			}
+			Ok(())
+		}).await?;
 
 		info!("Cosigning board request for utxo {}", utxo);
 		let resp = builder.server_cosign(self.server_key.leak_ref());
@@ -845,27 +876,28 @@ impl Server {
 		// inserted-row count returned by execute_vtxo_tree_update, which makes
 		// the fresh-vs-retry decision atomic with the write rather than
 		// depending on a separate racy pre-read.
-		// The funding root is already spent by the signed board exit. Insert it
-		// in that state, rather than transiently classifying the server-only
-		// Expiry policy as a customer birth at the deferred ownership trigger.
-		let (roots, leaves): (Vec<_>, Vec<_>) = builder.build_server_vtxos().into_iter()
-			.partition(|output| output.id() == VtxoId::from(vtxo.chain_anchor()));
+		let outputs = builder.build_server_vtxos();
+		let leaf_ids = outputs.iter().filter(|output| output.policy().user_pubkey().is_some())
+			.map(|leaf| leaf.id()).collect::<Vec<_>>();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&funding_tx)
 			.upsert_unsigned_tx([builder.exit_txid()])
-			.insert_oor_spent_vtxos(roots.into_iter().map(|root| (root, builder.exit_txid())))
-			.insert_spendable_vtxos(leaves)
+			.insert_spendable_vtxos(outputs)
 			.mark_vtxos_oor_spent(builder.spend_info());
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();
 		let inserted = self.db.write(async |t| {
 			// also binds boards cosigned before outputs were bound on cosign
-			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid).await?;
-			if bound != exit_txid {
+			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid, None, vtxo.user_pubkey()).await?;
+			if bound.0 != exit_txid {
 				return badarg!("board utxo {} is already registered with another exit tx",
 					vtxo.chain_anchor(),
 				);
 			}
+			let update = if self.config.expiry_payouts {
+				let mailbox = bound.1.context("board exit has no admitted payout mailbox")?;
+				update.bind_owner_mailboxes(leaf_ids.iter().map(|id| (*id, mailbox)))?
+			} else { update };
 			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;
@@ -996,6 +1028,8 @@ impl Server {
 				.context(vtxo_id)
 				.badarg("vtxo not found in database")?;
 
+			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
+
 			// Check vtxo is fully signed
 			if !vtxo.has_all_witnesses() {
 				return badarg!("vtxo {} is not fully signed", vtxo_id);
@@ -1017,8 +1051,6 @@ impl Server {
 			vtxo.validate(&anchor_tx)
 				.context(vtxo_id)
 				.badarg("vtxo validation failed")?;
-
-			Self::check_registration_matches_stored(&stored.vtxo, vtxo)?;
 
 			self.check_registration_inputs_not_exited(vtxo).await?;
 

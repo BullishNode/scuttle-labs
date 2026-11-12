@@ -3,58 +3,33 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
+use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::secp256k1::PublicKey;
-use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
+use bitcoin_ext::{BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 
 use super::expiry_lightning::LightningSourceState;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
-use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
-use super::expiry_inventory::BackingSnapshot;
+use super::ln::LightningHtlcSubscriptionStatus;
 use super::Tx;
 
-pub(crate) const MAX_PAYOUT_VSIZE: usize = 10_000;
-
-pub(crate) struct FallbackClaim {
-	pub vtxo_id: VtxoId,
-	pub source_vtxo_ids: BTreeSet<VtxoId>,
-	pub owner_mailbox: PublicKey,
-	pub gross: Amount,
-	pub payout: Amount,
-	pub confirmed_block: Option<BlockRef>,
-	/// Canonical N6 user discharge, independent of the superseded payout parent.
-	pub user_claimed: bool,
-}
+pub(crate) const MAX_PAYOUT_VSIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FallbackOutcome {
+pub(crate) enum FallbackState {
 	Pending,
-	Spent,
+	Paid,
 	Forfeited,
 }
 
-/// A known source cannot retire because only its first paid portion was
-/// returned. All of its principal must be covered by canonical decisions.
-fn fallback_outcome<'a>(principal: Amount, claims: impl IntoIterator<Item = &'a FallbackClaim>)
-	-> anyhow::Result<Option<FallbackOutcome>>
-{
-	let mut covered = Amount::ZERO;
-	let mut pending = false;
-	let mut paid = false;
-	let mut any = false;
-	for claim in claims {
-		any = true;
-		covered = covered.checked_add(claim.gross).context("fallback source coverage overflow")?;
-		pending |= claim.confirmed_block.is_none() && !claim.user_claimed;
-		paid |= claim.payout > Amount::ZERO || claim.user_claimed;
-	}
-	ensure!(covered <= principal, "fallback decisions exceed their known source");
-	Ok(if !any { None }
-		else if pending || covered != principal { Some(FallbackOutcome::Pending) }
-		else if paid { Some(FallbackOutcome::Spent) }
-		else { Some(FallbackOutcome::Forfeited) })
+/// The expiry payout decided for a coin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FallbackReceipt {
+	pub state: FallbackState,
+	pub gross: Amount,
+	pub fee: Amount,
+	pub payout: Amount,
 }
 
 fn receive_timeout_allowed(
@@ -73,299 +48,68 @@ fn receive_timeout_allowed(
 	}
 }
 
-struct SplitRecoveryPaths {
-	rows: BTreeSet<usize>,
-	transactions: BTreeSet<Txid>,
-	keys: BTreeSet<PublicKey>,
-}
-
-fn retained_server_recovery(vtxo: &ServerVtxo) -> bool {
-	matches!(vtxo.policy(), ServerVtxoPolicy::ServerOwned | ServerVtxoPolicy::Expiry(_)
-		| ServerVtxoPolicy::Checkpoint(_) | ServerVtxoPolicy::HarkLeaf(_) | ServerVtxoPolicy::HarkLeaf_v0(_)
-		| ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcRecv(_) | VtxoPolicy::ServerHtlcRecv_v0(_)))
-}
-
-/// A signed next transaction alone is insufficient. For example, a board's
-/// next transaction ends at a user-only leaf: publishing it would destroy our
-/// expiry path for an abandoned wallet. Follow every branch until there is an
-/// server recovery path, accounting for each sibling and anchor.
-fn split_recovery_paths(
-	root: &ServerVtxo, snapshot: &BackingSnapshot,
-	signed: &BTreeMap<Txid, Transaction>, owned: &BTreeSet<PublicKey>,
-) -> anyhow::Result<Option<SplitRecoveryPaths>> {
-	let facts = snapshot.regular.iter().enumerate()
-		.map(|(i, f)| (f.state.vtxo.point(), i)).collect::<BTreeMap<_, _>>();
-	ensure!(facts.len() == snapshot.regular.len(), "split inventory has duplicate outputs");
-	let mut pending = vec![(root.point(), root.txout())];
-	let mut visited = BTreeSet::new();
-	let mut transactions = BTreeSet::new();
-	let mut keys = BTreeSet::new();
-	while let Some((point, output)) = pending.pop() {
-		let Some(&index) = facts.get(&point) else { return Ok(None); };
-		ensure!(visited.insert(index), "split recovery paths overlap or cycle");
-		let fact = &snapshot.regular[index];
-		let vtxo = &fact.state.vtxo;
-		ensure!(vtxo.txout() == output && vtxo.server_pubkey() == root.server_pubkey()
-			&& vtxo.chain_anchor() == root.chain_anchor(), "split recovery metadata differs from its signed path");
-		if fact.onchain_spent_height.is_some() || fact.onchain_spent_txid.is_some() {
-			return Ok(None);
-		}
-		if point != root.point() {
-			// These exact policy kinds also delimit the metadata-only recovery
-			// inventory. Every decoded policy is validated before trusting it.
-			if retained_server_recovery(vtxo) { continue; }
-			if let ServerVtxoPolicy::User(VtxoPolicy::Pubkey(policy)) = vtxo.policy() {
-				if fact.state.oor_spent_txid.is_none() {
-					if policy.user_pubkey == root.server_pubkey() { continue; }
-					if owned.contains(&policy.user_pubkey) {
-						keys.insert(policy.user_pubkey);
-						continue;
-					}
-				}
-			}
-		}
-		let Some(next) = fact.state.oor_spent_txid.and_then(|id| signed.get(&id)) else { return Ok(None); };
-		ensure!(next.input.len() == 1 && next.input[0].previous_output == point,
-			"split recovery step is not a signed single-input spend of its backing");
-		let value = next.output.iter().try_fold(Amount::ZERO, |sum, o| sum.checked_add(o.value))
-			.context("split recovery output amount overflow")?;
-		ensure!(value == output.value, "split recovery step does not conserve all backing");
-		let txid = next.compute_txid();
-		ensure!(Some(txid) == fact.state.oor_spent_txid, "split recovery transaction has the wrong id");
-		transactions.insert(txid);
-		for (vout, child) in next.output.iter().enumerate() {
-			if !child.is_p2a_fee_anchor() {
-				pending.push((OutPoint::new(txid, u32::try_from(vout)?), child.clone()));
-			}
-		}
-	}
-	Ok(Some(SplitRecoveryPaths { rows: visited, transactions, keys }))
-}
-
 pub struct PendingExpiryPayout {
 	pub id: i64,
 	pub inputs: Vec<ServerVtxo>,
 	pub payouts: Vec<TxOut>,
 	pub parent: Option<Transaction>,
+	pub parent_fee: Option<Amount>,
 }
 
 impl Tx<'_> {
-	/// Follow only immutable registered OOR edges. The stage resolver below
-	/// still decides whether a descendant is actually this input owner's right;
-	/// sharing a transaction or a mailbox is not sufficient.
-	/// Reporting uses a read-only snapshot of the last completed block;
-	/// financial decisions validate the chain independently.
-	async fn source_fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
-		if ids.is_empty() { return Ok(BTreeMap::new()); }
-		let raw = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let rows = self.query("WITH RECURSIVE branch AS (
-			SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in FROM vtxo WHERE vtxo_id=ANY($1)
-			UNION
-			SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
-			FROM vtxo v JOIN branch p ON v.vtxo_txid=p.oor_spent_txid
-			WHERE p.spent_in_round IS NULL AND p.offboarded_in IS NULL
-		) SELECT vtxo_id FROM branch", &[&raw]).await?;
-		let mut candidates = ids.iter().copied().collect::<BTreeSet<_>>();
-		for row in rows { candidates.insert(row.get::<_, &str>("vtxo_id").parse()?); }
-		let candidates = candidates.into_iter().collect::<Vec<_>>();
-		let raw = candidates.iter().map(ToString::to_string).collect::<Vec<_>>();
-		// Ordinary uncommitted status reads do not depend on watchmand/Core.
-		if self.query_opt("SELECT e.id FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			WHERE e.vtxo_id=ANY($1) AND c.disposition='customer' LIMIT 1", &[&raw]).await?.is_none() {
-			return Ok(BTreeMap::new());
-		}
-		let point = self.expiry_view().await?.context("fallback projection has no published watchman tip")?;
-		self.fallback_claims(&candidates, point).await
-	}
-
-	/// Aggregate direct and stage-selected input-owner portions onto the
-	/// authenticated coin identity. Keep birth ownership separate from payee.
-	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
-		-> anyhow::Result<BTreeMap<VtxoId, FallbackOutcome>>
+	/// The payout decided for each coin, keyed by the coin and the mailbox
+	/// it was born with. A payout to another mailbox, such as an undelivered
+	/// arkoor output refunded to its sender, is not reported to the coin.
+	pub(crate) async fn fallback_receipts(&self, owners: &BTreeMap<VtxoId, PublicKey>)
+		-> anyhow::Result<BTreeMap<VtxoId, FallbackReceipt>>
 	{
-		if !self.expiry_payouts() { return Ok(BTreeMap::new()); }
-		let claims = self.source_fallback_claims(ids).await?;
-		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
-		let owners = self.coin_owner_mailboxes(ids).await?;
-		let mut outcomes = BTreeMap::new();
-		for (id, source) in sources {
-			let Some(owner) = owners.get(&id) else { continue; };
-			let matching = claims.values().filter(|claim|
-				claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(&id));
-			if let Some(outcome) = fallback_outcome(source.vtxo.amount(), matching)? {
-				outcomes.insert(id, outcome);
-			}
-		}
-		Ok(outcomes)
-	}
-
-	/// A collected receive can have no final coin row. Use its actual grants
-	/// and admitted destination bindings, not the provider's grant ownership.
-	/// The public hash-only response receives an outcome, never these keys.
-	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
-		-> anyhow::Result<Option<FallbackOutcome>>
-	{
-		if !self.expiry_payouts() { return Ok(None); }
-		let rows = self.query("SELECT v.vtxo_id,v.amount,c.output_vtxo_id,c.output_vtxo
-			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing'
-			JOIN lightning_htlc_subscription s ON s.id=v.lightning_htlc_subscription_id AND s.payment_hash=h.payment_hash
-			LEFT JOIN expiry_lightning_receive_claim c ON c.source_vtxo_id=v.vtxo_id
-				AND c.subscription_id=s.id AND c.payment_hash=s.payment_hash
-			WHERE s.id=$1 AND s.payment_hash=$2 ORDER BY v.vtxo_id",
-			&[&sub.id, &sub.payment_hash.to_string()]).await?;
-		let grants = rows.iter().map(|row| row.get::<_, &str>("vtxo_id").parse())
-			.collect::<Result<BTreeSet<VtxoId>, _>>()?;
-		ensure!(grants == sub.htlc_vtxos.iter().copied().collect(), "receive grant identities differ from subscription");
-		let mut principal = Amount::ZERO;
-		let mut destinations = BTreeMap::new();
-		let mut ids = grants.iter().copied().collect::<Vec<_>>();
+		if !self.expiry_payouts() || owners.is_empty() { return Ok(BTreeMap::new()); }
+		let ids = owners.keys().map(ToString::to_string).collect::<Vec<_>>();
+		// The winning decision of each coin: a confirmed one, else the latest.
+		let rows = self.query("SELECT DISTINCT ON (c.vtxo_id) c.vtxo_id,c.disposition,c.owner_mailbox, \
+			c.gross_sat,c.fee_sat,c.payout_sat,a.status,v.confirmed_height IS NOT NULL AS exposed, \
+			a.confirmed_height+5 <= (SELECT MAX(height) FROM watchmand_block) AS deep \
+			FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+			JOIN vtxo v ON v.vtxo_id=c.vtxo_id \
+			WHERE c.vtxo_id=ANY($1) ORDER BY c.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC",
+			&[&ids]).await?;
+		let mut receipts = BTreeMap::new();
 		for row in rows {
-			let source: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
-			let amount = Amount::from_sat(u64::try_from(row.get::<_, i64>("amount"))?);
-			principal = principal.checked_add(amount).context("receive grant amount overflow")?;
-			let Some(raw) = row.get::<_, Option<&[u8]>>("output_vtxo") else { continue; };
-			let output = ark::Vtxo::<ark::vtxo::Full>::deserialize(raw)?;
-			let output_id: VtxoId = row.get::<_, &str>("output_vtxo_id").parse()?;
-			ensure!(output.id() == output_id
-				&& output.amount() == amount, "receive destination differs from its source");
-			let Some((id, key)) = self.receive_claim_recipient(source).await? else { continue; };
-			ensure!(id == output.id(), "collected receive destination differs");
-			let super::expiry_attribution::Attribution::Owned { mailbox_pk, .. } = self.expiry_owner(key).await? else {
-				bail!("collected receive destination has no admitted mailbox");
+			let id: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
+			let mailbox = row.get::<_, Option<&str>>("owner_mailbox").map(str::parse::<PublicKey>).transpose()?;
+			if row.get::<_, &str>("disposition") != "customer" || mailbox.as_ref() != owners.get(&id) {
+				continue;
+			}
+			// The holder put the coin itself on chain, so no payout follows.
+			let status: &str = row.get("status");
+			if status == "conflicted" && row.get::<_, bool>("exposed") { continue; }
+			let amount = |column| -> anyhow::Result<Amount> {
+				Ok(Amount::from_sat(u64::try_from(row.get::<_, i64>(column))?))
 			};
-			destinations.insert(id, mailbox_pk);
-			ids.push(id);
+			let payout = amount("payout_sat")?;
+			let state = if status != "confirmed" || row.get::<_, Option<bool>>("deep") != Some(true) {
+				FallbackState::Pending
+			} else if payout > Amount::ZERO { FallbackState::Paid } else { FallbackState::Forfeited };
+			receipts.insert(id, FallbackReceipt { state, gross: amount("gross_sat")?, fee: amount("fee_sat")?, payout });
 		}
-		let claims = self.source_fallback_claims(&ids).await?;
-		let matching = claims.values().filter(|claim| destinations.iter().any(|(id, owner)|
-			claim.owner_mailbox == *owner && claim.source_vtxo_ids.contains(id)));
-		fallback_outcome(principal, matching)
+		Ok(receipts)
 	}
 
-	/// Select the winning economic decision before filtering for customer claims.
-	/// The receipt describes that decision; it does not promote a pending parent
-	/// or replace the wallet's independent canonical-chain confirmation check.
-	async fn fallback_claims(&self, ids: &[VtxoId], point: BlockRef) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
-		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let rows = self.query("SELECT c.vtxo_id,c.owner_mailbox,c.gross_sat,c.payout_sat,
-			CASE WHEN a.status='confirmed'
-				AND cv.processed_height >= a.confirmed_height+5
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
-				THEN a.confirmed_height END AS confirmed_height,
-			CASE WHEN a.status='confirmed'
-				AND cv.processed_height >= a.confirmed_height+5
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
-				THEN a.confirmed_hash END AS confirmed_hash,
-			EXISTS(SELECT 1 FROM expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id
-				 AND cv.processed_height >= t.height+5
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=t.height AND b.hash=t.hash)
-				AND cv.processed_height=(SELECT MAX(height) FROM watchmand_block)
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=cv.processed_height AND b.hash=cv.processed_hash)) AS user_claimed
-			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,e.id AS entitlement_id,c.allocation_id,c.owner_mailbox,c.gross_sat,c.fee_sat,
-				c.payout_sat,c.forfeited_sat,c.spk,c.disposition FROM expiry_entitlement e
-				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
-				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC) c
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id
-			CROSS JOIN (SELECT $2::BIGINT AS processed_height,$3::TEXT AS processed_hash) cv
-			WHERE c.disposition='customer'", &[&ids, &i64::from(point.height), &point.hash.to_string()]).await?;
-		let mut claims: BTreeMap<VtxoId, FallbackClaim> = rows.into_iter().map(|row| {
-			let height: Option<i64> = row.get("confirmed_height");
-			let hash: Option<&str> = row.get("confirmed_hash");
-			let confirmed_block = match (height, hash) {
-				(Some(height), Some(hash)) => Some(BlockRef { height: BlockHeight::new(u32::try_from(height)?), hash: hash.parse()? }),
-				(None, None) => None,
-				_ => bail!("incomplete fallback confirmation receipt"),
-			};
-			let claim = FallbackClaim {
-				vtxo_id: row.get::<_, &str>("vtxo_id").parse()?,
-				source_vtxo_ids: BTreeSet::new(),
-				owner_mailbox: row.get::<_, &str>("owner_mailbox").parse()?,
-				gross: Amount::from_sat(u64::try_from(row.get::<_, i64>("gross_sat"))?),
-				payout: Amount::from_sat(u64::try_from(row.get::<_, i64>("payout_sat"))?),
-				confirmed_block,
-				user_claimed: row.get("user_claimed"),
-			};
-			Ok((row.get::<_, &str>("vtxo_id").parse()?, claim))
-		}).collect::<anyhow::Result<_>>()?;
-		for claim in claims.values_mut() {
-			claim.source_vtxo_ids = self.fallback_claim_sources(claim).await?;
-		}
-		Ok(claims)
+	/// The owner outputs of an allocation: each mailbox's total, to `tr(M)`.
+	async fn expiry_owner_outputs(&self, id: i64) -> anyhow::Result<BTreeMap<ScriptBuf, Amount>> {
+		self.query("SELECT owner_mailbox,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin \
+			WHERE allocation_id=$1 AND disposition='customer' GROUP BY owner_mailbox HAVING SUM(payout_sat)>0",
+			&[&id]).await?.into_iter().map(|row| Ok((
+				ark::fallback::payout_script(row.get::<_, &str>("owner_mailbox").parse()?),
+				Amount::from_sat(u64::try_from(row.get::<_, i64>("amount_sat"))?),
+			))).collect()
 	}
 
-	/// A receipt belongs to the stage-selected mailbox. Birth ownership is
-	/// only one possible source alias: a provisional recipient must not gain
-	/// its input owner's refund, and a collected receive grant belongs to its
-	/// admitted claimant even if the final output was never inserted.
-	async fn fallback_claim_sources(&self, claim: &FallbackClaim) -> anyhow::Result<BTreeSet<VtxoId>> {
-		let mut sources = BTreeSet::new();
-		if self.coin_owner_mailboxes(&[claim.vtxo_id]).await?.get(&claim.vtxo_id) == Some(&claim.owner_mailbox) {
-			sources.insert(claim.vtxo_id);
-		}
-		let row = self.query_one("SELECT c.evidence->>'kind' FROM expiry_entitlement e \
-			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1 \
-			ORDER BY c.allocation_id LIMIT 1", &[&claim.vtxo_id.to_string()]).await?;
-		match row.get::<_, Option<&str>>(0) {
-			Some("lightning_receive_claim") => {
-				let (output, key) = self.receive_claim_recipient(claim.vtxo_id).await?
-					.context("committed receive receipt has no collected claim")?;
-				ensure!(matches!(self.expiry_owner(key).await?, super::expiry_attribution::Attribution::Owned { mailbox_pk, .. }
-					if mailbox_pk == claim.owner_mailbox), "receive receipt differs from its admitted claimant");
-				sources.insert(output);
-			},
-			Some("input_owner") => {
-				let mut current = self.get_server_vtxo_by_id(claim.vtxo_id).await?.vtxo;
-				let mut seen = BTreeSet::from([current.id()]);
-				loop {
-					let last = current.transactions().last().context("input-owner receipt has no source transaction")?;
-					let [input] = last.tx.input.as_slice() else { bail!("input-owner receipt is not a single-input transition"); };
-					let parent = VtxoId::from(input.previous_output);
-					ensure!(seen.insert(parent), "input-owner receipt source cycle");
-					ensure!(self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND oor_spent_txid=$2",
-						&[&parent.to_string(), &current.point().txid.to_string()]).await?.is_some(),
-						"input-owner receipt lacks its immutable source spend");
-					current = self.get_server_vtxo_by_id(parent).await?.vtxo;
-					match current.policy() {
-						ServerVtxoPolicy::Checkpoint(_) => continue,
-						ServerVtxoPolicy::User(_) => {
-							if self.coin_owner_mailboxes(&[parent]).await?.get(&parent) == Some(&claim.owner_mailbox) {
-								sources.insert(parent);
-							}
-							break;
-						},
-						_ => bail!("input-owner receipt has an unsupported source policy"),
-					}
-				}
-			},
-			_ => {},
-		}
-		Ok(sources)
-	}
-
-	/// Select the winning allocation before matching its actual customer. An
-	/// unregistered change output can use a fresh key in the same immutable
-	/// mailbox as its input owner; a recipient in another mailbox cannot.
-	pub(crate) async fn fallback_customer_vtxos(
-		&self, vtxos: &[(VtxoId, PublicKey)],
-	) -> anyhow::Result<BTreeSet<VtxoId>> {
-		if vtxos.is_empty() { return Ok(BTreeSet::new()); }
-		let ids = vtxos.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>();
-		let keys = vtxos.iter().map(|(_, key)| key.to_string()).collect::<Vec<_>>();
-		self.query("SELECT q.vtxo_id FROM unnest($1::TEXT[],$2::TEXT[]) q(vtxo_id,user_pubkey) \
-			JOIN (SELECT DISTINCT ON (e.vtxo_id) e.vtxo_id,c.disposition,c.user_pubkey,c.owner_mailbox \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
-				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC \
-			) c ON c.vtxo_id=q.vtxo_id LEFT JOIN owner_key k ON k.user_pubkey=q.user_pubkey \
-			WHERE c.disposition='customer' AND (c.user_pubkey=q.user_pubkey OR c.owner_mailbox=k.mailbox_pk)",
-			&[&ids,&keys]).await?.into_iter().map(|row| Ok(row.get::<_, &str>("vtxo_id").parse()?)).collect()
-	}
-
-	/// A group is processed as a whole. Individual-input retries would lose its
-	/// cross-tree output aggregation and could charge the output fee twice.
+	/// Each allocation is one root and is paid by one transaction.
 	pub async fn pending_expiry_payouts(&self) -> anyhow::Result<Vec<PendingExpiryPayout>> {
-		let rows = self.query("SELECT id,sweep_tx FROM expiry_allocation_state WHERE status='pending' ORDER BY expiry_height,id", &[]).await?;
+		let rows = self.query("SELECT a.id,a.sweep_tx,p.fee_sat FROM expiry_allocation_state a \
+			LEFT JOIN expiry_payout_attempt p ON p.allocation_id=a.id AND p.txid=a.sweep_txid \
+			WHERE a.status='pending' ORDER BY a.expiry_height,a.id", &[]).await?;
 		let mut ret = Vec::with_capacity(rows.len());
 		for row in rows {
 			let id: i64 = row.get("id");
@@ -376,135 +120,79 @@ impl Tx<'_> {
 				ORDER BY v.vtxo_id
 			", &[&id]).await?
 				.into_iter().map(|r| ServerVtxo::deserialize(r.get("vtxo"))).collect::<Result<Vec<_>, _>>()?;
-			let payouts = self.query("SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0 ORDER BY spk", &[&id]).await?
-				.into_iter().map(|r| Ok(TxOut {
-					script_pubkey: ScriptBuf::from_hex(r.get("spk"))?,
-					value: Amount::from_sat(u64::try_from(r.get::<_, i64>("amount_sat"))?),
-				})).collect::<anyhow::Result<Vec<_>>>()?;
+			let payouts = self.expiry_owner_outputs(id).await?.into_iter()
+				.map(|(script_pubkey, value)| TxOut { script_pubkey, value }).collect();
 			let parent = row.get::<_, Option<&[u8]>>("sweep_tx").map(deserialize).transpose()?;
-			ret.push(PendingExpiryPayout { id, inputs, payouts, parent });
+			let parent_fee = row.get::<_, Option<i64>>("fee_sat")
+				.map(|fee| u64::try_from(fee).map(Amount::from_sat)).transpose()?;
+			ensure!(parent.is_some() == parent_fee.is_some(),
+				"pending payout attempt lacks a recorded fee or transaction");
+			ret.push(PendingExpiryPayout { id, inputs, payouts, parent, parent_fee });
 		}
 		Ok(ret)
 	}
 
-	/// Compare-and-set the exact signed parent before any network publication.
-	/// Once present, a restart or fee bump must use precisely the same bytes.
-	pub async fn store_expiry_parent(
-		&self, view: BlockRef, id: i64, parent: &Transaction,
+	/// Keep every signed replacement and the exact owner outputs before any
+	/// network publication. An older attempt can still win on chain.
+	pub async fn store_expiry_attempt(
+		&self, view: BlockRef, id: i64, payout: &Transaction,
+		fee: Amount, operator_spk: &ScriptBuf,
 	) -> anyhow::Result<()> {
 		self.lock_watchman_tip(view).await?;
-		let row = self.query_one("SELECT sweep_tx FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
+		self.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
 		ensure!(self.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1", &[&id]).await?.get::<_, &str>(0) == "pending",
 			"expiry allocation is no longer pending");
-		let raw = serialize(parent);
-		if let Some(old) = row.get::<_, Option<&[u8]>>("sweep_tx") {
-			ensure!(old == raw.as_slice(), "attempt to replace immutable expiry parent");
+		ensure!(payout.version == bitcoin::transaction::Version::TWO
+			&& payout.vsize() <= MAX_PAYOUT_VSIZE
+			&& payout.input.iter().any(|input| input.sequence.to_consensus_u32() <= 0xFFFFFFFD)
+			&& payout.output.iter().all(TxOutExt::is_standard),
+			"direct expiry attempt is nonstandard or lacks RBF");
+		let roots = self.query("SELECT v.vtxo FROM expiry_allocation_input i \
+			JOIN vtxo v ON v.vtxo_id=i.vtxo_id WHERE i.allocation_id=$1", &[&id]).await?
+			.into_iter().map(|row| ServerVtxo::deserialize(row.get("vtxo")))
+			.collect::<Result<Vec<ServerVtxo>, _>>()?;
+		let backing = roots.iter().map(|root| root.point()).collect::<BTreeSet<_>>();
+		let spent = payout.input.iter().map(|input| input.previous_output)
+			.collect::<BTreeSet<_>>();
+		ensure!(!backing.is_empty() && backing.is_subset(&spent)
+			&& spent.len() == payout.input.len(),
+			"direct expiry attempt omits or duplicates allocated backing");
+		let expected = self.expiry_owner_outputs(id).await?;
+		ensure!(!expected.contains_key(operator_spk),
+			"operator drain aliases an owner script");
+		let owner_outputs = payout.output.iter().filter(|out| expected.contains_key(&out.script_pubkey))
+			.collect::<Vec<_>>();
+		ensure!(owner_outputs.len() == expected.len() && owner_outputs.iter().all(|out|
+			expected.get(&out.script_pubkey) == Some(&out.value)),
+			"direct expiry attempt changes owner outputs");
+		// Owners are paid from the swept roots only. Watchman inputs may pay
+		// the mining fee, never an owner.
+		let swept = roots.iter().try_fold(Amount::ZERO, |sum, root| sum.checked_add(root.amount()));
+		let owed = expected.values().try_fold(Amount::ZERO, |sum, value| sum.checked_add(*value));
+		ensure!(owed.zip(swept).is_some_and(|(owed, swept)| owed <= swept),
+			"direct expiry attempt pays owners more than its roots hold");
+		let other = payout.output.iter().filter(|out| !expected.contains_key(&out.script_pubkey))
+			.collect::<Vec<_>>();
+		ensure!(other.len() <= 1 && other.iter().all(|out| &out.script_pubkey == operator_spk),
+			"direct expiry attempt pays an unknown script");
+		let txid = payout.compute_txid().to_string();
+		let raw = serialize(payout);
+		let fee_sat = i64::try_from(fee.to_sat())?;
+		if let Some(same) = self.query_opt("SELECT signed_tx,fee_sat FROM expiry_payout_attempt \
+			WHERE allocation_id=$1 AND txid=$2", &[&id,&txid]).await? {
+			ensure!(same.get::<_, &[u8]>("signed_tx") == raw.as_slice() && same.get::<_, i64>("fee_sat") == fee_sat,
+				"stored direct expiry attempt changed bytes or fee");
 			return Ok(());
 		}
-		self.execute("UPDATE expiry_allocation SET sweep_txid=$2,sweep_tx=$3 WHERE id=$1", &[&id,&parent.compute_txid().to_string(),&raw]).await?;
+		let prior_fee = self.query_one("SELECT MAX(fee_sat) FROM expiry_payout_attempt WHERE allocation_id=$1",
+			&[&id]).await?.get::<_, Option<i64>>(0);
+		ensure!(prior_fee.is_none_or(|prior| fee_sat > prior),
+			"direct expiry replacement does not raise the absolute fee");
+		self.execute("INSERT INTO expiry_payout_attempt(allocation_id,txid,signed_tx,fee_sat) \
+			VALUES($1,$2,$3,$4)", &[&id,&txid,&raw,&fee_sat]).await?;
 		Ok(())
 	}
 
-}
-
-impl Tx<'_> {
-	/// Request only an one-input signed tree step. No manufactured
-	/// transaction or arbitrary txid can become a split instruction.
-	pub async fn request_expiry_split(
-		&self, view: BlockRef, root: &ServerVtxo,
-	) -> anyhow::Result<bool> {
-		// Prepare without coin or chain-view locks. Only the short recheck below
-		// serializes against a new obligation, a key drop or a changed chain view.
-		let snapshot = self.backing_recovery_snapshot(root).await?;
-		let txids = snapshot.regular.iter().filter(|f| f.state.vtxo_id == root.id() || !retained_server_recovery(&f.state.vtxo))
-			.filter_map(|f| f.state.oor_spent_txid)
-			.map(|id| id.to_string()).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>();
-		let raw = self.query("SELECT txid,signed_tx FROM virtual_transaction WHERE txid=ANY($1) AND signed_tx IS NOT NULL", &[&txids]).await?;
-		let mut signed = BTreeMap::new();
-		for row in raw {
-			let id = row.get::<_, &str>("txid").parse()?;
-			let tx: Transaction = deserialize(row.get::<_, &[u8]>("signed_tx"))?;
-			ensure!(tx.compute_txid() == id, "stored split transaction has the wrong id");
-			signed.insert(id, tx);
-		}
-		let pubkeys = snapshot.regular.iter().filter_map(|f| match f.state.vtxo.policy() {
-			ServerVtxoPolicy::User(VtxoPolicy::Pubkey(p)) => Some(p.user_pubkey.to_string()),
-			_ => None,
-		}).collect::<Vec<_>>();
-		let owned = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1)", &[&pubkeys]).await?
-			.into_iter().map(|r| r.get::<_, &str>("pubkey").parse()).collect::<Result<BTreeSet<_>, _>>()?;
-		let backing = root.clone();
-		let (snapshot, signed, paths) = tokio::task::spawn_blocking(move || {
-			let paths = split_recovery_paths(&backing, &snapshot, &signed, &owned)?;
-			Ok::<_, anyhow::Error>((snapshot, signed, paths))
-		}).await.context("split recovery preparation task failed")??;
-		let Some(paths) = paths else {
-			return Ok(false);
-		};
-
-		self.lock_watchman_tip(view).await?;
-		let expected = paths.rows.iter().map(|&i| {
-			let state = &snapshot.regular[i].state;
-			(state.vtxo_id.to_string(), (state.updated_at, state.spend_state.as_str().to_owned()))
-		}).collect::<BTreeMap<_, _>>();
-		let ids = expected.keys().cloned().collect::<Vec<_>>();
-		let rows = self.query("
-			SELECT vtxo_id,updated_at,spend_state::TEXT AS spend_state,onchain_spent_height,onchain_spent_txid
-			FROM vtxo
-			WHERE vtxo_id=ANY($1)
-			ORDER BY vtxo_id FOR UPDATE
-		", &[&ids]).await?;
-		let actual = rows.into_iter().map(|r| {
-			ensure!(r.get::<_, Option<i32>>("onchain_spent_height").is_none()
-				&& r.get::<_, Option<&str>>("onchain_spent_txid").is_none(), "split recovery path has been spent");
-			Ok((r.get("vtxo_id"), (r.get("updated_at"), r.get("spend_state"))))
-		}).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
-		ensure!(expected == actual, "split recovery path changed during preparation");
-		let signed_ids = paths.transactions.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let locked = self.query("SELECT txid,signed_tx FROM virtual_transaction WHERE txid=ANY($1) ORDER BY txid FOR SHARE", &[&signed_ids]).await?;
-		ensure!(locked.len() == paths.transactions.len(), "split recovery signed path disappeared");
-		for row in locked {
-			let id: Txid = row.get::<_, &str>("txid").parse()?;
-			ensure!(row.get::<_, Option<&[u8]>>("signed_tx") == Some(serialize(&signed[&id]).as_slice()),
-				"split recovery signed path changed during preparation");
-		}
-		let keys = paths.keys.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let locked_keys = self.query("SELECT pubkey FROM ephemeral_tweak WHERE pubkey=ANY($1) ORDER BY pubkey FOR SHARE", &[&keys]).await?;
-		ensure!(locked_keys.len() == keys.len(), "split recovery key was dropped during preparation");
-		ensure!(root.expiry_height() <= view.height,
-			"expiry split backing is not mature");
-		let row = self.query_one("SELECT oor_spent_txid FROM vtxo WHERE vtxo_id=$1", &[&root.id().to_string()]).await?;
-		let Some(txid) = row.get::<_, Option<&str>>("oor_spent_txid") else { return Ok(false); };
-		let txid = txid.parse()?;
-		let tx = self.get_virtual_transaction_by_txid(txid).await?.context("expiry split transaction missing")?
-			.signed_tx.context("expiry split transaction is unsigned")?;
-		ensure!(tx.input.len() == 1 && tx.input[0].previous_output == root.point(),
-			"expiry split is not a single-input step on its backing path");
-		ensure!(self.query_opt("
-			SELECT i.vtxo_id
-			FROM expiry_allocation_input i JOIN expiry_allocation_state a ON a.id=i.allocation_id
-			WHERE i.vtxo_id=ANY($1) AND a.status='pending' LIMIT 1
-		", &[&ids]).await?.is_none(),
-			"cannot split a recovery path reserved for a pending payout");
-		self.execute("
-			INSERT INTO expiry_split_request(vtxo_id,progress_txid)
-			VALUES($1,$2)
-			ON CONFLICT(vtxo_id) DO UPDATE SET progress_txid=EXCLUDED.progress_txid
-		",
-			&[&root.id().to_string(),&txid.to_string()]).await?;
-		Ok(true)
-	}
-
-	pub async fn pending_expiry_splits(&self) -> anyhow::Result<Vec<(bitcoin::Txid, ServerVtxo)>> {
-		self.query("
-			SELECT s.progress_txid,v.vtxo
-			FROM expiry_split_request s JOIN vtxo v ON v.vtxo_id=s.vtxo_id
-			WHERE v.onchain_spent_height IS NULL
-			ORDER BY v.vtxo_id
-		", &[]).await?
-			.into_iter().map(|r| Ok((r.get::<_, &str>("progress_txid").parse()?,ServerVtxo::deserialize(r.get("vtxo"))?)))
-			.collect()
-	}
 }
 
 impl Tx<'_> {
@@ -569,18 +257,14 @@ impl Tx<'_> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
 		// Physical reservations survive while pending/confirmed. An operator
-		// entitlement stays reserved until all its allocations have conflicted.
-		// Customer entitlements remain irreversible even across a conflict;
+		// decision stays reserved until all its allocations have conflicted.
+		// Customer decisions remain irreversible even across a conflict;
 		// the off-chain obligation guard retains its separate stronger fence.
 		if let Some(row) = self.query_opt("SELECT vtxo_id FROM ( \
 			SELECT i.vtxo_id FROM expiry_allocation_input i JOIN expiry_allocation_state a ON a.id=i.allocation_id \
 				WHERE i.vtxo_id=ANY($1) AND a.status<>'conflicted' \
-			UNION SELECT e.vtxo_id FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1) AND ( \
-				NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
-				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-					WHERE c.entitlement_id=e.id AND a.status<>'conflicted') \
-				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer') \
-				OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id))) fenced \
+			UNION SELECT c.vtxo_id FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE c.vtxo_id=ANY($1) AND (a.status<>'conflicted' OR c.disposition='customer')) fenced \
 			ORDER BY vtxo_id LIMIT 1", &[&ids]).await? {
 			return Err(crate::error::FallbackRefusal::DecidedForFallback(row.get::<_, &str>("vtxo_id").parse()?).into());
 		}
@@ -591,55 +275,8 @@ impl Tx<'_> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use ark::arkoor::{ArkoorDestination, package::ArkoorPackageBuilder};
-	use ark::board::BoardBuilder;
-	use ark::lightning::PaymentHash;
-	use ark::test_util::dummy::DummyTestVtxoSpec;
-	use ark::vtxo::Full;
-	use bitcoin_ext::BlockDelta;
-	use crate::database::{SpendState, VtxoState};
-	use crate::database::expiry_inventory::BackingVtxoFact;
 	use LightningHtlcSubscriptionStatus::{Canceled, Created, Accepted, HtlcsReady, Settled};
 	use HtlcResolution::{Fulfilled, Revoked};
-	use bitcoin::hashes::Hash;
-
-	#[test]
-	fn source_outcome_requires_complete_canonical_coverage() {
-		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7;32]).unwrap().public_key();
-		let mut first = FallbackClaim {
-			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
-			owner_mailbox: key, gross: Amount::from_sat(40_000),
-			payout: Amount::from_sat(39_000),
-			confirmed_block: None, user_claimed: false,
-		};
-		let principal = Amount::from_sat(100_000);
-		assert_eq!(fallback_outcome(principal, []).unwrap(), None);
-		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
-		first.confirmed_block = Some(BlockRef { height: BlockHeight::new(1), hash: bitcoin::BlockHash::all_zeros() });
-		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
-		let mut second = FallbackClaim {
-			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), owner_mailbox: key,
-			gross: Amount::from_sat(60_000), payout: Amount::ZERO,
-			confirmed_block: None, user_claimed: false,
-		};
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-		second.confirmed_block = first.confirmed_block;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
-		first.payout = Amount::ZERO;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Forfeited));
-		assert!(fallback_outcome(Amount::from_sat(99_999), [&first, &second]).is_err());
-		first.confirmed_block = None;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-		first.user_claimed = true;
-		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
-		second.confirmed_block = None;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-		second.user_claimed = true;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
-		first.user_claimed = false;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-	}
 
 	#[test]
 	fn receive_timeout_keeps_collected_and_inflight_grants() {
@@ -658,80 +295,4 @@ mod tests {
 		}
 	}
 
-	fn fact(vtxo: ark::ServerVtxo<Full>, spent: Option<Txid>) -> BackingVtxoFact {
-		BackingVtxoFact {
-			state: VtxoState {
-				id: 1, vtxo_id: vtxo.id(), vtxo: vtxo.to_bare(), oor_spent_txid: spent,
-				spent_in_round: None, offboarded_in: None, banned_until_height: None,
-				spend_state: SpendState::Spendable, confirmed_height: None, decided_for_fallback: false,
-				created_at: chrono::Local::now(), updated_at: chrono::Local::now(),
-			},
-			full_vtxo: Some(vtxo),
-			onchain_spent_height: None, onchain_spent_txid: None,
-			lightning_htlc_subscription_id: None,
-		}
-	}
-
-	fn board() -> (DummyTestVtxoSpec, ark::Vtxo<Full>, BackingSnapshot, BTreeMap<Txid, Transaction>) {
-		let spec = DummyTestVtxoSpec { amount: Amount::from_sat(100_330), fee: Amount::from_sat(330), ..Default::default() };
-		let (funding, board) = spec.build();
-		let builder = BoardBuilder::new_from_vtxo(&board, &funding, board.server_pubkey()).unwrap();
-		let mut rows = builder.build_server_vtxos();
-		let root = rows.remove(0);
-		let source = rows.remove(0);
-		let signed = board.transactions().map(|item| (item.tx.compute_txid(), item.tx)).collect();
-		let snapshot = BackingSnapshot {
-			roots: vec![root.to_bare()],
-			regular: vec![fact(root, Some(board.point().txid)), fact(source, None)],
-		};
-		(spec, board, snapshot, signed)
-	}
-
-	#[test]
-	fn expiry_split_never_exposes_an_abandoned_user_only_board_leaf() {
-		let (_, _, snapshot, signed) = board();
-		assert!(split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new()).unwrap().is_none());
-	}
-
-	#[test]
-	fn expiry_split_follows_real_signed_steps_to_preserve_mixed_siblings() {
-		let (spec, board, mut snapshot, mut signed) = board();
-		let package = ArkoorPackageBuilder::new_with_checkpoints([board], vec![
-			ArkoorDestination {
-				total_amount: Amount::from_sat(50_000),
-				policy: VtxoPolicy::new_pubkey(spec.user_keypair.public_key()),
-			},
-			ArkoorDestination {
-				total_amount: Amount::from_sat(50_000),
-				policy: VtxoPolicy::new_server_htlc_send(spec.user_keypair.public_key(),
-					PaymentHash::from([12; 32]), spec.expiry_height + BlockDelta::new(12)),
-			},
-		]).unwrap().cosign_both(&[spec.user_keypair], &spec.server_keypair).unwrap();
-		for (id, txid) in package.input_spend_info() {
-			snapshot.regular.iter_mut().find(|f| f.state.vtxo_id == id).unwrap().state.oor_spent_txid = Some(txid);
-		}
-		for tx in package.signed_virtual_transactions() { signed.insert(tx.compute_txid(), tx); }
-		let internal = package.build_signed_internal_vtxos();
-		for (vtxo, spent) in internal {
-			if let Some(old) = snapshot.regular.iter_mut().find(|f| f.state.vtxo_id == vtxo.id()) {
-				*old = fact(vtxo, Some(spent));
-			} else { snapshot.regular.push(fact(vtxo, Some(spent))); }
-		}
-		for leaf in package.build_signed_vtxos() { snapshot.regular.push(fact(leaf.into(), None)); }
-		let paths = split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new())
-			.unwrap().expect("both branches retain their server expiry checkpoint");
-		assert!(paths.rows.iter().any(|&i| matches!(snapshot.regular[i].state.vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))));
-		assert!(!paths.rows.iter().any(|&i| matches!(snapshot.regular[i].state.vtxo.policy(), ServerVtxoPolicy::User(VtxoPolicy::ServerHtlcSend(_)))));
-		assert_eq!(paths.rows.iter().filter(|&&i| matches!(snapshot.regular[i].state.vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))).count(), 2);
-		let sibling = snapshot.regular.iter().position(|f| matches!(f.state.vtxo.policy(), ServerVtxoPolicy::Checkpoint(_))).unwrap();
-		let removed = snapshot.regular.remove(sibling);
-		assert!(split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new()).unwrap().is_none(),
-			"every sibling needs its actual output metadata, including the ordinary branch");
-		snapshot.regular.insert(sibling, removed);
-		// Removing the signed bridge must not be substituted by the
-		// unsigned geometry available in the descendant's full encoding.
-		let bridge = snapshot.regular[1].state.oor_spent_txid.unwrap();
-		signed.remove(&bridge);
-		assert!(split_recovery_paths(&snapshot.roots[0], &snapshot, &signed, &BTreeSet::new()).unwrap().is_none());
-	}
 }

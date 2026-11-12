@@ -40,7 +40,8 @@ async fn partial_terminal() {
 		.cfg(|cfg| cfg.daemon_manual_sync = true).create()).await;
 	let invoice = recipient.bolt11_invoice(sat(180_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	let receive_key = recipient.new_address().await.unwrap().policy().user_pubkey();
+	let receive_keypair = super::receive_claim_keypair(&srv, &recipient, hash).await;
+	let receive_key = receive_keypair.public_key();
 	let receive_destination = recipient.fallback_script();
 	let actor = ctx.bark("sender", &srv).cfg(|cfg| cfg.daemon_manual_sync = true)
 		.funded(sat(400_000)).create().await;
@@ -78,9 +79,9 @@ async fn partial_terminal() {
 		intent_nonce: None, source_owner_signatures: Vec::new(),
 	}, &keys[0]).await).await.unwrap();
 	let reply = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(recipient.owner_link(receive_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receive_key.serialize().to_vec(),
 		htlc_recv_expiry: (tip + BlockDelta::new(36)).to_u32(), lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, tip + BlockDelta::new(36), &receive_keypair).serialize()),
 	}).await.unwrap().into_inner();
 	let grants = reply.htlc_vtxos.iter().map(|raw| Vtxo::<Full>::deserialize(raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(Vtxo::amount).sum::<bitcoin::Amount>(), sat(180_000));
@@ -160,7 +161,7 @@ async fn partial_terminal() {
 			"the exact raw A authorization must be durable before canonical grant consumption");
 	}
 	let prior_fences = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM ( \
-		SELECT vtxo_id FROM expiry_entitlement UNION ALL SELECT vtxo_id FROM expiry_allocation_input \
+		SELECT vtxo_id FROM expiry_allocation_coin UNION ALL SELECT vtxo_id FROM expiry_allocation_input \
 		) prior WHERE vtxo_id=$1",&[&sources[0].id().to_string()]).await?.get::<_,i64>(0))).await.unwrap();
 	assert_eq!(prior_fences,0,"this case qualifies an observed user claim without a prior decided/allocation fence");
 	let unpaid = sources[1].id();
@@ -171,8 +172,8 @@ async fn partial_terminal() {
 			srv.watchmand().wait_for_sync_height(height).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&unpaid.to_string()]).await?)).await.unwrap();
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				WHERE c.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&unpaid.to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { return deserialize(row.get("sweep_tx")).unwrap(); }
 		}
 		panic!("the genuinely unpaid original source still requires an absent user");
@@ -186,14 +187,15 @@ async fn partial_terminal() {
 		"a grant-funded parent alone cannot discharge B while its original backing remains independently live");
 	assert!(!parent.input.iter().any(|input| input.previous_output == point));
 	let (index, output) = parent.output.iter().enumerate().find(|(_, output)| output.script_pubkey == fallback).unwrap();
-	assert_eq!(output.value, sat(99_000));
+	assert_eq!(output.value, sat(98_000));
 	assert!(!parent.output.iter().any(|output| output.script_pubkey == receive_destination));
 	let mut value = sat(0);
 	for input in &parent.input {
 		let previous = ctx.bitcoind().await_transaction(input.previous_output.txid).await;
 		value += previous.output[input.previous_output.vout as usize].value;
 	}
-	assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>(), value);
+	assert_eq!(parent.output.iter().map(|output| output.value).sum::<bitcoin::Amount>()
+		+ super::expiry_test::actual_fee(&ctx, &parent).await, value);
 	let height = ctx.generate_blocks(6).await;
 	assert!(chain.get_tx_out(&parent.compute_txid(), index as u32, Some(true)).unwrap().unwrap().confirmations >= 6);
 	assert!(chain.get_tx_out(&claim.compute_txid(), 0, Some(true)).unwrap().unwrap().confirmations >= 6);
@@ -227,8 +229,8 @@ pub(super) async fn wait_partial_confirmation(
 				{ return Ok(false); }
 				t.lock_watchman_tip(view).await?;
 				let recorded = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_tx=$2",
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE c.vtxo_id=$1 AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_tx=$2",
 					&[&unpaid.to_string(), &bitcoin::consensus::serialize(parent)]).await?.get::<_, i64>(0);
 				if recorded != 1 { return Ok(false); }
 				let source = t.query_one("SELECT v.onchain_spent_txid,h.offchain_resolution::TEXT,h.chain_resolution::TEXT \
@@ -238,8 +240,8 @@ pub(super) async fn wait_partial_confirmation(
 				assert!(source.get::<_,Option<&str>>("offchain_resolution").is_none(),
 					"an actual user claim cannot be manufactured into permanent off-chain cancellation");
 				let duplicate = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed'", &[&paid_source]).await?
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE c.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed'", &[&paid_source]).await?
 					.get::<_, i64>(0);
 				assert_eq!(duplicate, 0, "the actual prior user receipt must not receive a second fallback");
 				Ok(true)

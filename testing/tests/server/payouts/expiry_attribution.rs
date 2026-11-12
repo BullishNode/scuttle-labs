@@ -1,22 +1,23 @@
-use super::{expiry_test::published_payout, owner_helpers::unmapped_owner_link};
+use super::expiry_test::published_payout;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use ark::arkoor::{ArkoorDestination, package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse}};
+use ark::attestations::VtxoStatusAttestation;
 use ark::lightning::PaymentHash;
+use ark::mailbox::MailboxIdentifier;
 use ark::vtxo::Full;
-use ark::{ProtocolEncoding, Vtxo, VtxoPolicy, SECP};
+use ark::{ProtocolEncoding, Vtxo, VtxoId, VtxoPolicy, SECP};
 use ark_testing::{sat, Captaind, TestContext};
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::consensus::serialize;
-use bitcoin::secp256k1::{Keypair, PublicKey};
+use bitcoin::secp256k1::Keypair;
 use bitcoin::{Amount, Network, OutPoint, Transaction, TxOut};
 use bitcoin_ext::{BlockDelta, BlockHeight};
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
-use server::database::expiry_attribution::Attribution;
 use server_rpc::protos;
 
 struct Owner {
@@ -46,9 +47,11 @@ async fn server_with_lifetime(ctx: &TestContext, lifetime: BlockDelta) -> Arc<Ca
 	srv
 }
 
-/// Exercise the public board protocol with evidence verified by the production link helper.
-async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair) -> Vtxo<Full> {
-	let link = unmapped_owner_link(srv, &key, &owner.mailbox).await;
+/// Exercise the public board protocol with an explicit destination binding.
+/// Returns the cosigned board and its funding transaction, not yet broadcast.
+async fn cosign_board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair, retry: bool)
+	-> (Vtxo<Full>, Transaction)
+{
 	let core = ctx.bitcoind().sync_client();
 	let address = ctx.bitcoind().get_new_address();
 	let funding_id = ctx.bitcoind().fund_addr(&address, sat(200_000)).await;
@@ -61,7 +64,7 @@ async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair) -
 	let info = srv.ark_info().await;
 	let expiry = tip + info.vtxo_lifetime;
 	assert_eq!(info.fees.board.calculate(sat(100_000)).unwrap(), Amount::ZERO);
-	let builder = ark::board::BoardBuilder::new(key.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta);
+	let builder = ark::board::BoardBuilder::new(key.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta).unwrap();
 	let unsigned = Transaction {
 		version: bitcoin::transaction::Version::TWO, lock_time: bitcoin::absolute::LockTime::ZERO,
 		input: vec![bitcoin::TxIn { previous_output: OutPoint::new(funding_id, index as u32),
@@ -77,23 +80,46 @@ async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair) -
 	let point = OutPoint::new(funding.compute_txid(), 0);
 	let builder = builder.set_funding_details(sat(100_000), Amount::ZERO, point).unwrap().generate_user_nonces();
 	let mut rpc = srv.get_public_rpc().await;
-	let cosign = rpc.request_board_cosign(protos::BoardCosignRequest {
-		owner_proof: Some(link.into()),
+	let request = protos::BoardCosignRequest {
+		owner_mailbox: Some(MailboxIdentifier::from_pubkey(owner.mailbox.public_key()).serialize()),
 		amount: 100_000, utxo: serialize(&point), expiry_height: expiry.into(),
 		user_pubkey: key.public_key().serialize().to_vec(), pub_nonce: builder.user_pub_nonce().serialize().to_vec(),
 		funding_tx: serialize(&funding),
-	}).await.unwrap().into_inner().try_into().unwrap();
+	};
+	let cosign: ark::board::BoardCosignResponse = rpc.request_board_cosign(request.clone())
+		.await.unwrap().into_inner().try_into().unwrap();
+	if retry {
+		let retry: ark::board::BoardCosignResponse = rpc.request_board_cosign(request.clone())
+			.await.unwrap().into_inner().try_into().unwrap();
+		assert!(builder.verify_cosign_response(&retry));
+		let mut conflicting = request;
+		conflicting.owner_mailbox = Some(MailboxIdentifier::from_pubkey(owner.key(2).public_key()).serialize());
+		let error = rpc.request_board_cosign(conflicting).await.expect_err("board mailbox must be immutable");
+		assert_eq!(error.code(), tonic::Code::InvalidArgument);
+	}
 	assert!(builder.verify_cosign_response(&cosign));
 	let coin = builder.build_vtxo(&cosign, &key).unwrap();
 	coin.validate(&funding).unwrap();
 	assert_eq!(coin.amount(), sat(100_000));
 	assert_eq!(coin.user_pubkey(), key.public_key());
-	core.send_raw_transaction(&funding).unwrap();
+	(coin, funding)
+}
+
+async fn board(ctx: &TestContext, srv: &Captaind, owner: &Owner, key: Keypair, register: bool) -> Vtxo<Full> {
+	let (coin, funding) = cosign_board(ctx, srv, owner, key, !register).await;
+	confirm_board(ctx, srv, &coin, &funding, register).await;
+	coin
+}
+
+async fn confirm_board(ctx: &TestContext, srv: &Captaind, coin: &Vtxo<Full>, funding: &Transaction, register: bool) {
+	ctx.bitcoind().sync_client().send_raw_transaction(funding).unwrap();
 	let tip = ctx.generate_blocks(BOARD_CONFIRMATIONS).await;
 	srv.wait_for_sync_height(tip).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
-	rpc.register_board_vtxo(protos::BoardVtxoRequest { board_vtxo: coin.serialize() }).await.unwrap();
-	coin
+	if register {
+		srv.get_public_rpc().await.register_board_vtxo(protos::BoardVtxoRequest { board_vtxo: coin.serialize() })
+			.await.unwrap();
+	}
 }
 
 async fn expire(ctx: &TestContext, srv: &Captaind, height: BlockHeight) {
@@ -104,7 +130,7 @@ async fn expire(ctx: &TestContext, srv: &Captaind, height: BlockHeight) {
 }
 
 async fn assert_paid_to_owner(
-	ctx: &TestContext, srv: &Captaind, owner: &Owner, coin: &Vtxo<Full>, owner_key: PublicKey,
+	ctx: &TestContext, srv: &Captaind, owner: &Owner, coin: &Vtxo<Full>,
 ) {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let parent = tokio::time::timeout(Duration::from_secs(45), async {
@@ -121,22 +147,137 @@ async fn assert_paid_to_owner(
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
 	let outputs = parent.output.iter().enumerate().filter(|(_, output)| output.script_pubkey == owner.script).collect::<Vec<_>>();
 	assert_eq!(outputs.len(), 1);
-	assert_eq!(outputs[0].1.value, sat(99_000));
+	assert_eq!(outputs[0].1.value, sat(98_000));
 	let tip = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(tip).await;
 	srv.watchmand().wait_for_sync_height(tip).await;
 	let core = ctx.bitcoind().sync_client();
 	let confirmed = core.get_tx_out(&parent.compute_txid(), outputs[0].0 as u32, Some(true)).unwrap().unwrap();
 	assert!(confirmed.confirmations >= 6);
-	assert_eq!(confirmed.value, sat(99_000));
-	assert_eq!(db.read(async |tx| tx.expiry_owner(owner_key).await).await.unwrap(),
-		Attribution::Owned { mailbox_pk: owner.mailbox.public_key(), spk: owner.script.clone() });
-	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
-		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&coin.id().to_string()]).await?)).await.unwrap();
-	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 1_000), ("payout_sat", 99_000), ("forfeited_sat", 0)] {
+	assert_eq!(confirmed.value, sat(98_000));
+	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
+		FROM expiry_allocation_coin c \
+		WHERE c.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&coin.id().to_string()]).await?)).await.unwrap();
+	assert_eq!(row.get::<_, Option<&str>>("owner_mailbox"), Some(owner.mailbox.public_key().to_string().as_str()));
+	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 2_000), ("payout_sat", 98_000), ("forfeited_sat", 0)] {
 		assert_eq!(row.get::<_, i64>(field), amount);
 	}
+}
+
+#[tokio::test]
+async fn offline_unregistered_board_is_paid_to_admitted_mailbox() {
+	let ctx = TestContext::new("server/offline_unregistered_board_is_paid_to_admitted_mailbox").await;
+	let srv = server_with_lifetime(&ctx, BlockDelta::new(24)).await;
+	let owner = Owner::new();
+	let coin = board(&ctx, &srv, &owner, owner.key(1), false).await;
+	let root = coin.chain_anchor().into();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	assert!(db.read(async |tx| tx.try_get_bare_vtxo_by_id(coin.id()).await).await.unwrap().is_none());
+	let attestation = VtxoStatusAttestation::new(coin.id(), &owner.key(1)).serialize();
+	let mut rpc = srv.get_public_rpc().await;
+	let pending = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(), attestation: attestation.clone(),
+	}).await.unwrap().into_inner();
+	assert_eq!(pending.spend_state, protos::VtxoSpendState::Unregistered as i32);
+	assert_eq!(pending.owner_mailbox, owner.mailbox.public_key().serialize());
+	assert!(pending.fallback_payout.is_none());
+	assert!(rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(coin.id(), &owner.key(2)).serialize(),
+	}).await.is_err());
+	// The cosign binding and funding root must survive a captain crash even
+	// though the holder never registers the completed board VTXO.
+	srv.watchmand().stop().await.unwrap();
+	srv.crash_stop().await.unwrap();
+	srv.start().await.unwrap();
+	srv.watchmand().start().await.unwrap();
+	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
+	srv.wait_for_sync_height(tip).await;
+	srv.watchmand().wait_for_sync_height(tip).await;
+	let mut rpc = srv.get_public_rpc().await;
+	let after_restart = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(), attestation: attestation.clone(),
+	}).await.unwrap().into_inner();
+	assert_eq!(after_restart.spend_state, pending.spend_state);
+	assert_eq!(after_restart.owner_mailbox, pending.owner_mailbox);
+	expire(&ctx, &srv, coin.expiry_height()).await;
+	let parent = tokio::time::timeout(Duration::from_secs(40), async {
+		for _ in 0..20 {
+			if let Some((_, parent)) = published_payout(&db, root).await { return parent; }
+			srv.watchmand().trigger_sweep().await;
+			tokio::time::sleep(Duration::from_millis(500)).await;
+			let tip = ctx.generate_blocks(1).await;
+			srv.wait_for_sync_height(tip).await;
+			srv.watchmand().wait_for_sync_height(tip).await;
+		}
+		panic!("unregistered board did not produce an owner payout");
+	}).await.expect("unregistered board payout timed out");
+	assert!(parent.input.iter().any(|input| input.previous_output == coin.chain_anchor()));
+	let payout_index = parent.output.iter().position(|output|
+		output.script_pubkey == owner.script && output.value == sat(98_000))
+		.expect("admitted mailbox payout missing");
+	let tip = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(tip).await;
+	srv.watchmand().wait_for_sync_height(tip).await;
+	let paid = ctx.bitcoind().sync_client().get_tx_out(&parent.compute_txid(), payout_index as u32,
+		Some(true)).unwrap().expect("owner payout output missing from Core");
+	assert!(paid.confirmations >= 6);
+	assert_eq!(paid.value, sat(98_000));
+	let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(), attestation: attestation.clone(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert_eq!(status.owner_mailbox, owner.mailbox.public_key().serialize());
+	assert_eq!(status.fallback_payout.map(|f| f.state), Some(protos::FallbackState::Paid as i32));
+	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest {
+		vtxos: vec![protos::VtxoStatusQuery {
+			vtxo_id: coin.id().to_bytes().to_vec(), attestation,
+		}],
+	}).await.unwrap().into_inner();
+	assert!(batch.missing_vtxo_ids.is_empty());
+	assert_eq!(batch.vtxos.len(), 1);
+	assert_eq!(batch.vtxos[0].spend_state, status.spend_state);
+	assert_eq!(batch.vtxos[0].owner_mailbox, status.owner_mailbox);
+	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat \
+		FROM expiry_allocation_coin c \
+		WHERE c.vtxo_id=$1", &[&root.to_string()]).await?)).await.unwrap();
+	assert_eq!(row.get::<_, &str>("owner_mailbox"), owner.mailbox.public_key().to_string());
+	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 2_000), ("payout_sat", 98_000)] {
+		assert_eq!(row.get::<_, i64>(field), amount);
+	}
+}
+
+/// A board cosigned in payout mode is on the frontier from cosign. If its
+/// funding never confirms, the watchman stops loading it once the board
+/// expires. A holder who confirms and registers it later is still paid.
+#[tokio::test]
+async fn unconfirmed_cosigned_board_leaves_frontier_at_expiry() {
+	let ctx = TestContext::new("server/unconfirmed_cosigned_board_leaves_frontier_at_expiry").await;
+	let srv = server_with_lifetime(&ctx, BlockDelta::new(24)).await;
+	let owner = Owner::new();
+	let (coin, funding) = cosign_board(&ctx, &srv, &owner, owner.key(1), false).await;
+	let root: VtxoId = coin.chain_anchor().into();
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let tracked = async || db.read(async |tx| tx.get_frontier().await).await.unwrap().contains_key(&root);
+	assert!(tracked().await, "a cosigned funding root is on the frontier");
+	// The board can still confirm before its expiry.
+	expire(&ctx, &srv, BlockHeight::new(coin.expiry_height().to_u32() - 2)).await;
+	srv.watchmand().trigger_sweep().await;
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	assert!(tracked().await, "an unexpired cosigned board stays on the frontier");
+	expire(&ctx, &srv, coin.expiry_height()).await;
+	tokio::time::timeout(Duration::from_secs(30), async {
+		while tracked().await {
+			srv.watchmand().trigger_sweep().await;
+			tokio::time::sleep(Duration::from_millis(200)).await;
+		}
+	}).await.expect("an expired, never confirmed board must leave the frontier");
+	let bound = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM board_exit WHERE funding_outpoint=$1",
+		&[&root.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(bound, 1, "the exit binding stays");
+	confirm_board(&ctx, &srv, &coin, &funding, true).await;
+	assert!(tracked().await, "registration puts the funding root back on the frontier");
+	assert_paid_to_owner(&ctx, &srv, &owner, &coin).await;
 }
 
 #[tokio::test]
@@ -148,7 +289,7 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	assert_eq!(srv.mailbox_keypair().public_key(), srv.ark_info().await.mailbox_pubkey);
 
 	let input_key = owner.key(1);
-	let input = board(&ctx, &srv, &owner, input_key).await;
+	let input = board(&ctx, &srv, &owner, input_key, true).await;
 	let tip = BlockHeight::new(ctx.bitcoind().get_block_count().await as u32);
 	let deadline = tip + srv.config().htlc_send_expiry_delta + BlockDelta::new(2);
 	let policy = VtxoPolicy::new_server_htlc_send(owner.key(500).public_key(), PaymentHash::from([19; 32]), deadline);
@@ -156,10 +297,12 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 		ArkoorDestination { total_amount: sat(100_000), policy: policy.clone() },
 	]).unwrap().generate_user_nonces(&[input_key]).unwrap();
 	let mut rpc = srv.get_public_rpc().await;
-	let link = unmapped_owner_link(&srv, &owner.key(500), &owner.mailbox).await;
 	let mut request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
 	for part in &mut request.parts {
-		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) { output.owner_proof = Some(link.into()); }
+		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
+			output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv, policy.clone(), &owner.key(500),
+				MailboxIdentifier::from_pubkey(owner.mailbox.public_key())).await);
+		}
 	}
 	let response = rpc.request_lightning_pay_htlc_cosign(protos::LightningPayHtlcCosignRequest {
 		parts: request.parts,
@@ -178,10 +321,12 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	let revoke = ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		vec![coin.clone()], VtxoPolicy::new_pubkey(refund_key.public_key()),
 	).unwrap().generate_user_nonces(&[owner.key(500)]).unwrap();
-	let link = unmapped_owner_link(&srv, &refund_key, &owner.mailbox).await;
 	let mut request = protos::ArkoorPackageCosignRequest::from(revoke.cosign_request());
 	for part in &mut request.parts {
-		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) { output.owner_proof = Some(link.into()); }
+		for output in part.outputs.iter_mut().chain(&mut part.isolated_outputs) {
+			output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv, VtxoPolicy::new_pubkey(refund_key.public_key()),
+				&refund_key, MailboxIdentifier::from_pubkey(owner.mailbox.public_key())).await);
+		}
 	}
 	let response = rpc.request_lightning_pay_htlc_revocation(
 		request,
@@ -198,9 +343,47 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	assert_eq!(stored.spend_state, server::database::SpendState::Unregistered);
 	assert!(db.read(async |tx| tx.get_virtual_transaction_by_txid(refund.point().txid).await)
 		.await.unwrap().unwrap().signed_tx.is_none());
-	assert_eq!(db.read(async |tx| tx.expiry_owner(owner.key(500).public_key()).await)
-		.await.unwrap(), Attribution::Owned { mailbox_pk: owner.mailbox.public_key(), spk: owner.script.clone() });
+	assert_eq!(db.read(async |tx| tx.coin_owner_mailboxes(&[coin.id()]).await).await.unwrap()
+		.get(&coin.id()), Some(&owner.mailbox.public_key()));
 	// Keep the signed refund local, so attribution must use the committed input owner.
 	expire(&ctx, &srv, deadline.max(refund.expiry_height())).await;
-	assert_paid_to_owner(&ctx, &srv, &owner, refund, owner.key(500).public_key()).await;
+	assert_paid_to_owner(&ctx, &srv, &owner, refund).await;
+}
+
+/// An arkoor output never registered by expiry is paid to its sender's
+/// mailbox. Its recipient learns only that the coin is spent.
+#[tokio::test]
+async fn unregistered_arkoor_recipient_sees_no_sender_payout() {
+	let ctx = TestContext::new("server/unregistered_arkoor_recipient_sees_no_sender_payout").await;
+	let srv = server_with_lifetime(&ctx, BlockDelta::new(24)).await;
+	let owner = Owner::new();
+	let input_key = owner.key(1);
+	let input = board(&ctx, &srv, &owner, input_key, true).await;
+	let recipient = Xpriv::new_master(Network::Regtest, &[119; 64]).unwrap().to_keypair(&SECP);
+	let recipient_mailbox = MailboxIdentifier::from_pubkey(
+		Xpriv::new_master(Network::Regtest, &[120; 64]).unwrap().to_keypair(&SECP).public_key());
+	let policy = VtxoPolicy::new_pubkey(recipient.public_key());
+	let send = ArkoorPackageBuilder::new_claim_all_with_checkpoints([input.clone()], policy.clone())
+		.unwrap().generate_user_nonces(&[input_key]).unwrap();
+	let mut request = protos::ArkoorPackageCosignRequest::from(send.cosign_request());
+	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv, policy.clone(),
+			&recipient, recipient_mailbox).await);
+	}
+	let mut rpc = srv.get_public_rpc().await;
+	let response = rpc.request_arkoor_cosign(request).await.unwrap().into_inner();
+	let outputs = send.user_cosign(&[input_key], ArkoorPackageCosignResponse::try_from(response).unwrap())
+		.unwrap().build_signed_vtxos();
+	assert_eq!(outputs.len(), 1);
+	let coin = &outputs[0];
+	// The recipient holds the signed coin but never registers it.
+	expire(&ctx, &srv, coin.expiry_height()).await;
+	assert_paid_to_owner(&ctx, &srv, &owner, coin).await;
+	let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(coin.id(), &recipient).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert_eq!(status.owner_mailbox, recipient_mailbox.as_pubkey().serialize());
+	assert!(status.fallback_payout.is_none(), "the sender's refund is not the recipient's payout");
 }

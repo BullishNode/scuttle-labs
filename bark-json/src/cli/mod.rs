@@ -88,6 +88,8 @@ pub struct ArkInfo {
 	pub tos_link: Option<String>,
 	/// The maximum number of inputs for an offboard
 	pub max_offboard_inputs: usize,
+	/// The maximum number of outputs of a single round participation
+	pub max_round_participation_outputs: usize,
 
 	/// The number of blocks a VTXO lives before it expires.
 	///
@@ -128,6 +130,8 @@ impl<'de> serde::Deserialize<'de> for ArkInfo {
 			tos_link: Option<String>,
 			max_offboard_inputs: usize,
 			#[serde(default)]
+			max_round_participation_outputs: usize,
+			#[serde(default)]
 			vtxo_expiry_delta: BlockDelta,
 		}
 
@@ -163,6 +167,11 @@ impl<'de> serde::Deserialize<'de> for ArkInfo {
 			max_vtxo_exit_depth: v.max_vtxo_exit_depth,
 			tos_link: v.tos_link,
 			max_offboard_inputs: v.max_offboard_inputs,
+			// Older daemons don't report it; their server allowed a whole round.
+			max_round_participation_outputs: match v.max_round_participation_outputs {
+				0 => 4_usize.saturating_pow(v.nb_round_nonces as u32),
+				n => n,
+			},
 		})
 	}
 }
@@ -200,6 +209,7 @@ impl<T: Borrow<ark::ArkInfo>> From<T> for ArkInfo {
 			fees: v.fees.clone().into(),
 			max_vtxo_exit_depth: v.max_vtxo_exit_depth,
 			max_offboard_inputs: v.max_offboard_inputs,
+			max_round_participation_outputs: v.max_round_participation_outputs,
 			tos_link: v.tos_link.clone(),
 		}
 	}
@@ -347,7 +357,7 @@ pub struct BalanceSummary {
 	#[serde(rename = "needs_refresh_sat", with = "bitcoin::amount::serde::as_sat")]
 	#[cfg_attr(feature = "utoipa", schema(value_type = u64))]
 	pub needs_refresh: Amount,
-	/// Sats held by operations: the sum of the `pending_*_sat`
+	/// Sats held by operations in progress: the sum of the `pending_*_sat`
 	/// fields of [Balance]. They either come back as spendable or leave the
 	/// wallet, for example to the on-chain wallet.
 	#[serde(rename = "pending_sat", with = "bitcoin::amount::serde::as_sat")]
@@ -614,7 +624,7 @@ pub struct LightningReceiveInfo {
 	/// The payment hash linked to the lightning receive
 	#[cfg_attr(feature = "utoipa", schema(value_type = String))]
 	pub payment_hash: PaymentHash,
-	/// Lifecycle phase of the invoice.
+	/// Lifecycle phase of the receive
 	pub state: LightningReceiveStateKind,
 	/// The invoice string, if known.
 	pub invoice: String,
@@ -788,27 +798,6 @@ mod test {
 	use bitcoin::FeeRate;
 	use super::*;
 
-	#[test]
-	fn ordinary_pending_balance_counts_each_bucket_once() {
-		let balance = Balance {
-			spendable: Amount::from_sat(2_000),
-			needs_refresh: Amount::ZERO,
-			pending_lightning_send: Amount::ZERO,
-			claimable_lightning_receive: Amount::ZERO,
-			pending_in_round: Amount::ZERO,
-			pending_board: Amount::ZERO,
-			pending_arkoor_send: Amount::ZERO,
-			pending_offboard: Amount::from_sat(5_000),
-			pending_exit: Amount::ZERO,
-		};
-		let summary = BalanceSummary::from(&balance);
-		assert_eq!(summary.spendable, Amount::from_sat(2_000));
-		assert_eq!(summary.pending, Amount::from_sat(5_000));
-		assert_eq!(summary.total, Amount::from_sat(7_000));
-		let encoded = serde_json::to_value(&summary).unwrap();
-		assert!(encoded.get("awaiting_settlement_sat").is_none());
-	}
-
 	fn lightning_receive_base_json() -> serde_json::Value {
 		serde_json::json!({
 			"amount_sat": 1000,
@@ -915,6 +904,7 @@ mod test {
 			max_vtxo_exit_depth: 10,
 			tos_link: None,
 			max_offboard_inputs: 4,
+			max_round_participation_outputs: 4,
 		}
 	}
 
@@ -984,6 +974,7 @@ mod test {
 				fees: j.fees.into(),
 				max_vtxo_exit_depth: j.max_vtxo_exit_depth,
 				max_offboard_inputs: j.max_offboard_inputs,
+				max_round_participation_outputs: j.max_round_participation_outputs,
 				tos_link: j.tos_link,
 			}
 		}

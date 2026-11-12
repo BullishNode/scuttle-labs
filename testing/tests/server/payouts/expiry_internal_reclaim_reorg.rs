@@ -113,7 +113,8 @@ async fn reclaim_reorg() {
 	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
 	let invoice = recipient.bolt11_invoice(sat(90_000), None, None).await.unwrap();
 	let hash = PaymentHash::from(&invoice);
-	let receiver_key = recipient.new_address().await.unwrap().policy().user_pubkey();
+	let receiver_keypair = super::receive_claim_keypair(&srv, &recipient, hash).await;
+	let receiver_key = receiver_keypair.public_key();
 	let receiver_destination = recipient.fallback_script();
 	let sender = ctx.bark("absent-sender", &srv).funded(sat(200_000)).create().await;
 	let ids = sender.board_and_confirm_and_register(&ctx, sat(100_000)).await;
@@ -143,9 +144,9 @@ async fn reclaim_reorg() {
 		intent_nonce: None, source_owner_signatures: Vec::new(),
 	}, &key).await).await.unwrap();
 	let granted = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(recipient.owner_link(receiver_key).await.unwrap().into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver_key.serialize().to_vec(),
 		htlc_recv_expiry: outgoing_deadline.to_u32(), lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(hash, outgoing_deadline, &receiver_keypair).serialize()),
 	}).await.unwrap().into_inner();
 	let grants = granted.htlc_vtxos.iter().map(|b| Vtxo::<Full>::deserialize(b).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.iter().map(|g| g.amount()).sum::<bitcoin::Amount>(), sat(90_000));
@@ -179,8 +180,7 @@ async fn reclaim_reorg() {
 					}
 				}
 				let count = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-					WHERE e.vtxo_id=$1 AND c.disposition='customer'", &[&source]).await?.get::<_, i64>(0))).await.unwrap();
+					WHERE c.vtxo_id=$1 AND c.disposition='customer'", &[&source]).await?.get::<_, i64>(0))).await.unwrap();
 				assert_eq!(count, 0, "sender allocation must wait through H+5 for every actual grant closure");
 			}
 			let Some(closures) = closures else { continue; };
@@ -290,7 +290,7 @@ async fn reclaim_reorg() {
 		tokio::time::sleep(Duration::from_millis(500)).await;
 	}
 	let sender_decisions = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.disposition='customer'",
+		WHERE c.vtxo_id=$1 AND c.disposition='customer'",
 		&[&source]).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(sender_decisions, 0, "the receiver's actual collection cannot also authorize a sender refund");
 	let current = assert_canonical_money(&ctx, &destination, &receiver_destination, sat(0), sat(88_000)).await;

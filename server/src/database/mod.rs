@@ -16,7 +16,6 @@ pub mod expiry_decision;
 pub mod expiry_ownership;
 pub mod expiry_payout;
 pub(crate) mod expiry_lightning;
-pub(crate) mod expiry_receive;
 
 mod ban;
 pub mod block;
@@ -38,11 +37,12 @@ mod query;
 pub use self::block::BlockTable;
 pub use self::model::*;
 
+
 use std::borrow::Borrow;
 use std::str::FromStr;
 use std::task;
 use std::backtrace::Backtrace;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -56,6 +56,7 @@ use bdk_wallet::{chain::Merge, ChangeSet};
 use bitcoin::{Amount, OutPoint, Script, Transaction, Txid};
 use bitcoin::consensus::{serialize, deserialize};
 use bitcoin::secp256k1::{self, PublicKey};
+use bitcoin_ext::BlockHeight;
 use chrono::Local;
 use futures::Stream;
 use tokio_postgres::{Client, NoTls, RowStream};
@@ -78,7 +79,7 @@ const NOARG: &[&bool] = &[];
 
 const DEFAULT_DATABASE: &str = "postgres";
 
-/// Advisory lock keys for PostgreSQL transaction and session locks.
+/// Advisory lock keys for `pg_advisory_xact_lock`.
 ///
 /// Each variant maps to a unique lock id. Using an enum avoids
 /// computing `hashtext(...)` at runtime and makes every lock site
@@ -268,7 +269,7 @@ impl Db {
 
 		let pool = Self::pool_connect(&config.name, config).await?;
 		let db = Db { pool, expiry_payouts };
-		// V78 stores the selected mode in the same transaction as its schema.
+		// V80 stores the selected mode in the same transaction as its schema.
 		db.run_migrations().await?;
 		let stored: bool = db.get_conn().await?.query_one(
 			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
@@ -350,15 +351,15 @@ impl Db {
 		if read_only {
 			// We want to commit read queries regardless of error because it's the
 			// fastest path and doesn't skew failure stats.
-			pgtx.commit().await.context("tx commit error")?;
+			pgtx.commit().await.context("db tx commit error")?;
 		} else {
 			if ret.is_ok() {
-				pgtx.commit().await.context("tx commit error")?;
+				pgtx.commit().await.context("db tx commit error")?;
 			} else {
-				pgtx.rollback().await.context("tx rollback error")?;
+				pgtx.rollback().await.context("db tx rollback error")?;
 			}
 		}
-		Ok(ret.context("tx body error")?)
+		Ok(ret.context("db tx body error")?)
 	}
 
 	/// Perform db operations in read-only mode
@@ -425,6 +426,13 @@ impl<'t> Tx<'t> {
 		query::try_get_bare_vtxo_by_id(&self, id).await
 	}
 
+	pub async fn get_existing_vtxos_by_id(
+		&self,
+		ids: &[VtxoId],
+	) -> anyhow::Result<HashMap<VtxoId, VtxoState<Full, ServerVtxoPolicy>>> {
+		query::get_existing_vtxos_by_id(&self, ids).await
+	}
+
 	pub async fn get_bare_vtxo_by_id(
 		&self,
 		id: VtxoId,
@@ -488,7 +496,7 @@ impl<'t> Tx<'t> {
 		&self,
 		update: tree::VtxoTreeUpdate,
 	) -> anyhow::Result<u64> {
-		tree::execute_vtxo_tree_update(self, update).await
+		tree::execute_vtxo_tree_update(&self, update).await
 	}
 
 	/// Queries a virtual transaction by txid
@@ -746,15 +754,26 @@ impl<'t> Tx<'t> {
 			res.push(entry);
 		}
 
-
 		Ok(res)
 	}
 
-	pub async fn store_round_participation_in_mailbox(
+	/// Store the completed round participations in their mailboxes, one
+	/// message per distinct pair, all under a single checkpoint.
+	///
+	/// Returns `None` if there is nothing to store.
+	pub async fn store_round_participations_in_mailbox(
 		&self,
-		mailbox_id: MailboxIdentifier,
-		unlock_hash: UnlockHash,
+		participations: impl IntoIterator<Item = (MailboxIdentifier, UnlockHash)>,
 	) -> anyhow::Result<Option<Checkpoint>> {
+		let mut seen = HashSet::new();
+		let (mailbox_ids, unlock_hashes): (Vec<_>, Vec<_>) = participations.into_iter()
+			.filter(|p| seen.insert(*p))
+			.map(|(m, h)| (m.to_string(), h.to_string()))
+			.unzip();
+		if mailbox_ids.is_empty() {
+			return Ok(None);
+		}
+
 		// Acquire advisory lock to serialize all mailbox writes.
 		// This prevents race conditions where checkpoints could be committed out of order.
 		// Lock is automatically released when transaction commits/rolls back.
@@ -764,17 +783,18 @@ impl<'t> Tx<'t> {
 
 		let checkpoint: i64 = self.query_one("SELECT next_checkpoint()", &[]).await?.get(0);
 
-		let statement = self.prepare("
+		let statement = self.prepare_typed("
 			INSERT INTO mailbox (unblinded_mailbox_id, unlock_hash, checkpoint, mailbox_type, created_at)
-			VALUES ($1, $2, $3, $4::TEXT::mailbox_type, NOW());
-		").await?;
+			SELECT m, h, $3, $4::TEXT::mailbox_type, NOW()
+			FROM unnest($1::TEXT[], $2::TEXT[]) AS p(m, h);
+		", &[Type::TEXT_ARRAY, Type::TEXT_ARRAY, Type::INT8, Type::TEXT]).await?;
 		let rows_updated = self.execute(&statement, &[
-			&mailbox_id.to_string(),
-			&unlock_hash.to_string(),
+			&mailbox_ids,
+			&unlock_hashes,
 			&checkpoint,
 			&MailboxType::RoundParticipationCompleted.as_str(),
 		]).await?;
-		debug_assert_eq!(rows_updated, 1);
+		debug_assert_eq!(rows_updated, mailbox_ids.len() as u64);
 
 		Ok(Some(checkpoint as u64))
 	}
@@ -878,6 +898,16 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<Checkpoint>> {
 		if vtxo_ids.is_empty() {
 			return Ok(None);
+		}
+		if self.expiry_payouts() {
+			let admitted = self.coin_owner_mailboxes(vtxo_ids).await?;
+			for id in vtxo_ids {
+				if admitted.get(id).is_some_and(|owner| *owner != mailbox_id.as_pubkey()) {
+					return crate::error::badarg!(
+						"vtxo {} is bound to another mailbox", id,
+					);
+				}
+			}
 		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
@@ -1019,7 +1049,7 @@ impl<'t> Tx<'t> {
 				&forfeit_result.connector_vtxos, SpendState::OffboardConnector
 			)
 			.mark_vtxos_offboard_spent(offboard_triples);
-		tree::execute_vtxo_tree_update(self, update).await?;
+		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// register the connector output vtxo directly into the frontier, so
 		// the watchman can sweep it once the input vtxos have expired
@@ -1035,23 +1065,48 @@ impl<'t> Tx<'t> {
 		funding_outpoint: OutPoint,
 		funding_spk: &Script,
 		exit_txid: Txid,
-	) -> anyhow::Result<Txid> {
+		owner_mailbox: Option<PublicKey>,
+		user_pubkey: PublicKey,
+	) -> anyhow::Result<(Txid, Option<PublicKey>)> {
 		let insert = self.prepare_typed(
-			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid)
-			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;",
-			&[Type::TEXT, Type::BYTEA, Type::TEXT],
+			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid, owner_mailbox, user_pubkey)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING;",
+			&[Type::TEXT, Type::BYTEA, Type::TEXT, Type::TEXT, Type::TEXT],
 		).await?;
 		let outpoint = funding_outpoint.to_string();
 		let spk = funding_spk.as_bytes();
-		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string()]).await?;
+		let mailbox = owner_mailbox.map(|key| key.to_string());
+		let user_key = user_pubkey.to_string();
+		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string(), &mailbox, &user_key]).await?;
 
 		// a separate statement, so it sees a row a concurrent insert committed
 		let select = self.prepare_typed(
-			"SELECT exit_txid FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
+			"SELECT exit_txid, owner_mailbox, user_pubkey FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
 			&[Type::TEXT, Type::BYTEA],
 		).await?;
 		let row = self.query_one(&select, &[&outpoint, &spk]).await?;
-		Ok(Txid::from_str(row.get("exit_txid"))?)
+		let stored_mailbox = row.get::<_, Option<&str>>("owner_mailbox").map(PublicKey::from_str).transpose()?;
+		if owner_mailbox.is_some() && owner_mailbox != stored_mailbox {
+			return crate::error::badarg!("board output already has another payout mailbox");
+		}
+		let stored_user_key = row.get::<_, Option<&str>>("user_pubkey");
+		if stored_user_key.is_some_and(|stored| stored != user_key)
+			|| (self.expiry_payouts() && stored_user_key.is_none()) {
+			return crate::error::badarg!("board output already has another owner key");
+		}
+		Ok((Txid::from_str(row.get("exit_txid"))?, stored_mailbox))
+	}
+
+	/// A board cosigned in payout mode is on the frontier before its funding
+	/// confirms. Forget the funding root of one still unconfirmed and
+	/// unregistered at its expiry, so it is not loaded on every block forever.
+	/// The holder keeps the cosigned exit; registering it inserts the root again.
+	pub async fn drop_unconfirmed_board_roots(&self, tip: BlockHeight) -> anyhow::Result<u64> {
+		Ok(self.execute("DELETE FROM vtxo v USING board_exit b \
+			WHERE v.frontier_at IS NOT NULL AND v.onchain_spent_height IS NULL \
+			AND v.confirmed_height IS NULL AND v.expiry<=$1 AND v.vtxo_id=b.funding_outpoint \
+			AND NOT EXISTS (SELECT 1 FROM vtxo child WHERE child.vtxo_txid=b.exit_txid)",
+			&[&i32::try_from(tip.to_u32())?]).await?)
 	}
 
 	/// Flip `wallet_commit` from FALSE to TRUE for the given offboard.

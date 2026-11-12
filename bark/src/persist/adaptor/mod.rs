@@ -79,6 +79,7 @@ use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 use crate::{WalletProperties, WalletVtxo};
 
+
 pub mod partition {
 	pub const PROPERTIES: u8 = 0;
 	#[allow(unused)]
@@ -116,9 +117,6 @@ pub mod partition {
 	/// An index from [WalletActionId] to the movement that action owns, so a
 	/// re-driven action step reuses its movement instead of duplicating it.
 	pub const MOVEMENT_ACTION: u8 = 17;
-
-	// Retired registration/receipt formats. Never reuse these partitions.
-	pub const LEGACY_SCUTTLE: std::ops::RangeInclusive<u8> = 18..=21;
 
 	pub const LAST_IDS: u8 = u8::MAX;
 }
@@ -446,10 +444,6 @@ impl<S: StorageAdaptor> StorageAdaptorWrapper<S> {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	async fn init_wallet(&self, properties: &WalletProperties) -> anyhow::Result<()> {
-		let mut lock = self.inner.write().await;
-		for old in partition::LEGACY_SCUTTLE {
-			ensure!(lock.get_all(old).await?.is_empty(), "old Scuttle state requires a fresh store");
-		}
 		let record = Record::from_data(
 			partition::PROPERTIES,
 			// NB: a single set of properties is stored, so no need for primary key
@@ -457,15 +451,11 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None,
 			properties,
 		)?;
-		lock.put(record).await
+		self.inner.write().await.put(record).await
 	}
 
 	async fn read_properties(&self) -> anyhow::Result<Option<WalletProperties>> {
-		let lock = self.inner.read().await;
-		for old in partition::LEGACY_SCUTTLE {
-			ensure!(lock.get_all(old).await?.is_empty(), "old Scuttle state requires a fresh store");
-		}
-		match lock.get(partition::PROPERTIES, &[]).await? {
+		match self.inner.read().await.get(partition::PROPERTIES, &[]).await? {
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
@@ -479,15 +469,6 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			&& properties.mailbox_identity.as_ref().is_none_or(|stored| *stored == identity),
 			"mailbox identity differs from the stored wallet");
 		properties.mailbox_identity = Some(identity);
-		lock.put(Record::from_data(partition::PROPERTIES, &[], None, &properties)?).await
-	}
-
-	async fn set_server_payouts(&self, payouts: bool) -> anyhow::Result<()> {
-		let mut lock = self.inner.write().await;
-		let mut properties: WalletProperties = lock.get(partition::PROPERTIES, &[]).await?
-			.context("wallet not initialized")?.to_data()?;
-		ensure!(properties.server_payouts.is_none_or(|stored| stored == payouts), "server payout mode has changed");
-		properties.server_payouts = Some(payouts);
 		lock.put(Record::from_data(partition::PROPERTIES, &[], None, &properties)?).await
 	}
 
@@ -1173,6 +1154,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			None => Ok(None),
 		}
 	}
+
 
 	async fn store_exit_vtxo_entry(&self, exit: &StoredExit) -> anyhow::Result<()> {
 		let record = Record::from_data(

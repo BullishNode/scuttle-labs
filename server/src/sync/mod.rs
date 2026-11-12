@@ -16,7 +16,7 @@ use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 use bitcoin_ext::BlockRef;
 
-use crate::database::{BlockTable, Db, Tx};
+use crate::database::{BlockTable, Db};
 use crate::system::RuntimeManager;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -70,15 +70,9 @@ pub trait ChainEventListener: Send + Sync {
 	///
 	/// Reorgs can be of arbitrary depth. Implementations should roll back any
 	/// state that depended on blocks after the fork point.
-	/// Use the supplied rollback transaction for database work: it already
-	/// holds the exclusive validity barrier. Borrowing another pooled
-	/// connection here can deadlock even with a single listener.
-	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: BlockRef) -> anyhow::Result<()>;
-
-	/// Refresh local caches after rollback SQL commits and releases its
-	/// connection, before replacement blocks or completed-view publication.
-	/// Financial rollback belongs in `on_reorg`, not this cache callback.
-	async fn on_reorg_committed(&self, _block_ref: BlockRef) -> anyhow::Result<()> { Ok(()) }
+	///
+	/// Also called once on startup with the indexed tip.
+	async fn on_reorg(&self, block_ref: BlockRef) -> anyhow::Result<()>;
 
 	/// Called when the mempool has been polled.
 	///
@@ -138,13 +132,25 @@ impl Process {
 		Ok(())
 	}
 
+	/// Takes a mempool snapshot and hands it to the listeners.
+	///
+	/// The snapshot is only handed on once no block arrived since it was taken,
+	/// so the listeners read it against the chain it was taken on.
 	async fn poll_mempool(&mut self) -> anyhow::Result<()> {
 		// We don't want false evictions.
 		// You should only do this if you are sure that
 		// all blocks are fully synced.
 		self.block_index.sync().await?;
 
-		let txids = self.bitcoind.get_raw_mempool().await?.0;
+		// Sync after the snapshot, so a block that took its txs out of it reads
+		// as confirmed. If that finds a block, retake the snapshot: a reorg puts
+		// orphaned txs back in the mempool.
+		let txids = loop {
+			let txids = self.bitcoind.get_raw_mempool().await?.0;
+			if !self.block_index.sync().await? {
+				break txids;
+			}
+		};
 		let mempool = RawMempool {
 			observed_at: chrono::Local::now(),
 			txids,

@@ -110,8 +110,6 @@ async fn recover_vtxos_by_xpub_splits_a_key_over_several_calls() {
 	let key2 = (0..3).map(|i| build(keypair(2), i)).collect::<Vec<_>>();
 
 	let db = Db::connect(&srv.config().postgres).await.expect("connect to captaind's postgres");
-	super::register_test_owners(&db, &srv.mailbox_keypair(), super::test_server_mailbox_key(),
-		&[keypair(0), keypair(2)]).await;
 	for batch in key0.chunks(RECOVERY_VTXO_PAGE_SIZE).chain([&key2[..]]) {
 		db.write(async |t| t.upsert_vtxos(batch.iter().map(|v| ServerVtxo::from(v.clone()))).await)
 			.await.expect("upsert vtxos");

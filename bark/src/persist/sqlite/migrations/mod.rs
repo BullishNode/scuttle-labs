@@ -219,6 +219,7 @@ impl MigrationContext {
 		Ok(new_version)
 	}
 
+
 	/// Creates the migrations table if it doesn't exist yet
 	fn create_migrations_table_if_not_exists(&self, conn: &Connection) -> anyhow::Result<()> {
 		let query =
@@ -251,6 +252,7 @@ trait Migration {
 		format!("{}->{}:'{}'", self.from_version(), self.to_version(), self.name())
 	}
 }
+
 
 #[cfg(test)]
 mod test {

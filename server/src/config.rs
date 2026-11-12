@@ -209,6 +209,9 @@ mod defaults {
 
 	/// Pending offboard sessions may lock a quarter of the rounds wallet.
 	pub fn offboard_max_locked_percent() -> u8 { 25 }
+
+	/// A round participation may have at most this many outputs.
+	pub fn max_round_participation_outputs() -> usize { 4 }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -286,6 +289,11 @@ pub struct Config {
 	#[serde(with = "utils::serde::duration")]
 	pub round_sign_time: Duration,
 	pub nb_round_nonces: usize,
+	/// The maximum number of outputs of a single round participation.
+	///
+	/// Must fit in a round, so at most `4 ^ nb_round_nonces`.
+	#[serde(default = "defaults::max_round_participation_outputs")]
+	pub max_round_participation_outputs: usize,
 	/// The duration after which to drop forfeit nonces
 	#[serde(with = "utils::serde::duration")]
 	pub round_forfeit_nonces_timeout: Duration,
@@ -406,6 +414,13 @@ pub struct Config {
 	/// when preparing a lightning claim.
 	pub ln_receive_anti_dos_required: bool,
 
+	/// Whether users can ask to have their Ark address put in the route
+	/// hints of their lightning receive invoices. Other users of this
+	/// server can then pay those invoices with an arkoor, without the
+	/// lightning send and receive fees.
+	#[serde(default)]
+	pub ln_receive_ark_address_hints: bool,
+
 	/// Indicates whether the Ark server requires clients to sign with the
 	/// participation's mailbox key when querying a round participation status.
 	#[serde(default)]
@@ -454,8 +469,7 @@ pub struct Config {
 	/// The maximum number of messages we return to mailbox queries.
 	///
 	/// A message holds a whole batch post, so a page can carry more rows
-	/// than this. The read and subscription endpoints cap this at eight
-	/// checkpoints to keep a response within Bark's decoding limit.
+	/// than this.
 	#[serde(alias = "read_mailbox_max_items")]
 	pub max_read_mailbox_items: usize,
 
@@ -495,13 +509,6 @@ pub struct Config {
 	/// Defaults to 1 hour. Only relevant if [Self::bitcoin_address_blocklist] is set.
 	#[serde(default, with = "utils::serde::duration::opt")]
 	pub bitcoin_address_blocklist_refresh_interval: Option<Duration>,
-
-	/// Require the board funding tx from users
-	///
-	/// This should be enforced always in prod, but in order to test backwards
-	/// compatibility, we allow disabling it in tests.
-	#[serde(default)]
-	pub require_board_funding_tx: bool,
 
 	/// Build round vtxo trees with the legacy v0 hashlock clauses.
 	///
@@ -614,6 +621,16 @@ impl Config {
 			);
 		}
 
+		let round_capacity = 4_usize.saturating_pow(self.nb_round_nonces as u32);
+		if self.max_round_participation_outputs == 0
+			|| self.max_round_participation_outputs > round_capacity
+		{
+			bail!("Invalid configuration: max_round_participation_outputs ({}) must be \
+				between 1 and the round capacity 4 ^ nb_round_nonces ({})",
+				self.max_round_participation_outputs, round_capacity,
+			);
+		}
+
 		// At 0 the wallet trusts every unconfirmed tx, including deposits
 		// from third parties, so coin selection would spend outputs that
 		// a double-spend can still invalidate.
@@ -643,10 +660,6 @@ impl Config {
 		// At 0 every xpub scan is rejected; recovery_xpub_nb_keys = 0 disables the rpc instead.
 		if self.max_concurrent_xpub_recoveries == 0 {
 			bail!("Invalid configuration: max_concurrent_xpub_recoveries must be at least 1");
-		}
-
-		if self.network == bitcoin::Network::Bitcoin && !self.require_board_funding_tx {
-			bail!("Cannot turn off require_board_funding_tx on mainnet");
 		}
 
 		if self.network == bitcoin::Network::Bitcoin && self.round_legacy_hashlock_clauses {
@@ -810,7 +823,6 @@ mod test {
 		let mut cfg = Config::load(DEFAULT_CAPTAIND_CONFIG_PATH).unwrap();
 		cfg.bitcoind.cookie = Some(".cookie".into());
 		cfg.network = bitcoin::Network::Bitcoin;
-		cfg.require_board_funding_tx = true;
 		cfg.validate().expect("default config on mainnet");
 
 		cfg.htlc_expiry_delta = BlockDelta::ZERO;
@@ -901,6 +913,21 @@ mod test {
 		let cfg = load(Path::new(DEFAULT_CAPTAIND_CONFIG_PATH), "10m");
 		assert_eq!(cfg.cln_xpay_max_retry_for, Duration::from_secs(5 * 60));
 		cfg.validate().expect_err("explicit maximum below the timeout");
+	}
+
+	#[test]
+	fn max_round_participation_outputs_must_fit_in_a_round() {
+		let mut cfg = Config::load(Path::new(DEFAULT_CAPTAIND_CONFIG_PATH)).unwrap();
+		cfg.bitcoind.cookie = Some(".cookie".into());
+		cfg.nb_round_nonces = 2;
+		cfg.max_round_participation_outputs = 16;
+		cfg.validate().expect("a whole round fits");
+
+		cfg.max_round_participation_outputs = 17;
+		cfg.validate().expect_err("more than a round holds");
+
+		cfg.max_round_participation_outputs = 0;
+		cfg.validate().expect_err("no outputs at all");
 	}
 
 	#[test]

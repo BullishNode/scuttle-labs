@@ -59,7 +59,6 @@ pub fn router() -> Router<Arc<ServerState>> {
 	request_body = bark_json::web::LightningInvoiceRequest,
 	responses(
 		(status = 200, description = "Returns the created invoice", body = bark_json::cli::InvoiceInfo),
-		(status = 409, description = "The server refused the operation or recipient; inspect the stable refusal code", body = error::FallbackRefusalError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Generates a new BOLT11 invoice for the specified amount via the Ark server, \
@@ -96,14 +95,14 @@ pub async fn generate_invoice(
 	responses(
 		(status = 200, description = "Returns the created invoice", body = bark_json::cli::InvoiceInfo),
 		(status = 400, description = "Bad request", body = error::BadRequestError),
-		(status = 409, description = "The server refused the operation or recipient; inspect the stable refusal code", body = error::FallbackRefusalError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
-	description = "Generates a new BOLT11 invoice. When paid, the wallet app claims the Lightning \
-		receive and forwards the resulting Ark VTXO to the specified Ark address mailbox. \
-		With expiry payouts enabled, the address must carry a joint owner link. The server verifies the link \
-		and preserves the recipient's immutable coin-to-mailbox binding. Missing or invalid ownership \
-		at expiry leaves that customer's bitcoin held instead of assigning it to the provider or operator. \
+	description = "Generates a new BOLT11 invoice. When paid, the wallet claims the Lightning \
+		receive and forwards the resulting Ark VTXO to the supplied Ark address mailbox. \
+		With expiry payouts enabled, the server binds the recipient output to the mailbox \
+		blinded in the supplied Ark address. The recipient wallet must verify the signed coin \
+		and its authenticated owner mailbox before crediting the receive. Missing or unresolved \
+		ownership at expiry leaves that customer's bitcoin held. \
 		The invoice expires after `expiry_secs` if given, otherwise after the Ark server's \
 		invoice expiry, which is also the longest it accepts.",
 	tag = "lightning"
@@ -293,7 +292,6 @@ pub async fn cancel_receive(
 			preimage if payment was immediately settled", body = bark_json::web::LightningPayResponse),
 		(status = 400, description = "The provided destination is not a valid \
 			BOLT11 invoice, BOLT12 offer, Lightning address, or LNURL", body = error::BadRequestError),
-		(status = 409, description = "The server refused the operation or recipient; inspect the stable refusal code", body = error::FallbackRefusalError),
 		(status = 500, description = "Internal server error", body = error::InternalServerError)
 	),
 	description = "Sends a payment to a Lightning destination. Accepts a BOLT11 invoice, \

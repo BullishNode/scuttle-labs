@@ -114,8 +114,22 @@ impl Server {
 			// nb this call is quite expensive computationally, so we don't want to
 			// keep the lock while doing it
 			let nonces = HarkForfeitNonces::generate(self.server_key.leak_ref(), unlock_hash);
-			ret.push(nonces.public_nonce());
-			self.forfeit_nonces.lock().insert_some(*vtxo, nonces);
+
+			// A concurrent request may have stored nonces meanwhile. Hand out
+			// those rather than overwrite them, so every caller gets the nonce
+			// whose secret the server keeps.
+			let mut stored = self.forfeit_nonces.lock();
+			let concurrent = stored.get(vtxo)
+				.and_then(|opt| opt.as_ref())
+				.filter(|n| n.unlock_hash == unlock_hash)
+				.map(|n| n.public_nonce());
+			match concurrent {
+				Some(pub_nonce) => ret.push(pub_nonce),
+				None => {
+					ret.push(nonces.public_nonce());
+					stored.insert_some(*vtxo, nonces);
+				},
+			}
 		}
 		Ok(ret)
 	}
@@ -194,25 +208,54 @@ impl Server {
 		let mut ff_txids = Vec::with_capacity(forfeits.len());
 		let mut ff_vtxos = Vec::with_capacity(forfeits.len());
 		let mut input_forfeit_pairs = Vec::with_capacity(forfeits.len());
+		// Verify every bundle before consuming any nonce, so an invalid bundle,
+		// which anyone knowing the participation can send, uses up none of them.
+		let mut pub_nonces = Vec::with_capacity(forfeits.len());
 		for (vtxo_ff, vtxo) in forfeits.iter().zip(&vtxos) {
+			let pub_nonce = {
+				let nonces = self.forfeit_nonces.lock();
+				let nonces = nonces.get(&vtxo_ff.vtxo_id).and_then(|n| n.as_ref()).with_badarg(||
+					format!("no forfeit nonces generated for vtxo {}", vtxo_ff.vtxo_id),
+				)?;
+				if nonces.unlock_hash != unlock_hash {
+					return badarg!("forfeit nonces were generated for unlock hash {} instead of {}",
+						nonces.unlock_hash, unlock_hash,
+					);
+				}
+				nonces.public_nonce()
+			};
+			if let Err(e) = vtxo_ff.verify(&vtxo.vtxo, &pub_nonce) {
+				return badarg!("forfeit validation failed for vtxo {}: {}", vtxo_ff.vtxo_id, e);
+			}
+			pub_nonces.push(pub_nonce);
+		}
+
+		// Then consume them all at once, unless a concurrent request did first.
+		let sec_nonces = {
+			let mut nonces = self.forfeit_nonces.lock();
+			for (vtxo_ff, pub_nonce) in forfeits.iter().zip(&pub_nonces) {
+				let unchanged = nonces.get(&vtxo_ff.vtxo_id).and_then(|n| n.as_ref())
+					.is_some_and(|n| n.public_nonce() == *pub_nonce);
+				if !unchanged {
+					return badarg!("forfeit nonces for vtxo {} were used or replaced meanwhile",
+						vtxo_ff.vtxo_id,
+					);
+				}
+			}
+			forfeits.iter()
+				.map(|ff| nonces.take(&ff.vtxo_id).expect("checked above").into_secret_nonce())
+				.collect::<Vec<_>>()
+		};
+
+		for (((vtxo_ff, vtxo), pub_nonce), sec_nonce) in forfeits.iter().zip(&vtxos)
+			.zip(pub_nonces).zip(sec_nonces)
+		{
 			let input = part.inputs.iter().find(|i| i.vtxo_id == vtxo_ff.vtxo_id)
 				.expect("checked this before");
-			let nonces = self.forfeit_nonces.lock().take(&input.vtxo_id).with_badarg(||
-				format!("no forfeit nonces generated for vtxo {}", input.vtxo_id),
-			)?;
-			if nonces.unlock_hash != unlock_hash {
-				return badarg!("forfeit nonces were generated for unlock hash {} instead of {}",
-					nonces.unlock_hash, unlock_hash,
-				);
-			}
-			let pub_nonce = nonces.public_nonce();
-			if let Err(e) = vtxo_ff.verify(&vtxo.vtxo, &pub_nonce) {
-				return badarg!("forfeit validation failed for vtxo {}: {}", input.vtxo_id, e);
-			}
 			let (_ff_sig, ff_tx, ff_vtxo) = vtxo_ff.finish(
 				&vtxo.vtxo,
 				&pub_nonce,
-				nonces.into_secret_nonce(),
+				sec_nonce,
 				self.server_key.leak_ref(),
 			);
 			let ff_txid = ff_tx.compute_txid();
@@ -225,6 +268,13 @@ impl Server {
 
 		let round_id = part.round_id.context("round participation has no round_id")?;
 		self.db.write(async |t| {
+			// Persist all signed forfeit txs in a single batch. Either all succeed or
+			// none do; on a partial failure the user retries with the same bundles.
+			t.set_forfeit_transactions(unlock_hash, &vtxo_ids, &ff_txs, &ff_txids).await
+				.context("error storing signed forfeit txs")?;
+
+			// Transition the round output vtxos from 'unclaimed' to 'spendable' and
+			// record the forfeit txid on the round inputs.
 			let round = t.get_round(round_id).await?
 				.context("round not found for participation")?;
 			// NB the round can predate the v1 hashlock clauses, so the tree's
@@ -238,20 +288,6 @@ impl Server {
 			let output_vtxo_ids = leaf_idxs.into_iter()
 				.map(|idx| tree.build_vtxo(idx).id())
 				.collect::<Vec<_>>();
-
-			let mut guarded_ids = vtxo_ids.clone();
-			guarded_ids.extend(output_vtxo_ids.iter().copied());
-			guarded_ids.sort_unstable();
-			guarded_ids.dedup();
-			crate::database::expiry_guard::guard_obligation_changes(t, &guarded_ids).await?;
-
-			// Persist all signed forfeit txs in a single batch. Either all succeed or
-			// none do; on a partial failure the user retries with the same bundles.
-			t.set_forfeit_transactions(unlock_hash, &vtxo_ids, &ff_txs, &ff_txids).await
-				.context("error storing signed forfeit txs")?;
-
-			// Transition the round output vtxos from 'unclaimed' to 'spendable' and
-			// record the forfeit txid on the round inputs.
 
 			let update = VtxoTreeUpdate::new()
 				.upsert_signed_tx(ff_txs)
