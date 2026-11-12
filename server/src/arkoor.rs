@@ -12,6 +12,7 @@ use ark::arkoor::package::{
 };
 
 use crate::database::htlc_vtxo::{self, HtlcResolution};
+use crate::database::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
 use crate::database::tree::VtxoTreeUpdate;
 use crate::destination::DestinationBindings;
 use crate::error::ContextExt;
@@ -97,6 +98,7 @@ impl Server {
 		&self,
 		builder: ArkoorPackageBuilder<ServerCanCosign>,
 		destinations: &DestinationBindings,
+		paid_receive: Option<&LightningHtlcSubscription>,
 	) -> anyhow::Result<(ArkoorPackageBuilder<ServerSigned>, u64)> {
 		let vtxo_guard = self.vtxos_in_flux.try_lock(builder.input_ids()).map_err(|e| {
 			slog!(ArkoorInputAlreadyInFlux, vtxo: e.id);
@@ -147,6 +149,20 @@ impl Server {
 			htlc_vtxo::set_htlc_vtxo_resolutions(
 				&t, &claimed_htlc_recvs, HtlcResolution::Fulfilled,
 			).await?;
+			if let Some(receive) = paid_receive {
+				// The arkoor settles the receive it pays, together with its
+				// own spend. A retry of the arkoor that settled it finds the
+				// receive settled and changes nothing.
+				let settled = t.store_lightning_htlc_subscription_status(
+					receive.id,
+					LightningHtlcSubscriptionStatus::Settled,
+					None,
+					Some(LightningHtlcSubscriptionStatus::Created),
+				).await?;
+				if !settled && inserted > 0 {
+					return badarg!("invoice is no longer payable");
+				}
+			}
 			Ok(inserted)
 		}).await?;
 		drop(vtxo_guard);
@@ -161,6 +177,7 @@ impl Server {
 		&self,
 		request: ArkoorPackageCosignRequest<VtxoId>,
 		destinations: &DestinationBindings,
+		paid_receive: Option<&LightningHtlcSubscription>,
 	) -> anyhow::Result<ArkoorPackageCosignResponse> {
 		let input_vtxo_ids = request.inputs().cloned().collect::<Vec<VtxoId>>();
 		let input_vtxo_states = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxo_ids).await).await?;
@@ -212,7 +229,9 @@ impl Server {
 			v.check_spendable_for_oor(chain_tip, *spending_txid)?;
 		}
 
-		let (builder, inserted) = self.cosign_oor_with_builder(builder, destinations).await?;
+		let (builder, inserted) = self.cosign_oor_with_builder(
+			builder, destinations, paid_receive,
+		).await?;
 
 		slog!(ArkoorCosign, input_ids: input_vtxo_ids,
 			output_ids: builder.build_unsigned_vtxos().into_iter().map(|v| v.id()).collect(),

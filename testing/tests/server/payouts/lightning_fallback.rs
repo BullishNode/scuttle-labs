@@ -21,6 +21,7 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 		payment_hash: hash.to_vec(), amount_sat: 90_000, min_cltv_delta: 58,
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
 		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
+		ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
 	let mut payer = lightning.external.grpc_client().await;
@@ -117,6 +118,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		payment_hash: hash.to_vec(), amount_sat: 100_000, min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
 		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
+		ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	let pay_task = {
 		let payer = payer.clone();
@@ -358,6 +360,7 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 		mailbox_id: Some(MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
 		description: None, expiry_secs: None,
 		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
+		ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	let pay_task = {
 		let payer = payer.clone();

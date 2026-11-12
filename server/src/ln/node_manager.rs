@@ -502,7 +502,9 @@ impl LightningManager {
 
 	/// Finish the backend cancellation and notifications after the attempt
 	/// and its successful subscription promotion committed together.
-	async fn finish_intra_ark_payment(
+	///
+	/// An arkoor that paid the receive directly finishes the same way.
+	pub(crate) async fn finish_intra_ark_payment(
 		&self,
 		subscription: LightningHtlcSubscription,
 	) {
@@ -634,6 +636,7 @@ impl LightningManager {
 		description: Option<String>,
 		receiver_mailbox_id: Option<MailboxIdentifier>,
 		claim_pubkey: Option<PublicKey>,
+		route_hints: Vec<(PublicKey, u64)>,
 	) -> anyhow::Result<Bolt11Invoice> {
 		let node = self.hold_active_node().context("no active hold-compatible cln node")?;
 		let mut hold_client = node.hold_rpc.clone().expect("hold-active node has hold_rpc");
@@ -643,7 +646,17 @@ impl LightningManager {
 			amount_msat: amount.to_msat(),
 			min_final_cltv_expiry: Some(cltv_delta.into()),
 			expiry: Some(expiry.as_secs()),
-			routing_hints: vec![],
+			routing_hints: route_hints.into_iter().map(|(node_id, short_channel_id)| {
+				hold_plugin::RoutingHint {
+					hops: vec![hold_plugin::Hop {
+						public_key: node_id.serialize().to_vec(),
+						short_channel_id,
+						base_fee: 0,
+						ppm_fee: 0,
+						cltv_expiry_delta: 0,
+					}],
+				}
+			}).collect(),
 			description: description.map(hold_plugin::invoice_request::Description::Memo),
 		}).await?.into_inner();
 
