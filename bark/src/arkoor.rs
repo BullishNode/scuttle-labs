@@ -8,6 +8,7 @@ use log::{error, info, warn};
 
 use ark::{ProtocolEncoding, VtxoPolicy};
 use ark::arkoor::ArkoorDestination;
+use ark::lightning::{Bolt11Invoice, PaymentHash};
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
 use ark::vtxo::{Full, Vtxo, VtxoId};
 use server_rpc::{protos, ServerConnection};
@@ -213,6 +214,7 @@ impl Wallet {
 		change_keypair: Keypair,
 		change_pieces: Option<Vec<Amount>>,
 		destination_address: Option<ark::Address>,
+		paid_invoice: Option<PaymentHash>,
 	) -> anyhow::Result<ArkoorCreateResult> {
 		let (mut srv, _) = self.require_server().await?;
 		let input_ids = inputs.into_iter().map(|v| v.id()).collect::<Vec<_>>();
@@ -267,7 +269,15 @@ impl Wallet {
 			.into_iter().collect::<BTreeMap<_, _>>();
 		self.attach_payout_destinations(&mut cosign_request, &supplied).await?;
 
-		let response = srv.client.request_arkoor_cosign(cosign_request).await
+		let response = match paid_invoice {
+			Some(payment_hash) => srv.client.request_lightning_receive_arkoor_cosign(
+				protos::LightningReceiveArkoorCosignRequest {
+					payment_hash: payment_hash.to_vec(),
+					cosign_request: Some(cosign_request),
+				},
+			).await,
+			None => srv.client.request_arkoor_cosign(cosign_request).await,
+		}
 			.context("error requesting arkoor cosign")?
 			.into_inner();
 
@@ -308,7 +318,18 @@ impl Wallet {
 		destination: &ark::Address,
 		amount: Amount,
 	) -> anyhow::Result<MovementId> {
-		let action = start_arkoor_send(self, destination.clone(), amount).await?;
+		self.send_arkoor(destination, amount, None).await
+	}
+
+	/// Make an arkoor payment, which pays `paid_invoice` when given. See
+	/// [Self::send_arkoor_payment].
+	pub(crate) async fn send_arkoor(
+		&self,
+		destination: &ark::Address,
+		amount: Amount,
+		paid_invoice: Option<Bolt11Invoice>,
+	) -> anyhow::Result<MovementId> {
+		let action = start_arkoor_send(self, destination.clone(), amount, paid_invoice).await?;
 		let action_id = action.id();
 
 		// Lock the action before its checkpoint exists. Otherwise a wallet sync

@@ -128,6 +128,7 @@ async fn unrelated_preimage_does_not_claim_failed_send_source_in_mode(payout: bo
 		mailbox_id: payout.then(|| ark::mailbox::MailboxIdentifier::from_pubkey(key.public_key()).serialize()),
 		description: None, expiry_secs: None,
 		claim_pubkey: payout.then(|| key.public_key().serialize().to_vec()),
+		ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	let paying = {
 		let eve_ln = eve_ln.clone();

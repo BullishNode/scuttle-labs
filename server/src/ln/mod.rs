@@ -29,7 +29,11 @@ use ark::arkoor::package::{ArkoorPackageCosignRequest, ArkoorPackageCosignRespon
 use ark::attestations::{LightningReceiveAttestation, LightningReceiveClaimAttestation, LightningSendIntent};
 use ark::fees::{validate_and_subtract_fee, VtxoFeeInfo};
 use ark::integration::{TokenStatus, TokenType};
-use ark::lightning::{Bolt12Invoice, Invoice, Offer, PaymentHash, PaymentStatus, Preimage};
+use ark::address::VtxoDelivery;
+use ark::lightning::{
+	ark_address_route_hints, Bolt12Invoice, Invoice, Offer, PaymentHash, PaymentStatus, Preimage,
+};
+use ark::mailbox::{BlindedMailboxIdentifier, MailboxIdentifier};
 use ark::util::IteratorExt;
 use server_rpc::protos::{self, InputVtxo, lightning_payment_status};
 use server_rpc::protos::prepare_lightning_receive_claim_request::LightningReceiveAntiDos;
@@ -283,7 +287,7 @@ impl Server {
 
 		slog!(LightningPayHtlcsRequested, payment_hash, expiry);
 
-		let (builder, _) = self.cosign_oor_with_builder(builder, destinations).await?;
+		let (builder, _) = self.cosign_oor_with_builder(builder, destinations, None).await?;
 		Ok(builder.cosign_response())
 	}
 
@@ -695,6 +699,7 @@ impl Server {
 		description: Option<String>,
 		expiry: Option<Duration>,
 		claim_pubkey: Option<PublicKey>,
+		ark_address_hint: bool,
 	) -> anyhow::Result<protos::StartLightningReceiveResponse> {
 		info!("Starting bolt11 board with payment_hash: {}", payment_hash.as_hex());
 
@@ -812,8 +817,16 @@ impl Server {
 		// between last lightning htlc and htlc-recv vtxo one
 		let ln_cltv_delta = min_cltv_delta + self.config.htlc_expiry_delta;
 
+		let route_hints = match (claim_pubkey, mailbox_id) {
+			(Some(claim_pubkey), Some(mailbox_id))
+				if ark_address_hint && self.config.ln_receive_ark_address_hints
+			=> self.ark_address_route_hints(claim_pubkey, mailbox_id)?.to_vec(),
+			_ => vec![],
+		};
+
 		let invoice = self.lightning_manager.generate_invoice(
 			payment_hash, amount, ln_cltv_delta, expiry, description, mailbox_id, claim_pubkey,
+			route_hints,
 		).await?;
 		trace!("Hold invoice created. payment_hash: {}, amount: {}, {}",
 			payment_hash, amount, invoice.to_string(),
@@ -822,6 +835,72 @@ impl Server {
 		Ok(protos::StartLightningReceiveResponse {
 			bolt11: invoice.to_string()
 		})
+	}
+
+	/// The route hints that put the Ark address of a user's key and mailbox
+	/// in an invoice.
+	fn ark_address_route_hints(
+		&self,
+		user_pubkey: PublicKey,
+		mailbox_id: MailboxIdentifier,
+	) -> anyhow::Result<[(PublicKey, u64); 2]> {
+		// The ECDH of our mailbox key with the user's key is the one the
+		// user blinds its mailbox with in its own addresses.
+		let blinded_id = BlindedMailboxIdentifier::new(
+			mailbox_id, user_pubkey, self.mailbox_key.leak_ref(),
+		).badarg("claim key doesn't blind the mailbox")?;
+
+		let address = ark::Address::new(
+			self.config.network != bitcoin::Network::Bitcoin,
+			self.server_pubkey,
+			VtxoPolicy::new_pubkey(user_pubkey),
+			vec![VtxoDelivery::ServerMailbox { blinded_id }],
+		);
+		ark_address_route_hints(&address).context("address has no route hints")
+	}
+
+	/// Cosign an arkoor that pays the invoice of a lightning receive on the
+	/// Ark address in its route hints, which settles the receive.
+	///
+	/// The invoice can no longer be paid afterwards, like when it was paid
+	/// over lightning.
+	#[tracing::instrument(skip(self, request, destinations))]
+	pub(crate) async fn cosign_lightning_receive_arkoor(
+		&self,
+		payment_hash: PaymentHash,
+		request: ArkoorPackageCosignRequest<VtxoId>,
+		destinations: &DestinationBindings,
+	) -> anyhow::Result<ArkoorPackageCosignResponse> {
+		if !self.config.ln_receive_ark_address_hints {
+			return badarg!("paying invoices by arkoor is disabled on this server");
+		}
+
+		// Held for the whole call, so no other call decides on this payment
+		// while the arkoor is validated and the receive settled.
+		let _guard = self.payment_guards.lock(payment_hash).await;
+
+		let sub = self.db.read(async |t| t.get_htlc_subscription_by_payment_hash(payment_hash).await).await?
+			.not_found([payment_hash], "no pending payment with this payment hash")?;
+		let claim_pubkey = sub.claim_pubkey.badarg("invoice has no Ark address")?;
+		// A retry of the arkoor that settled the receive is cosigned again.
+		if sub.status == LightningHtlcSubscriptionStatus::Created && sub.invoice.is_expired() {
+			return badarg!("invoice is no longer payable");
+		}
+
+		let policy = VtxoPolicy::new_pubkey(claim_pubkey);
+		let paid = request.all_outputs()
+			.filter(|o| o.policy == policy)
+			.map(|o| o.total_amount)
+			.sum::<Amount>();
+		if paid < sub.amount() {
+			return badarg!("arkoor pays {} of the {} invoice", paid, sub.amount());
+		}
+
+		let response = self.cosign_oor(request, destinations, Some(&sub)).await?;
+
+		self.lightning_manager.finish_intra_ark_payment(sub).await;
+
+		Ok(response)
 	}
 
 	/// Polls until the HTLC subscription for `payment_hash` reaches a
@@ -1222,7 +1301,7 @@ impl Server {
 				.context("could not settle hold invoice, refusing to release the claim")?;
 		}
 
-		let (builder, _) = self.cosign_oor_with_builder(builder, destinations).await?;
+		let (builder, _) = self.cosign_oor_with_builder(builder, destinations, None).await?;
 		let vtxo_request = VtxoRequest {
 			amount: sub.amount(),
 			policy: vtxo_policy,
