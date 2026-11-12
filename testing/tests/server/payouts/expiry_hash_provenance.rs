@@ -164,7 +164,8 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[ark::ServerVtxo::from(sources[1].0.clone()).to_bare()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == grants[1]).unwrap();
 	let proposal = db.read(async |t| t.propose_expiry_ownership(fact, expired).await).await.unwrap();
-	assert_eq!(proposal.disposition, OwnershipDisposition::Customer { user_pubkey: sources[1].1.public_key() });
+	let birth = db.read(async |t| t.coin_owner_mailboxes(&[grants[1]]).await).await.unwrap()[&grants[1]];
+	assert_eq!(proposal.disposition, OwnershipDisposition::Customer { mailbox: birth });
 
 	let (allocation, payout) = super::expiry_test::wait_payout(&db, grants[1]).await;
 	assert_eq!(ctx.bitcoind().await_transaction(payout.compute_txid()).await, payout);

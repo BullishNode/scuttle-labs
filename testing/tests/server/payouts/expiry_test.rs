@@ -14,7 +14,6 @@ use bark::Wallet;
 use bark::vtxo::VtxoState;
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, Txid, TxOut};
 use bitcoin::consensus::deserialize;
-use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
@@ -105,7 +104,7 @@ pub(super) async fn confirm_epoch(
 	let rows = tokio::time::timeout(Duration::from_secs(40), async {
 		for _ in 0..20 {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
-				c.subsidy_sat,c.forfeited_sat,c.spk,c.owner_mailbox,c.user_pubkey,a.id,a.sweep_tx,a.sweep_txid \
+				c.subsidy_sat,c.forfeited_sat,c.owner_mailbox,a.id,a.sweep_tx,a.sweep_txid \
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
 				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids],
@@ -134,9 +133,8 @@ pub(super) async fn confirm_epoch(
 		assert_eq!(row.get::<_, i64>("payout_sat"), leaf.payout as i64);
 		assert_eq!(row.get::<_, i64>("subsidy_sat"), leaf.subsidy as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), leaf.forfeited as i64);
-		assert_eq!(row.get::<_, String>("spk"), leaf.script.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, String>("owner_mailbox"), leaf.mailbox.as_pubkey().to_string());
-		assert_eq!(row.get::<_, String>("user_pubkey"), leaf.coin.user_pubkey().to_string());
+		assert_eq!(ark::fallback::payout_script(leaf.mailbox.as_pubkey()), leaf.script);
 		let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 		let txid = parent.compute_txid();
 		assert_eq!(row.get::<_, String>("sweep_txid"), txid.to_string());

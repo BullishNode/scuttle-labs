@@ -3,28 +3,16 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context;
-use bitcoin::{Amount, ScriptBuf, Txid};
-use bitcoin::hex::DisplayHex;
-use bitcoin::secp256k1::PublicKey;
+use bitcoin::{Amount, Txid};
 
 use ark::{ServerVtxo, VtxoId};
 use chrono::{DateTime, Local};
 
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use super::expiry_inventory::BackingSnapshot;
-use super::expiry_ownership::{OwnershipBindingSource, OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
+use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use super::{SpendState, Tx};
 use crate::watchman::settlement::{allocate, CustomerLeaf};
-
-pub struct VerifiedPayee {
-	pub mailbox: PublicKey,
-	pub script: ScriptBuf,
-}
-
-pub struct ReadyCoin {
-	pub ownership: OwnershipProposal,
-	pub payee: Option<VerifiedPayee>,
-}
 
 fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
 	match evidence {
@@ -51,7 +39,7 @@ fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
 /// every fact it depends on is unchanged under phase B's locks.
 pub struct ExpiryRootPlan {
 	root: ServerVtxo,
-	coins: Vec<ReadyCoin>,
+	coins: Vec<OwnershipProposal>,
 	branch: ExpiryBranchState,
 	existing_entitlements: BTreeMap<VtxoId, i64>,
 }
@@ -143,28 +131,19 @@ impl Tx<'_> {
 				}
 			}
 			let ownership = self.propose_expiry_ownership(fact, view.height).await?;
-			let payee = match &ownership.disposition {
-				OwnershipDisposition::Customer { .. } => match self.derived_expiry_owner(&ownership).await? {
-					super::expiry_attribution::Attribution::Owned { mailbox_pk, spk } => Some(VerifiedPayee { mailbox: mailbox_pk, script: spk }),
-					super::expiry_attribution::Attribution::Unresolved => {
-						self.observe_expiry_hold(ownership.id, "owner_binding_unresolved"); valid = false; continue;
-					},
-				},
-				OwnershipDisposition::Operator => None,
-				OwnershipDisposition::Unresolved(reason) => {
-					self.observe_expiry_hold(ownership.id, reason);
-					valid = false; continue;
-				},
-			};
+			if let OwnershipDisposition::Unresolved(reason) = ownership.disposition {
+				self.observe_expiry_hold(ownership.id, reason);
+				valid = false; continue;
+			}
 			if let Some((entitlement, free)) = self.expiry_entitlement(ownership.id).await? {
 				valid &= free;
 				existing_entitlements.insert(ownership.id, entitlement);
 			}
-			coins.push(ReadyCoin { ownership, payee });
+			coins.push(ownership);
 		}
 		if coins.is_empty() { self.observe_expiry_hold(root.id(), "current_branch_has_no_owned_terminal"); }
 		if valid && !coins.is_empty() {
-			let cancellations = coins.iter().flat_map(|coin| coin.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
+			let cancellations = coins.iter().flat_map(|coin| coin.cancellations.iter().copied()).collect::<Vec<_>>();
 			valid = self.can_cancel_expiry_participations(&cancellations).await?;
 		}
 		if !valid || coins.is_empty() { return Ok(None); }
@@ -184,7 +163,7 @@ impl Tx<'_> {
 		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
 		let (snapshot, current) = self.expiry_branch_state(std::slice::from_ref(&root)).await?;
 		ensure!(current == branch, "expiry branch changed during analysis");
-		let lightning = coins.iter().filter(|coin| !matches!(coin.ownership.evidence,
+		let lightning = coins.iter().filter(|coin| !matches!(coin.evidence,
 			Some(OwnershipEvidence::Pubkey | OwnershipEvidence::Board | OwnershipEvidence::IrreversibleEntitlement | OwnershipEvidence::InputOwner
 				| OwnershipEvidence::Pool | OwnershipEvidence::Padding | OwnershipEvidence::Forfeit
 				| OwnershipEvidence::Offboard | OwnershipEvidence::Exchange { .. }))).collect::<Vec<_>>();
@@ -195,45 +174,39 @@ impl Tx<'_> {
 			subscriptions.sort_unstable(); subscriptions.dedup();
 			self.query("SELECT id FROM lightning_htlc_subscription WHERE id=ANY($1) ORDER BY id FOR SHARE", &[&subscriptions]).await?;
 			for coin in lightning {
-				let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == coin.ownership.id)
+				let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == coin.id)
 					.context("expiry coin left its branch")?;
-				ensure!(self.propose_expiry_ownership(fact, view.height).await? == coin.ownership,
+				ensure!(self.propose_expiry_ownership(fact, view.height).await? == *coin,
 					"expiry Lightning facts changed during analysis");
 			}
 		}
 		for coin in &coins {
-			ensure!(self.expiry_entitlement(coin.ownership.id).await?
-				== existing_entitlements.get(&coin.ownership.id).map(|id| (*id, true)), "expiry entitlement changed during analysis");
+			ensure!(self.expiry_entitlement(coin.id).await?
+				== existing_entitlements.get(&coin.id).map(|id| (*id, true)), "expiry entitlement changed during analysis");
 		}
 		// Each owner pays one fee for this root, whatever else expires at
 		// the same height.
-		let leaves = coins.iter().filter_map(|c| c.payee.as_ref().map(|payee| CustomerLeaf {
-			id: c.ownership.id, script: payee.script.clone(), amount: c.ownership.gross,
-		})).collect();
+		let leaves = coins.iter().filter_map(|c| match c.disposition {
+			OwnershipDisposition::Customer { mailbox } => Some(CustomerLeaf {
+				id: c.id, script: ark::fallback::payout_script(mailbox), amount: c.gross,
+			}),
+			_ => None,
+		}).collect();
 		let amounts = allocate(leaves)?;
 
 		// Final selection precedes every cancellation effect. The branch was
 		// locked and rechecked without writes above; an unexpected change in
 		// the cancellations now rolls back the entire decision transaction.
-		let cancellations = coins.iter().flat_map(|c| c.ownership.cancellations.iter().copied()).collect::<Vec<_>>();
+		let cancellations = coins.iter().flat_map(|c| c.cancellations.iter().copied()).collect::<Vec<_>>();
 		ensure!(self.cancel_expiry_participations(&cancellations).await?, "selected expiry cancellation changed under its locks");
 		let policy = amounts.iter()
 			.map(|a| (a.id,a)).collect::<BTreeMap<_, _>>();
 		let id: i64 = self.query_one("INSERT INTO expiry_allocation(expiry_height) VALUES($1) RETURNING id",
 			&[&i32::try_from(root.expiry_height().to_u32())?]).await?.get(0);
 		self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&root.id().to_string()]).await?;
-		for coin in &coins {
-			let proposal = &coin.ownership;
+		for proposal in &coins {
 			let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
-			let mut observed = evidence_json(evidence);
-			if matches!(proposal.disposition, OwnershipDisposition::Customer { .. }) {
-				observed["binding_source"] = match &proposal.binding_source {
-					OwnershipBindingSource::Coin(id) => serde_json::json!({"kind":"coin","id":id.to_string()}),
-					OwnershipBindingSource::InputCoins(ids) => serde_json::json!({"kind":"input_coins",
-						"ids":ids.iter().map(ToString::to_string).collect::<Vec<_>>() }),
-					OwnershipBindingSource::Allocation(id) => serde_json::json!({"kind":"allocation","id":id}),
-				};
-			}
+			let observed = evidence_json(evidence);
 			let entitlement = if let Some(existing) = existing_entitlements.get(&proposal.id) {
 				*existing
 			} else {
@@ -249,29 +222,19 @@ impl Tx<'_> {
 			let payout = allocation.map_or(Amount::ZERO, |a| a.payout).to_sat();
 			let forfeited = allocation.map_or(Amount::ZERO, |a| a.forfeited).to_sat();
 			let subsidy = allocation.map_or(Amount::ZERO, |a| a.subsidy).to_sat();
-			let (mailbox, user_key, script) = match (&proposal.disposition, &coin.payee) {
-				(OwnershipDisposition::Customer { user_pubkey, .. }, Some(payee)) => (
-					Some(payee.mailbox.to_string()),
-					Some(user_pubkey.to_string()),
-					Some(payee.script.as_bytes().to_lower_hex_string())
-				),
-				_ => (None, None, None),
-			};
-			let disposition = match (&proposal.disposition, &coin.payee) {
-				(OwnershipDisposition::Customer { .. }, Some(_)) => "customer",
-				(OwnershipDisposition::Operator, None) => "operator",
-				_ => bail!("allocation ownership lacks its verified payout destination"),
+			let (disposition, mailbox) = match proposal.disposition {
+				OwnershipDisposition::Customer { mailbox } => ("customer", Some(mailbox.to_string())),
+				OwnershipDisposition::Operator => ("operator", None),
+				OwnershipDisposition::Unresolved(_) => bail!("allocation ownership is unresolved"),
 			};
 			self.execute("
-				INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,user_pubkey,spk,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,evidence)
-				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::TEXT::JSONB)
+				INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,evidence)
+				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::TEXT::JSONB)
 			",
 				&[
 					&id,
 					&entitlement,
 					&mailbox,
-					&user_key,
-					&script,
 					&disposition,
 					&i64::try_from(proposal.gross.to_sat())?,
 					&i64::try_from(fee)?,

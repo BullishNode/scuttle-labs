@@ -357,6 +357,7 @@ fn internal_safe_pool_grants()
 		}
 		assert_eq!(least_depth, 6);
 		let point = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
+		let birth = db.read(async |t| t.coin_owner_mailboxes(&[source]).await).await.unwrap()[&source];
 		tokio::time::timeout(Duration::from_secs(10), async {
 			loop {
 				let proposal = db.read(async |t| {
@@ -365,7 +366,7 @@ fn internal_safe_pool_grants()
 					Ok(Some(t.propose_expiry_ownership(&fact, view.height).await?))
 				}).await.unwrap();
 				if let Some(proposal) = proposal {
-					if matches!(proposal.disposition, server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey } if user_pubkey == key.public_key()) {
+					if proposal.disposition == (server::database::expiry_ownership::OwnershipDisposition::Customer { mailbox: birth }) {
 						assert!(matches!(proposal.evidence,
 							Some(server::database::expiry_ownership::OwnershipEvidence::HtlcInternalGrantsReclaimed { payment_hash, .. }) if payment_hash == hash));
 						break;

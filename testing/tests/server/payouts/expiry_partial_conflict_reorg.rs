@@ -12,7 +12,6 @@ use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, TxOut, Txid};
 use bitcoin::consensus::deserialize;
-use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockDelta, BlockRef};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{BlockTable, Db};
@@ -26,7 +25,7 @@ async fn assert_physical_cut(
 	expected_payers: &BTreeMap<String, Txid>, stored_parents: &BTreeMap<i64, Transaction>,
 	canonical: &BTreeMap<Txid, BlockHash>, backing: &BTreeMap<OutPoint, TxOut>,
 	sponsors: &BTreeMap<OutPoint, TxOut>, customer: &ScriptBuf,
-	owner_mailbox: &str, owner_keys: &BTreeMap<String, String>,
+	owner_mailbox: &str,
 	initial_funding: &BTreeMap<OutPoint, TxOut>, boards: &BTreeMap<Txid, Transaction>,
 	ordinary_change: &BTreeMap<OutPoint, TxOut>, board_fee: Amount,
 ) -> (BTreeMap<Txid, Transaction>, Amount, Amount) {
@@ -83,7 +82,7 @@ async fn assert_physical_cut(
 	assert_eq!(actual_board_fee, board_fee);
 	fee_total += actual_board_fee;
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS entitlement_gross,c.disposition,c.owner_mailbox, \
-		c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.status,a.confirmed_height,a.confirmed_hash \
+		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.status,a.confirmed_height,a.confirmed_hash \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE a.status<>'conflicted' AND e.vtxo_id=ANY($1)", &[&coins]).await?)).await.unwrap();
 	assert_eq!(rows.len(), coins.len());
@@ -95,8 +94,6 @@ async fn assert_physical_cut(
 		let point = parent_points[&payer];
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner_mailbox);
-		assert_eq!(row.get::<_, String>("user_pubkey"), owner_keys[&coin]);
-		assert_eq!(row.get::<_, String>("spk"), customer.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 		assert_eq!(row.get::<_, i64>("entitlement_gross"), 100_000);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
@@ -301,10 +298,6 @@ async fn partial_conflict_reorg() {
 	let owner_mailbox = client.mailbox_identifier().as_pubkey();
 
 	let exiting_key = client.get_vtxo_key(&exiting).await.unwrap();
-	let owner_keys = BTreeMap::from([
-		(exiting.id().to_string(), exiting_key.public_key().to_string()),
-		(untouched.id().to_string(), client.get_vtxo_key(&untouched).await.unwrap().public_key().to_string()),
-	]);
 	assert_ne!(exiting.chain_anchor(), untouched.chain_anchor());
 	assert_eq!(exiting.expiry_height(), untouched.expiry_height());
 	assert_eq!(exiting.amount() + untouched.amount(), sat(200_000));
@@ -579,7 +572,7 @@ async fn partial_conflict_reorg() {
 	assert_final_outcome(&ctx, &db, &coins, &expected_payers, &stored_parents, &canonical).await;
 	let physical_cut = Box::pin(assert_physical_cut(&ctx, &db, &srv, &coins, &expected_payers,
 		&stored_parents, &canonical, &backing, &fee_sponsors, &destination,
-		&owner_mailbox.to_string(), &owner_keys, &initial_funding, &boards, &ordinary_change, board_fee)).await;
+		&owner_mailbox.to_string(), &initial_funding, &boards, &ordinary_change, board_fee)).await;
 	assert_eq!(decided_obligations(&db, &coins).await, permanent);
 	// Reconsidering a shorter real branch must not resurrect the old claim's
 	// economic payment or supersede the longer canonical payout branch.
@@ -594,7 +587,7 @@ async fn partial_conflict_reorg() {
 	assert_final_outcome(&ctx, &db, &coins, &expected_payers, &stored_parents, &canonical).await;
 	assert_eq!(Box::pin(assert_physical_cut(&ctx, &db, &srv, &coins, &expected_payers,
 		&stored_parents, &canonical, &backing, &fee_sponsors, &destination,
-		&owner_mailbox.to_string(), &owner_keys, &initial_funding, &boards, &ordinary_change, board_fee)).await, physical_cut,
+		&owner_mailbox.to_string(), &initial_funding, &boards, &ordinary_change, board_fee)).await, physical_cut,
 		"a settled reconsider cycle must retain the same canonical signed packages and physical money cut");
 	assert!(rpc.custom_get_raw_transaction_info(claim_txid, None).unwrap()
 		.is_none_or(|info| info.confirmations.unwrap_or(0) == 0));

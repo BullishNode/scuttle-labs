@@ -66,8 +66,6 @@ CREATE TABLE expiry_allocation_coin (
 	allocation_id BIGINT NOT NULL REFERENCES expiry_allocation(id),
 	entitlement_id BIGINT NOT NULL REFERENCES expiry_entitlement(id),
 	owner_mailbox TEXT CHECK (owner_mailbox IS NULL OR length(owner_mailbox) = 66),
-	user_pubkey TEXT,
-	spk TEXT,
 	disposition TEXT NOT NULL CHECK (disposition IN ('customer', 'operator')),
 	gross_sat BIGINT NOT NULL CHECK (gross_sat > 0),
 	fee_sat BIGINT NOT NULL CHECK (fee_sat >= 0),
@@ -76,8 +74,8 @@ CREATE TABLE expiry_allocation_coin (
 	subsidy_sat BIGINT NOT NULL DEFAULT 0 CHECK (subsidy_sat >= 0),
 	evidence JSONB NOT NULL,
 	PRIMARY KEY (allocation_id, entitlement_id),
-	CHECK ((disposition = 'customer' AND owner_mailbox IS NOT NULL AND user_pubkey IS NOT NULL
-		AND spk IS NOT NULL AND gross_sat + subsidy_sat = fee_sat + payout_sat + forfeited_sat)
+	CHECK ((disposition = 'customer' AND owner_mailbox IS NOT NULL
+		AND gross_sat + subsidy_sat = fee_sat + payout_sat + forfeited_sat)
 		OR (disposition = 'operator' AND fee_sat = 0 AND payout_sat = 0
 			AND forfeited_sat = 0 AND subsidy_sat = 0))
 );

@@ -95,6 +95,16 @@ impl Tx<'_> {
 		Ok(receipts)
 	}
 
+	/// The owner outputs of an allocation: each mailbox's total, to `tr(M)`.
+	async fn expiry_owner_outputs(&self, id: i64) -> anyhow::Result<BTreeMap<ScriptBuf, Amount>> {
+		self.query("SELECT owner_mailbox,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin \
+			WHERE allocation_id=$1 AND disposition='customer' GROUP BY owner_mailbox HAVING SUM(payout_sat)>0",
+			&[&id]).await?.into_iter().map(|row| Ok((
+				ark::fallback::payout_script(row.get::<_, &str>("owner_mailbox").parse()?),
+				Amount::from_sat(u64::try_from(row.get::<_, i64>("amount_sat"))?),
+			))).collect()
+	}
+
 	/// Each allocation is one root and is paid by one transaction.
 	pub async fn pending_expiry_payouts(&self) -> anyhow::Result<Vec<PendingExpiryPayout>> {
 		let rows = self.query("SELECT a.id,a.sweep_tx,p.fee_sat FROM expiry_allocation_state a \
@@ -110,11 +120,8 @@ impl Tx<'_> {
 				ORDER BY v.vtxo_id
 			", &[&id]).await?
 				.into_iter().map(|r| ServerVtxo::deserialize(r.get("vtxo"))).collect::<Result<Vec<_>, _>>()?;
-			let payouts = self.query("SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' GROUP BY spk HAVING SUM(payout_sat)>0 ORDER BY spk", &[&id]).await?
-				.into_iter().map(|r| Ok(TxOut {
-					script_pubkey: ScriptBuf::from_hex(r.get("spk"))?,
-					value: Amount::from_sat(u64::try_from(r.get::<_, i64>("amount_sat"))?),
-				})).collect::<anyhow::Result<Vec<_>>>()?;
+			let payouts = self.expiry_owner_outputs(id).await?.into_iter()
+				.map(|(script_pubkey, value)| TxOut { script_pubkey, value }).collect();
 			let parent = row.get::<_, Option<&[u8]>>("sweep_tx").map(deserialize).transpose()?;
 			let parent_fee = row.get::<_, Option<i64>>("fee_sat")
 				.map(|fee| u64::try_from(fee).map(Amount::from_sat)).transpose()?;
@@ -150,12 +157,7 @@ impl Tx<'_> {
 		ensure!(!backing.is_empty() && backing.is_subset(&spent)
 			&& spent.len() == payout.input.len(),
 			"direct expiry attempt omits or duplicates allocated backing");
-		let expected = self.query("SELECT spk,SUM(payout_sat)::BIGINT AS amount_sat \
-			FROM expiry_allocation_coin WHERE allocation_id=$1 AND disposition='customer' \
-			GROUP BY spk HAVING SUM(payout_sat)>0", &[&id]).await?
-			.into_iter().map(|row| Ok((ScriptBuf::from_hex(row.get("spk"))?,
-				Amount::from_sat(u64::try_from(row.get::<_, i64>("amount_sat"))?))))
-			.collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+		let expected = self.expiry_owner_outputs(id).await?;
 		ensure!(!expected.contains_key(operator_spk),
 			"operator drain aliases an owner script");
 		let owner_outputs = payout.output.iter().filter(|out| expected.contains_key(&out.script_pubkey))

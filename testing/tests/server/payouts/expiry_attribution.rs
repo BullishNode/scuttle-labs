@@ -155,11 +155,10 @@ async fn assert_paid_to_owner(
 	let confirmed = core.get_tx_out(&parent.compute_txid(), outputs[0].0 as u32, Some(true)).unwrap().unwrap();
 	assert!(confirmed.confirmations >= 6);
 	assert_eq!(confirmed.value, sat(98_000));
-	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.owner_mailbox,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
+	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&coin.id().to_string()]).await?)).await.unwrap();
 	assert_eq!(row.get::<_, Option<&str>>("owner_mailbox"), Some(owner.mailbox.public_key().to_string().as_str()));
-	assert_eq!(row.get::<_, Option<&str>>("spk"), Some(owner.script.to_hex_string().as_str()));
 	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 2_000), ("payout_sat", 98_000), ("forfeited_sat", 0)] {
 		assert_eq!(row.get::<_, i64>(field), amount);
 	}
@@ -239,11 +238,10 @@ async fn offline_unregistered_board_is_paid_to_admitted_mailbox() {
 	assert_eq!(batch.vtxos.len(), 1);
 	assert_eq!(batch.vtxos[0].spend_state, status.spend_state);
 	assert_eq!(batch.vtxos[0].owner_mailbox, status.owner_mailbox);
-	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.owner_mailbox,c.user_pubkey,c.gross_sat,c.fee_sat,c.payout_sat \
+	let row = db.read(async |tx| Ok(tx.query_one("SELECT c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		WHERE e.vtxo_id=$1", &[&root.to_string()]).await?)).await.unwrap();
 	assert_eq!(row.get::<_, &str>("owner_mailbox"), owner.mailbox.public_key().to_string());
-	assert_eq!(row.get::<_, &str>("user_pubkey"), owner.key(1).public_key().to_string());
 	for (field, amount) in [("gross_sat", 100_000), ("fee_sat", 2_000), ("payout_sat", 98_000)] {
 		assert_eq!(row.get::<_, i64>(field), amount);
 	}

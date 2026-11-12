@@ -13,7 +13,6 @@ use ark_testing::{btc, sat, TestContext};
 use ark_testing::daemon::lightningd::Lightningd;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
 use bitcoin::consensus::deserialize;
-use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use cln_rpc::listpays_pays::ListpaysPaysStatus;
@@ -251,7 +250,7 @@ async fn failed_swap_during_restart() {
 	canonical_direct_payout(&ctx, &parent, &destination, &operator_script).await;
 	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone())]);
 	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid, \
-		c.disposition,c.owner_mailbox,c.user_pubkey,c.spk,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
+		c.disposition,c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
 		e.vtxo_id \
 		FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
@@ -265,8 +264,6 @@ async fn failed_swap_during_restart() {
 			assert_eq!(row.get::<_, i64>("id"), allocation);
 			assert_eq!(row.get::<_, String>("vtxo_id"), source.to_string());
 			assert_eq!(row.get::<_, String>("owner_mailbox"), owner_mailbox.to_string());
-			assert_eq!(row.get::<_, String>("user_pubkey"), key.public_key().to_string());
-			assert_eq!(row.get::<_, String>("spk"), destination.as_bytes().to_lower_hex_string());
 			assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 			assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 			assert_eq!(row.get::<_, i64>("payout_sat"), 98_000);

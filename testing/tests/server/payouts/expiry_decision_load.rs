@@ -109,12 +109,13 @@ async fn large_expiry_group_leaves_captaind_serving() {
 		lock_wait_max={wait:.3}s settlement_lock_max={slowest_admission:?}", coins.len());
 
 	for (id, _, script) in &coins {
-		let rows = db.read(async |t| Ok(t.query("SELECT c.disposition,c.spk FROM expiry_entitlement e \
+		let rows = db.read(async |t| Ok(t.query("SELECT c.disposition,c.owner_mailbox FROM expiry_entitlement e \
 			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1", &[&id.to_string()]).await?))
 			.await.unwrap();
 		assert_eq!(rows.len(), 1, "one entitlement and one allocation for {id}");
 		assert_eq!(rows[0].get::<_, &str>("disposition"), "customer");
-		assert_eq!(rows[0].get::<_, &str>("spk"), bitcoin::hex::DisplayHex::to_lower_hex_string(script.as_bytes()));
+		let mailbox = rows[0].get::<_, &str>("owner_mailbox").parse().unwrap();
+		assert_eq!(&ark::fallback::payout_script(mailbox), script);
 	}
 	assert!(hold > 0.0, "the sampler must observe the decision write");
 	assert!(!settlement, "a group without Lightning evidence must not block Lightning admissions");

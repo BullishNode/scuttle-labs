@@ -410,14 +410,13 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 		ctx.bitcoind().await_transaction(parent.compute_txid()).await;
 		assert!(parent.output.iter().any(|out| out.script_pubkey == provider_script && out.value > Amount::ZERO));
 		assert!(parent.output.iter().all(|out| out.script_pubkey != recipient_script));
-		let owners = db.read(async |tx| Ok(tx.query("SELECT c.user_pubkey, c.owner_mailbox \
+		let owners = db.read(async |tx| Ok(tx.query("SELECT c.owner_mailbox \
 			FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
 			&[&grant.id().to_string()]).await?)).await.unwrap();
 		assert!(!owners.is_empty());
 		for owner in owners {
-			assert_eq!(owner.get::<_, Option<String>>("user_pubkey"), Some(grant_key.public_key().to_string()),
+			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()),
 				"grant {} was allocated to someone other than the provider", grant.id());
-			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()));
 		}
 	}
 	let status_request = |grant: &Vtxo<Full>| protos::GetVtxoStatusRequest {

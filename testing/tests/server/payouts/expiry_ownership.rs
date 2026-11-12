@@ -76,10 +76,8 @@ async fn held_coin_is_alarmed_before_decision() {
 	let snapshot = db.read(async |t| t.backing_subtree_snapshot(&[root.clone()]).await).await.unwrap();
 	let fact = snapshot.regular.iter().find(|f| f.state.vtxo_id == htlc.id()).unwrap();
 	let ready = db.read(async |t| t.propose_expiry_ownership(fact, tip).await).await.unwrap();
-	assert!(matches!(ready.disposition,
-		server::database::expiry_ownership::OwnershipDisposition::Customer { user_pubkey, .. }
-			if user_pubkey == key.public_key()
-	));
+	let birth = db.read(async |t| t.coin_owner_mailboxes(&[htlc.id()]).await).await.unwrap()[&htlc.id()];
+	assert_eq!(ready.disposition, server::database::expiry_ownership::OwnershipDisposition::Customer { mailbox: birth });
 	assert!(matches!(ready.evidence, Some(
 		server::database::expiry_ownership::OwnershipEvidence::HtlcUnattemptedExpired
 			| server::database::expiry_ownership::OwnershipEvidence::IrreversibleEntitlement

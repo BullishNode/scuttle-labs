@@ -87,6 +87,12 @@ async fn proposal(db: &Db, source: &Vtxo<Full>, tip: BlockHeight) -> OwnershipPr
 	db.read(async |t| t.propose_expiry_ownership(fact, tip).await).await.unwrap()
 }
 
+/// A refund pays the mailbox the source was born with.
+async fn birth_owner(db: &Db, source: &Vtxo<Full>) -> OwnershipDisposition {
+	let mailbox = db.read(async |t| t.coin_owner_mailboxes(&[source.id()]).await).await.unwrap()[&source.id()];
+	OwnershipDisposition::Customer { mailbox }
+}
+
 /// F3: a source decided after its cosign is refused in the attempt write,
 /// and no attempt is recorded.
 #[tokio::test]
@@ -235,7 +241,7 @@ async fn open_attempt_on_canceled_receive_is_refunded_after_htlc_expiry() {
 	let tip = ctx.bitcoind().get_block_count().await as u32;
 	let tip = ctx.generate_blocks(htlc_expiry.to_u32() + 1 - tip).await;
 	let refund = proposal(&db, &source, tip).await;
-	assert_eq!(refund.disposition, OwnershipDisposition::Customer { user_pubkey: source.user_pubkey() });
+	assert_eq!(refund.disposition, birth_owner(&db, &source).await);
 	assert_eq!(refund.evidence, Some(OwnershipEvidence::HtlcExternalFailed));
 }
 
@@ -248,13 +254,13 @@ async fn unattempted_source_with_stored_preimage_is_refunded() {
 	let srv = payout_server(&ctx, &lightning).await;
 	let preimage = Preimage::random();
 	let hash = preimage.compute_payment_hash();
-	let (source, key) = htlc_send_source(&ctx, &srv, hash).await;
+	let (source, _) = htlc_send_source(&ctx, &srv, hash).await;
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	assert!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap().is_some());
 	let htlc_expiry = source.policy().as_server_htlc_send().unwrap().htlc_expiry;
 	let tip = ctx.bitcoind().get_block_count().await as u32;
 	let tip = ctx.generate_blocks(htlc_expiry.to_u32() + 1 - tip).await;
 	let refund = proposal(&db, &source, tip).await;
-	assert_eq!(refund.disposition, OwnershipDisposition::Customer { user_pubkey: key.public_key() });
+	assert_eq!(refund.disposition, birth_owner(&db, &source).await);
 	assert_eq!(refund.evidence, Some(OwnershipEvidence::HtlcUnattemptedExpired));
 }

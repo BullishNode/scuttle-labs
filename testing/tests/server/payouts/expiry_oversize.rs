@@ -12,7 +12,6 @@ use ark_testing::daemon::captaind::ArkClient;
 use bitcoin::{Network, OutPoint, ScriptBuf, Transaction, TxOut};
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::consensus::{deserialize, serialize};
-use bitcoin::hex::DisplayHex;
 use bitcoin::secp256k1::{Keypair, rand::{thread_rng, RngCore}};
 use bitcoin_ext::{BlockDelta, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
@@ -265,7 +264,7 @@ async fn direct_large_payout() {
 			srv.watchmand().trigger_sweep().await;
 			let rows = db.read(async |tx| Ok(tx.query(
 				"SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
-				 c.spk,c.owner_mailbox,c.user_pubkey,a.sweep_tx,a.sweep_txid \
+				 c.owner_mailbox,a.sweep_tx,a.sweep_txid \
 				 FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
 				 JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 				 WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
@@ -297,9 +296,7 @@ async fn direct_large_payout() {
 		assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 		assert_eq!(row.get::<_, i64>("payout_sat"), (LEAF_SAT - 2_000) as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
-		assert_eq!(row.get::<_, String>("spk"), owner.script.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, String>("owner_mailbox"), owner.mailbox.as_pubkey().to_string());
-		assert_eq!(row.get::<_, String>("user_pubkey"), owner.key.public_key().to_string());
 	}
 	let no_split_table = db.read(async |tx| Ok(tx.query_one(
 		"SELECT to_regclass('expiry_split_request') IS NULL", &[],

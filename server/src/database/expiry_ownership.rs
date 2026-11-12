@@ -14,19 +14,12 @@ use super::ln::LightningHtlcSubscriptionStatus;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
 use super::{SpendState, Tx};
 
+/// A customer is paid to `tr(M)` of the mailbox the coin was born with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipDisposition {
-	Customer { user_pubkey: PublicKey },
+	Customer { mailbox: PublicKey },
 	Operator,
 	Unresolved(&'static str),
-}
-
-/// The immutable record from which a customer's payout mailbox is read.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OwnershipBindingSource {
-	Coin(VtxoId),
-	InputCoins(Vec<VtxoId>),
-	Allocation(i64),
 }
 
 /// The irreversible layer records these facts; a chain-only conclusion is
@@ -63,7 +56,6 @@ pub struct OwnershipProposal {
 	pub id: VtxoId,
 	pub gross: Amount,
 	pub disposition: OwnershipDisposition,
-	pub binding_source: OwnershipBindingSource,
 	pub evidence: Option<OwnershipEvidence>,
 	/// These entire participations must be cancelled atomically at commit.
 	/// A proposal never cancels anything during background readiness work.
@@ -82,7 +74,6 @@ impl OwnershipProposal {
 		Self {
 			id: fact.state.vtxo_id, gross: fact.state.vtxo.amount(),
 			disposition: OwnershipDisposition::Unresolved(reason), evidence: None,
-			binding_source: OwnershipBindingSource::Coin(fact.state.vtxo_id),
 			cancellations: Vec::new(),
 		}
 	}
@@ -140,6 +131,15 @@ impl Tx<'_> {
 		slog!(ExpiryHoldObserved, vtxo_id: id, reason: reason.to_owned());
 	}
 
+	/// A customer coin without a recorded owner is held, never an error,
+	/// so the other roots are still decided.
+	async fn coin_customer(&self, id: VtxoId) -> anyhow::Result<OwnershipDisposition> {
+		Ok(match self.coin_owner_mailboxes(&[id]).await?.remove(&id) {
+			Some(mailbox) => OwnershipDisposition::Customer { mailbox },
+			None => OwnershipDisposition::Unresolved("owner_binding_unresolved"),
+		})
+	}
+
 	/// Resolve one current economic terminal from the caller's snapshot.
 	pub async fn propose_expiry_ownership(
 		&self,
@@ -149,8 +149,8 @@ impl Tx<'_> {
 		let mut proposal = OwnershipProposal::pending(fact, "unresolved source ownership");
 		let full = &fact.state.vtxo;
 		let state = &fact.state;
-		if let Some((user_pubkey, _)) = self.unregistered_board_owner(state.vtxo_id).await? {
-			proposal.disposition = OwnershipDisposition::Customer { user_pubkey };
+		if let Some((_, mailbox)) = self.unregistered_board_owner(state.vtxo_id).await? {
+			proposal.disposition = OwnershipDisposition::Customer { mailbox };
 			proposal.evidence = Some(OwnershipEvidence::Board);
 			return Ok(proposal);
 		}
@@ -179,7 +179,7 @@ impl Tx<'_> {
 		// our own "spent" status as proof that the customer disappeared.
 		if state.spend_state == SpendState::Spent {
 			if let Some(row) = self.query_opt("
-				SELECT e.id,c.allocation_id,c.disposition,c.user_pubkey,c.evidence->>'kind' AS kind
+				SELECT c.disposition,c.owner_mailbox,c.evidence->>'kind' AS kind
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
 				WHERE e.vtxo_id=$1 ORDER BY c.allocation_id LIMIT 1
 			", &[&state.vtxo_id.to_string()]).await? {
@@ -198,13 +198,12 @@ impl Tx<'_> {
 						| "htlc_source_discharged"
 				)) {
 					proposal.disposition = if row.get::<_, &str>("disposition") == "customer" {
-						let key: &str = row.get("user_pubkey");
-						OwnershipDisposition::Customer { user_pubkey: key.parse()? }
+						let mailbox: &str = row.get("owner_mailbox");
+						OwnershipDisposition::Customer { mailbox: mailbox.parse()? }
 					} else if row.get::<_, &str>("disposition") == "operator" {
 						OwnershipDisposition::Operator
 					} else { return Ok(proposal); };
 					proposal.evidence = Some(OwnershipEvidence::IrreversibleEntitlement);
-					proposal.binding_source = OwnershipBindingSource::Allocation(row.get("allocation_id"));
 					return Ok(proposal);
 				}
 			}
@@ -236,8 +235,8 @@ impl Tx<'_> {
 			});
 			if forfeited {
 				proposal.disposition = OwnershipDisposition::Operator;
-			} else if let Ok(user) = full.clone().try_into_user_vtxo() {
-				proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+			} else if full.clone().try_into_user_vtxo().is_ok() {
+				proposal.disposition = self.coin_customer(state.vtxo_id).await?;
 				proposal.cancellations.push(id);
 			}
 			return Ok(proposal);
@@ -263,9 +262,8 @@ impl Tx<'_> {
 		}
 		if state.spend_state == SpendState::Unregistered {
 			if fact.full_vtxo.is_some() {
-				if let Some(sources) = self.expiry_input_owner_sources(state.vtxo_id).await? {
-					proposal.disposition = OwnershipDisposition::Customer { user_pubkey: sources[0].1 };
-					proposal.binding_source = OwnershipBindingSource::InputCoins(sources.into_iter().map(|source| source.0).collect());
+				if let Some(mailbox) = self.expiry_input_owner(state.vtxo_id).await? {
+					proposal.disposition = OwnershipDisposition::Customer { mailbox };
 					proposal.evidence = Some(OwnershipEvidence::InputOwner);
 				}
 			}
@@ -277,7 +275,7 @@ impl Tx<'_> {
 			if let Some(part) = part {
 				let id = part.get::<_, i64>("id");
 				let forfeited = part.get::<_, bool>("forfeited");
-				proposal.disposition = if forfeited { OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() } }
+				proposal.disposition = if forfeited { self.coin_customer(state.vtxo_id).await? }
 					else { proposal.cancellations.push(id); OwnershipDisposition::Operator };
 				proposal.evidence = Some(OwnershipEvidence::Exchange { participation_id: id, unlock_hash: hash.to_string(), forfeited });
 			} else if let Some(cancelled) = self.query_opt(
@@ -324,7 +322,7 @@ impl Tx<'_> {
 						LightningHtlcSubscriptionStatus::Settled => {
 							// Until its claim output is registered, the grant pays the
 							// mailbox it was born with: the receiver's.
-							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+							proposal.disposition = self.coin_customer(state.vtxo_id).await?;
 							proposal.evidence = Some(OwnershipEvidence::HtlcStoredPreimage);
 						},
 						LightningHtlcSubscriptionStatus::Canceled if expired_contract => {
@@ -350,7 +348,7 @@ impl Tx<'_> {
 					// until every grant is reclaimed, even past the source's CLTV.
 					match self.internal_receive_closed(state.vtxo_id, hash, &htlcs, tip).await? {
 						Some(true) => {
-							proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+							proposal.disposition = self.coin_customer(state.vtxo_id).await?;
 							proposal.evidence = Some(OwnershipEvidence::HtlcInternalGrantsReclaimed { payment_hash: hash });
 							return Ok(proposal);
 						},
@@ -384,7 +382,7 @@ impl Tx<'_> {
 				if matches!(source, LightningSourceState::Unattempted | LightningSourceState::Failed)
 					&& fact.onchain_spent_height.is_none() && htlc.htlc.chain_resolution.is_none()
 					&& htlc.htlc.htlc_expiry <= tip {
-					proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+					proposal.disposition = self.coin_customer(state.vtxo_id).await?;
 					proposal.evidence = Some(match source {
 						LightningSourceState::Failed => OwnershipEvidence::HtlcExternalFailed,
 						_ => OwnershipEvidence::HtlcUnattemptedExpired,
@@ -403,7 +401,7 @@ impl Tx<'_> {
 			proposal.evidence = Some(OwnershipEvidence::HtlcOffchain);
 			proposal.disposition = match (htlc.direction(), resolution) {
 				(HtlcDirection::Incoming, HtlcResolution::Fulfilled) | (HtlcDirection::Outgoing, HtlcResolution::Revoked) => OwnershipDisposition::Operator,
-				_ => OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() },
+				_ => self.coin_customer(state.vtxo_id).await?,
 			};
 			return Ok(proposal);
 		}
@@ -411,7 +409,7 @@ impl Tx<'_> {
 			proposal.disposition = OwnershipDisposition::Unresolved("nonterminal spend state without settlement evidence");
 			return Ok(proposal);
 		}
-		proposal.disposition = OwnershipDisposition::Customer { user_pubkey: user.user_pubkey() };
+		proposal.disposition = self.coin_customer(state.vtxo_id).await?;
 		proposal.evidence = Some(OwnershipEvidence::Pubkey);
 		Ok(proposal)
 	}

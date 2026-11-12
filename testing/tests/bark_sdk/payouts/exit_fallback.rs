@@ -8,7 +8,7 @@ async fn assert_payouts_once(
 	operator_script: &bitcoin::ScriptBuf,
 	first_height: u64,
 ) {
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.user_pubkey,c.spk,c.disposition, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.disposition, \
 		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.confirmed_height,a.confirmed_hash,a.sweep_tx \
 		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 		JOIN vtxo v ON v.vtxo_id=e.vtxo_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
@@ -26,12 +26,11 @@ async fn assert_payouts_once(
 		assert!(info.confirmations.unwrap() >= 6);
 		assert_eq!(ctx.bitcoind().await_transaction(txid).await, signed);
 		let id = row.get::<_, String>("vtxo_id");
-		let (gross, script, mailbox, key) = expected.get(&id).expect("no other same-root owner may be paid");
+		let (gross, script, mailbox, _) = expected.get(&id).expect("no other same-root owner may be paid");
 		assert!(canonical_coins.insert(id), "one canonical economic discharge per coin");
 		assert_eq!(row.get::<_, String>("disposition"), "customer");
 		assert_eq!(row.get::<_, Option<String>>("owner_mailbox").as_ref(), Some(mailbox));
-		assert_eq!(row.get::<_, Option<String>>("user_pubkey").as_ref(), Some(key));
-		assert_eq!(row.get::<_, Option<String>>("spk"), Some(script.to_hex_string()));
+		assert_eq!(&ark::fallback::payout_script(mailbox.parse().unwrap()), script);
 		assert_eq!(row.get::<_, i64>("gross_sat"), gross.to_sat() as i64);
 		let fee = gross.to_sat().div_ceil(100).max(2_000);
 		*fees_by_parent.entry(txid).or_insert(sat(0)) += sat(fee);
