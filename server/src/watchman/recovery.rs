@@ -66,9 +66,9 @@ impl Tx<'_> {
 		Ok(())
 	}
 
-	/// Reorg repair uses the retained facts after frontier rollback. It neither
-	/// queries Core for every historical allocation nor rewrites signed parents.
-	/// The caller holds the exclusive validity barrier through this transaction.
+	/// Reorg repair runs in the transaction that removes the orphaned blocks.
+	/// It neither queries Core for every historical allocation nor rewrites
+	/// signed parents.
 	pub(crate) async fn reorg_expiry_observations(&self, fork: BlockRef) -> anyhow::Result<()> {
 		let height = i64::from(fork.height);
 		self.execute("DELETE FROM expiry_terminal_claim WHERE height>$1", &[&height]).await?;

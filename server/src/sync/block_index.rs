@@ -221,22 +221,28 @@ impl BlockIndex {
 		// Lower the published tip first, it must never point above the stored tip.
 		self.update_sync_height(block);
 		self.pending_reorg = true;
+		self.db.write(async |t| {
+			t.remove_blocks_above(self.block_table, block.height).await?;
+			if matches!(self.block_table, BlockTable::Watchmand) {
+				t.reorg_expiry_observations(block).await?;
+			}
+			Ok(())
+		}).await?;
 		self.notify_reorg(block).await
 	}
 
-	/// Rolls all listeners back to `block`, removes the blocks above it and
-	/// clears [Self::pending_reorg], all in one transaction.
+	/// Rolls all listeners back to `block` and clears [Self::pending_reorg].
 	async fn notify_reorg(&mut self, block: BlockRef) -> anyhow::Result<()> {
-		self.db.write(async |t| {
-			// Lock the same stable birthday row as source decisions. Appending
-			// a new tip cannot bypass a decision that still uses an older tip.
-			t.query("SELECT height FROM watchmand_block ORDER BY height ASC LIMIT 1 FOR UPDATE", &[]).await?;
-			let results = join_all(self.listeners.iter().map(|listener| listener.on_reorg(t, block))).await;
-			for result in results { result.context("Failed to process reorg")?; }
-			t.remove_blocks_above(self.block_table, block.height).await?;
-			if matches!(self.block_table, BlockTable::Watchmand) { t.reorg_expiry_observations(block).await?; }
-			Ok(())
-		}).await?;
+		let results = join_all(self.listeners.iter().map(|listener| {
+			listener.on_reorg(block)
+		})).await;
+
+		// Raise the error if one of the ChainListeners failed
+		for result in results {
+			if result.is_err() {
+				bail!("Failed to process reorg: {:#?}", result)
+			}
+		}
 
 		self.pending_reorg = false;
 		Ok(())
