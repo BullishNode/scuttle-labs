@@ -811,7 +811,6 @@ CREATE TABLE public.expiry_allocation (
     id bigint NOT NULL,
     expiry_height integer NOT NULL,
     broadcast_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT expiry_allocation_expiry_height_check CHECK ((expiry_height >= 0))
 );
 
@@ -880,7 +879,6 @@ CREATE TABLE public.expiry_payout_attempt (
     txid text NOT NULL,
     signed_tx bytea NOT NULL,
     fee_sat bigint NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT expiry_payout_attempt_fee_sat_check CHECK ((fee_sat >= 0)),
     CONSTRAINT expiry_payout_attempt_txid_check CHECK ((length(txid) = 64))
 );
@@ -959,7 +957,6 @@ CREATE VIEW public.expiry_allocation_state AS
             ELSE latest.signed_tx
         END AS sweep_tx,
     a.broadcast_at,
-    a.created_at,
         CASE
             WHEN o.confirmed THEN 'confirmed'::text
             WHEN (o.conflicted OR (EXISTS ( SELECT 1
@@ -995,8 +992,7 @@ CREATE VIEW public.expiry_allocation_state AS
 
 CREATE TABLE public.expiry_cancelled_participation (
     participation_id bigint NOT NULL,
-    unlock_hash text,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    unlock_hash text
 );
 
 

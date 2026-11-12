@@ -26,16 +26,14 @@ CREATE INDEX board_exit_exit_txid_idx ON board_exit(exit_txid);
 CREATE TABLE expiry_cancelled_participation (
 	-- Upstream may delete a superseded pending participation. Keep its cancellation tombstone.
 	participation_id BIGINT PRIMARY KEY,
-	unlock_hash TEXT UNIQUE,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	unlock_hash TEXT UNIQUE
 );
 
 -- Financial decisions are immutable; frontier spends determine their status.
 CREATE TABLE expiry_allocation (
 	id BIGSERIAL PRIMARY KEY,
 	expiry_height INTEGER NOT NULL CHECK (expiry_height >= 0),
-	broadcast_at TIMESTAMPTZ,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	broadcast_at TIMESTAMPTZ
 );
 
 CREATE TABLE expiry_allocation_input (
@@ -51,7 +49,6 @@ CREATE TABLE expiry_payout_attempt (
 	txid TEXT NOT NULL CHECK (length(txid) = 64),
 	signed_tx BYTEA NOT NULL,
 	fee_sat BIGINT NOT NULL CHECK (fee_sat >= 0),
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 	PRIMARY KEY (allocation_id, txid),
 	UNIQUE (txid)
 );
@@ -102,7 +99,7 @@ WITH observed AS (
 SELECT a.id,a.expiry_height,
 	CASE WHEN o.confirmed THEN o.confirmed_txid ELSE latest.txid END AS sweep_txid,
 	CASE WHEN o.confirmed THEN winner.signed_tx ELSE latest.signed_tx END AS sweep_tx,
-	a.broadcast_at,a.created_at,
+	a.broadcast_at,
 	CASE WHEN o.confirmed THEN 'confirmed'
 		WHEN o.conflicted OR EXISTS (
 			SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_coin paid ON paid.vtxo_id=c.vtxo_id
