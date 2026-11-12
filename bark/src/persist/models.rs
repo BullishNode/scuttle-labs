@@ -48,7 +48,7 @@ pub struct SerdeVtxo {
 	/// records stored before this field existed, so they get caught up.
 	#[serde(default)]
 	pub registered: bool,
-	#[serde(deserialize_with = "serde::Deserialize::deserialize")]
+	#[serde(default)]
 	pub fallback_status: Option<crate::vtxo::FallbackStatus>,
 }
 

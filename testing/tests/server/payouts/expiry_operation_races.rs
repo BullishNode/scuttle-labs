@@ -284,7 +284,6 @@ async fn offboard_race(offboard_wins: bool, after_analysis: bool) {
 		let customer = db.read(async |tx| Ok(tx.query_one("
 			SELECT COUNT(*)
 			FROM expiry_allocation_coin c
-			
 			WHERE c.vtxo_id=$1
 			AND c.disposition='customer'
 		", &[&id.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
