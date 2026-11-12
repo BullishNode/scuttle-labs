@@ -6,6 +6,25 @@ https://docs.second.tech/changelog/changelog/
 
 Below is a more detailed summary for each version.
 
+# Scuttle Run 4 experiment (unreleased)
+
+- A payout-enabled server advertises `scuttle-1` at numeric protocol version 5.
+  `bark-wallet` callers can set `Config::require_scuttle_payouts` to refuse a
+  server without that label. The disabled mode retains upstream negotiation.
+- Each Arkoor output carries the blinded mailbox identifier from an
+  upstream-format address. The server binds the unblinded mailbox to the
+  actual output before cosigning. Board, round and default Lightning receive
+  use their existing mailbox fields. A recipient verifies its signed coin and
+  attested mailbox before crediting it.
+- Expired resolved roots use direct owner payouts with inline mining fees and
+  auditable replacements. Fallback status is an operator report; an
+  application Bitcoin wallet must confirm and spend its `tr(M)` outputs.
+- The fork migrations are consolidated for a new Run 4 database. This
+  experiment does not migrate an existing Run 3 payout database.
+- The product Rust SDK is `bark-wallet` in this Scuttle repository. The pinned
+  external consumer under `testing/` checks the Git dependency against the
+  paired server.
+
 # v0.8.1
 
 - `bark`

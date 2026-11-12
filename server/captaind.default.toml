@@ -1,3 +1,6 @@
+# Pay expired backing to its admitted owner; fixed at database creation.
+expiry_payouts = false
+
 #
 # This is a template config file for captaind.
 # All required values have a default value provided in this file.

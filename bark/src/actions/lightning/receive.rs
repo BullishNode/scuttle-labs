@@ -17,6 +17,7 @@ use rand::seq::IteratorRandom;
 
 use ark::arkoor::package::ArkoorPackageBuilder;
 use ark::arkoor::state::UserGeneratedNonces;
+use ark::address::VtxoDelivery;
 use ark::attestations::{LightningReceiveAttestation, LightningReceiveClaimAttestation};
 use ark::fees::validate_and_subtract_fee;
 use ark::lightning::{Bolt11InvoiceExt, PaymentHash, Preimage};
@@ -169,8 +170,9 @@ impl WalletAction for LightningReceive {
 				}
 			},
 			Progress::PreimageRevealed(htlcs) => {
-				// Retrying claim.
-				let claim = prepare_lightning_receive_claim(wallet, &self, htlcs).await?;
+				// Retrying a disclosed claim must never abandon its grant.
+				let claim = prepare_lightning_receive_claim(wallet, &self, htlcs).await
+					.map_err(|e| AdvanceError::Retry(e.into_anyhow()))?;
 				match claim_lightning_receive_htlcs(wallet, &self, htlcs, claim).await? {
 					None => return Ok(Advance::Done),
 					Some(delivery) => Progress::Delivering(delivery),
@@ -201,6 +203,9 @@ impl WalletAction for LightningReceive {
 	/// The step failed transiently. Retry it, unless the claim window
 	/// has closed or the claim retry budget is spent.
 	async fn on_retry(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if finish_paid_out_receive(wallet, &self).await {
+			return Advance::Done;
+		}
 		match &self.progress {
 			// No money committed; just back off. Expiry reaping happens in
 			// the step.
@@ -232,6 +237,9 @@ impl WalletAction for LightningReceive {
 	/// The step can't be completed as-is: the server rejected the request
 	/// or our own state is inconsistent.
 	async fn on_abort(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if finish_paid_out_receive(wallet, &self).await {
+			return Advance::Done;
+		}
 		match &self.progress {
 			// Nothing committed server-side: the executor removes the row
 			// when the action fails.
@@ -264,8 +272,8 @@ pub enum Progress {
 	/// movement is created. The preimage has NOT been revealed yet, so the
 	/// receive is still cancellable.
 	HtlcsReady(Htlcs),
-	/// The preimage has been revealed via the claim RPC in
-	/// exchange of pubkey VTXOs.
+	/// The claim RPC may have revealed the preimage in exchange for pubkey
+	/// VTXOs. Persisted before transmission, including a lost reply.
 	/// Past the point of no return — the receive can no longer be
 	/// cancelled. On failure we leave it pending rather than auto-exit;
 	/// the caller falls back to an on-chain exit via
@@ -665,6 +673,7 @@ async fn prepare_lightning_receive_htlcs(
 struct PreparedClaim {
 	srv: ServerConnection,
 	builder: ArkoorPackageBuilder<UserGeneratedNonces>,
+	package: protos::ArkoorPackageCosignRequest,
 	keypairs: Vec<Keypair>,
 }
 
@@ -705,7 +714,13 @@ async fn prepare_lightning_receive_claim(
 		.generate_user_nonces(&keypairs)
 		.context("arkoor nonce generation for claim failed").abort()?;
 
-	Ok(PreparedClaim { srv, builder, keypairs })
+	let mut supplied = std::collections::BTreeMap::new();
+	if let Some(address) = recv.claim_destination.as_ref() {
+		supplied.insert(address.policy().user_pubkey(), address.clone());
+	}
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	wallet.attach_payout_destinations(&mut package, &supplied).await.abort()?;
+	Ok(PreparedClaim { srv, builder, package, keypairs })
 }
 
 /// Claiming -> done, or -> Delivering when the receive has a claim
@@ -724,15 +739,19 @@ async fn claim_lightning_receive_htlcs(
 	htlcs: &Htlcs,
 	claim: PreparedClaim,
 ) -> Result<Option<Delivery>, AdvanceError> {
-	let PreparedClaim { mut srv, builder, keypairs } = claim;
+	let PreparedClaim { mut srv, builder, package, keypairs } = claim;
 
 	info!("Claiming arkoor against payment preimage for {}", recv.payment_hash);
-	let package_cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	// A lost reply or process stop can occur after the server settles the
+	// payer. Commit that possibility under the existing action lock before
+	// any request can reveal the preimage; a restart must never abandon it.
+	let checkpoint = LightningReceive { progress: Progress::PreimageRevealed(htlcs.clone()), ..recv.clone() };
+	wallet.inner.db.upsert_wallet_action_checkpoint(&recv.id(), &checkpoint.into()).await.retry()?;
 	let resp = srv.client.claim_lightning_receive(protos::ClaimLightningReceiveRequest {
 		payment_hash: recv.payment_hash.to_byte_array().to_vec(),
 		payment_preimage: recv.payment_preimage.to_vec(),
-		cosign_request: Some(package_cosign_request),
-	}).await.retry_unless_rejected()?.into_inner();
+		cosign_request: Some(package),
+	}).await.context("lightning receive claim failed").retry()?.into_inner();
 
 	// The preimage is out, so from here on only retry: the server's
 	// claim_lightning_receive is idempotent and hands out fresh cosign
@@ -760,11 +779,10 @@ async fn claim_lightning_receive_htlcs(
 	info!("Got arkoors from lightning: {}",
 		outputs.iter().map(|v| v.id().to_string()).collect::<Vec<_>>().join(", "));
 
-	// A destination owned by this wallet needs no mailbox delivery: the
-	// outputs are already keyed to one of our pubkeys.
+	// Local delivery requires both the output key and payout mailbox to
+	// belong to this wallet.
 	let external_destination = match recv.claim_destination.as_ref() {
-		Some(destination) => wallet.pubkey_keypair(&destination.policy().user_pubkey())
-			.await.retry()?.is_none(),
+		Some(destination) => !local_claim_destination(wallet, destination).await.retry()?,
 		None => false,
 	};
 
@@ -837,6 +855,56 @@ async fn deliver_lightning_receive(
 	).await.context("failed to finish lightning receive movement").retry()?;
 
 	Ok(())
+}
+
+/// Close a receive whose HTLCs the server paid out at their expiry instead
+/// of honouring the claim: the sats arrive on-chain, at this wallet's
+/// fallback address or at the one of the claim destination.
+///
+/// Returns whether the receive is over. `false` on any error, which leaves
+/// the receive to its ordinary retry handling.
+async fn finish_paid_out_receive(wallet: &Wallet, recv: &LightningReceive) -> bool {
+	let Progress::PreimageRevealed(htlcs) = &recv.progress else {
+		return false;
+	};
+	let res = async {
+		if !wallet.check_fallback_all_spent(&htlcs.vtxo_ids).await? {
+			return Ok(false);
+		}
+		// Settled record first, then the movement: see claim_lightning_receive_htlcs.
+		let amount = recv.invoice.get_payment_amount(None)
+			.context("receive invoice has no amount")?;
+		wallet.inner.db.record_settled_lightning_receive(
+			recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+		).await?;
+		wallet.inner.movements.finish_movement_with_update(
+			htlcs.movement_id,
+			MovementStatus::Successful,
+			MovementUpdate::new().effective_balance(SignedAmount::ZERO),
+		).await?;
+		anyhow::Ok(true)
+	}.await;
+	res.unwrap_or_else(|e| {
+		warn!("Could not check lightning receive {} for a fallback payout: {:#}",
+			recv.payment_hash, e,
+		);
+		false
+	})
+}
+
+async fn local_claim_destination(wallet: &Wallet, address: &ark::Address) -> anyhow::Result<bool> {
+	let Some((_, keypair)) = wallet.pubkey_keypair(&address.policy().user_pubkey()).await? else {
+		return Ok(false);
+	};
+	let properties = wallet.properties().await?;
+	if !wallet.server_payouts().await { return Ok(true); }
+	let server_mailbox = match properties.server_mailbox_pubkey {
+		Some(key) => key,
+		None => wallet.require_ark_info().await?.mailbox_pubkey,
+	};
+	let own_blinded = wallet.mailbox_identifier().to_blinded(server_mailbox, &keypair)?;
+	Ok(matches!(address.delivery(), [VtxoDelivery::ServerMailbox { blinded_id }]
+		if *blinded_id == own_blinded))
 }
 
 async fn deliver_vtxos_to_address(

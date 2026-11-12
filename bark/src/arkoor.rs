@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::Context;
 use bitcoin::{Amount, NetworkKind};
 use bitcoin::hex::DisplayHex;
@@ -32,6 +34,8 @@ pub enum ArkoorAddressError {
 	PolicyNotSupported(VtxoPolicy),
 	#[error("Unknown delivery mechanism: {0}")]
 	UnknownDeliveryMechanism(String),
+	#[error("Recipient must provide an upstream-format server mailbox address")]
+	RecipientMustUpdate,
 	#[error("Other error: {0}")]
 	Other(String),
 }
@@ -163,7 +167,7 @@ impl Wallet {
 	pub async fn validate_arkoor_address(&self, address: &ark::Address) -> Result<(), ArkoorAddressError> {
 		let network = self.network().await
 			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?;
-		let (_, ark_info) = self.require_server().await
+		let (srv, ark_info) = self.require_server().await
 			.map_err(|e| ArkoorAddressError::Other(e.to_string()))?;
 
 		let network_kind = NetworkKind::from(network);
@@ -186,6 +190,11 @@ impl Wallet {
 		}
 
 		check_delivery(address.delivery())?;
+		if srv.scuttle_payouts().await {
+			if !matches!(address.delivery(), [VtxoDelivery::ServerMailbox { .. }]) {
+				return Err(ArkoorAddressError::RecipientMustUpdate);
+			}
+		}
 
 		Ok(())
 	}
@@ -203,6 +212,7 @@ impl Wallet {
 		inputs: impl IntoIterator<Item = WalletVtxo>,
 		change_keypair: Keypair,
 		change_pieces: Option<Vec<Amount>>,
+		destination_address: Option<ark::Address>,
 	) -> anyhow::Result<ArkoorCreateResult> {
 		let (mut srv, _) = self.require_server().await?;
 		let input_ids = inputs.into_iter().map(|v| v.id()).collect::<Vec<_>>();
@@ -252,9 +262,10 @@ impl Wallet {
 			.generate_user_nonces(&user_keypairs)
 			.context("invalid nb of keypairs")?;
 
-		let cosign_request = protos::ArkoorPackageCosignRequest::from(
-			builder.cosign_request(),
-		);
+		let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+		let supplied = destination_address.map(|address| (arkoor_dest.policy.user_pubkey(), address))
+			.into_iter().collect::<BTreeMap<_, _>>();
+		self.attach_payout_destinations(&mut cosign_request, &supplied).await?;
 
 		let response = srv.client.request_arkoor_cosign(cosign_request).await
 			.context("error requesting arkoor cosign")?

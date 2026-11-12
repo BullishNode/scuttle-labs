@@ -21,6 +21,7 @@ use log::{debug, error, info, trace, warn};
 
 use ark::arkoor::ArkoorDestination;
 use ark::arkoor::package::{ArkoorPackageBuilder, ArkoorPackageCosignResponse};
+use ark::attestations::LightningSendIntent;
 use ark::lightning::{Invoice, PaymentHash, PaymentStatus, Preimage};
 use ark::mailbox::MailboxIdentifier;
 use ark::{ProtocolEncoding, VtxoId, VtxoPolicy};
@@ -92,6 +93,9 @@ pub struct LightningSend {
 	/// leaves it to the server, and for checkpoints predating this field.
 	#[serde(default)]
 	pub retry_for: Option<Duration>,
+	/// Persisted before initiation, so a crash retries the same signed request.
+	#[serde(default)]
+	pub intent_nonce: Option<[u8; 32]>,
 
 	// Mutable state:
 	pub progress: Progress,
@@ -174,11 +178,16 @@ impl WalletAction for LightningSend {
 				Progress::HtlcReceived(htlcs)
 			},
 			Progress::HtlcReceived(htlcs) => {
+				if self.intent_nonce.is_none() {
+					return Ok(Advance::Next(LightningSend {
+						intent_nonce: Some(rand::random()), ..self
+					}));
+				}
 				initiate_lightning_send_payment(wallet, &self, htlcs).await?;
 				Progress::PaymentInitiated(htlcs.clone())
 			},
 			Progress::PaymentInitiated(htlcs) => {
-				match check_lightning_send_payment_status(wallet, &self).await.retry()? {
+				match check_lightning_send_payment_status(wallet, &self, htlcs).await.retry()? {
 					PaymentStatus::Success(preimage) => {
 						settle_lightning_send_payment(wallet, &self, htlcs, preimage).await?;
 						return Ok(Advance::Done);
@@ -205,6 +214,16 @@ impl WalletAction for LightningSend {
 			},
 			Progress::RevocableHtlcs { htlcs, revocation } |
 			Progress::RevocationStuck { htlcs, revocation } => {
+				// HTLCs the server pays out at expiry can't be revoked: the
+				// refund arrives on-chain and the send is over.
+				if wallet.check_fallback_all_spent(&htlcs.vtxo_ids).await.retry()? {
+					wallet.inner.movements.finish_movement_with_update(
+						htlcs.movement_id,
+						MovementStatus::Failed,
+						MovementUpdate::new().effective_balance(SignedAmount::ZERO).fee(Amount::ZERO),
+					).await.retry()?;
+					return Ok(Advance::Done);
+				}
 				revoke_lightning_send_htlcs(wallet, &self, htlcs, revocation).await?;
 				return Ok(Advance::Done);
 			},
@@ -418,6 +437,7 @@ pub(crate) async fn start_lightning_send(
 		movement_id: None,
 		revocation_key: revocation_keypair.public_key(),
 		retry_for,
+		intent_nonce: Some(rand::random()),
 		allow_exit_of_htlcs: false,
 		progress: Progress::Start,
 	})
@@ -488,7 +508,7 @@ async fn request_lightning_send_htlcs(
 	// Ensure inputs are fully registered server-side before the cosign.
 	wallet.register_vtxo_transactions_with_server(&full_inputs).await
 		.context("failed to register lightning-send input vtxo transactions with server")
-		.retry()?;
+		.retry_unless_rejected()?;
 
 	let mut input_keypairs = Vec::with_capacity(full_inputs.len());
 	for input in full_inputs.iter() {
@@ -519,9 +539,9 @@ async fn request_lightning_send_htlcs(
 		.generate_user_nonces(&input_keypairs)
 		.context("invalid nb of keypairs").abort()?;
 
-	let cosign_request = protos::LightningPayHtlcCosignRequest {
-		parts: protos::ArkoorPackageCosignRequest::from(builder.cosign_request()).parts,
-	};
+	let mut package = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	wallet.attach_payout_destinations(&mut package, &Default::default()).await.abort()?;
+	let cosign_request = protos::LightningPayHtlcCosignRequest { parts: package.parts };
 	let response = srv.client.request_lightning_pay_htlc_cosign(cosign_request).await
 		.retry_unless_rejected()?.into_inner();
 
@@ -595,7 +615,16 @@ async fn initiate_lightning_send_payment(
 	send: &LightningSend,
 	htlcs: &Htlcs,
 ) -> Result<(), AdvanceError> {
-	let (mut srv, _) = wallet.require_server().await.retry()?;
+	let (mut srv, info) = wallet.require_server().await.retry()?;
+	let retry_for_secs = send.retry_for.map(|d| d.as_secs().try_into().unwrap_or(u32::MAX));
+	let nonce = send.intent_nonce.context("missing Lightning send intent nonce").retry()?;
+	let (_, keypair) = wallet.pubkey_keypair(&send.htlc_key).await.retry()?
+		.context("missing Lightning source owner key").retry()?;
+	let intent = LightningSendIntent::new(
+		nonce, info.server_pubkey, info.network, &send.invoice,
+		send.payment_amount, &htlcs.vtxo_ids, Some(htlcs.mailbox_id), retry_for_secs,
+	);
+	let signature = intent.sign(&keypair).serialize().to_vec();
 
 	let req = protos::InitiateLightningPaymentRequest {
 		invoice: send.invoice.to_string(),
@@ -603,7 +632,9 @@ async fn initiate_lightning_send_payment(
 		payment_amount_sat: send.payment_amount.to_sat(),
 		mailbox_id: Some(htlcs.mailbox_id.serialize()),
 		// The server caps it to its own maximum.
-		retry_for_secs: send.retry_for.map(|d| d.as_secs().try_into().unwrap_or(u32::MAX)),
+		retry_for_secs,
+		intent_nonce: Some(nonce.to_vec()),
+		source_owner_signatures: vec![signature; htlcs.vtxo_ids.len()],
 	};
 	// A rejection aborts: `abort` then revokes the HTLCs.
 	srv.client.initiate_lightning_payment(req).await.retry_unless_rejected()?;
@@ -617,6 +648,7 @@ async fn initiate_lightning_send_payment(
 async fn check_lightning_send_payment_status(
 	wallet: &Wallet,
 	send: &LightningSend,
+	htlcs: &Htlcs,
 ) -> anyhow::Result<PaymentStatus> {
 	let (mut srv, _) = wallet.require_server().await?;
 	let payment_hash = send.invoice.payment_hash();
@@ -628,6 +660,7 @@ async fn check_lightning_send_payment_status(
 	let req = protos::CheckLightningPaymentRequest {
 		hash: payment_hash.to_vec(),
 		wait: false,
+		htlc_vtxo_ids: htlcs.vtxo_ids.iter().map(|id| id.to_bytes().to_vec()).collect(),
 	};
 	// NB: don't early-return on transport errors; collapse to
 	// expired-or-pending so the executor can revoke when appropriate.
@@ -678,6 +711,8 @@ pub(crate) async fn settle_lightning_send_payment(
 	if preimage.compute_payment_hash() != payment_hash {
 		abort!("preimage does not match payment hash {}", payment_hash);
 	}
+	let effective_balance = -send.total_amount().to_signed()
+		.context("lightning payment amount out of range").abort()?;
 	info!("Lightning payment succeeded! Payment hash: {}", payment_hash.as_hex());
 
 	wallet.inner.db.record_paid_invoice(payment_hash, preimage).await.retry()?;
@@ -690,10 +725,11 @@ pub(crate) async fn settle_lightning_send_payment(
 		wallet.inner.movements.finish_movement_with_update(
 			htlcs.movement_id,
 			MovementStatus::Successful,
-			MovementUpdate::new().metadata([(
-				"payment_preimage".into(),
-				serde_json::to_value(preimage).expect("payment preimage can serde"),
-			)]),
+			MovementUpdate::new().effective_balance(effective_balance).fee(send.fee)
+				.metadata([(
+					"payment_preimage".into(),
+					serde_json::to_value(preimage).expect("payment preimage can serde"),
+				)]),
 		).await.retry()?;
 	}
 
@@ -730,7 +766,8 @@ async fn revoke_lightning_send_htlcs(
 		.generate_user_nonces(&htlc_keypairs)
 		.context("failed to generate user nonces").abort()?;
 
-	let cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	wallet.attach_payout_destinations(&mut cosign_request, &Default::default()).await.abort()?;
 	let response = srv.client
 		.request_lightning_pay_htlc_revocation(cosign_request).await
 		.retry_unless_rejected()?.into_inner();

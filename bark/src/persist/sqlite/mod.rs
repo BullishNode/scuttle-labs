@@ -104,6 +104,15 @@ impl BarkPersister for SqliteClient {
 		Ok(query::fetch_properties(&conn)?)
 	}
 
+	async fn set_mailbox_identity(&self, identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		let conn = self.connect()?;
+		let changed = conn.execute("UPDATE bark_properties SET mailbox_pubkey=?1
+			WHERE id=1 AND network=?2 AND (mailbox_pubkey IS NULL OR mailbox_pubkey=?1)",
+			[identity.public_key.to_string(), identity.network.to_string()])?;
+		ensure!(changed == 1, "mailbox identity differs from the stored wallet");
+		Ok(())
+	}
+
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
 		let conn = self.connect()?;
 		query::set_server_pubkey(&conn, &server_pubkey)?;
@@ -285,6 +294,16 @@ impl BarkPersister for SqliteClient {
 		let tx = conn.transaction().context("Failed to start transaction")?;
 		query::store_vtxo_keys(&tx, keys)?;
 		tx.commit().context("Failed to commit transaction")
+	}
+
+	async fn set_vtxo_fallback_status(&self, id: VtxoId, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut conn = self.connect()?;
+		let tx = conn.transaction()?;
+		let coin = query::set_vtxo_fallback_status(&tx, id, status)?;
+		tx.commit()?;
+		Ok(coin)
 	}
 
 	async fn get_last_vtxo_key_index(&self) -> anyhow::Result<Option<u32>> {

@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bdk_wallet::coin_selection::SingleRandomDraw;
-use bitcoin::secp256k1::{rand, Keypair};
-use bitcoin::{Amount, OutPoint, Transaction};
+use bitcoin::secp256k1::{rand, Keypair, PublicKey};
+use bitcoin::{Amount, OutPoint};
 use futures::{stream, StreamExt, TryStreamExt};
 use tracing::{debug, error, info, warn};
 
@@ -349,6 +349,7 @@ impl VtxoPool {
 		&self,
 		srv: &Server,
 		dest: ArkoorDestination,
+		owner_mailbox: Option<PublicKey>,
 		mut inputs: TakenInputs,
 		commit: F,
 	) -> anyhow::Result<Vec<Vtxo<Full>>>
@@ -426,6 +427,9 @@ impl VtxoPool {
 
 		let change = check_change_outputs(change)?;
 
+		let bindings = owner_mailbox.into_iter()
+			.flat_map(|mailbox| sent.iter().map(move |vtxo| (vtxo.id(), mailbox)))
+			.collect::<Vec<_>>();
 		let update = VtxoTreeUpdate::new()
 			.upsert_signed_tx(signed_vtxs)
 			.insert_oor_spent_vtxos(internal_vtxos)
@@ -437,7 +441,8 @@ impl VtxoPool {
 				change.iter().cloned().map(ServerVtxo::from),
 				database::SpendState::Pool,
 			)
-			.mark_vtxos_oor_spent(input_spend_info);
+			.mark_vtxos_oor_spent(input_spend_info)
+			.bind_owner_mailboxes(bindings)?;
 
 		// An htlc-recv vtxo exists as soon as we hand out our signatures,
 		// so its htlc_vtxo row is written together with the vtxo itself.
@@ -475,6 +480,7 @@ impl VtxoPool {
 		};
 
 		srv.db.write(async |t| {
+			crate::database::expiry_guard::guard_new_lightning_inputs(t, &input_ids).await?;
 			t.execute_vtxo_tree_update(update).await?;
 			htlc_vtxo::create_htlc_vtxos(&t, &htlc_recvs, HtlcDirection::Outgoing).await?;
 			t.mark_vtxopool_vtxos_spent(input_ids.iter().copied()).await
@@ -522,6 +528,7 @@ impl VtxoPool {
 		&self,
 		srv: &Server,
 		dest: ArkoorDestination,
+		owner_mailbox: Option<PublicKey>,
 		commit: F,
 	) -> anyhow::Result<Vec<Vtxo<Full>>>
 	where
@@ -532,7 +539,7 @@ impl VtxoPool {
 			bail!("vtxo pool is empty");
 		};
 
-		let sent = self.prepare_arkoor(srv, dest, inputs, commit).await?;
+		let sent = self.prepare_arkoor(srv, dest, owner_mailbox, inputs, commit).await?;
 		update_all_bucket_metrics(&self.data);
 		self.check_trigger.notify_one();
 		Ok(sent)
@@ -707,6 +714,21 @@ impl Process {
 		// finish and broadcast the tx
 		let tx = wallet.finish_tx(funding_psbt).context("error finishing tree funding tx")?;
 
+		// The cached tree still holds unsigned hArk leaf transactions. The
+		// finalized VTXOs above carry their signatures AND preimage;
+		// persist that full path before handing any pool coin to a receive.
+		// Deduplicate shared ancestors so one INSERT cannot update one txid twice.
+		let mut signed_txs = BTreeMap::new();
+		for vtxo in &vtxos {
+			vtxo.validate(&tx).context("finalized pool VTXO has an invalid signed path")?;
+			for step in vtxo.transactions() {
+				let txid = step.tx.compute_txid();
+				if let Some(old) = signed_txs.insert(txid, step.tx.clone()) {
+					ensure!(old == step.tx, "finalized pool paths disagree on a shared transaction");
+				}
+			}
+		}
+
 		// Create the vtxos and virtual transactions in the database
 		// before committing the funding tx to the wallet. The funding tx
 		// is handed to the nursery in the same db tx, so that once the
@@ -715,11 +737,10 @@ impl Process {
 		let confirm_target = self.srv.nursery_confirm_target();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&tx)
-			.upsert_signed_tx(tree.internal_node_txs().iter().cloned())
-			.upsert_unsigned_tx(tree.unsigned_leaf_txs().iter().map(Transaction::compute_txid))
+			.upsert_signed_tx(signed_txs.into_values())
 			.insert_oor_spent_vtxos(tree.internal_vtxos())
 			.insert_unspent_vtxos(
-				tree.output_vtxos().map(ServerVtxo::from),
+				vtxos.iter().cloned().map(ServerVtxo::from),
 				database::SpendState::Pool,
 			);
 		self.srv.db.write(async |t| {

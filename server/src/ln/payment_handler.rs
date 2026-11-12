@@ -159,7 +159,7 @@ impl<'a> PaymentAttemptHandler<'a> {
 			// optimistic-lock race would otherwise leave the vtxos flagged
 			// ln-spent for an attempt we did not transition.
 			if updated && preimage.is_some() {
-				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.payment_hash).await?;
+				let not_spendable = t.mark_htlc_send_vtxos_ln_spent(attempt.id).await?;
 				if !not_spendable.is_empty() {
 					warn!(
 						"Lightning payment attempt ({}): HTLC-send vtxos for payment hash {} \

@@ -94,6 +94,8 @@ message HandshakeResponse {
 	// Public Service Announcement, a generalized message from the server to be
 	// displayed to the user.
 	optional string psa = 3;
+	// Identifies the Scuttle payout protocol without changing numeric negotiation.
+	optional string protocol_label = 4;
 }
 
 message ArkInfo {
@@ -222,6 +224,10 @@ enum VtxoSpendState {
 	VTXO_SPEND_STATE_UNREGISTERED = 4;
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
+	// A committed fallback decision has unresolved relevant portions.
+	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
+	// Terminal policy result with no Bitcoin payout.
+	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 7;
 }
 
 message GetVtxoStatusRequest {
@@ -232,6 +238,19 @@ message GetVtxoStatusRequest {
 
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
+	bytes owner_mailbox = 2;
+	bool fallback_committed = 3;
+	optional FallbackPayout fallback_payout = 4;
+}
+
+// Amounts the server decided for a coin's expiry payout to `tr(owner_mailbox)`.
+message FallbackPayout {
+	// The coin value taken from Ark.
+	uint64 gross_sat = 1;
+	// The fallback fee withheld from it.
+	uint64 fee_sat = 2;
+	// The amount paid on-chain; zero when the fee consumed the coin.
+	uint64 payout_sat = 3;
 }
 
 message VtxoStatusQuery {
@@ -248,6 +267,9 @@ message GetVtxosStatusByIdsRequest {
 message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
+	bytes owner_mailbox = 3;
+	bool fallback_committed = 4;
+	optional FallbackPayout fallback_payout = 5;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -281,6 +303,8 @@ message RecoveredVtxo {
 	// xpub/derivation_index.
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
+	bytes owner_mailbox = 4;
+	bool fallback_committed = 5;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -307,6 +331,7 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
+	optional bytes owner_mailbox = 8;
 }
 
 message BoardCosignResponse {
@@ -334,6 +359,7 @@ message VtxoRequest {
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
+	bytes blinded_mailbox_id = 4;
 }
 
 message ArkoorCosignRequest {
@@ -376,11 +402,17 @@ message InitiateLightningPaymentRequest {
 	// single attempt. Values above the server's maximum are capped to it.
 	// The server picks its default when unset.
 	optional uint32 retry_for_secs = 5;
+	// Fresh sends require one owner signature for each source, in source order.
+	// A retry of an open send must resend the same signed fields.
+	optional bytes intent_nonce = 6;
+	repeated bytes source_owner_signatures = 7;
 }
 
 message CheckLightningPaymentRequest {
 	bytes hash = 1;
 	bool wait = 2;
+	// Complete HTLC input set of the payment attempt being checked.
+	repeated bytes htlc_vtxo_ids = 3;
 }
 
 message PaymentSuccessStatus {
@@ -477,6 +509,9 @@ message CheckLightningReceiveResponse {
 	LightningReceiveStatus status = 3;
 	// Empty until the status is HTLCS_READY or SETTLED
 	repeated bytes htlc_vtxos = 4;
+	// Aggregate expiry outcome of the actual collected receive destination.
+	// This hash-only query never returns mailbox identities or allocation data.
+	optional VtxoSpendState fallback_spend_state = 5;
 }
 
 // offboard

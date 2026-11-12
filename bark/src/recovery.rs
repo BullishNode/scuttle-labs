@@ -463,7 +463,22 @@ impl Wallet {
 		// The server is the authority on whether a vtxo was spent elsewhere,
 		// and recovery has nothing else to go on.
 		let queries = owned.iter().map(|(vtxo, keypair)| (vtxo.id(), keypair)).collect::<Vec<_>>();
-		let states = self.fetch_vtxo_spend_states(&queries).await?;
+		let (srv, _) = self.require_server().await?;
+		let states = if srv.scuttle_payouts().await {
+			// A coin whose expiry payout goes to another mailbox is not ours.
+			let mut statuses = self.fetch_vtxo_statuses(&queries).await?;
+			owned.retain(|(vtxo, _)| {
+				let foreign = statuses.get(&vtxo.id()).is_some_and(|s| !s.own_mailbox);
+				if foreign {
+					warn!("Recovery vtxo {} pays out to another mailbox", vtxo.id());
+					report.push_foreign(vtxo);
+				}
+				!foreign
+			});
+			statuses.drain().map(|(id, status)| (id, status.state)).collect()
+		} else {
+			self.fetch_vtxo_spend_states(&queries).await?
+		};
 
 		let vtxos = owned.into_iter().map(|(vtxo, _)| {
 			// The fetch logged why an answer is missing.
@@ -524,6 +539,11 @@ impl Wallet {
 			for vtxo in &spent {
 				debug!("Recovery vtxo {} already spent, skipping", vtxo.id());
 				report.push_skipped(vtxo);
+			}
+			// A spent coin may have been paid out at expiry: record that payout.
+			let ids = spent.iter().map(|v| v.id()).collect::<Vec<_>>();
+			if let Err(e) = self.check_fallback(&ids).await {
+				warn!("Could not check recovered VTXOs for a fallback payout: {:#}", e);
 			}
 		}
 
@@ -620,6 +640,7 @@ impl Wallet {
 	async fn recover_from_xpub(&self, report: &mut RecoveryReport) -> anyhow::Result<bool> {
 		let (mut srv, ark_info) = self.require_server().await?;
 		let xpub = self.vtxo_xpub().encode().to_vec();
+		let payouts = srv.scuttle_payouts().await;
 
 		let mut start_index = 0u32;
 		let mut cursor_vtxo_id = None;
@@ -673,6 +694,12 @@ impl Wallet {
 				}
 				max_index = max_index.max(Some(index));
 
+				if payouts && bitcoin::secp256k1::PublicKey::from_slice(&entry.owner_mailbox).ok()
+					!= Some(self.mailbox_keypair().public_key()) {
+					warn!("Recovery coin {} belongs to another or unknown mailbox", vtxo.id());
+					report.push_foreign(&vtxo);
+					continue;
+				}
 				let adoption = VtxoSpendState::try_from(entry.spend_state)
 					.map_err(|_| anyhow::anyhow!(
 						"server returned unknown spend state {}; this wallet may need updating",

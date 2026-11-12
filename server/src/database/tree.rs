@@ -1,14 +1,16 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use anyhow::{Context, bail};
 
 use bitcoin::{Transaction, Txid};
+use bitcoin::secp256k1::PublicKey;
 use tracing::debug;
 
-use ark::{ProtocolEncoding, ServerVtxo, Vtxo, VtxoId};
+use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, Vtxo, VtxoId, VtxoPolicy};
 use ark::vtxo::{Bare, Full};
 
 use super::model::{SpendState, VirtualTransaction};
+use super::Tx;
 
 // -- Update structs --
 
@@ -171,6 +173,7 @@ pub struct VtxoTreeUpdate {
 	tx_inserts: Vec<VirtualTransaction<'static>>,
 	vtxo_inserts: VtxoInserts,
 	vtxo_updates: VtxoUpdates,
+	owner_bindings: BTreeMap<VtxoId, PublicKey>,
 }
 
 impl VtxoTreeUpdate {
@@ -179,7 +182,18 @@ impl VtxoTreeUpdate {
 			tx_inserts: Vec::new(),
 			vtxo_inserts: VtxoInserts::new(),
 			vtxo_updates: VtxoUpdates::new(),
+			owner_bindings: BTreeMap::new(),
 		}
+	}
+
+	/// Bind each customer birth to the mailbox admitted for that exact VTXO.
+	pub fn bind_owner_mailboxes(mut self, bindings: impl IntoIterator<Item = (VtxoId, PublicKey)>) -> anyhow::Result<Self> {
+		for (id, mailbox) in bindings {
+			if self.owner_bindings.insert(id, mailbox).is_some_and(|previous| previous != mailbox) {
+				bail!("conflicting mailbox bindings for VTXO {id}");
+			}
+		}
+		Ok(self)
 	}
 
 	// -- virtual tx upserts --
@@ -430,13 +444,69 @@ impl VtxoTreeUpdate {
 /// VTXO row was written, `0` means every insert hit `ON CONFLICT DO NOTHING`
 /// (i.e. an idempotent retry of an already-applied update).
 pub async fn execute_vtxo_tree_update(
-	tx: &tokio_postgres::Transaction<'_>,
+	tx: &Tx<'_>,
 	update: VtxoTreeUpdate,
 ) -> anyhow::Result<u64> {
 	debug_assert!(validate(&update).is_ok(), "{}", validate(&update).unwrap_err());
+	let mut customer_ids = Vec::new();
+	for index in 0..update.vtxo_inserts.vtxo_ids.len() {
+		let state = update.vtxo_inserts.spend_states[index].parse::<SpendState>()?;
+		let customer_birth = match state {
+			SpendState::Spendable | SpendState::Unregistered | SpendState::Unclaimed
+				| SpendState::HtlcRecvUnclaimed => true,
+			SpendState::Spent | SpendState::Pool | SpendState::LnSpent | SpendState::RoundForfeit
+				| SpendState::OffboardForfeit | SpendState::OffboardConnector => false,
+		};
+		if !customer_birth { continue; }
+		let policy = ServerVtxoPolicy::deserialize(&update.vtxo_inserts.policies[index])?;
+		if state == SpendState::Unclaimed
+			&& policy == ServerVtxoPolicy::User(VtxoPolicy::new_pubkey(*crate::round::UNSPENDABLE)) {
+			continue;
+		}
+		if policy.user_pubkey().is_some() {
+			customer_ids.push(update.vtxo_inserts.vtxo_ids[index].clone());
+		}
+	}
+
+	let changes = &update.vtxo_updates;
+	let mut obligation_ids = changes.oor_spends.iter().map(|s| s.vtxo_id)
+		.chain(changes.round_spends.iter().map(|s| s.vtxo_id))
+		.chain(changes.offboard_spends.iter().map(|s| s.vtxo_id))
+		.chain(changes.round_forfeits.iter().map(|s| s.vtxo_id))
+		.chain(changes.claims.iter().copied())
+		.chain(changes.registrations.iter().copied())
+		.chain(changes.provide_signatures.iter().map(|v| v.id()))
+		.collect::<Vec<_>>();
+	obligation_ids.sort_unstable();
+	obligation_ids.dedup();
+	super::expiry_guard::guard_obligation_changes(tx, &obligation_ids).await?;
 
 	upsert_virtual_transactions(tx, &update.tx_inserts).await?;
 	let inserted = insert_vtxos(tx, &update.vtxo_inserts).await?;
+	if tx.expiry_payouts() {
+		let mut mailboxes = Vec::with_capacity(customer_ids.len());
+		for id in &customer_ids {
+			let vtxo_id = id.parse::<VtxoId>()?;
+			let mailbox = update.owner_bindings.get(&vtxo_id)
+				.with_context(|| format!("customer VTXO {id} has no admitted mailbox"))?;
+			mailboxes.push(mailbox.to_string());
+		}
+		if update.owner_bindings.len() != customer_ids.len() {
+			bail!("mailbox binding set differs from customer VTXO births");
+		}
+		tx.execute("INSERT INTO coin_owner (vtxo_id, mailbox_pk)
+			SELECT * FROM UNNEST($1::text[], $2::text[])
+			ON CONFLICT (vtxo_id) DO NOTHING", &[&customer_ids, &mailboxes]).await?;
+		let rows = tx.query("SELECT vtxo_id, mailbox_pk FROM coin_owner WHERE vtxo_id=ANY($1)", &[&customer_ids]).await?;
+		let stored = rows.into_iter().map(|row|
+			(row.get::<_, String>("vtxo_id"), row.get::<_, String>("mailbox_pk")))
+			.collect::<BTreeMap<_, _>>();
+		for (id, mailbox) in customer_ids.iter().zip(mailboxes.iter()) {
+			if stored.get(id) != Some(mailbox) {
+				bail!("customer VTXO {id} has a conflicting mailbox binding");
+			}
+		}
+	}
 	apply_vtxo_updates(tx, &update.vtxo_updates).await?;
 
 	Ok(inserted)

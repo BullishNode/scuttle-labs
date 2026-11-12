@@ -368,14 +368,14 @@ impl ChainEventListener for FrontierChainListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
-		let _guard = self.lock().await;
-		// Rollback all transactions that ocurred above this block
-		self.db.write(async |t| {
-			t.reorg_frontier(block_ref.height).await?;
-			htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(&t, block_ref.height).await?;
-			Ok(())
-		}).await
+	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: bitcoin_ext::BlockRef) -> anyhow::Result<()> {
+		// The rollback tx already holds the validity barrier. If a reindex has
+		// the frontier lock, retry the reorg after it completes instead of
+		// waiting while holding that barrier.
+		let _guard = self.lock.try_lock().context("frontier busy during reorg")?;
+		tx.reorg_frontier(block_ref.height).await?;
+		htlc_vtxo::clear_htlc_vtxo_chain_resolutions_above(tx, block_ref.height).await?;
+		Ok(())
 	}
 
 	async fn on_mempool_update(&self, _mempool: &RawMempool) -> anyhow::Result<()> {

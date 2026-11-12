@@ -642,7 +642,11 @@ CREATE TABLE public.board_exit (
     funding_outpoint text NOT NULL,
     funding_spk bytea NOT NULL,
     exit_txid text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    owner_mailbox text,
+    user_pubkey text,
+    CONSTRAINT board_exit_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66))),
+    CONSTRAINT board_exit_user_pubkey_check CHECK (((user_pubkey IS NULL) OR (length(user_pubkey) = 66)))
 );
 
 
@@ -757,6 +761,17 @@ ALTER SEQUENCE public.cln_xpay_id_seq OWNED BY public.cln_xpay.id;
 
 
 --
+-- Name: coin_owner; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.coin_owner (
+    vtxo_id text NOT NULL,
+    mailbox_pk text NOT NULL,
+    CONSTRAINT coin_owner_mailbox_pk_check CHECK ((length(mailbox_pk) = 66))
+);
+
+
+--
 -- Name: ephemeral_tweak; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -786,6 +801,251 @@ CREATE SEQUENCE public.ephemeral_tweak_id_seq
 --
 
 ALTER SEQUENCE public.ephemeral_tweak_id_seq OWNED BY public.ephemeral_tweak.id;
+
+
+--
+-- Name: expiry_allocation; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_allocation (
+    id bigint NOT NULL,
+    expiry_height integer NOT NULL,
+    broadcast_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT expiry_allocation_expiry_height_check CHECK ((expiry_height >= 0))
+);
+
+
+--
+-- Name: expiry_allocation_coin; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_allocation_coin (
+    allocation_id bigint NOT NULL,
+    entitlement_id bigint NOT NULL,
+    owner_mailbox text,
+    user_pubkey text,
+    spk text,
+    disposition text NOT NULL,
+    gross_sat bigint NOT NULL,
+    fee_sat bigint NOT NULL,
+    payout_sat bigint NOT NULL,
+    forfeited_sat bigint NOT NULL,
+    subsidy_sat bigint DEFAULT 0 NOT NULL,
+    evidence jsonb NOT NULL,
+    CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND (user_pubkey IS NOT NULL) AND (spk IS NOT NULL) AND ((gross_sat + subsidy_sat) = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0) AND (subsidy_sat = 0)))),
+    CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
+    CONSTRAINT expiry_allocation_coin_fee_sat_check CHECK ((fee_sat >= 0)),
+    CONSTRAINT expiry_allocation_coin_forfeited_sat_check CHECK ((forfeited_sat >= 0)),
+    CONSTRAINT expiry_allocation_coin_gross_sat_check CHECK ((gross_sat > 0)),
+    CONSTRAINT expiry_allocation_coin_owner_mailbox_check CHECK (((owner_mailbox IS NULL) OR (length(owner_mailbox) = 66))),
+    CONSTRAINT expiry_allocation_coin_payout_sat_check CHECK ((payout_sat >= 0)),
+    CONSTRAINT expiry_allocation_coin_subsidy_sat_check CHECK ((subsidy_sat >= 0))
+);
+
+
+--
+-- Name: expiry_allocation_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.expiry_allocation_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: expiry_allocation_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.expiry_allocation_id_seq OWNED BY public.expiry_allocation.id;
+
+
+--
+-- Name: expiry_allocation_input; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_allocation_input (
+    allocation_id bigint NOT NULL,
+    vtxo_id text NOT NULL
+);
+
+
+--
+-- Name: expiry_payout_attempt; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_payout_attempt (
+    allocation_id bigint NOT NULL,
+    txid text NOT NULL,
+    signed_tx bytea NOT NULL,
+    fee_sat bigint NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT expiry_payout_attempt_fee_sat_check CHECK ((fee_sat >= 0)),
+    CONSTRAINT expiry_payout_attempt_txid_check CHECK ((length(txid) = 64))
+);
+
+
+--
+-- Name: expiry_terminal_claim; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_terminal_claim (
+    entitlement_id bigint NOT NULL,
+    txid text NOT NULL,
+    height bigint NOT NULL,
+    hash text NOT NULL,
+    CONSTRAINT expiry_terminal_claim_height_check CHECK ((height >= 0))
+);
+
+
+--
+-- Name: vtxo; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vtxo (
+    id bigint NOT NULL,
+    vtxo_id text NOT NULL,
+    vtxo bytea NOT NULL,
+    expiry integer NOT NULL,
+    oor_spent_txid text,
+    spent_in_round bigint,
+    created_at timestamp with time zone NOT NULL,
+    updated_at timestamp with time zone NOT NULL,
+    lightning_htlc_subscription_id bigint,
+    offboarded_in text,
+    vtxo_txid text NOT NULL,
+    exit_delta integer NOT NULL,
+    policy_type text NOT NULL,
+    policy bytea NOT NULL,
+    server_pubkey text NOT NULL,
+    amount bigint NOT NULL,
+    anchor_point text NOT NULL,
+    banned_until_height integer,
+    spend_state public.spend_state NOT NULL,
+    frontier_at timestamp with time zone,
+    confirmed_height integer,
+    onchain_spent_height integer,
+    onchain_spent_txid text
+);
+
+
+--
+-- Name: watchmand_block; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.watchmand_block (
+    height bigint NOT NULL,
+    hash text NOT NULL
+);
+
+
+--
+-- Name: expiry_allocation_state; Type: VIEW; Schema: public; Owner: -
+--
+
+CREATE VIEW public.expiry_allocation_state AS
+ WITH observed AS (
+         SELECT a_1.id,
+            ((count(i.vtxo_id) > 0) AND bool_and(((v.onchain_spent_txid IS NOT NULL) AND (b_1.height IS NOT NULL) AND (EXISTS ( SELECT 1
+                   FROM public.expiry_payout_attempt p
+                  WHERE ((p.allocation_id = a_1.id) AND (p.txid = v.onchain_spent_txid)))))) AND (count(DISTINCT v.onchain_spent_txid) = 1)) AS confirmed,
+            (bool_or(((v.onchain_spent_txid IS NOT NULL) AND (NOT (EXISTS ( SELECT 1
+                   FROM public.expiry_payout_attempt p
+                  WHERE ((p.allocation_id = a_1.id) AND (p.txid = v.onchain_spent_txid))))))) OR (count(DISTINCT v.onchain_spent_txid) > 1)) AS conflicted,
+            min(v.onchain_spent_txid) AS confirmed_txid,
+            min(b_1.height) AS height
+           FROM (((public.expiry_allocation a_1
+             LEFT JOIN public.expiry_allocation_input i ON ((i.allocation_id = a_1.id)))
+             LEFT JOIN public.vtxo v ON ((v.vtxo_id = i.vtxo_id)))
+             LEFT JOIN public.watchmand_block b_1 ON ((b_1.height = v.onchain_spent_height)))
+          GROUP BY a_1.id
+        )
+ SELECT a.id,
+    a.expiry_height,
+        CASE
+            WHEN o.confirmed THEN o.confirmed_txid
+            ELSE latest.txid
+        END AS sweep_txid,
+        CASE
+            WHEN o.confirmed THEN winner.signed_tx
+            ELSE latest.signed_tx
+        END AS sweep_tx,
+    a.broadcast_at,
+    a.created_at,
+        CASE
+            WHEN o.confirmed THEN 'confirmed'::text
+            WHEN (o.conflicted OR (EXISTS ( SELECT 1
+               FROM public.expiry_allocation_coin c
+              WHERE ((c.allocation_id = a.id) AND ((EXISTS ( SELECT 1
+                       FROM public.expiry_terminal_claim t
+                      WHERE (t.entitlement_id = c.entitlement_id))) OR (EXISTS ( SELECT 1
+                       FROM (public.expiry_allocation_coin paid
+                         JOIN observed prior ON ((prior.id = paid.allocation_id)))
+                      WHERE ((paid.entitlement_id = c.entitlement_id) AND prior.confirmed AND (prior.id <> a.id))))))))) THEN 'conflicted'::text
+            ELSE 'pending'::text
+        END AS status,
+        CASE
+            WHEN o.confirmed THEN o.height
+            ELSE NULL::bigint
+        END AS confirmed_height,
+        CASE
+            WHEN o.confirmed THEN b.hash
+            ELSE NULL::text
+        END AS confirmed_hash
+   FROM ((((public.expiry_allocation a
+     JOIN observed o ON ((o.id = a.id)))
+     LEFT JOIN public.expiry_payout_attempt winner ON (((winner.allocation_id = a.id) AND (winner.txid = o.confirmed_txid))))
+     LEFT JOIN LATERAL ( SELECT p.txid,
+            p.signed_tx
+           FROM public.expiry_payout_attempt p
+          WHERE (p.allocation_id = a.id)
+          ORDER BY p.fee_sat DESC
+         LIMIT 1) latest ON (true))
+     LEFT JOIN public.watchmand_block b ON ((b.height = o.height)));
+
+
+--
+-- Name: expiry_cancelled_participation; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_cancelled_participation (
+    participation_id bigint NOT NULL,
+    unlock_hash text,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: expiry_entitlement; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.expiry_entitlement (
+    id bigint NOT NULL,
+    vtxo_id text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL
+);
+
+
+--
+-- Name: expiry_entitlement_id_seq; Type: SEQUENCE; Schema: public; Owner: -
+--
+
+CREATE SEQUENCE public.expiry_entitlement_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: expiry_entitlement_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
+--
+
+ALTER SEQUENCE public.expiry_entitlement_id_seq OWNED BY public.expiry_entitlement.id;
 
 
 --
@@ -1209,7 +1469,9 @@ CREATE TABLE public.lightning_payment_attempt (
     user_fee_sat bigint,
     user_agent text,
     retry_for_secs integer,
-    max_routing_fee_msat bigint
+    max_routing_fee_msat bigint,
+    intent_id text,
+    CONSTRAINT lightning_payment_attempt_intent_id_check CHECK (((intent_id IS NULL) OR (length(intent_id) = 64)))
 );
 
 
@@ -1457,6 +1719,17 @@ ALTER SEQUENCE public.round_participation_id_seq OWNED BY public.round_participa
 
 
 --
+-- Name: server_mode; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.server_mode (
+    singleton boolean DEFAULT true NOT NULL,
+    expiry_payouts boolean DEFAULT false NOT NULL,
+    CONSTRAINT server_mode_singleton_check CHECK (singleton)
+);
+
+
+--
 -- Name: sweep; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -1487,37 +1760,6 @@ CREATE SEQUENCE public.sweep_id_seq
 --
 
 ALTER SEQUENCE public.sweep_id_seq OWNED BY public.sweep.id;
-
-
---
--- Name: vtxo; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.vtxo (
-    id bigint NOT NULL,
-    vtxo_id text NOT NULL,
-    vtxo bytea NOT NULL,
-    expiry integer NOT NULL,
-    oor_spent_txid text,
-    spent_in_round bigint,
-    created_at timestamp with time zone NOT NULL,
-    updated_at timestamp with time zone NOT NULL,
-    lightning_htlc_subscription_id bigint,
-    offboarded_in text,
-    vtxo_txid text NOT NULL,
-    exit_delta integer NOT NULL,
-    policy_type text NOT NULL,
-    policy bytea NOT NULL,
-    server_pubkey text NOT NULL,
-    amount bigint NOT NULL,
-    anchor_point text NOT NULL,
-    banned_until_height integer,
-    spend_state public.spend_state NOT NULL,
-    frontier_at timestamp with time zone,
-    confirmed_height integer,
-    onchain_spent_height integer,
-    onchain_spent_txid text
-);
 
 
 --
@@ -2142,16 +2384,6 @@ ALTER SEQUENCE public.wallet_changeset_id_seq OWNED BY public.wallet_changeset.i
 
 
 --
--- Name: watchmand_block; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.watchmand_block (
-    height bigint NOT NULL,
-    hash text NOT NULL
-);
-
-
---
 -- Name: arkoor_mailbox id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -2177,6 +2409,20 @@ ALTER TABLE ONLY public.cln_xpay ALTER COLUMN id SET DEFAULT nextval('public.cln
 --
 
 ALTER TABLE ONLY public.ephemeral_tweak ALTER COLUMN id SET DEFAULT nextval('public.ephemeral_tweak_id_seq'::regclass);
+
+
+--
+-- Name: expiry_allocation id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation ALTER COLUMN id SET DEFAULT nextval('public.expiry_allocation_id_seq'::regclass);
+
+
+--
+-- Name: expiry_entitlement id; Type: DEFAULT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_entitlement ALTER COLUMN id SET DEFAULT nextval('public.expiry_entitlement_id_seq'::regclass);
 
 
 --
@@ -2347,6 +2593,14 @@ ALTER TABLE ONLY public.cln_xpay
 
 
 --
+-- Name: coin_owner coin_owner_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.coin_owner
+    ADD CONSTRAINT coin_owner_pkey PRIMARY KEY (vtxo_id);
+
+
+--
 -- Name: ephemeral_tweak ephemeral_tweak_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2360,6 +2614,86 @@ ALTER TABLE ONLY public.ephemeral_tweak
 
 ALTER TABLE ONLY public.ephemeral_tweak
     ADD CONSTRAINT ephemeral_tweak_pubkey_key UNIQUE (pubkey);
+
+
+--
+-- Name: expiry_allocation_coin expiry_allocation_coin_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation_coin
+    ADD CONSTRAINT expiry_allocation_coin_pkey PRIMARY KEY (allocation_id, entitlement_id);
+
+
+--
+-- Name: expiry_allocation_input expiry_allocation_input_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation_input
+    ADD CONSTRAINT expiry_allocation_input_pkey PRIMARY KEY (allocation_id, vtxo_id);
+
+
+--
+-- Name: expiry_allocation expiry_allocation_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation
+    ADD CONSTRAINT expiry_allocation_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: expiry_cancelled_participation expiry_cancelled_participation_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_cancelled_participation
+    ADD CONSTRAINT expiry_cancelled_participation_pkey PRIMARY KEY (participation_id);
+
+
+--
+-- Name: expiry_cancelled_participation expiry_cancelled_participation_unlock_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_cancelled_participation
+    ADD CONSTRAINT expiry_cancelled_participation_unlock_hash_key UNIQUE (unlock_hash);
+
+
+--
+-- Name: expiry_entitlement expiry_entitlement_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_entitlement
+    ADD CONSTRAINT expiry_entitlement_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: expiry_entitlement expiry_entitlement_vtxo_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_entitlement
+    ADD CONSTRAINT expiry_entitlement_vtxo_id_key UNIQUE (vtxo_id);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_pkey PRIMARY KEY (allocation_id, txid);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_txid_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_txid_key UNIQUE (txid);
+
+
+--
+-- Name: expiry_terminal_claim expiry_terminal_claim_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_terminal_claim
+    ADD CONSTRAINT expiry_terminal_claim_pkey PRIMARY KEY (entitlement_id);
 
 
 --
@@ -2459,6 +2793,14 @@ ALTER TABLE ONLY public.lightning_payment_attempt_htlc_vtxo
 
 
 --
+-- Name: lightning_payment_attempt lightning_payment_attempt_intent_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.lightning_payment_attempt
+    ADD CONSTRAINT lightning_payment_attempt_intent_id_key UNIQUE (intent_id);
+
+
+--
 -- Name: lightning_payment_attempt lightning_payment_attempt_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -2512,6 +2854,14 @@ ALTER TABLE ONLY public.round_participation
 
 ALTER TABLE ONLY public.round
     ADD CONSTRAINT round_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: server_mode server_mode_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.server_mode
+    ADD CONSTRAINT server_mode_pkey PRIMARY KEY (singleton);
 
 
 --
@@ -2590,6 +2940,13 @@ CREATE INDEX arkoor_mailbox_pubkey_ix ON public.arkoor_mailbox USING btree (pubk
 --
 
 CREATE UNIQUE INDEX arkoor_mailbox_vtxo_id_uix ON public.arkoor_mailbox USING btree (vtxo_id);
+
+
+--
+-- Name: board_exit_exit_txid_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX board_exit_exit_txid_idx ON public.board_exit USING btree (exit_txid);
 
 
 --
@@ -3048,6 +3405,70 @@ ALTER TABLE ONLY public.cln_hold
 
 ALTER TABLE ONLY public.cln_xpay
     ADD CONSTRAINT cln_xpay_lightning_node_id_fkey FOREIGN KEY (lightning_node_id) REFERENCES public.lightning_node(id);
+
+
+--
+-- Name: coin_owner coin_owner_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.coin_owner
+    ADD CONSTRAINT coin_owner_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
+
+
+--
+-- Name: expiry_allocation_coin expiry_allocation_coin_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation_coin
+    ADD CONSTRAINT expiry_allocation_coin_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
+
+
+--
+-- Name: expiry_allocation_coin expiry_allocation_coin_entitlement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation_coin
+    ADD CONSTRAINT expiry_allocation_coin_entitlement_id_fkey FOREIGN KEY (entitlement_id) REFERENCES public.expiry_entitlement(id);
+
+
+--
+-- Name: expiry_allocation_input expiry_allocation_input_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation_input
+    ADD CONSTRAINT expiry_allocation_input_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
+
+
+--
+-- Name: expiry_allocation_input expiry_allocation_input_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_allocation_input
+    ADD CONSTRAINT expiry_allocation_input_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
+
+
+--
+-- Name: expiry_entitlement expiry_entitlement_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_entitlement
+    ADD CONSTRAINT expiry_entitlement_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
+
+
+--
+-- Name: expiry_payout_attempt expiry_payout_attempt_allocation_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_payout_attempt
+    ADD CONSTRAINT expiry_payout_attempt_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
+
+
+--
+-- Name: expiry_terminal_claim expiry_terminal_claim_entitlement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.expiry_terminal_claim
+    ADD CONSTRAINT expiry_terminal_claim_entitlement_id_fkey FOREIGN KEY (entitlement_id) REFERENCES public.expiry_entitlement(id);
 
 
 --

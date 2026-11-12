@@ -434,6 +434,21 @@ impl RoundState {
 		Ok(true)
 	}
 
+	/// Whether the server decided an expiry payout for one of our inputs.
+	///
+	/// It then cancelled the participation as a whole and accepts no forfeit
+	/// for it anymore, so the round is over for us.
+	async fn has_fallback_input(&self, wallet: &Wallet) -> anyhow::Result<bool> {
+		for input in &self.participation.inputs {
+			if let Some(vtxo) = wallet.inner.db.get_wallet_vtxo(input.id()).await? {
+				if vtxo.fallback_status.is_some() {
+					return Ok(true);
+				}
+			}
+		}
+		Ok(false)
+	}
+
 	/// Take on a participation built by
 	/// [RoundState::try_shrink_participation], and keep the movement's
 	/// consumed VTXOs and amounts in sync with it.
@@ -697,6 +712,16 @@ impl RoundState {
 	/// When success or failure is returned, the round state can be eliminated
 	//TODO(stevenroose) make RoundState manage its own db record
 	pub async fn sync(&mut self, wallet: &Wallet) -> anyhow::Result<RoundStatus> {
+		let awaits_forfeit = match self.flow {
+			RoundFlowState::NonInteractivePending { .. } => true,
+			RoundFlowState::Finished { .. } => !self.done,
+			_ => false,
+		};
+		if awaits_forfeit && self.has_fallback_input(wallet).await? {
+			info!("Server pays out an input of this round at its expiry; canceling it");
+			self.flow = RoundFlowState::Canceled;
+		}
+
 		match self.flow {
 			RoundFlowState::Finished { ref funding_tx, .. } if self.done => {
 				Ok(RoundStatus::Confirmed {
@@ -838,7 +863,7 @@ impl RoundState {
 			RoundFlowState::Finished { ref funding_tx, unlock_hash } => {
 				let funding_txid = funding_tx.compute_txid();
 				let confirmed = check_funding_tx_confirmations(
-					wallet, funding_txid, &funding_tx,
+					wallet, funding_txid, &funding_tx, true,
 				).await.context("error checking funding tx confirmations")?;
 				if !confirmed {
 					trace!("Funding tx {} not yet deeply enough confirmed", funding_txid);
@@ -1185,6 +1210,14 @@ async fn hark_vtxo_swap(
 	unlock_hash: UnlockHash,
 	sent_forfeit_sigs: bool,
 ) -> Result<(), HarkForfeitError> {
+	if let Some(output) = output_vtxos.iter().find(|v| v.unlock_hash() != Some(unlock_hash)) {
+		let error = anyhow!("round output {} has another participation's unlock hash", output.id());
+		return Err(if sent_forfeit_sigs {
+			HarkForfeitError::SentForfeits(error)
+		} else {
+			HarkForfeitError::Err(error)
+		});
+	}
 	let (mut srv, _) = wallet.require_server().await.map_err(HarkForfeitError::Err)?;
 
 	// before we start make sure the server has our input vtxo signatures
@@ -1364,6 +1397,7 @@ fn check_round_matches_participation(
 	scheduled_height: Option<BlockHeight>,
 	tip: BlockHeight,
 	exit_margin: BlockDelta,
+	already_released: bool,
 ) -> anyhow::Result<()> {
 	ensure!(new_vtxos.len() == part.outputs.len(),
 		"unexpected number of VTXOs: got {}, expected {}", new_vtxos.len(), part.outputs.len(),
@@ -1381,7 +1415,7 @@ fn check_round_matches_participation(
 	// We have two requirements on the outputs:
 	// - if we asked for a scheduled height, we want the server to respect it
 	// - if our inputs are not expired yet, we want the output VTXOs to be exitable
-	let expired_inputs = part.inputs.iter().all(|v| v.expiry_height() <= tip);
+	let expired_inputs = already_released || part.inputs.iter().all(|v| v.expiry_height() <= tip);
 	let max_input_exit_delta = part.inputs.iter().map(|v| v.exit_delta()).max()
 		.expect("min one input");
 	let min_exitable = min_exitable_output_vtxo_expiry_height(tip, exit_margin, max_input_exit_delta);
@@ -1428,6 +1462,7 @@ async fn check_funding_tx_confirmations(
 	wallet: &Wallet,
 	funding_txid: Txid,
 	funding_tx: &Transaction,
+	broadcast_missing: bool,
 ) -> anyhow::Result<bool> {
 	let tip = wallet.inner.chain.tip().await.context("chain source error")?;
 	let conf_height = tip.saturating_sub(wallet.inner.config.round_tx_required_confirmations) + BlockDelta::new(1);
@@ -1446,6 +1481,7 @@ async fn check_funding_tx_confirmations(
 				Ok(false)
 			}
 		},
+		TxStatus::NotFound if !broadcast_missing => Ok(false),
 		TxStatus::NotFound => {
 			// let's try to submit it to our mempool
 			//TODO(stevenroose) change this to an explicit "testmempoolaccept" so that we can
@@ -1510,16 +1546,7 @@ async fn progress_delegated(
 		return Ok(HarkProgressResult::RoundPending);
 	}
 
-	// Since we got here, we clearly don't think we're finished.
-	// So even if the server thinks we did the dance before, we need the
-	// cosignature on the leaf tx so we need to do the dance again.
-	// "Guilty feet have got no rhythm."
-	if status == protos::RoundParticipationStatus::RoundPartReleased {
-		let preimage = resp.unlock_preimage.as_ref().map(|p| p.as_hex());
-		warn!("Server says preimage was already released for hArk participation \
-			with unlock hash {}. Supposed preimage: {:?}", unlock_hash, preimage,
-		);
-	}
+	let already_released = status == protos::RoundParticipationStatus::RoundPartReleased;
 
 	let funding_tx_bytes = resp.round_funding_tx
 		.context("funding txid should be provided when status is not pending")
@@ -1533,7 +1560,7 @@ async fn progress_delegated(
 	);
 
 	// Check the confirmation status of the funding tx
-	let confirmed = check_funding_tx_confirmations(wallet, funding_txid, &funding_tx).await
+	let confirmed = check_funding_tx_confirmations(wallet, funding_txid, &funding_tx, !already_released).await
 		.context("checking funding tx confirmations")
 		.map_err(HarkForfeitError::Err)?;
 
@@ -1564,7 +1591,7 @@ async fn progress_delegated(
 		.map_err(HarkForfeitError::Err)?;
 	check_round_matches_participation(
 		participation, &new_vtxos, &funding_tx, &ark_info, scheduled_height,
-		tip, wallet.inner.config.vtxo_exit_margin,
+		tip, wallet.inner.config.vtxo_exit_margin, already_released,
 	)
 		.context("new VTXOs received from server don't match our participation")
 		.map_err(HarkForfeitError::Err)?;
@@ -1573,7 +1600,7 @@ async fn progress_delegated(
 	// SentForfeits would set the round's forfeit flag, which disables the
 	// exitability check above on the next attempt.
 	hark_vtxo_swap(
-		wallet, participation, &mut new_vtxos, &funding_tx, unlock_hash, sent_forfeit_sigs,
+		wallet, participation, &mut new_vtxos, &funding_tx, unlock_hash, sent_forfeit_sigs || already_released,
 	).await.map_err(|e| match e {
 		HarkForfeitError::Err(e) =>
 			HarkForfeitError::Err(e.context("error forfeiting hArk VTXOs")),
@@ -1657,7 +1684,7 @@ async fn progress_attempt(
 			}
 
 			match construct_new_vtxos(
-				part, unsigned_round_tx, vtxos_spec, cosign_sigs,
+				part, unsigned_round_tx, vtxos_spec, cosign_sigs, *unlock_hash,
 			).await {
 				Ok(v) => AttemptProgressResult::Finished {
 					funding_tx: signed_round_tx.clone(),
@@ -1754,6 +1781,7 @@ async fn construct_new_vtxos(
 	unsigned_round_tx: &Transaction,
 	vtxo_tree: &VtxoTreeSpec,
 	vtxo_cosign_sigs: &[schnorr::Signature],
+	unlock_hash: UnlockHash,
 ) -> anyhow::Result<Vec<Vtxo<Full>>> {
 	let round_txid = unsigned_round_tx.compute_txid();
 	let vtxos_utxo = OutPoint::new(round_txid, ROUND_TX_VTXO_TREE_VOUT);
@@ -1769,37 +1797,18 @@ async fn construct_new_vtxos(
 		.into_signed_tree(vtxo_cosign_sigs.to_vec())
 		.into_cached_tree();
 
-	let mut expected_vtxos = participation.outputs.iter().collect::<Vec<_>>();
-	let total_nb_expected_vtxos = expected_vtxos.len();
-
-	let mut new_vtxos = vec![];
-	for (idx, req) in signed_vtxos.spec.spec.vtxos.iter().enumerate() {
-		if let Some(expected_idx) = expected_vtxos.iter().position(|r| **r == req.vtxo) {
-			let vtxo = signed_vtxos.build_vtxo(idx);
-
-			// validate the received vtxos
-			// This is more like a sanity check since we crafted them ourselves.
-			check_vtxo_fails_hash_lock(unsigned_round_tx, &vtxo)
-				.context("constructed invalid vtxo from tree")?;
-
-			info!("New VTXO from round: {} ({}, {})",
-				vtxo.id(), vtxo.amount(), vtxo.policy_type(),
-			);
-
-			new_vtxos.push(vtxo);
-			expected_vtxos.swap_remove(expected_idx);
-		}
-	}
-
-	if !expected_vtxos.is_empty() {
-		if expected_vtxos.len() == total_nb_expected_vtxos {
-			// we must have done something wrong
-			bail!("None of our VTXOs were present in round!");
-		} else {
-			bail!("Server included some of our VTXOs but not all: {} missing: {:?}",
-				expected_vtxos.len(), expected_vtxos,
-			);
-		}
+	let leaf_idxs = signed_vtxos.spec.spec.leaf_idxs_for_participation(
+		unlock_hash, participation.outputs.iter(),
+	).context("our outputs not part of tree for this participation")?;
+	let mut new_vtxos = Vec::with_capacity(leaf_idxs.len());
+	for idx in leaf_idxs {
+		let vtxo = signed_vtxos.build_vtxo(idx);
+		check_vtxo_fails_hash_lock(unsigned_round_tx, &vtxo)
+			.context("constructed invalid vtxo from tree")?;
+		info!("New VTXO from round: {} ({}, {})",
+			vtxo.id(), vtxo.amount(), vtxo.policy_type(),
+		);
+		new_vtxos.push(vtxo);
 	}
 	Ok(new_vtxos)
 }
@@ -1815,6 +1824,7 @@ async fn persist_round_success(
 	debug!("Persisting newly finished round. {} new vtxos, movement ID {:?}",
 		new_vtxos.len(), movement_id,
 	);
+	let verify_payout_owner = wallet.server_payouts().await;
 
 	// we first try all actions that need to happen and only afterwards return errors
 	// so that we achieve maximum success
@@ -1827,8 +1837,11 @@ async fn persist_round_success(
 	let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 	let spent_result = wallet.inner.db.steal_lock_to_spent(&input_ids).await
 		.context("failed to mark input VTXOs as spent");
-	let store_result = wallet.store_spendable_vtxos(new_vtxos).await
-		.context("failed to store new VTXOs");
+	let store_result = if verify_payout_owner {
+		wallet.store_locked_vtxos(new_vtxos, Some(VtxoLockHolder::RoundPayoutCheck)).await
+	} else {
+		wallet.store_spendable_vtxos(new_vtxos).await
+	}.context("failed to store new VTXOs");
 	let update_result = if let Some(mid) = movement_id {
 		wallet.inner.movements.finish_movement_with_update(
 			mid,
@@ -1844,6 +1857,13 @@ async fn persist_round_success(
 	store_result?;
 	spent_result?;
 	update_result?;
+	if verify_payout_owner {
+		for output in new_vtxos {
+			if let Err(error) = wallet.release_verified_round_output(output).await {
+				warn!("Round output {} remains locked pending payout-owner verification: {error:#}", output.id());
+			}
+		}
+	}
 
 	Ok(())
 }
@@ -2018,6 +2038,14 @@ impl Wallet {
 		participation: RoundParticipation,
 		movement_kind: Option<RoundMovement>,
 	) -> anyhow::Result<StoredRoundState> {
+		// Payout mode binds every output to this wallet's mailbox.
+		if self.require_server().await?.0.scuttle_payouts().await {
+			for output in &participation.outputs {
+				let key = output.policy.user_pubkey();
+				ensure!(self.pubkey_keypair(&key).await?.is_some(),
+					"keypair {} not found for requested round output", key);
+			}
+		}
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 
 		// The inputs are only locked at attempt start; here they must just
@@ -2073,6 +2101,14 @@ impl Wallet {
 		// Pending participations over the same inputs stand: the server drops
 		// the ones it holds when it stores this submission, and they notice
 		// on their next sync.
+		// Payout mode binds every output to this wallet's mailbox.
+		if self.require_server().await?.0.scuttle_payouts().await {
+			for output in &participation.outputs {
+				let key = output.policy.user_pubkey();
+				ensure!(self.pubkey_keypair(&key).await?.is_some(),
+					"keypair {} not found for requested round output", key);
+			}
+		}
 		let input_ids = participation.inputs.iter().map(|v| v.id()).collect::<Vec<_>>();
 		self.check_inputs_spendable(&input_ids).await?;
 

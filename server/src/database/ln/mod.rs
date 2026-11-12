@@ -213,6 +213,27 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Get the payment attempt initiated against the given htlc subscription
+	/// that is open or succeeded.
+	///
+	/// Unlike the open-attempt lookup, this still finds the funding attempt
+	/// after it succeeded, so a receive whose settlement was interrupted is
+	/// still recognized as an intra-Ark payment.
+	pub async fn get_lightning_payment_attempt_by_subscription_id(
+		&self,
+		lightning_htlc_subscription_id: i64,
+	) -> anyhow::Result<Option<LightningPaymentAttempt>> {
+		let stmt = self.prepare(&format!("
+			SELECT {LIGHTNING_PAYMENT_ATTEMPT_COLUMNS}
+			FROM lightning_payment_attempt lpa
+			WHERE lpa.lightning_htlc_subscription_id = $1 AND lpa.status <> 'failed'
+			ORDER BY lpa.created_at DESC
+			LIMIT 1;
+		")).await?;
+		let row = self.query_opt(&stmt, &[&lightning_htlc_subscription_id]).await?;
+		row.map(TryInto::try_into).transpose()
+	}
+
 	/// Stores data after lightning payment start.
 	///
 	/// Creates a new payment attempt for the given invoice and links the
@@ -243,6 +264,8 @@ impl<'t> Tx<'t> {
 		retry_for: Duration,
 		// `None` for intra-Ark self-payments, which never reach CLN.
 		max_routing_fee: Option<Amount>,
+		// The id of the signed send intent, with expiry payouts.
+		intent_id: Option<&str>,
 	) -> anyhow::Result<i64> {
 		let payment_hash = invoice.payment_hash();
 
@@ -275,11 +298,12 @@ impl<'t> Tx<'t> {
 				user_fee_sat,
 				user_agent,
 				retry_for_secs,
+				intent_id,
 				max_routing_fee_msat,
 				created_at,
 				updated_at,
 				lightning_htlc_subscription_id
-			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW(), NOW(), $11)
+			) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW(), $12)
 			RETURNING id, updated_at;
 		").await?;
 
@@ -297,7 +321,7 @@ impl<'t> Tx<'t> {
 				&node_id, &payment_hash.to_string(), &(amount.to_msat() as i64),
 				&mailbox_str, &requested_status,
 				&block_height_i32, &user_fee_sat_i64, &user_agent, &retry_for_secs_i32,
-				&max_routing_fee_msat_i64,
+				&intent_id, &max_routing_fee_msat_i64,
 				&lightning_htlc_subscription_id,
 			],
 		).await?;
@@ -937,10 +961,11 @@ impl<'t> Tx<'t> {
 		}
 	}
 
-	/// Transition every currently-`spendable` HTLC-send vtxo linked to any
-	/// attempt for the given payment hash to `ln-spent`. Called when a
-	/// lightning send settles, so the vtxo is explicitly marked as consumed
-	/// by a paid invoice.
+	/// Transition every currently-`spendable` HTLC-send vtxo linked to the
+	/// given attempt to `ln-spent`. Called when a lightning send settles, so
+	/// the vtxo is explicitly marked as consumed by a paid invoice. Only the
+	/// attempt that succeeded is marked: another payer's HTLCs on the same
+	/// payment hash are still theirs.
 	///
 	/// Returns the ids of linked vtxos left untouched because their
 	/// `spend_state` was no longer `spendable` at update time (e.g. already
@@ -948,7 +973,7 @@ impl<'t> Tx<'t> {
 	/// empty vec means every linked vtxo transitioned.
 	pub async fn mark_htlc_send_vtxos_ln_spent(
 		&self,
-		payment_hash: PaymentHash,
+		attempt_id: i64,
 	) -> anyhow::Result<Vec<VtxoId>> {
 		let stmt = self.prepare("
 			WITH found AS (
@@ -956,7 +981,7 @@ impl<'t> Tx<'t> {
 				FROM vtxo
 				JOIN lightning_payment_attempt_htlc_vtxo link ON link.vtxo_id = vtxo.vtxo_id
 				JOIN lightning_payment_attempt lpa ON lpa.id = link.lightning_payment_attempt_id
-				WHERE lpa.payment_hash = $1
+				WHERE lpa.id = $1
 			),
 			updated AS (
 				UPDATE vtxo
@@ -969,7 +994,7 @@ impl<'t> Tx<'t> {
 			WHERE vtxo_id NOT IN (SELECT vtxo_id FROM updated)
 		").await?;
 
-		let rows = self.query(&stmt, &[&payment_hash.to_string()]).await
+		let rows = self.query(&stmt, &[&attempt_id]).await
 			.context("failed to mark HTLC-send vtxos as ln-spent")?;
 
 		rows.iter()
@@ -1001,6 +1026,14 @@ impl<'t> Tx<'t> {
 		} else {
 			Ok(None)
 		}
+	}
+
+	/// Hold off any new settlement until this transaction ends, so an expiry
+	/// decision made on "no preimage stored" stays true when it commits.
+	pub async fn lock_htlc_settlements(&self) -> anyhow::Result<()> {
+		self.execute("SELECT pg_advisory_xact_lock_shared($1)",
+			&[&(super::AdvisoryLock::HtlcSettlementWrite as i64)]).await?;
+		Ok(())
 	}
 
 	/// The sole sanctioned settlement gate for any fund-releasing path

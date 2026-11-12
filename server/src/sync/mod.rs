@@ -16,7 +16,7 @@ use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 use bitcoin_ext::BlockRef;
 
-use crate::database::{BlockTable, Db};
+use crate::database::{BlockTable, Db, Tx};
 use crate::system::RuntimeManager;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -72,7 +72,11 @@ pub trait ChainEventListener: Send + Sync {
 	/// state that depended on blocks after the fork point.
 	///
 	/// Also called once on startup with the indexed tip.
-	async fn on_reorg(&self, block_ref: BlockRef) -> anyhow::Result<()>;
+	///
+	/// Use the supplied rollback transaction for database work: it already
+	/// holds the exclusive validity barrier. Borrowing another pooled
+	/// connection here can deadlock even with a single listener.
+	async fn on_reorg(&self, tx: &Tx<'_>, block_ref: BlockRef) -> anyhow::Result<()>;
 
 	/// Called when the mempool has been polled.
 	///

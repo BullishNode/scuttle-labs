@@ -8,6 +8,15 @@ mod embedded {
 	}
 }
 
+pub mod expiry_attribution;
+pub(crate) mod expiry_guard;
+pub mod expiry_inventory;
+pub mod expiry_chain;
+pub mod expiry_decision;
+pub mod expiry_ownership;
+pub mod expiry_payout;
+pub(crate) mod expiry_lightning;
+
 mod ban;
 pub mod block;
 pub mod data_migrations;
@@ -47,6 +56,7 @@ use bdk_wallet::{chain::Merge, ChangeSet};
 use bitcoin::{Amount, OutPoint, Script, Transaction, Txid};
 use bitcoin::consensus::{serialize, deserialize};
 use bitcoin::secp256k1::{self, PublicKey};
+use bitcoin_ext::BlockHeight;
 use chrono::Local;
 use futures::Stream;
 use tokio_postgres::{Client, NoTls, RowStream};
@@ -147,13 +157,16 @@ pub enum MailboxPayload {
 
 #[derive(Clone)]
 pub struct Db {
-	pool: Pool<ConnectionManager>
+	pool: Pool<ConnectionManager>,
+	expiry_payouts: bool,
 }
 
 impl Db {
 	async fn run_migrations(&self) -> anyhow::Result<()> {
 		let mut conn = self.get_conn().await?;
-		embedded::migrations::runner().run_async::<Client>(&mut conn).await?;
+		conn.query_one("SELECT set_config('ark.expiry_payouts', $1, false)",
+			&[&self.expiry_payouts.to_string()]).await?;
+		embedded::migrations::runner().run_async::<Client>(&mut *conn).await?;
 		info!("All migrations got successfully run");
 		Ok(())
 	}
@@ -226,13 +239,17 @@ impl Db {
 	pub async fn connect(config: &PostgresConfig) -> anyhow::Result<Self> {
 		let pool = Self::pool_connect(&config.name, config).await?;
 
-		let db = Db { pool };
+		let mut db = Db { pool, expiry_payouts: false };
 		db.run_migrations().await?;
+		let expiry_payouts = db.get_conn().await?.query_one(
+			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
+		).await?.get(0);
+		db.expiry_payouts = expiry_payouts;
 
 		Ok(db)
 	}
 
-	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
+	pub async fn create_with_payouts(config: &PostgresConfig, expiry_payouts: bool) -> anyhow::Result<Self> {
 		info!("Checking if a database exists...");
 		let connect = Self::raw_connect(config).await;
 
@@ -250,8 +267,22 @@ impl Db {
 			conn.execute(&statement, &[]).await?;
 		}
 
-		Self::connect(config).await
+		let pool = Self::pool_connect(&config.name, config).await?;
+		let db = Db { pool, expiry_payouts };
+		// V78 stores the selected mode in the same transaction as its schema.
+		db.run_migrations().await?;
+		let stored: bool = db.get_conn().await?.query_one(
+			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
+		).await?.get(0);
+		ensure!(stored == expiry_payouts, "database was created in a different payout mode");
+		Ok(db)
 	}
+
+	pub async fn create(config: &PostgresConfig) -> anyhow::Result<Self> {
+		Self::create_with_payouts(config, false).await
+	}
+
+	pub fn expiry_payouts(&self) -> bool { self.expiry_payouts }
 
 	/// Check out a raw pooled connection, below the [Db::read]/[Db::write]
 	/// transaction API. Only for tests that must manipulate session state.
@@ -315,7 +346,7 @@ impl Db {
 			.read_only(read_only)
 			.start().await
 			.context("unable to start db tx")?;
-		let tx = Tx { inner: &pgtx };
+		let tx = Tx { inner: &pgtx, expiry_payouts: self.expiry_payouts };
 		let ret = f(&tx).await;
 		if read_only {
 			// We want to commit read queries regardless of error because it's the
@@ -351,6 +382,7 @@ impl Db {
 /// A managed postgres DB transaction
 pub struct Tx<'t> {
 	inner: &'t tokio_postgres::Transaction<'t>,
+	expiry_payouts: bool,
 }
 
 impl<'t> std::ops::Deref for Tx<'t> {
@@ -362,6 +394,8 @@ impl<'t> std::ops::Deref for Tx<'t> {
 }
 
 impl<'t> Tx<'t> {
+	pub fn expiry_payouts(&self) -> bool { self.expiry_payouts }
+
 	/**
 	 * VTXOs
 	*/
@@ -487,6 +521,16 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<Checkpoint>> {
 		if vtxos.is_empty() {
 			return Ok(None);
+		}
+
+		if self.expiry_payouts() {
+			let ids = vtxos.iter().map(|vtxo| vtxo.id()).collect::<Vec<_>>();
+			let owners = self.coin_owner_mailboxes(&ids).await?;
+			for id in ids {
+				if owners.get(&id) != Some(&mailbox_id.as_pubkey()) {
+					return crate::error::badarg!("vtxo {} does not belong to the provided mailbox", id);
+				}
+			}
 		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
@@ -844,6 +888,8 @@ impl<'t> Tx<'t> {
 		}
 	}
 
+	/// Store recovery hints only. A mailbox holder may name foreign or unknown
+	/// IDs; this path must never create VTXOs or coin-to-mailbox bindings.
 	pub async fn store_vtxo_ids_in_mailbox(
 		&self,
 		mailbox_type: MailboxType,
@@ -852,6 +898,16 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<Checkpoint>> {
 		if vtxo_ids.is_empty() {
 			return Ok(None);
+		}
+		if self.expiry_payouts() {
+			let admitted = self.coin_owner_mailboxes(vtxo_ids).await?;
+			for id in vtxo_ids {
+				if admitted.get(id).is_some_and(|owner| *owner != mailbox_id.as_pubkey()) {
+					return crate::error::badarg!(
+						"vtxo {} is bound to another mailbox", id,
+					);
+				}
+			}
 		}
 
 		// Acquire advisory lock to serialize all mailbox writes.
@@ -1009,23 +1065,48 @@ impl<'t> Tx<'t> {
 		funding_outpoint: OutPoint,
 		funding_spk: &Script,
 		exit_txid: Txid,
-	) -> anyhow::Result<Txid> {
+		owner_mailbox: Option<PublicKey>,
+		user_pubkey: PublicKey,
+	) -> anyhow::Result<(Txid, Option<PublicKey>)> {
 		let insert = self.prepare_typed(
-			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid)
-			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING;",
-			&[Type::TEXT, Type::BYTEA, Type::TEXT],
+			"INSERT INTO board_exit (funding_outpoint, funding_spk, exit_txid, owner_mailbox, user_pubkey)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING;",
+			&[Type::TEXT, Type::BYTEA, Type::TEXT, Type::TEXT, Type::TEXT],
 		).await?;
 		let outpoint = funding_outpoint.to_string();
 		let spk = funding_spk.as_bytes();
-		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string()]).await?;
+		let mailbox = owner_mailbox.map(|key| key.to_string());
+		let user_key = user_pubkey.to_string();
+		self.execute(&insert, &[&outpoint, &spk, &exit_txid.to_string(), &mailbox, &user_key]).await?;
 
 		// a separate statement, so it sees a row a concurrent insert committed
 		let select = self.prepare_typed(
-			"SELECT exit_txid FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
+			"SELECT exit_txid, owner_mailbox, user_pubkey FROM board_exit WHERE funding_outpoint = $1 AND funding_spk = $2;",
 			&[Type::TEXT, Type::BYTEA],
 		).await?;
 		let row = self.query_one(&select, &[&outpoint, &spk]).await?;
-		Ok(Txid::from_str(row.get("exit_txid"))?)
+		let stored_mailbox = row.get::<_, Option<&str>>("owner_mailbox").map(PublicKey::from_str).transpose()?;
+		if owner_mailbox.is_some() && owner_mailbox != stored_mailbox {
+			return crate::error::badarg!("board output already has another payout mailbox");
+		}
+		let stored_user_key = row.get::<_, Option<&str>>("user_pubkey");
+		if stored_user_key.is_some_and(|stored| stored != user_key)
+			|| (self.expiry_payouts() && stored_user_key.is_none()) {
+			return crate::error::badarg!("board output already has another owner key");
+		}
+		Ok((Txid::from_str(row.get("exit_txid"))?, stored_mailbox))
+	}
+
+	/// A board cosigned in payout mode is on the frontier before its funding
+	/// confirms. Forget the funding root of one still unconfirmed and
+	/// unregistered at its expiry, so it is not loaded on every block forever.
+	/// The holder keeps the cosigned exit; registering it inserts the root again.
+	pub async fn drop_unconfirmed_board_roots(&self, tip: BlockHeight) -> anyhow::Result<u64> {
+		Ok(self.execute("DELETE FROM vtxo v USING board_exit b \
+			WHERE v.frontier_at IS NOT NULL AND v.onchain_spent_height IS NULL \
+			AND v.confirmed_height IS NULL AND v.expiry<=$1 AND v.vtxo_id=b.funding_outpoint \
+			AND NOT EXISTS (SELECT 1 FROM vtxo child WHERE child.vtxo_txid=b.exit_txid)",
+			&[&i32::try_from(tip.to_u32())?]).await?)
 	}
 
 	/// Flip `wallet_commit` from FALSE to TRUE for the given offboard.

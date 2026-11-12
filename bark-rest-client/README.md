@@ -222,6 +222,7 @@ Class | Method | HTTP request | Description
  - [ExitTxStatusOneOf4](docs/ExitTxStatusOneOf4.md)
  - [ExitVtxoAlreadySpentState](docs/ExitVtxoAlreadySpentState.md)
  - [ExitVtxoSweptState](docs/ExitVtxoSweptState.md)
+ - [FallbackStatusInfo](docs/FallbackStatusInfo.md)
  - [FeeEstimateQuery](docs/FeeEstimateQuery.md)
  - [FeeEstimateResponse](docs/FeeEstimateResponse.md)
  - [FeeInfo](docs/FeeInfo.md)

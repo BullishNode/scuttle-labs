@@ -6,6 +6,49 @@ use std::error::Error as StdError;
 use anyhow::Context;
 
 use ark::VtxoId;
+use ark::tree::signed::UnlockHash;
+/// The durable cancellation tombstone prevents this round from accepting forfeits.
+#[derive(Debug)]
+pub struct RoundCancelledBeforeForfeit(pub UnlockHash);
+
+impl fmt::Display for RoundCancelledBeforeForfeit {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "round participation {} was cancelled before accepting forfeits", self.0)
+	}
+}
+
+impl StdError for RoundCancelledBeforeForfeit {}
+
+/// Stable client refusal reasons, independent of explanatory error text.
+#[derive(Debug, Clone, Copy)]
+pub enum FallbackRefusal {
+	DecidedForFallback(VtxoId),
+	ExpiredNewLightning(VtxoId),
+}
+
+impl FallbackRefusal {
+	pub fn reason(&self) -> &'static str {
+		match self {
+			Self::DecidedForFallback(_) => "decided_for_fallback",
+			Self::ExpiredNewLightning(_) => "expired_new_lightning",
+		}
+	}
+
+	pub fn vtxo_id(&self) -> VtxoId {
+		match self { Self::DecidedForFallback(id) | Self::ExpiredNewLightning(id) => *id }
+	}
+}
+
+impl fmt::Display for FallbackRefusal {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::DecidedForFallback(id) => write!(f, "vtxo {} is reserved for expiry recovery", id),
+			Self::ExpiredNewLightning(id) => write!(f, "vtxo {} has expired backing for a new Lightning obligation", id),
+		}
+	}
+}
+
+impl StdError for FallbackRefusal {}
 
 /// An error type to add context to anyhow to indicate any form
 /// of incorrect user input.

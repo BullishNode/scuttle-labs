@@ -422,6 +422,7 @@ impl TestContext {
 		// NB we don't auto-complete `..Default::default()` here
 		// to force us to evaluate every value in test context.
 		server::config::Config {
+			expiry_payouts: false,
 			data_dir: data_dir.clone(),
 			network: Network::Regtest,
 			vtxo_lifetime: BlockDelta::new(432),
@@ -641,6 +642,7 @@ impl TestContext {
 		#[allow(deprecated)]
 		bark::Config {
 			server_address: srv.ark_url(),
+			require_scuttle_payouts: false,
 			server_access_token: None,
 			user_agent: None,
 			esplora_address: if bitcoind.is_none() {

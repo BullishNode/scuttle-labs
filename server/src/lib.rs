@@ -33,6 +33,7 @@ mod intman;
 pub mod ln;
 pub mod nursery;
 mod offboards;
+mod destination;
 pub mod recovery;
 mod round;
 pub mod telemetry;
@@ -45,6 +46,7 @@ use crate::database::htlc_vtxo::{self, HtlcDirection};
 use crate::database::tree::VtxoTreeUpdate;
 pub use crate::intman::{CAPTAIND_API_KEY, CAPTAIND_CLI_API_KEY};
 pub use crate::config::Config;
+pub use crate::error::FallbackRefusal;
 pub use bark_common::{fs_perms, secret};
 
 use std::collections::HashSet;
@@ -267,7 +269,7 @@ impl Server {
 		fs::create_dir_all(&cfg.data_dir).context("can't create dir")?;
 		fs_perms::harden(&cfg.data_dir, 0o700)?;
 
-		let db = database::Db::create(&cfg.postgres).await?;
+		let db = database::Db::create_with_payouts(&cfg.postgres, cfg.expiry_payouts).await?;
 
 		// Initiate key material.
 		let seed = {
@@ -377,6 +379,8 @@ impl Server {
 		let db = database::Db::connect(&cfg.postgres)
 			.await
 			.context("failed to connect to db")?;
+		ensure!(db.expiry_payouts() == cfg.expiry_payouts,
+			"expiry_payouts differs from the mode fixed at database creation");
 
 		let bitcoind = bcd::build_client(&cfg.bitcoind.url, cfg.bitcoind.auth())?;
 		bcd::require_network(&bitcoind, cfg.network).await?;
@@ -648,6 +652,7 @@ impl Server {
 		utxo: OutPoint,
 		funding_tx: &Transaction,
 		user_pub_nonce: PublicNonce,
+		owner_mailbox: Option<PublicKey>,
 	) -> anyhow::Result<ark::board::BoardCosignResponse> {
 		check_max_amount("board", amount, self.config.max_board_amount)?;
 
@@ -713,9 +718,15 @@ impl Server {
 		// validate funding tx is real
 		// check that any of the inputs is a vtxo
 		self.db.read(async |tx| {
-			// check the funding tx itself first, obviously can't exist
-			if tx.get_virtual_transaction_by_txid(utxo.txid).await?.is_some() {
-				return badarg!("invalid funding tx: known as virtual tx: {}", utxo.txid);
+			// Only a previously bound board output may reuse a funding tx
+			// already recorded by this payout-enabled server.
+			if let Some(known) = tx.get_virtual_transaction_by_txid(utxo.txid).await? {
+				let retry = self.config.expiry_payouts && known.is_funding
+					&& tx.query_opt("SELECT 1 FROM board_exit WHERE funding_outpoint=$1 LIMIT 1",
+						&[&utxo.to_string()]).await?.is_some();
+				if !retry {
+					return badarg!("invalid funding tx: known as virtual tx: {}", utxo.txid);
+				}
 			}
 			let input_ids = funding_tx.input.iter()
 				.map(|i| VtxoId::from(i.previous_output))
@@ -758,14 +769,32 @@ impl Server {
 			user_pub_nonce,
 		);
 
+		if self.config.expiry_payouts && owner_mailbox.is_none() {
+			return badarg!("board output requires a payout mailbox");
+		}
+
 		// Fees and the exit delta can change, so bind the output to one exit
 		// before signing, or two signed exits could spend it.
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();
-		let bound = self.db.write(async |t| t.bind_board_exit(utxo, &spk, exit_txid).await).await?;
-		if bound != exit_txid {
-			return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
-		}
+		self.db.write(async |t| {
+			let bound = t.bind_board_exit(utxo, &spk, exit_txid, owner_mailbox, user_pubkey).await?;
+			if bound.0 != exit_txid {
+				return badarg!("board utxo {} is already cosigned for another exit tx", utxo);
+			}
+			if self.config.expiry_payouts {
+				// The funding output is already a customer liability even if the
+				// holder never returns with the signed exit for registration.
+				let root = builder.funding_vtxo();
+				let update = VtxoTreeUpdate::new()
+					.upsert_unsigned_funding_tx(utxo.txid)
+					.upsert_unsigned_tx([exit_txid])
+					.insert_oor_spent_vtxos([(root, exit_txid)]);
+				t.execute_vtxo_tree_update(update).await?;
+				t.add_funding_vtxos_to_frontier(utxo.txid, None).await?;
+			}
+			Ok(())
+		}).await?;
 
 		info!("Cosigning board request for utxo {}", utxo);
 		let resp = builder.server_cosign(self.server_key.leak_ref());
@@ -847,21 +876,28 @@ impl Server {
 		// inserted-row count returned by execute_vtxo_tree_update, which makes
 		// the fresh-vs-retry decision atomic with the write rather than
 		// depending on a separate racy pre-read.
+		let outputs = builder.build_server_vtxos();
+		let leaf_ids = outputs.iter().filter(|output| output.policy().user_pubkey().is_some())
+			.map(|leaf| leaf.id()).collect::<Vec<_>>();
 		let update = VtxoTreeUpdate::new()
 			.upsert_funding_tx(&funding_tx)
 			.upsert_unsigned_tx([builder.exit_txid()])
-			.insert_spendable_vtxos(builder.build_server_vtxos())
+			.insert_spendable_vtxos(outputs)
 			.mark_vtxos_oor_spent(builder.spend_info());
 		let spk = builder.funding_script_pubkey();
 		let exit_txid = builder.exit_txid();
 		let inserted = self.db.write(async |t| {
 			// also binds boards cosigned before outputs were bound on cosign
-			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid).await?;
-			if bound != exit_txid {
+			let bound = t.bind_board_exit(vtxo.chain_anchor(), &spk, exit_txid, None, vtxo.user_pubkey()).await?;
+			if bound.0 != exit_txid {
 				return badarg!("board utxo {} is already registered with another exit tx",
 					vtxo.chain_anchor(),
 				);
 			}
+			let update = if self.config.expiry_payouts {
+				let mailbox = bound.1.context("board exit has no admitted payout mailbox")?;
+				update.bind_owner_mailboxes(leaf_ids.iter().map(|id| (*id, mailbox)))?
+			} else { update };
 			let inserted = t.execute_vtxo_tree_update(update).await?;
 			t.add_funding_vtxos_to_frontier(funding_txid, Some(confirmed_height)).await
 				.context("failed to add board vtxos to frontier")?;

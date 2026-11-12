@@ -12,7 +12,7 @@ use bitcoin_ext::rpc::{BitcoinRpcExt, BitcoinRpcClient, RpcApi};
 
 use server::sync::{ChainEventListener, RawMempool, BlockData};
 use server::sync::block_index::{BlockIndex};
-use server::database::{BlockTable, Db};
+use server::database::{BlockTable, Db, Tx};
 
 use ark_testing::TestContext;
 
@@ -71,7 +71,7 @@ impl ChainEventListener for BlockIndexListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, block: BlockRef) -> anyhow::Result<()> {
 		if let Some(tip) = *self.tip.lock() {
 			if block.height > tip.height {
 				panic!(
@@ -198,7 +198,7 @@ impl ChainEventListener for FailOnceReorgListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, _block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, _block: BlockRef) -> anyhow::Result<()> {
 		let calls = self.calls.fetch_add(1, Ordering::SeqCst);
 		if calls == 1 {
 			bail!("simulated reorg failure");
@@ -304,7 +304,7 @@ impl ChainEventListener for RecordingListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, block: BlockRef) -> anyhow::Result<()> {
 		let mut blocks = self.blocks.lock();
 		if blocks.keys().any(|h| *h > block.height) && self.fail_rollback.swap(false, Ordering::SeqCst) {
 			bail!("simulated reorg failure");
@@ -433,8 +433,8 @@ impl ChainEventListener for SharedListener {
 		self.0.on_block_added(block).await
 	}
 
-	async fn on_reorg(&self, block: BlockRef) -> anyhow::Result<()> {
-		self.0.on_reorg(block).await
+	async fn on_reorg(&self, tx: &Tx<'_>, block: BlockRef) -> anyhow::Result<()> {
+		self.0.on_reorg(tx, block).await
 	}
 }
 
@@ -488,7 +488,7 @@ impl ChainEventListener for ReorgCountingListener {
 		Ok(())
 	}
 
-	async fn on_reorg(&self, block: BlockRef) -> anyhow::Result<()> {
+	async fn on_reorg(&self, _tx: &Tx<'_>, block: BlockRef) -> anyhow::Result<()> {
 		self.reorgs.fetch_add(1, Ordering::SeqCst);
 		*self.last_reorg.lock() = Some(block);
 		Ok(())

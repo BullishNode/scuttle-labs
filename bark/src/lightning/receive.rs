@@ -85,16 +85,15 @@ impl<'a> Bolt11InvoiceBuilder<'a> {
 	/// steal the payment unless they provide a different address than the
 	/// desired end user.
 	///
-	/// It can still strand it: delivering the signed output to the
-	/// destination's mailbox is a separate step that only this wallet can
-	/// perform, and nothing else (not the server, not the destination) can
-	/// discover or recover that output until it does. The delivery is a
-	/// parked action that resumes automatically on restart, so a crash
-	/// recovers on its own — but for as long as this wallet stays offline
-	/// (or simply never delivers), the destination cannot claim funds that
-	/// are already theirs. Forwarding through a third party means trusting
-	/// it to eventually come back online and deliver, not trusting it with
-	/// custody.
+	/// Delivery of the signed Ark output to the destination's mailbox is a
+	/// separate step that only this wallet performs. The delivery action
+	/// resumes on restart. Until delivery, the destination cannot use that
+	/// Ark output. A recorded claim can still produce a bitcoin payout at
+	/// expiry. Before a claim is recorded, the grant remains this wallet's
+	/// coin and its expiry payout goes to this wallet. After a claim is
+	/// recorded, the server uses the output's address for its payout.
+	/// Forwarding through a third party means trusting it to deliver and
+	/// reconcile the payment with the intended recipient.
 	pub fn claim_destination(mut self, claim_destination: impl Into<Option<ark::Address>>) -> Self {
 		self.claim_destination = claim_destination.into();
 		self

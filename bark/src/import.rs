@@ -135,6 +135,15 @@ impl Wallet {
 		self.inner.db.store_vtxos(&rows).await
 			.context("failed to store imported VTXOs")?;
 
+		// A spent coin may have been paid out at expiry: record that payout.
+		let spent = to_store.iter()
+			.filter(|(_, state)| *state == VtxoState::Spent)
+			.map(|(vtxo, _)| vtxo.id())
+			.collect::<Vec<_>>();
+		if let Err(e) = self.check_fallback(&spent).await {
+			warn!("Could not check imported VTXOs for a fallback payout: {:#}", e);
+		}
+
 		for (vtxo, state) in &to_store {
 			info!("Successfully imported VTXO {} as {}", vtxo.id(), state.kind());
 			ids.push(vtxo.id());
@@ -159,7 +168,13 @@ impl Wallet {
 		}
 
 		let id = vtxo.id();
-		let spend_state = self.fetch_vtxo_spend_state(id, keypair).await?;
+		let (srv, _) = self.require_server().await?;
+		let spend_state = if srv.scuttle_payouts().await {
+			// A coin whose expiry payout goes to another mailbox is not ours.
+			self.fetch_own_vtxo_status(id, keypair).await?.state
+		} else {
+			self.fetch_vtxo_spend_state(id, keypair).await?
+		};
 		let adoption = ServerStatusAdoption::from_spend_state(spend_state)
 			.with_context(|| format!("cannot decide the state of vtxo {id}"))?;
 		Ok(match adoption {

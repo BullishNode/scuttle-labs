@@ -86,6 +86,19 @@ impl Offboard {
 	pub fn check_destination(&self, network: bitcoin::Network) -> anyhow::Result<bitcoin::Address> {
 		Ok(self.destination.clone().require_network(network)?)
 	}
+
+	/// Whether the server paid out one of the coins of an offboard that is
+	/// not broadcast yet at their expiry. It refuses the forfeit of such a
+	/// coin forever, so the offboard can no longer complete.
+	async fn paid_out(&self, wallet: &Wallet) -> anyhow::Result<bool> {
+		match self.progress {
+			Progress::ArkoorRegistrationRequired { .. }
+				| Progress::ReadyForOffboard { prior_txid: Some(_), .. }
+				| Progress::OffboardTxPrepared { .. }
+			=> wallet.check_fallback(&self.pending_balance_vtxo_ids()).await,
+			_ => Ok(false),
+		}
+	}
 }
 
 /// Which flavour of offboard this action drives.
@@ -329,9 +342,24 @@ impl WalletAction for Offboard {
 		}
 	}
 
+	/// The step failed transiently. Retry it, unless the offboard can no
+	/// longer complete.
+	async fn on_retry(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if or_retry!(self, self.paid_out(wallet).await) {
+			or_retry!(self, fail_offboard_movement(wallet, &self).await);
+			return Advance::Failed(error);
+		}
+		Advance::Retry { state: self, error }
+	}
+
 	/// The step can't be completed as-is: the server rejected the request
 	/// or our own state is inconsistent.
 	async fn on_abort(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		if or_retry!(self, self.paid_out(wallet).await) {
+			or_retry!(self, fail_offboard_movement(wallet, &self).await);
+			return Advance::Failed(error);
+		}
+
 		match &self.progress {
 			// Nothing is locked yet, so the user is better served by a fresh
 			// attempt than by a lingering checkpoint.
@@ -576,7 +604,7 @@ async fn arkoor_split_offboard(
 	};
 
 	let arkoor = wallet.create_checkpointed_arkoor_with_vtxos(
-		split_destination, inputs.into_iter(), change_keypair, change_pieces.clone(),
+		split_destination, inputs.into_iter(), change_keypair, change_pieces.clone(), None,
 	).await.retry_unless_rejected()?;
 
 	// From here on only retry: aborting would release inputs the server considers spent.

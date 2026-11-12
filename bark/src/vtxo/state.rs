@@ -23,8 +23,9 @@
 
 use std::fmt;
 use std::ops::Deref;
+use std::str::FromStr;
 
-use bitcoin::Weight;
+use bitcoin::{Amount, Weight};
 use bitcoin_ext::BlockHeight;
 
 use ark::Vtxo;
@@ -51,6 +52,10 @@ pub enum VtxoLockHolder {
 	/// A pre-action subsystem (round, offboard, board, lightning
 	/// receive). The movement is used as a stable handle.
 	Movement { id: MovementId },
+	/// An arkoor mailbox payment awaiting server registration.
+	MailboxReceive,
+	/// A completed round output retained until its payout owner is attested.
+	RoundPayoutCheck,
 }
 
 impl From<MovementId> for VtxoLockHolder {
@@ -201,6 +206,47 @@ pub struct WalletVtxo {
 	/// migration can reset it to re-upload every VTXO.
 	#[serde(default)]
 	pub registered: bool,
+
+	/// Last observed fallback status for display. Ordinary Spent retirement
+	/// is sticky even if this status changes after a reorg.
+	#[serde(default)]
+	pub fallback_status: Option<FallbackStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackStatus { Pending, Spent, Forfeited }
+
+/// What the server decided for a coin's expiry payout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackPayout {
+	pub status: FallbackStatus,
+	/// The coin value taken from Ark.
+	pub gross: Amount,
+	/// The fallback fee withheld from it.
+	pub fee: Amount,
+	/// The amount paid on-chain; zero when the fee consumed the coin.
+	pub payout: Amount,
+	/// The wallet's fallback address `tr(M)`, derived from its own mailbox key.
+	pub address: bitcoin::Address,
+}
+
+impl FallbackStatus {
+	pub fn as_str(self) -> &'static str {
+		match self { Self::Pending => "pending", Self::Spent => "spent", Self::Forfeited => "forfeited" }
+	}
+
+	pub(crate) fn state_for(self, current: &VtxoState) -> VtxoState {
+		if *current == VtxoState::Exited { current.clone() } else { VtxoState::Spent }
+	}
+}
+
+impl FromStr for FallbackStatus {
+	type Err = anyhow::Error;
+	fn from_str(value: &str) -> Result<Self, Self::Err> {
+		Ok(match value { "pending" => Self::Pending, "spent" => Self::Spent,
+			"forfeited" => Self::Forfeited, _ => bail!("unknown fallback outcome") })
+	}
 }
 
 impl VtxoRef for WalletVtxo {

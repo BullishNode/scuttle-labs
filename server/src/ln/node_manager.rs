@@ -55,7 +55,7 @@ use ark::mailbox::MailboxIdentifier;
 use uuid::Uuid;
 
 use crate::Server;
-use crate::error::ContextExt;
+use crate::error::{ContextExt, FallbackRefusal};
 use crate::ln::cln::{ClnNodeInfo, ClnNodeOnlineState, NodeHandle};
 use crate::ln::cln::hold::ClnHoldConfig;
 use crate::ln::cln::xpay::ClnXpayConfig;
@@ -66,6 +66,7 @@ use crate::sync::SyncManager;
 use crate::system::RuntimeManager;
 use crate::config::Config;
 use crate::database;
+use crate::database::expiry_guard;
 use crate::database::hold::{self as hold_db, HoldTransition, NewClnHold};
 use crate::database::xpay::{self, NewClnXpay};
 use crate::database::ln::{
@@ -247,6 +248,7 @@ impl LightningManager {
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
 		retry_for: Duration,
+		intent_id: Option<String>,
 	) -> anyhow::Result<()> {
 		invoice.check_signature().context("invalid invoice signature")?;
 
@@ -262,7 +264,13 @@ impl LightningManager {
 			user_fee,
 			attempt_block_height,
 			retry_for,
+			intent_id.as_deref(),
 		).await {
+			// A source the expiry payout already decided, or is about to, never
+			// got an attempt: the client must hear it rather than poll a status.
+			if e.is::<FallbackRefusal>() {
+				return Err(e);
+			}
 			// The attempt is already recorded as failed and the client sees the
 			// failure via CheckLightningPayment. Benign races (someone else paid
 			// or canceled the invoice first) surface as PayInvoiceRace and
@@ -302,6 +310,7 @@ impl LightningManager {
 		user_fee: Amount,
 		attempt_block_height: BlockHeight,
 		retry_for: Duration,
+		intent_id: Option<&str>,
 	) -> anyhow::Result<()> {
 		let payment_hash = invoice.payment_hash();
 		let node = self.active_node().context("no active cln node")?;
@@ -363,6 +372,7 @@ impl LightningManager {
 		};
 
 		let attempt_id = self.db.write(async |t| {
+			expiry_guard::guard_new_lightning_inputs(t, htlc_vtxo_ids).await?;
 			let attempt_id = t.store_lightning_payment_start(
 				node.id, &invoice, amount, sender_mailbox_id, htlc_vtxo_ids,
 				lightning_htlc_subscription_id,
@@ -370,6 +380,7 @@ impl LightningManager {
 				// An intra-Ark payment short-circuits before xpay, so no
 				// routing budget is ever authorised for it.
 				lightning_htlc_subscription_id.is_none().then_some(max_routing_fee),
+				intent_id,
 			).await?;
 			// Same transaction as the attempt: the attempt check above is what
 			// keeps one payment per hash in flight, and the cln_xpay row must
@@ -545,15 +556,24 @@ impl LightningManager {
 	}
 
 	/// Gets the current payment status for a given payment hash.
+	///
+	/// With `htlc_vtxo_ids`, the status is that of the latest attempt these
+	/// HTLCs were committed to: another payer's attempt on the same hash says
+	/// nothing about this payer's coins.
 	pub async fn get_payment_status(
 		&self,
 		payment_hash: PaymentHash,
+		htlc_vtxo_ids: &[VtxoId],
 	) -> anyhow::Result<PaymentStatus> {
 		trace!("Getting payment status for payment hash: {}", payment_hash);
 
-		let attempt = self.db.read(async |t|
+		let by_hash = htlc_vtxo_ids.is_empty() || !self.db.expiry_payouts();
+		let attempt = self.db.read(async |t| if by_hash {
 			t.get_latest_payment_attempt_by_payment_hash(payment_hash).await
-		).await?.not_found([payment_hash], "payment attempt not found")?;
+		} else {
+			Ok(t.get_latest_payment_attempt_by_htlc_vtxos(htlc_vtxo_ids).await?
+				.filter(|attempt| attempt.payment_hash == payment_hash))
+		}).await?.not_found([payment_hash], "payment attempt not found")?;
 
 		trace!("Payment attempt status for payment {}: {}",
 			payment_hash, attempt.status,
@@ -581,6 +601,7 @@ impl LightningManager {
 	pub async fn wait_payment_status(
 		&self,
 		payment_hash: PaymentHash,
+		htlc_vtxo_ids: &[VtxoId],
 	) -> anyhow::Result<PaymentStatus> {
 		trace!("Waiting for payment status for payment hash: {}", payment_hash);
 
@@ -590,7 +611,7 @@ impl LightningManager {
 		let mut poll_interval = tokio::time::interval(self.invoice_poll_interval);
 
 		loop {
-			match self.get_payment_status(payment_hash).await? {
+			match self.get_payment_status(payment_hash, htlc_vtxo_ids).await? {
 				PaymentStatus::Success(preimage) => return Ok(PaymentStatus::Success(preimage)),
 				PaymentStatus::Failed => return Ok(PaymentStatus::Failed),
 				PaymentStatus::Pending => {},
@@ -696,22 +717,28 @@ impl LightningManager {
 			.read(async |t| t.get_htlc_subscription_by_id(subscription_id).await).await?
 			.expect("can only settle known invoice");
 
-		// If an open self-payment attempt exists for the payment hash, it is an
-		// intra-Ark lightning payment so we can mark it as succeeded,
-		// then skip hold invoice settlement.
-		let attempt = self.db.read(async |t| t.get_open_lightning_payment_attempt_by_payment_hash(payment_hash).await).await?
-			.filter(|attempt| attempt.is_self_payment());
+		// If a payment attempt was initiated against this subscription, it is
+		// an intra-Ark lightning payment so we can mark it as succeeded, then
+		// skip hold invoice settlement. The attempt is found by its link, open
+		// or not: after a restart between the attempt's success and the
+		// receive's settlement it is already Succeeded, and its hold invoice
+		// was canceled when the receive was accepted.
+		let attempt = self.db.read(async |t|
+			t.get_lightning_payment_attempt_by_subscription_id(subscription_id).await
+		).await?;
 		let is_self_payment = attempt.is_some();
 		if let Some(attempt) = attempt {
 			// NB: the xpay reconciliation loop may also post the mailbox notification
 			// for the same payment hash. The DB insert is idempotent (ON CONFLICT DO NOTHING).
-			self.payment_handler().process_payment_attempt(
-				&self.settler, &attempt,
-				LightningPaymentStatus::Succeeded,
-				None,
-				None,
-				Some(preimage),
-			).await?;
+			if attempt.status != LightningPaymentStatus::Succeeded {
+				self.payment_handler().process_payment_attempt(
+					&self.settler, &attempt,
+					LightningPaymentStatus::Succeeded,
+					None,
+					None,
+					Some(preimage),
+				).await?;
+			}
 		} else {
 			// Settle the hold invoice on the node that created the
 			// subscription - that's where the HTLCs are locked. The user has

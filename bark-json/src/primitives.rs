@@ -164,6 +164,21 @@ impl From<Vtxo<Full>> for VtxoInfo {
 	}
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum FallbackStatusInfo { Pending, Spent, Forfeited }
+
+impl From<bark::vtxo::FallbackStatus> for FallbackStatusInfo {
+	fn from(status: bark::vtxo::FallbackStatus) -> Self {
+		match status {
+			bark::vtxo::FallbackStatus::Pending => Self::Pending,
+			bark::vtxo::FallbackStatus::Spent => Self::Spent,
+			bark::vtxo::FallbackStatus::Forfeited => Self::Forfeited,
+		}
+	}
+}
+
 /// A VTXO together with its current wallet state.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "utoipa", derive(ToSchema))]
@@ -173,6 +188,9 @@ pub struct WalletVtxoInfo {
 	pub vtxo: VtxoInfo,
 	/// The current state of this VTXO in the wallet.
 	pub state: VtxoStateInfo,
+	/// Last authenticated fallback outcome; this is not another balance.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub fallback_status: Option<FallbackStatusInfo>,
 }
 
 impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
@@ -190,6 +208,7 @@ impl<'a> From<&'a bark::WalletVtxo> for WalletVtxoInfo {
 				exit_depth: Some(v.exit_depth),
 			},
 			state: VtxoStateInfo::from(&v.state),
+			fallback_status: v.fallback_status.map(Into::into),
 		}
 	}
 }
@@ -250,7 +269,10 @@ impl<'a> From<&'a VtxoState> for VtxoStateInfo {
 					Some(bark::vtxo::VtxoLockHolder::Action { id }) => {
 						VtxoStateInfo::Locked { movement_id: None, action_id: Some(id.clone()) }
 					},
-					None => VtxoStateInfo::Locked { movement_id: None, action_id: None },
+					Some(bark::vtxo::VtxoLockHolder::MailboxReceive)
+					| Some(bark::vtxo::VtxoLockHolder::RoundPayoutCheck) | None => {
+						VtxoStateInfo::Locked { movement_id: None, action_id: None }
+					},
 				}
 			},
 		}

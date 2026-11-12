@@ -1,3 +1,4 @@
+mod payouts;
 mod ban;
 mod blocklist;
 mod block_index;
@@ -1710,6 +1711,7 @@ async fn reject_overlong_board_cosign() {
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+		owner_mailbox: Some(user_key.public_key().serialize().to_vec()),
 		amount: sat(100_000).to_sat(),
 		utxo: OutPoint::null().serialize(),
 		expiry_height,
@@ -1766,6 +1768,7 @@ async fn request_board_cosign_with_funding_tx(
 
 	let mut rpc = srv.get_public_rpc().await;
 	let res = rpc.request_board_cosign(protos::BoardCosignRequest {
+		owner_mailbox: Some(user_key.public_key().serialize().to_vec()),
 		amount: amount.to_sat(),
 		utxo: utxo.serialize(),
 		expiry_height: tip + ark_info.vtxo_lifetime.to_u32(),
@@ -2613,6 +2616,7 @@ async fn test_register_board() {
 
 	// Request server to cosign the board
 	let cosign_request = protos::BoardCosignRequest {
+		owner_mailbox: Some(client_cosign_keypair.public_key().serialize().to_vec()),
 		amount: board_amount.to_sat(),
 		utxo: board_utxo.serialize(),
 		expiry_height: expiry_height.into(),

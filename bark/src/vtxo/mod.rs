@@ -4,7 +4,7 @@ mod signing;
 mod state;
 
 pub use self::selection::{FilterVtxos, RefreshStrategy, VtxoFilter};
-pub use self::state::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+pub use self::state::{FallbackPayout, FallbackStatus, VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
 use anyhow::Context;
 use bitcoin::secp256k1::PublicKey;
@@ -72,7 +72,10 @@ impl ServerStatusAdoption {
 	pub fn from_spend_state(spend_state: VtxoSpendState) -> anyhow::Result<Self> {
 		Ok(match spend_state {
 			VtxoSpendState::Spendable => ServerStatusAdoption::Spendable,
-			VtxoSpendState::Spent => ServerStatusAdoption::Spent,
+			// A coin decided for an expiry payout is gone from Ark.
+			VtxoSpendState::Spent
+			| VtxoSpendState::FallbackPending
+			| VtxoSpendState::FallbackForfeited => ServerStatusAdoption::Spent,
 			state @ (
 				VtxoSpendState::Unclaimed
 				| VtxoSpendState::Unregistered

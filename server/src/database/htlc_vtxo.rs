@@ -132,6 +132,46 @@ impl Htlc {
 	}
 }
 
+/// A grant's canonical reclamation is terminal only after six blocks in both
+/// completed daemon views. Resolution heights are rolled back with the view.
+pub(crate) fn grant_reclamation_confirmed(
+	height: BlockHeight,
+	tip: BlockHeight,
+	watchman_tip: Option<BlockHeight>,
+) -> bool {
+	watchman_tip.is_some_and(|watchman| tip.min(watchman).to_u32().checked_sub(height.to_u32())
+		.is_some_and(|depth| depth >= 5))
+}
+
+/// Payout-mode form of [crate::ln::htlc_recvs_expired]. A collected grant
+/// never expires, and a grant reclaimed on-chain counts only once that
+/// reclamation is six blocks deep, so a reorg cannot both refund the sender
+/// and let the receiver claim.
+pub(crate) fn payout_htlc_recvs_expired(
+	htlc_vtxos: &[HtlcVtxo],
+	tip: BlockHeight,
+	watchman_tip: Option<BlockHeight>,
+) -> bool {
+	let Some(watchman_tip) = watchman_tip else {
+		return false;
+	};
+	let height = std::cmp::min(tip, watchman_tip);
+	let htlc_recvs = htlc_vtxos.iter()
+		.filter(|h| h.direction() == HtlcDirection::Outgoing)
+		.collect::<Vec<_>>();
+	!htlc_recvs.is_empty() && htlc_recvs.iter().all(|h| {
+		if h.htlc.resolution() == Some(HtlcResolution::Fulfilled) || height <= h.htlc_expiry() {
+			return false;
+		}
+		match h.htlc.chain_resolution {
+			Some(HtlcResolution::Revoked) => h.htlc.chain_resolution_height.is_some_and(|block|
+				grant_reclamation_confirmed(block, tip, Some(watchman_tip))),
+			None => !h.vtxo.is_exited(),
+			Some(HtlcResolution::Fulfilled) => false,
+		}
+	})
+}
+
 /// An htlc vtxo: the vtxo state joined with its htlc data.
 #[derive(Debug)]
 pub struct HtlcVtxo {
@@ -190,6 +230,7 @@ const HTLC_VTXO_COLUMNS: &str = "
 	v.id, v.vtxo_id, v.vtxo, v.expiry, v.oor_spent_txid, v.spent_in_round,
 	v.offboarded_in, v.banned_until_height, v.confirmed_height,
 	v.spend_state::TEXT AS spend_state, v.created_at, v.updated_at,
+	EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=v.vtxo_id) AS decided_for_fallback,
 	hv.payment_hash, hv.htlc_expiry,
 	hv.direction::TEXT AS direction,
 	hv.offchain_resolution::TEXT AS offchain_resolution,
@@ -366,6 +407,36 @@ pub async fn clear_htlc_vtxo_chain_resolutions_above(
 #[cfg(test)]
 mod test {
 	use super::*;
+
+	#[test]
+	fn fulfilled_grants_never_expire_and_revoked_grants_wait_for_six_blocks() {
+		let coin = ark::test_util::VTXO_VECTORS.board_vtxo.clone();
+		let now = chrono::Local::now();
+		let mut grant = HtlcVtxo {
+			htlc: Htlc { payment_hash: ark::lightning::PaymentHash::from([1; 32]),
+				htlc_expiry: BlockHeight::new(100), direction: HtlcDirection::Outgoing,
+				offchain_resolution: Some(HtlcResolution::Fulfilled),
+				chain_resolution: None, chain_resolution_height: None },
+			vtxo: crate::database::VtxoState { id: 1, vtxo_id: coin.id(), vtxo: coin,
+				oor_spent_txid: None, spent_in_round: None, offboarded_in: None,
+				banned_until_height: None, spend_state: crate::database::SpendState::Spendable,
+				decided_for_fallback: false, confirmed_height: None, created_at: now, updated_at: now },
+		};
+		assert!(!payout_htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
+		grant.htlc.offchain_resolution = None;
+		assert!(payout_htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
+		grant.vtxo.confirmed_height = Some(BlockHeight::new(110));
+		grant.htlc.chain_resolution = Some(HtlcResolution::Revoked);
+		grant.htlc.chain_resolution_height = Some(BlockHeight::new(120));
+		for (server, watchman, expected) in [(124, Some(124), false), (125, Some(125), true),
+			(150, Some(124), false), (124, Some(150), false), (150, None, false)] {
+			assert_eq!(payout_htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(server),
+				watchman.map(BlockHeight::new)), expected);
+		}
+		grant.htlc.chain_resolution = Some(HtlcResolution::Fulfilled);
+		assert!(!payout_htlc_recvs_expired(std::slice::from_ref(&grant), BlockHeight::new(150), Some(BlockHeight::new(150))));
+	}
+
 
 	const PAYMENT_HASH: &str =
 		"0000000000000000000000000000000000000000000000000000000000000001";

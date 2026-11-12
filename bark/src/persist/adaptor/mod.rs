@@ -424,7 +424,7 @@ async fn update_vtxo_state_checked<S: StorageAdaptor>(
 		adaptor.put(updated_record).await?;
 	}
 
-	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state, serde_vtxo.registered))
+	Ok(wallet_vtxo_from_full(&serde_vtxo.vtxo, new_state, serde_vtxo.registered, serde_vtxo.fallback_status))
 }
 
 pub struct StorageAdaptorWrapper<S: StorageAdaptor> {
@@ -459,6 +459,17 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			Some(record) => Ok(Some(record.to_data()?)),
 			None => Ok(None),
 		}
+	}
+
+	async fn set_mailbox_identity(&self, identity: crate::MailboxIdentity) -> anyhow::Result<()> {
+		let mut lock = self.inner.write().await;
+		let mut properties: WalletProperties = lock.get(partition::PROPERTIES, &[]).await?
+			.context("wallet not initialized")?.to_data()?;
+		ensure!(properties.network == identity.network
+			&& properties.mailbox_identity.as_ref().is_none_or(|stored| *stored == identity),
+			"mailbox identity differs from the stored wallet");
+		properties.mailbox_identity = Some(identity);
+		lock.put(Record::from_data(partition::PROPERTIES, &[], None, &properties)?).await
 	}
 
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
@@ -695,10 +706,15 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 		let mut lock = self.inner.write().await;
 
 		for (vtxo, state) in vtxos {
+			// BarkPersister::store_vtxos is insert-only. In particular a
+			// recovery retry must never replace a live operation's holder or
+			// resurrect a Spent row. Keep lookup+insert under this same lock.
+			if get_vtxo(&*lock, vtxo.id()).await?.is_some() { continue; }
 			let serde_vtxo = SerdeVtxo {
 				vtxo: (*vtxo).clone(),
 				states: vec![(*state).clone()],
 				registered: false,
+				fallback_status: None,
 			};
 
 			let sk = sort::vtxo_sort_key(
@@ -722,7 +738,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 				let state = serde_vtxo.current_state()
 					.context("vtxo has no state")?.clone();
 				Ok(Some(wallet_vtxo_from_full(
-					&serde_vtxo.vtxo, state, serde_vtxo.registered,
+					&serde_vtxo.vtxo, state, serde_vtxo.registered, serde_vtxo.fallback_status,
 				)))
 			},
 			None => Ok(None),
@@ -738,7 +754,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 			let state = serde_vtxo.current_state()
 				.context("vtxo has no state")?.clone();
 			out.push(wallet_vtxo_from_full(
-				&serde_vtxo.vtxo, state, serde_vtxo.registered,
+				&serde_vtxo.vtxo, state, serde_vtxo.registered, serde_vtxo.fallback_status,
 			));
 		}
 		Ok(out)
@@ -757,7 +773,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 					.cloned()
 					.context("vtxo has no state")?;
 				Ok(wallet_vtxo_from_full(
-					&serde_vtxo.vtxo, state, serde_vtxo.registered,
+					&serde_vtxo.vtxo, state, serde_vtxo.registered, serde_vtxo.fallback_status,
 				))
 			})
 			.collect()
@@ -786,7 +802,7 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 					.context("vtxo has no current state")?.clone();
 				debug_assert_eq!(current_state.kind(), *state);
 				records.push(wallet_vtxo_from_full(
-					&serde_vtxo.vtxo, current_state, serde_vtxo.registered,
+					&serde_vtxo.vtxo, current_state, serde_vtxo.registered, serde_vtxo.fallback_status,
 				));
 			}
 		}
@@ -840,6 +856,21 @@ impl <S: StorageAdaptor> BarkPersister for StorageAdaptorWrapper<S> {
 	) -> anyhow::Result<WalletVtxo> {
 		let mut lock = self.inner.write().await;
 		update_vtxo_state_checked(&mut *lock, vtxo_id, new_state, allowed_old_states).await
+	}
+
+	async fn set_vtxo_fallback_status(&self, id: VtxoId, status: crate::vtxo::FallbackStatus)
+		-> anyhow::Result<WalletVtxo>
+	{
+		let mut lock = self.inner.write().await;
+		let mut coin = get_vtxo(&*lock, id).await?.context("fallback source is not stored")?;
+		let state = status.state_for(coin.current_state().context("fallback source has no state")?);
+		if coin.fallback_status != Some(status) || coin.current_state() != Some(&state) {
+			coin.fallback_status = Some(status);
+			if coin.current_state() != Some(&state) { coin.states.push(state.clone()); }
+			let sk = sort::vtxo_sort_key(state.kind(), coin.vtxo.expiry_height().to_u32(), coin.vtxo.amount());
+			lock.put(Record::from_data(partition::VTXO, &id.to_bytes(), Some(sk), &coin)?).await?;
+		}
+		Ok(coin.to_wallet_vtxo()?)
 	}
 
 	async fn release_vtxo_lock(

@@ -5,4 +5,5 @@ mod history;
 mod lifecycle;
 mod mnemonic;
 mod onchain;
+mod payouts;
 mod signmessage;

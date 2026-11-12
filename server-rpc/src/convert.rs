@@ -527,6 +527,7 @@ impl TryFrom<protos::ArkoorDestination> for ArkoorDestination {
 impl From<ArkoorDestination> for protos::ArkoorDestination {
 	fn from(v: ArkoorDestination) -> Self {
 		Self {
+			blinded_mailbox_id: Vec::new(),
 			total_amount: v.total_amount.to_sat(),
 			policy: v.policy.serialize(),
 		}
@@ -792,6 +793,26 @@ mod test {
 	use std::str::FromStr;
 	use bitcoin::hex::FromHex;
 	use super::*;
+
+	#[test]
+	fn scuttle_preserves_upstream_invoice_expiry_tag() {
+		use prost::Message;
+
+		#[derive(Clone, PartialEq, prost::Message)]
+		struct UpstreamReceive {
+			#[prost(uint64, optional, tag = "6")]
+			expiry_secs: Option<u64>,
+		}
+		let old = UpstreamReceive { expiry_secs: Some(60) };
+		let new = protos::StartLightningReceiveRequest::decode(old.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(new.expiry_secs, Some(60));
+		let new = protos::StartLightningReceiveRequest {
+			expiry_secs: Some(90),
+			..Default::default()
+		};
+		let old = UpstreamReceive::decode(new.encode_to_vec().as_slice()).unwrap();
+		assert_eq!(old.expiry_secs, Some(90));
+	}
 
 	#[test]
 	fn test_preimage_bytes() {

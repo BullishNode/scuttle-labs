@@ -31,6 +31,8 @@
 //!   force-exit a freshly claimed VTXO
 //! * `4`: ppm fees round up to a satoshi instead of down; ppm expiry fees
 //!   are calculated on the exact total across all VTXOs
+//! Scuttle payout servers use the upstream numeric version range and also
+//! advertise the `scuttle-1` protocol label.
 
 #[cfg(all(any(target_os = "android", target_os = "ios"), feature = "tls-native-roots"))]
 compile_error!("feature `tls-native-roots` can't be used on Android or iOS, use `tls-webpki-roots` instead");
@@ -122,6 +124,9 @@ pub const MIN_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_PPM_FEE_TOTAL;
 ///
 /// For info on protocol versions, see [server_rpc](crate) module documentation.
 pub const MAX_PROTOCOL_VERSION: u64 = pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES;
+
+/// Required handshake label for Scuttle's optional expiry payout mode.
+pub const SCUTTLE_PAYOUT_PROTOCOL_LABEL: &str = "scuttle-1";
 
 /// The bark client version sent in HandshakeRequest. Exposed so
 /// alternate callers (e.g. integration tests) send the same string a
