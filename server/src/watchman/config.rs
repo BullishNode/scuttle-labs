@@ -29,7 +29,16 @@ pub struct Config {
 	#[serde(with = "crate::utils::serde::fee_rate")]
 	pub incremental_relay_fee: FeeRate,
 
+	/// Highest fee rate an expiry payout or its replacement may pay. The
+	/// watchman wallet funds any fee above the coins' own fees.
+	#[serde(default = "default_expiry_payout_max_fee_rate", with = "crate::utils::serde::fee_rate")]
+	pub expiry_payout_max_fee_rate: FeeRate,
+
 	/// Minimum confirmed funds in sats required to create a CPFP transaction.
 	#[serde(with = "crate::utils::serde::string")]
 	pub min_cpfp_amount: Amount,
+}
+
+fn default_expiry_payout_max_fee_rate() -> FeeRate {
+	FeeRate::from_sat_per_vb_u32(1000)
 }
