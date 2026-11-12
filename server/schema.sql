@@ -830,7 +830,7 @@ CREATE TABLE public.expiry_allocation_coin (
     payout_sat bigint NOT NULL,
     forfeited_sat bigint NOT NULL,
     subsidy_sat bigint DEFAULT 0 NOT NULL,
-    evidence jsonb NOT NULL,
+    replannable boolean NOT NULL,
     CONSTRAINT expiry_allocation_coin_check CHECK ((((disposition = 'customer'::text) AND (owner_mailbox IS NOT NULL) AND ((gross_sat + subsidy_sat) = ((fee_sat + payout_sat) + forfeited_sat))) OR ((disposition = 'operator'::text) AND (fee_sat = 0) AND (payout_sat = 0) AND (forfeited_sat = 0) AND (subsidy_sat = 0)))),
     CONSTRAINT expiry_allocation_coin_disposition_check CHECK ((disposition = ANY (ARRAY['customer'::text, 'operator'::text]))),
     CONSTRAINT expiry_allocation_coin_fee_sat_check CHECK ((fee_sat >= 0)),

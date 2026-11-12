@@ -51,6 +51,15 @@ pub enum OwnershipEvidence {
 	HtlcRecvExpired,
 }
 
+impl OwnershipEvidence {
+	/// A decision that rests on Lightning facts is planned again from those
+	/// facts after a conflict. Every other decision is repeated as made.
+	pub fn replannable(&self) -> bool {
+		matches!(self, Self::HtlcOffchain | Self::HtlcStoredPreimage
+			| Self::HtlcInternalGrantsReclaimed { .. } | Self::HtlcRecvExpired)
+	}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct OwnershipProposal {
 	pub id: VtxoId,
@@ -179,24 +188,11 @@ impl Tx<'_> {
 		// our own "spent" status as proof that the customer disappeared.
 		if state.spend_state == SpendState::Spent {
 			if let Some(row) = self.query_opt("
-				SELECT c.disposition,c.owner_mailbox,c.evidence->>'kind' AS kind
+				SELECT c.disposition,c.owner_mailbox,c.replannable
 				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
 				WHERE e.vtxo_id=$1 ORDER BY c.allocation_id LIMIT 1
 			", &[&state.vtxo_id.to_string()]).await? {
-				let kind: Option<&str> = row.get("kind");
-				if matches!(kind, Some(
-					"pubkey"
-						| "board"
-						| "input_owner"
-						| "pool"
-						| "padding"
-						| "forfeit"
-						| "offboard"
-						| "exchange"
-						| "htlc_unattempted_expired"
-						| "htlc_external_failed"
-						| "htlc_source_discharged"
-				)) {
+				if !row.get::<_, bool>("replannable") {
 					proposal.disposition = if row.get::<_, &str>("disposition") == "customer" {
 						let mailbox: &str = row.get("owner_mailbox");
 						OwnershipDisposition::Customer { mailbox: mailbox.parse()? }

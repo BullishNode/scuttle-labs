@@ -14,27 +14,6 @@ use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, Ownership
 use super::{SpendState, Tx};
 use crate::watchman::settlement::{allocate, CustomerLeaf};
 
-fn evidence_json(evidence: &OwnershipEvidence) -> serde_json::Value {
-	match evidence {
-		OwnershipEvidence::IrreversibleEntitlement => serde_json::json!({"kind":"irreversible_entitlement"}),
-		OwnershipEvidence::Pubkey => serde_json::json!({"kind":"pubkey"}),
-		OwnershipEvidence::Board => serde_json::json!({"kind":"board"}),
-		OwnershipEvidence::InputOwner => serde_json::json!({"kind":"input_owner"}),
-		OwnershipEvidence::Pool => serde_json::json!({"kind":"pool"}),
-		OwnershipEvidence::Padding => serde_json::json!({"kind":"padding"}),
-		OwnershipEvidence::Forfeit => serde_json::json!({"kind":"forfeit"}),
-		OwnershipEvidence::Offboard => serde_json::json!({"kind":"offboard"}),
-		OwnershipEvidence::Exchange { .. } => serde_json::json!({"kind":"exchange"}),
-		OwnershipEvidence::HtlcStoredPreimage => serde_json::json!({"kind":"htlc_stored_preimage"}),
-		OwnershipEvidence::HtlcSourceDischarged => serde_json::json!({"kind":"htlc_source_discharged"}),
-		OwnershipEvidence::HtlcExternalFailed => serde_json::json!({"kind":"htlc_external_failed"}),
-		OwnershipEvidence::HtlcInternalGrantsReclaimed { .. } => serde_json::json!({"kind":"htlc_internal_grants_reclaimed"}),
-		OwnershipEvidence::HtlcRecvExpired => serde_json::json!({"kind":"htlc_recv_expired"}),
-		OwnershipEvidence::HtlcUnattemptedExpired => serde_json::json!({"kind":"htlc_unattempted_expired"}),
-		OwnershipEvidence::HtlcOffchain => serde_json::json!({"kind":"htlc_offchain"}),
-	}
-}
-
 /// Phase A's analysis of one expired root, written by phase B only if
 /// every fact it depends on is unchanged under phase B's locks.
 pub struct ExpiryRootPlan {
@@ -206,7 +185,6 @@ impl Tx<'_> {
 		self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&root.id().to_string()]).await?;
 		for proposal in &coins {
 			let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
-			let observed = evidence_json(evidence);
 			let entitlement = if let Some(existing) = existing_entitlements.get(&proposal.id) {
 				*existing
 			} else {
@@ -228,8 +206,8 @@ impl Tx<'_> {
 				OwnershipDisposition::Unresolved(_) => bail!("allocation ownership is unresolved"),
 			};
 			self.execute("
-				INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,evidence)
-				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::TEXT::JSONB)
+				INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,replannable)
+				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 			",
 				&[
 					&id,
@@ -241,7 +219,7 @@ impl Tx<'_> {
 					&i64::try_from(payout)?,
 					&i64::try_from(forfeited)?,
 					&i64::try_from(subsidy)?,
-					&observed.to_string()
+					&evidence.replannable(),
 				]).await?;
 			self.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&proposal.id.to_string()]).await?;
 		}

@@ -64,7 +64,7 @@ async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 	let payout_index = parent.output.iter().position(|out| out.script_pubkey == destination).unwrap() as u32;
 	assert_eq!(parent.output[payout_index as usize].value, expected);
 	let permanent = db.read(async |t| Ok(t.query_one(
-		"SELECT e.id,(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&ids[0].to_string()],
+		"SELECT e.id,(SELECT replannable::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&ids[0].to_string()],
 	).await?)).await.unwrap();
 	let entitlement: i64 = permanent.get("id");
 	let irreversible: String = permanent.get("facts");
@@ -114,7 +114,7 @@ async fn expiry_actual_payout_reorg_preserves_receipt_and_fence() {
 	assert_eq!(ctx.bitcoind().await_transaction(txid).await, parent);
 	assert_eq!(rpc.get_tx_out(&txid, payout_index, Some(true)).unwrap().unwrap().value, expected);
 	let row = db.read(async |t| Ok(t.query_one(
-		"SELECT (SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
+		"SELECT (SELECT replannable::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts, \
 			(SELECT COUNT(*) FROM expiry_entitlement d WHERE d.id=e.id) AS fences, \
 			(SELECT COUNT(*) FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')) AS active, \
 			(SELECT COUNT(DISTINCT a.sweep_txid) FROM expiry_allocation_coin c \
@@ -231,7 +231,7 @@ async fn restart_unfunded_allocation_waits_for_trusted_sponsor_then_pays_owner()
 	let (allocation, entitlement, facts) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |t| Ok(t.query_opt(
-				"SELECT a.id,e.id AS entitlement,c.evidence::TEXT AS facts,a.status,a.sweep_tx,a.broadcast_at \
+				"SELECT a.id,e.id AS entitlement,c.replannable::TEXT AS facts,a.status,a.sweep_tx,a.broadcast_at \
 				 FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 				 JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND a.status<>'conflicted'",
 				 &[&ids[0].to_string()]).await?)).await.unwrap();
@@ -260,7 +260,7 @@ async fn restart_unfunded_allocation_waits_for_trusted_sponsor_then_pays_owner()
 	srv.watchmand().trigger_sweep().await;
 	tokio::time::sleep(Duration::from_secs(2)).await;
 	let held = db.read(async |t| Ok(t.query_one(
-		"SELECT a.sweep_tx,a.status,c.evidence::TEXT AS facts FROM expiry_allocation_state a \
+		"SELECT a.sweep_tx,a.status,c.replannable::TEXT AS facts FROM expiry_allocation_state a \
 		 JOIN expiry_allocation_coin c ON c.allocation_id=a.id WHERE a.id=$1 AND c.entitlement_id=$2",
 		 &[&allocation,&entitlement]).await?)).await.unwrap();
 	assert_eq!(held.get::<_, &str>("status"), "pending");
@@ -290,7 +290,7 @@ async fn restart_unfunded_allocation_waits_for_trusted_sponsor_then_pays_owner()
 	assert!(info.confirmations.unwrap_or(0) >= 6);
 	wait_for_confirmation(&db, allocation, tip, info.blockhash.unwrap()).await;
 	let final_row = db.read(async |t| Ok(t.query_one(
-		"SELECT a.sweep_txid,c.fee_sat,c.payout_sat,c.forfeited_sat,c.evidence::TEXT AS facts \
+		"SELECT a.sweep_txid,c.fee_sat,c.payout_sat,c.forfeited_sat,c.replannable::TEXT AS facts \
 		 FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		 WHERE a.id=$1 AND c.entitlement_id=$2",
 		 &[&allocation,&entitlement]).await?)).await.unwrap();

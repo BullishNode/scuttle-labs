@@ -193,7 +193,7 @@ async fn assert_physical_cut(
 
 async fn decided_obligations(db: &Db, coins: &[String]) -> BTreeMap<String, (i64, i64, String)> {
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.id,e.vtxo_id,(SELECT amount FROM vtxo original WHERE original.vtxo_id=e.vtxo_id) AS gross_sat, \
-		(SELECT evidence::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts,v.spend_state::TEXT AS spend_state \
+		(SELECT replannable::TEXT FROM expiry_allocation_coin first_coin WHERE first_coin.entitlement_id=e.id ORDER BY allocation_id LIMIT 1) AS facts,v.spend_state::TEXT AS spend_state \
 		FROM expiry_entitlement e JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE e.vtxo_id=ANY($1)",
 		&[&coins],
 	).await?)).await.unwrap();

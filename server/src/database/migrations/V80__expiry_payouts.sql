@@ -72,7 +72,8 @@ CREATE TABLE expiry_allocation_coin (
 	payout_sat BIGINT NOT NULL CHECK (payout_sat >= 0),
 	forfeited_sat BIGINT NOT NULL CHECK (forfeited_sat >= 0),
 	subsidy_sat BIGINT NOT NULL DEFAULT 0 CHECK (subsidy_sat >= 0),
-	evidence JSONB NOT NULL,
+	-- A Lightning decision is planned again after a conflict; others repeat.
+	replannable BOOLEAN NOT NULL,
 	PRIMARY KEY (allocation_id, entitlement_id),
 	CHECK ((disposition = 'customer' AND owner_mailbox IS NOT NULL
 		AND gross_sat + subsidy_sat = fee_sat + payout_sat + forfeited_sat)
