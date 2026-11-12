@@ -11,6 +11,7 @@
 mod convert;
 mod migrations;
 mod query;
+mod scuttle;
 
 
 use std::path::{Path, PathBuf};
@@ -106,11 +107,7 @@ impl BarkPersister for SqliteClient {
 
 	async fn set_mailbox_identity(&self, identity: crate::MailboxIdentity) -> anyhow::Result<()> {
 		let conn = self.connect()?;
-		let changed = conn.execute("UPDATE bark_properties SET mailbox_pubkey=?1
-			WHERE id=1 AND network=?2 AND (mailbox_pubkey IS NULL OR mailbox_pubkey=?1)",
-			[identity.public_key.to_string(), identity.network.to_string()])?;
-		ensure!(changed == 1, "mailbox identity differs from the stored wallet");
-		Ok(())
+		scuttle::bind_mailbox_identity(&conn, &identity)
 	}
 
 	async fn set_server_pubkey(&self, server_pubkey: PublicKey) -> anyhow::Result<()> {
