@@ -260,8 +260,8 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let (allocation, parent) = async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				WHERE c.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
 				&[&grant.id().to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -317,10 +317,10 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	}.wait_millis(10_000).await;
 	let final_state = db.read(async |tx| Ok(tx.query_one("SELECT \
 		(SELECT to_regclass('expiry_split_request') IS NULL) AS no_split_table, \
-		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1 AND c.disposition<>'operator') AS customers, \
-		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$2 AND a.status='confirmed') AS allocations",
+		(SELECT COUNT(*) FROM expiry_allocation_coin c \
+		JOIN vtxo v ON v.vtxo_id=c.vtxo_id WHERE v.anchor_point=$1 AND c.disposition<>'operator') AS customers, \
+		(SELECT COUNT(*) FROM expiry_allocation_coin c \
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=$2 AND a.status='confirmed') AS allocations",
 		&[&root.to_string(), &grant.id().to_string()],
 	).await?)).await.unwrap();
 	assert!(final_state.get::<_, bool>("no_split_table"));
@@ -414,7 +414,7 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 		assert!(parent.output.iter().any(|out| out.script_pubkey == provider_script && out.value > Amount::ZERO));
 		assert!(parent.output.iter().all(|out| out.script_pubkey != recipient_script));
 		let owners = db.read(async |tx| Ok(tx.query("SELECT c.owner_mailbox \
-			FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
+			FROM expiry_allocation_coin c WHERE c.vtxo_id=$1",
 			&[&grant.id().to_string()]).await?)).await.unwrap();
 		assert!(!owners.is_empty());
 		for owner in owners {

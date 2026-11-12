@@ -188,8 +188,8 @@ async fn expiry_payout_never_pays_owners_more_than_the_root() {
 	let (allocation, gross, fee) = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			if let Some(row) = db.read(async |t| Ok(t.query_opt("SELECT c.allocation_id,c.gross_sat,c.fee_sat \
-				FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.disposition='customer'", &[&id]).await?)).await.unwrap() {
+				FROM expiry_allocation_coin c \
+				WHERE c.vtxo_id=$1 AND c.disposition='customer'", &[&id]).await?)).await.unwrap() {
 				break (row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2));
 			}
 			tokio::time::sleep(Duration::from_millis(50)).await;

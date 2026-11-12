@@ -103,10 +103,10 @@ pub(super) async fn confirm_epoch(
 	let core = ctx.bitcoind().sync_client();
 	let rows = tokio::time::timeout(Duration::from_secs(40), async {
 		for _ in 0..20 {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
+			let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
 				c.subsidy_sat,c.forfeited_sat,c.owner_mailbox,a.id,a.sweep_tx,a.sweep_txid \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
+				FROM expiry_allocation_coin c \
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=ANY($1) \
 				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids],
 			).await?)).await.unwrap();
 			assert!(rows.len() <= leaves.len());
@@ -225,8 +225,7 @@ pub(super) async fn wait_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction
 			let row = db.read(async |t| Ok(t.query_opt(
 				"SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id LIMIT 1",
+				WHERE c.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id LIMIT 1",
 				&[&coin.to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -240,8 +239,8 @@ pub(super) async fn wait_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction
 /// Observe one current customer payout; never manufacture its allocation.
 pub(super) async fn published_payout(db: &Db, coin: VtxoId) -> Option<(i64, Transaction)> {
 	let rows = db.read(async |t| Ok(t.query("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a
-		JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id
-		WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
+		JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+		WHERE c.vtxo_id=$1 AND c.disposition='customer' AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
 		&[&coin.to_string()]).await?)).await.unwrap();
 	assert!(rows.len() <= 1, "one source cannot have duplicate current payouts");
 	rows.first().map(|row| (row.get("id"), deserialize(row.get("sweep_tx")).unwrap()))
@@ -257,7 +256,7 @@ pub(super) async fn confirmed_grant_closures(
 	for grant in grants {
 		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
 			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
+			WHERE c.vtxo_id=v.vtxo_id \
 			AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept, \
 			h.payment_hash,h.direction::TEXT AS direction \
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();

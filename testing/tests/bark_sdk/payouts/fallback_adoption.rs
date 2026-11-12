@@ -91,10 +91,10 @@ async fn full_sync_retires_previously_unseen_paid_mailbox_receipts() {
 	let original_ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 	let parents = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,a.sweep_txid,a.sweep_tx \
-				FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+			let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,a.sweep_txid,a.sweep_tx \
+				FROM expiry_allocation_coin c \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				WHERE e.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' \
+				WHERE c.vtxo_id=ANY($1) AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' \
 				AND a.broadcast_at IS NOT NULL", &[&original_ids]).await?)).await.unwrap();
 			assert!(rows.len() <= ids.len());
 			if rows.len() == ids.len() {

@@ -60,8 +60,7 @@ pub(super) async fn round_root_pays_both_current_owners_once() {
 			let rows = db.read(async |tx| Ok(tx.query(
 				"SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=ANY($1) AND c.disposition='customer' \
+				WHERE c.vtxo_id=ANY($1) AND c.disposition='customer' \
 				AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
 				&[&source_ids],
 			).await?)).await.unwrap();
@@ -87,8 +86,8 @@ pub(super) async fn round_root_pays_both_current_owners_once() {
 	assert!(parent.output.iter().all(|out| owners.iter().any(|(_, script)| *script == out.script_pubkey)
 		|| out.script_pubkey == operator_script));
 	let rows = db.read(async |tx| Ok(tx.query(
-		"SELECT e.vtxo_id,c.disposition,c.gross_sat,c.fee_sat,c.payout_sat \
-		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
+		"SELECT c.vtxo_id,c.disposition,c.gross_sat,c.fee_sat,c.payout_sat \
+		FROM expiry_allocation_coin c \
 		WHERE c.allocation_id=$1", &[&allocation],
 	).await?)).await.unwrap();
 	assert_eq!(rows.len(), 2);

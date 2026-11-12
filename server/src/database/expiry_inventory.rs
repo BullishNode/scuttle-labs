@@ -37,7 +37,7 @@ WITH RECURSIVE current_branch AS (
 SELECT vtxo_id,anchor_point,id,vtxo,expiry,exit_delta,policy,server_pubkey,amount,
 	oor_spent_txid,spent_in_round,offboarded_in,
 	banned_until_height,confirmed_height,spend_state::TEXT,created_at,updated_at,
-	EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=v.vtxo_id) AS decided_for_fallback,
+	EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=v.vtxo_id) AS decided_for_fallback,
 	onchain_spent_height,onchain_spent_txid,lightning_htlc_subscription_id
 FROM vtxo v WHERE vtxo_id IN (SELECT vtxo_id FROM current_branch)
 ORDER BY vtxo_id";

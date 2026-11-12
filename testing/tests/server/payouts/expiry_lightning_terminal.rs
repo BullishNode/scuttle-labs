@@ -162,7 +162,7 @@ async fn failed_external_payout(settle_during_decision: bool) {
 				if hold.vtxo_id == id && hold.reason == "failed Lightning payment has a stored preimage" { return; }
 			}
 		}).await.expect("the decision must re-read the settlement and hold the source");
-		assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1",
+		assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(DISTINCT vtxo_id) FROM expiry_allocation_coin WHERE vtxo_id=$1",
 			&[&id.to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0, "a settled hash must never refund its sender");
 		return;
 	}
@@ -334,8 +334,7 @@ fn internal_safe_pool_grants()
 		tokio::time::sleep(Duration::from_secs(1)).await;
 		assert!(db.read(async |t| Ok(t.query_opt(
 			"SELECT c.allocation_id FROM expiry_allocation_coin c
-			 JOIN expiry_entitlement e ON e.id = c.entitlement_id
-			 WHERE e.vtxo_id = $1 AND c.disposition = 'customer'",
+			 WHERE c.vtxo_id = $1 AND c.disposition = 'customer'",
 			&[&source.to_string()]).await?)).await.unwrap().is_none(), "sender refund must wait for six grant confirmations");
 		let fact = db.read(async |t| {
 			let snapshot = t.backing_subtree_snapshot(&[ark::ServerVtxo::from(incoming[0].clone()).to_bare()]).await?;
@@ -574,7 +573,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 			db.read(async |tx| {
 				assert!(tx.query_one("SELECT status NOT IN ('failed','succeeded') FROM lightning_payment_attempt WHERE id=$1",
 					&[&attempt]).await?.get::<_, bool>(0));
-				assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1",
+				assert_eq!(tx.query_one("SELECT COUNT(DISTINCT vtxo_id) FROM expiry_allocation_coin WHERE vtxo_id=$1",
 					&[&source.id().to_string()]).await?.get::<_, i64>(0), 0);
 				assert!(tx.get_htlc_settlement_by_payment_hash(hash).await?.is_none());
 				Ok(())
@@ -670,7 +669,7 @@ async fn pending_external_send_allows_unrelated_payout_then_refunds_offline_once
 		}).await.expect("both native peers must actually release the matching HTLCs");
 		assert!((ctx.bitcoind().get_block_count().await as u32) < deadline.to_u32());
 		assert_eq!(db.read(async |tx| Ok(tx.query_one(
-			"SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1",
+			"SELECT COUNT(DISTINCT vtxo_id) FROM expiry_allocation_coin WHERE vtxo_id=$1",
 			&[&source.id().to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 0);
 		let target = source.expiry_height().to_u32().max(deadline.to_u32()) + 1;
 		while (ctx.bitcoind().get_block_count().await as u32) < target {

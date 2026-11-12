@@ -75,7 +75,7 @@ async fn decide_during<T: Send + 'static>(
 		t.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) FOR UPDATE", &[&ids]).await?;
 		let call = tokio::spawn(call);
 		wait_for_lock_waiter(&waiter).await;
-		t.execute("INSERT INTO expiry_entitlement (vtxo_id) SELECT UNNEST($1::TEXT[])", &[&ids]).await?;
+		super::decide_for_fallback(t, &ids).await?;
 		Ok(call)
 	}).await.unwrap().await.unwrap()
 }

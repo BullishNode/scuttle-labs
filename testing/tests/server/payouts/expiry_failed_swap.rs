@@ -211,8 +211,8 @@ async fn failed_swap_during_restart() {
 	let fact = snapshot.regular.iter().find(|fact| fact.state.vtxo_id == source).unwrap();
 	let proposal = db.read(async |tx| tx.propose_expiry_ownership(fact, before_deadline).await).await.unwrap();
 	assert!(matches!(proposal.disposition, OwnershipDisposition::Unresolved(_)));
-	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement e \
-		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1", &[&root.to_string()],
+	let early = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
+		JOIN vtxo v ON v.vtxo_id=c.vtxo_id WHERE v.anchor_point=$1", &[&root.to_string()],
 	).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(early, 0, "neither customer payout nor operator discharge is due before the HTLC deadline");
 	let unspent = ctx.bitcoind().sync_client().get_tx_out(&root.txid, root.vout, Some(true)).unwrap().unwrap();
@@ -251,9 +251,9 @@ async fn failed_swap_during_restart() {
 	let mut graph = BTreeMap::from([(parent.compute_txid(), parent.clone())]);
 	let rows = db.read(async |tx| Ok(tx.query("SELECT a.id,a.status,a.sweep_tx,a.sweep_txid, \
 		c.disposition,c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
-		e.vtxo_id \
+		c.vtxo_id \
 		FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
+		JOIN vtxo v ON v.vtxo_id=c.vtxo_id \
 		WHERE v.anchor_point=$1", &[&root.to_string()],
 	).await?)).await.unwrap();
 	let mut active = 0;

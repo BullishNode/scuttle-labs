@@ -219,8 +219,8 @@ async fn boundaries() {
 	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>() + miner_fee, sat(7_999));
 	assert!(remainder.iter().all(|output| output.script_pubkey == operator));
 	let forbidden = old.iter().map(ToString::to_string).collect::<Vec<_>>();
-	assert!(db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_allocation_coin c \
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND c.disposition='customer'",
+	assert!(db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id FROM expiry_allocation_coin c \
+		WHERE c.vtxo_id=ANY($1) AND c.disposition='customer'",
 		&[&forbidden]).await?)).await.unwrap().is_empty());
 	let returned_sender = Box::pin(donor_cli.client()).await;
 	let sender_leaves = leaves.iter().filter(|leaf| leaf.mailbox == mailboxes[0]).collect::<Vec<_>>();

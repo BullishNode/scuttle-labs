@@ -139,8 +139,7 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 				'wal',(SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM htlc_settlement s WHERE s.payment_hash=$2),
 				'owners',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.vtxo_id) FROM coin_owner c WHERE c.vtxo_id=ANY($1)),
 				'virtual',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.txid) FROM virtual_transaction v WHERE v.txid=ANY($3)),
-				'entitlements',(SELECT jsonb_agg(to_jsonb(e) ORDER BY e.id) FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)),
-				'allocations',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.allocation_id,c.entitlement_id) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1)))::TEXT",
+				'allocations',(SELECT jsonb_agg(to_jsonb(c) ORDER BY c.allocation_id,c.vtxo_id) FROM expiry_allocation_coin c WHERE c.vtxo_id=ANY($1)))::TEXT",
 				&[&ids_text, &hash.to_string(), &txids]).await?.get::<_, String>(0))).await.unwrap();
 			let before = committed().await;
 			let response = rpc.request_lightning_pay_htlc_revocation(
@@ -176,15 +175,15 @@ async fn expiry_unused_same_hash_grant_returns_to_owner_after_other_source_paid(
 	assert_eq!(outputs[0].1.value, sat(98_000));
 	let owner = client.mailbox_keypair().public_key().to_string();
 	let row = db.read(async |t| Ok(t.query_one("SELECT c.disposition::TEXT,c.owner_mailbox,c.gross_sat,c.fee_sat,c.payout_sat
-		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id
-		WHERE c.allocation_id=$1 AND e.vtxo_id=$2", &[&allocation, &grants[1].to_string()]).await?)).await.unwrap();
+		FROM expiry_allocation_coin c
+		WHERE c.allocation_id=$1 AND c.vtxo_id=$2", &[&allocation, &grants[1].to_string()]).await?)).await.unwrap();
 	assert_eq!(row.get::<_, &str>("disposition"), "customer");
 	assert_eq!(row.get::<_, Option<&str>>("owner_mailbox"), Some(owner.as_str()));
 	assert_eq!(row.get::<_, i64>("gross_sat"), 100_000);
 	assert_eq!(row.get::<_, i64>("fee_sat"), 2_000);
 	assert_eq!(row.get::<_, i64>("payout_sat"), 98_000);
 	assert_eq!(db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.disposition='customer'",
+		WHERE c.vtxo_id=$1 AND c.disposition='customer'",
 		&[&grants[1].to_string()]).await?.get::<_, i64>(0))).await.unwrap(), 1);
 
 	let tip = ctx.generate_blocks(6).await;

@@ -139,8 +139,7 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 			wm.trigger_sweep().await;
 			let rows = db.read(async |tx| Ok(tx.query("SELECT DISTINCT a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
+				WHERE c.vtxo_id=$1 AND c.disposition='customer' AND a.broadcast_at IS NOT NULL",
 				&[&vtxo.to_string()],
 			).await?)).await.unwrap();
 			for row in rows {
@@ -163,8 +162,8 @@ async fn watchman_sweeps_funding_tx_during_exit() {
 	wm.trigger_sweep().await;
 	async {
 		loop {
-			let paid = db.read(async |tx| Ok(tx.query("SELECT DISTINCT e.vtxo_id FROM expiry_allocation_coin c \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
+			let paid = db.read(async |tx| Ok(tx.query("SELECT DISTINCT c.vtxo_id FROM expiry_allocation_coin c \
+				JOIN vtxo v ON v.vtxo_id=c.vtxo_id \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 				WHERE v.anchor_point=$1 AND a.status='confirmed' \
 				AND a.confirmed_height IS NOT NULL AND a.confirmed_hash IS NOT NULL \

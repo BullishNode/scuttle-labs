@@ -822,7 +822,7 @@ CREATE TABLE public.expiry_allocation (
 
 CREATE TABLE public.expiry_allocation_coin (
     allocation_id bigint NOT NULL,
-    entitlement_id bigint NOT NULL,
+    vtxo_id text NOT NULL,
     owner_mailbox text,
     disposition text NOT NULL,
     gross_sat bigint NOT NULL,
@@ -964,7 +964,7 @@ CREATE VIEW public.expiry_allocation_state AS
             WHEN o.confirmed THEN 'confirmed'::text
             WHEN (o.conflicted OR (EXISTS ( SELECT 1
                FROM ((public.expiry_allocation_coin c
-                 JOIN public.expiry_allocation_coin paid ON ((paid.entitlement_id = c.entitlement_id)))
+                 JOIN public.expiry_allocation_coin paid ON ((paid.vtxo_id = c.vtxo_id)))
                  JOIN observed prior ON ((prior.id = paid.allocation_id)))
               WHERE ((c.allocation_id = a.id) AND prior.confirmed AND (prior.id <> a.id))))) THEN 'conflicted'::text
             ELSE 'pending'::text
@@ -998,36 +998,6 @@ CREATE TABLE public.expiry_cancelled_participation (
     unlock_hash text,
     created_at timestamp with time zone DEFAULT now() NOT NULL
 );
-
-
---
--- Name: expiry_entitlement; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.expiry_entitlement (
-    id bigint NOT NULL,
-    vtxo_id text NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
-);
-
-
---
--- Name: expiry_entitlement_id_seq; Type: SEQUENCE; Schema: public; Owner: -
---
-
-CREATE SEQUENCE public.expiry_entitlement_id_seq
-    START WITH 1
-    INCREMENT BY 1
-    NO MINVALUE
-    NO MAXVALUE
-    CACHE 1;
-
-
---
--- Name: expiry_entitlement_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -
---
-
-ALTER SEQUENCE public.expiry_entitlement_id_seq OWNED BY public.expiry_entitlement.id;
 
 
 --
@@ -2401,13 +2371,6 @@ ALTER TABLE ONLY public.expiry_allocation ALTER COLUMN id SET DEFAULT nextval('p
 
 
 --
--- Name: expiry_entitlement id; Type: DEFAULT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_entitlement ALTER COLUMN id SET DEFAULT nextval('public.expiry_entitlement_id_seq'::regclass);
-
-
---
 -- Name: htlc_settlement id; Type: DEFAULT; Schema: public; Owner: -
 --
 
@@ -2603,7 +2566,7 @@ ALTER TABLE ONLY public.ephemeral_tweak
 --
 
 ALTER TABLE ONLY public.expiry_allocation_coin
-    ADD CONSTRAINT expiry_allocation_coin_pkey PRIMARY KEY (allocation_id, entitlement_id);
+    ADD CONSTRAINT expiry_allocation_coin_pkey PRIMARY KEY (allocation_id, vtxo_id);
 
 
 --
@@ -2636,22 +2599,6 @@ ALTER TABLE ONLY public.expiry_cancelled_participation
 
 ALTER TABLE ONLY public.expiry_cancelled_participation
     ADD CONSTRAINT expiry_cancelled_participation_unlock_hash_key UNIQUE (unlock_hash);
-
-
---
--- Name: expiry_entitlement expiry_entitlement_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_entitlement
-    ADD CONSTRAINT expiry_entitlement_pkey PRIMARY KEY (id);
-
-
---
--- Name: expiry_entitlement expiry_entitlement_vtxo_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_entitlement
-    ADD CONSTRAINT expiry_entitlement_vtxo_id_key UNIQUE (vtxo_id);
 
 
 --
@@ -2963,6 +2910,13 @@ CREATE UNIQUE INDEX cln_xpay_pending_hash_ux ON public.cln_xpay USING btree (pay
 --
 
 CREATE INDEX cln_xpay_pending_ix ON public.cln_xpay USING btree (lightning_node_id, id) WHERE (status = 'pending'::public.cln_xpay_status);
+
+
+--
+-- Name: expiry_allocation_coin_vtxo_id_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX expiry_allocation_coin_vtxo_id_idx ON public.expiry_allocation_coin USING btree (vtxo_id);
 
 
 --
@@ -3398,11 +3352,11 @@ ALTER TABLE ONLY public.expiry_allocation_coin
 
 
 --
--- Name: expiry_allocation_coin expiry_allocation_coin_entitlement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+-- Name: expiry_allocation_coin expiry_allocation_coin_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.expiry_allocation_coin
-    ADD CONSTRAINT expiry_allocation_coin_entitlement_id_fkey FOREIGN KEY (entitlement_id) REFERENCES public.expiry_entitlement(id);
+    ADD CONSTRAINT expiry_allocation_coin_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
 
 
 --
@@ -3419,14 +3373,6 @@ ALTER TABLE ONLY public.expiry_allocation_input
 
 ALTER TABLE ONLY public.expiry_allocation_input
     ADD CONSTRAINT expiry_allocation_input_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
-
-
---
--- Name: expiry_entitlement expiry_entitlement_vtxo_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_entitlement
-    ADD CONSTRAINT expiry_entitlement_vtxo_id_fkey FOREIGN KEY (vtxo_id) REFERENCES public.vtxo(vtxo_id);
 
 
 --

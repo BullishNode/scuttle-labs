@@ -131,7 +131,7 @@ async fn unbroadcast_offboard_remains_customer_liability() {
 		ctx.generate_blocks(1).await;
 	}
 	let state = db.read(async |tx| Ok(tx.query_one(
-		"SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1",
+		"SELECT COUNT(*) FROM expiry_allocation_coin c WHERE c.vtxo_id=$1",
 		&[&coin_id.to_string()],
 	).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(state, 0, "unpaid offboard must not release customer backing");
@@ -156,8 +156,7 @@ async fn unbroadcast_offboard_remains_customer_liability() {
 			srv.watchmand().trigger_sweep().await;
 			let owner = db.read(async |tx| Ok(tx.query_opt(
 				"SELECT c.disposition FROM expiry_allocation_coin c \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1", &[&coin_id.to_string()],
+				WHERE c.vtxo_id=$1", &[&coin_id.to_string()],
 			).await?.map(|row| row.get::<_, String>(0)))).await.unwrap();
 			if let Some(owner) = owner {
 				assert_eq!(owner, "operator", "confirmed payment may release backing once");
@@ -285,8 +284,8 @@ async fn offboard_race(offboard_wins: bool, after_analysis: bool) {
 		let customer = db.read(async |tx| Ok(tx.query_one("
 			SELECT COUNT(*)
 			FROM expiry_allocation_coin c
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id
-			WHERE e.vtxo_id=$1
+			
+			WHERE c.vtxo_id=$1
 			AND c.disposition='customer'
 		", &[&id.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
 		assert_eq!(customer, 0, "the binding offboard must not also receive a fallback payment");

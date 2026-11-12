@@ -8,10 +8,10 @@ async fn assert_payouts_once(
 	operator_script: &bitcoin::ScriptBuf,
 	first_height: u64,
 ) {
-	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.owner_mailbox,c.disposition, \
+	let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,c.owner_mailbox,c.disposition, \
 		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.confirmed_height,a.confirmed_hash,a.sweep_tx \
-		FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN vtxo v ON v.vtxo_id=e.vtxo_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+		FROM expiry_allocation_coin c \
+		JOIN vtxo v ON v.vtxo_id=c.vtxo_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		WHERE v.anchor_point=$1", &[&anchor.to_string()],
 	).await?)).await.unwrap();
 	let mut canonical_coins = std::collections::BTreeSet::new();

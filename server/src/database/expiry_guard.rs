@@ -16,7 +16,7 @@ pub(crate) async fn guard_obligation_changes(
 	// still excluding competing source mutations and allocation decisions.
 	tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id = ANY($1) ORDER BY vtxo_id FOR NO KEY UPDATE", &[&ids]).await?;
 	if let Some(row) = tx.query_opt(
-		"SELECT vtxo_id FROM (SELECT vtxo_id FROM expiry_entitlement WHERE vtxo_id=ANY($1) \
+		"SELECT vtxo_id FROM (SELECT vtxo_id FROM expiry_allocation_coin WHERE vtxo_id=ANY($1) \
 			UNION SELECT vtxo_id FROM expiry_allocation_input WHERE vtxo_id=ANY($1)) fenced \
 			ORDER BY vtxo_id LIMIT 1",
 		&[&ids],
@@ -97,7 +97,7 @@ impl super::Tx<'_> {
 
 	/// Cancel only the final selected group under the locks taken above.
 	/// Accepted forfeits always win if they committed first. Revalidation and
-	/// entitlement/fence writes must occur in this same transaction.
+	/// the decision writes must occur in this same transaction.
 	pub async fn cancel_expiry_participations(&self, participation_ids: &[i64]) -> anyhow::Result<bool> {
 		let Some(parts) = self.cancellable_expiry_parts(participation_ids, true).await? else { return Ok(false); };
 		for part in parts {
@@ -110,7 +110,7 @@ impl super::Tx<'_> {
 				self.execute("UPDATE vtxo SET spend_state='spendable',spent_in_round=NULL,updated_at=NOW() \
 					WHERE spent_in_round=$1 AND oor_spent_txid IS NULL AND offboarded_in IS NULL \
 					AND vtxo_id IN(SELECT vtxo_id FROM round_part_input WHERE participation_id=$2) \
-					AND NOT EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id)", &[&round, &id]).await?;
+					AND NOT EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=vtxo.vtxo_id)", &[&round, &id]).await?;
 			}
 		}
 		Ok(true)

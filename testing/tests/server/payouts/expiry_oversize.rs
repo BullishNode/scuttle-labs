@@ -263,11 +263,11 @@ async fn direct_large_payout() {
 		loop {
 			srv.watchmand().trigger_sweep().await;
 			let rows = db.read(async |tx| Ok(tx.query(
-				"SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
+				"SELECT c.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat, \
 				 c.owner_mailbox,a.sweep_tx,a.sweep_txid \
-				 FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+				 FROM expiry_allocation_coin c \
 				 JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-				 WHERE e.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
+				 WHERE c.vtxo_id=ANY($1) AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
 				&[&terminal_ids],
 			).await?)).await.unwrap();
 			if rows.len() == PAYEES { break rows; }

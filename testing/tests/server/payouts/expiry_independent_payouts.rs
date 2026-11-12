@@ -18,15 +18,14 @@ async fn assert_pending_root_is_untouched(
 	ctx: &TestContext, db: &Db, htlc: VtxoId, root: OutPoint, backing: &TxOut,
 ) {
 	let row = db.read(async |tx| Ok(tx.query_one("SELECT \
-		(SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1) AS entitlements, \
-		(SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=$1) AS fences, \
+		(SELECT COUNT(*) FROM expiry_allocation_coin WHERE vtxo_id=$1) AS fences, \
 		(SELECT COUNT(*) FROM expiry_allocation_input WHERE vtxo_id=$2) AS allocations, \
 		(SELECT to_regclass('expiry_split_request') IS NULL) AS no_split_table, \
 		(SELECT COUNT(*) FROM lightning_payment_attempt_htlc_vtxo WHERE vtxo_id=$1) AS attempts",
 		&[&htlc.to_string(), &VtxoId::from(root).to_string()],
 	).await?)).await.unwrap();
 	assert!(row.get::<_, bool>("no_split_table"));
-	for field in ["entitlements", "fences", "allocations", "attempts"] {
+	for field in ["fences", "allocations", "attempts"] {
 		assert_eq!(row.get::<_, i64>(field), 0,
 			"the unresolved tree must remain pending before its HTLC deadline: {field}");
 	}
@@ -104,8 +103,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 			assert_pending_root_is_untouched(&ctx, &db, htlc, pending.chain_anchor(), &pending_backing).await;
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx \
 				FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' \
+				WHERE c.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' \
 				AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1", &[&ready.id().to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -153,8 +151,7 @@ async fn expiry_ready_root_does_not_wait_for_unresolved_same_expiry_root() {
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_one("SELECT a.status,a.sweep_tx, \
-				(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e \
-				 ON e.id=c.entitlement_id WHERE e.vtxo_id=$2 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')) AS active \
+				(SELECT COUNT(*) FROM expiry_allocation_coin c WHERE c.vtxo_id=$2 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')) AS active \
 				FROM expiry_allocation_state a WHERE a.id=$1", &[&allocation, &ready.id().to_string()],
 			).await?)).await.unwrap();
 			assert_eq!(row.get::<_, i64>("active"), 1, "one ready entitlement has one active allocation");

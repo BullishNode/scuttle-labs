@@ -94,7 +94,7 @@ async fn large_expiry_group_leaves_captaind_serving() {
 	let started = Instant::now();
 	tokio::time::timeout(Duration::from_secs(120), async {
 		for round in 0.. {
-			let decided = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=ANY($1)",
+			let decided = db.read(async |t| Ok(t.query_one("SELECT COUNT(DISTINCT vtxo_id) FROM expiry_allocation_coin WHERE vtxo_id=ANY($1)",
 				&[&ids]).await?.get::<_, i64>(0))).await.unwrap();
 			if decided == ids.len() as i64 { break; }
 			tokio::time::sleep(Duration::from_millis(500)).await;
@@ -109,8 +109,8 @@ async fn large_expiry_group_leaves_captaind_serving() {
 		lock_wait_max={wait:.3}s settlement_lock_max={slowest_admission:?}", coins.len());
 
 	for (id, _, script) in &coins {
-		let rows = db.read(async |t| Ok(t.query("SELECT c.disposition,c.owner_mailbox FROM expiry_entitlement e \
-			JOIN expiry_allocation_coin c ON c.entitlement_id=e.id WHERE e.vtxo_id=$1", &[&id.to_string()]).await?))
+		let rows = db.read(async |t| Ok(t.query("SELECT c.disposition,c.owner_mailbox FROM expiry_allocation_coin c \
+			WHERE c.vtxo_id=$1", &[&id.to_string()]).await?))
 			.await.unwrap();
 		assert_eq!(rows.len(), 1, "one entitlement and one allocation for {id}");
 		assert_eq!(rows[0].get::<_, &str>("disposition"), "customer");

@@ -69,11 +69,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 				}
 				Ok::<_, anyhow::Error>(())
 			}).await.expect("competing writer must reach actual coin lock")?;
-			t.query_one("
-				INSERT INTO expiry_entitlement(vtxo_id)
-				VALUES($1)
-				RETURNING id
-			", &[&coin.id().to_string()]).await?;
+			super::decide_for_fallback(t, &[coin.id().to_string()]).await?;
 			t.execute("
 				UPDATE vtxo
 				SET spend_state = 'spent', updated_at = NOW()
@@ -92,10 +88,7 @@ async fn expiry_coin_fence_serializes_actual_tree_writes() {
 		assert_eq!(state[0].spent_in_round, None);
 		// Reset this isolated fixture for the next distinct real writer path.
 		db.write(async |t| {
-			t.execute("
-				DELETE
-				FROM expiry_entitlement
-			", &[]).await?;
+			t.batch_execute("DELETE FROM expiry_allocation_coin; DELETE FROM expiry_allocation").await?;
 			t.execute("
 				UPDATE vtxo
 				SET spend_state = 'spendable', updated_at = NOW()

@@ -161,7 +161,7 @@ async fn partial_terminal() {
 			"the exact raw A authorization must be durable before canonical grant consumption");
 	}
 	let prior_fences = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM ( \
-		SELECT vtxo_id FROM expiry_entitlement UNION ALL SELECT vtxo_id FROM expiry_allocation_input \
+		SELECT vtxo_id FROM expiry_allocation_coin UNION ALL SELECT vtxo_id FROM expiry_allocation_input \
 		) prior WHERE vtxo_id=$1",&[&sources[0].id().to_string()]).await?.get::<_,i64>(0))).await.unwrap();
 	assert_eq!(prior_fences,0,"this case qualifies an observed user claim without a prior decided/allocation fence");
 	let unpaid = sources[1].id();
@@ -172,8 +172,8 @@ async fn partial_terminal() {
 			srv.watchmand().wait_for_sync_height(height).await;
 			tokio::time::sleep(Duration::from_secs(1)).await;
 			let row = db.read(async |t| Ok(t.query_opt("SELECT a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&unpaid.to_string()]).await?)).await.unwrap();
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				WHERE c.vtxo_id=$1 AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL", &[&unpaid.to_string()]).await?)).await.unwrap();
 			if let Some(row) = row { return deserialize(row.get("sweep_tx")).unwrap(); }
 		}
 		panic!("the genuinely unpaid original source still requires an absent user");
@@ -229,8 +229,8 @@ pub(super) async fn wait_partial_confirmation(
 				{ return Ok(false); }
 				t.lock_watchman_tip(view).await?;
 				let recorded = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=$1 AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_tx=$2",
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE c.vtxo_id=$1 AND a.status<>'conflicted' AND a.status='confirmed' AND a.sweep_tx=$2",
 					&[&unpaid.to_string(), &bitcoin::consensus::serialize(parent)]).await?.get::<_, i64>(0);
 				if recorded != 1 { return Ok(false); }
 				let source = t.query_one("SELECT v.onchain_spent_txid,h.offchain_resolution::TEXT,h.chain_resolution::TEXT \
@@ -240,8 +240,8 @@ pub(super) async fn wait_partial_confirmation(
 				assert!(source.get::<_,Option<&str>>("offchain_resolution").is_none(),
 					"an actual user claim cannot be manufactured into permanent off-chain cancellation");
 				let duplicate = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-					WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed'", &[&paid_source]).await?
+					JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+					WHERE c.vtxo_id=$1 AND c.disposition='customer' AND a.status='confirmed'", &[&paid_source]).await?
 					.get::<_, i64>(0);
 				assert_eq!(duplicate, 0, "the actual prior user receipt must not receive a second fallback");
 				Ok(true)

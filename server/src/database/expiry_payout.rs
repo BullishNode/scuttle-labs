@@ -66,12 +66,12 @@ impl Tx<'_> {
 		if !self.expiry_payouts() || owners.is_empty() { return Ok(BTreeMap::new()); }
 		let ids = owners.keys().map(ToString::to_string).collect::<Vec<_>>();
 		// The winning decision of each coin: a confirmed one, else the latest.
-		let rows = self.query("SELECT DISTINCT ON (e.vtxo_id) e.vtxo_id,c.disposition,c.owner_mailbox, \
+		let rows = self.query("SELECT DISTINCT ON (c.vtxo_id) c.vtxo_id,c.disposition,c.owner_mailbox, \
 			c.gross_sat,c.fee_sat,c.payout_sat,a.status,v.confirmed_height IS NOT NULL AS exposed, \
 			a.confirmed_height+5 <= (SELECT MAX(height) FROM watchmand_block) AS deep \
-			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
-			WHERE e.vtxo_id=ANY($1) ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC",
+			FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+			JOIN vtxo v ON v.vtxo_id=c.vtxo_id \
+			WHERE c.vtxo_id=ANY($1) ORDER BY c.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC",
 			&[&ids]).await?;
 		let mut receipts = BTreeMap::new();
 		for row in rows {
@@ -257,17 +257,14 @@ impl Tx<'_> {
 		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
 		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
 		// Physical reservations survive while pending/confirmed. An operator
-		// entitlement stays reserved until all its allocations have conflicted.
-		// Customer entitlements remain irreversible even across a conflict;
+		// decision stays reserved until all its allocations have conflicted.
+		// Customer decisions remain irreversible even across a conflict;
 		// the off-chain obligation guard retains its separate stronger fence.
 		if let Some(row) = self.query_opt("SELECT vtxo_id FROM ( \
 			SELECT i.vtxo_id FROM expiry_allocation_input i JOIN expiry_allocation_state a ON a.id=i.allocation_id \
 				WHERE i.vtxo_id=ANY($1) AND a.status<>'conflicted' \
-			UNION SELECT e.vtxo_id FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1) AND ( \
-				NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
-				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
-					WHERE c.entitlement_id=e.id AND a.status<>'conflicted') \
-				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer'))) fenced \
+			UNION SELECT c.vtxo_id FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
+				WHERE c.vtxo_id=ANY($1) AND (a.status<>'conflicted' OR c.disposition='customer')) fenced \
 			ORDER BY vtxo_id LIMIT 1", &[&ids]).await? {
 			return Err(crate::error::FallbackRefusal::DecidedForFallback(row.get::<_, &str>("vtxo_id").parse()?).into());
 		}

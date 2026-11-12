@@ -60,3 +60,12 @@ async fn receive_claim_keypair(srv: &Captaind, wallet: &Wallet, hash: ark::light
 	let key = sub.claim_pubkey.expect("the wallet bound its receive to a claim key");
 	wallet.pubkey_keypair(&key).await.unwrap().expect("the claim key is the wallet's").1
 }
+
+/// Record coins as decided for an expiry payout: one operator row each in a
+/// fresh allocation. Any row fences the coin.
+pub(crate) async fn decide_for_fallback(t: &tokio_postgres::Transaction<'_>, ids: &[String]) -> anyhow::Result<()> {
+	let id: i64 = t.query_one("INSERT INTO expiry_allocation(expiry_height) VALUES(0) RETURNING id", &[]).await?.get(0);
+	t.execute("INSERT INTO expiry_allocation_coin(allocation_id,vtxo_id,disposition,gross_sat,fee_sat,payout_sat,\
+		forfeited_sat,replannable) SELECT $1,UNNEST($2::TEXT[]),'operator',1,0,0,0,FALSE", &[&id, &ids]).await?;
+	Ok(())
+}

@@ -75,7 +75,7 @@ async fn success_after_expiry_decision_never_consumes_the_decided_source() {
 		while !t.query_one("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND NOT granted)", &[&pid]).await?.get::<_, bool>(0) {
 			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 		}
-		t.execute("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1)", &[&id]).await?;
+		crate::payouts::decide_for_fallback(t, &[id.clone()]).await?;
 		t.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&id]).await?;
 		Ok(writer)
 	}).await.unwrap();

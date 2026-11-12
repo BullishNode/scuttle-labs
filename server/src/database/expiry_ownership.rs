@@ -189,8 +189,7 @@ impl Tx<'_> {
 		if state.spend_state == SpendState::Spent {
 			if let Some(row) = self.query_opt("
 				SELECT c.disposition,c.owner_mailbox,c.replannable
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
-				WHERE e.vtxo_id=$1 ORDER BY c.allocation_id LIMIT 1
+				FROM expiry_allocation_coin c WHERE c.vtxo_id=$1 ORDER BY c.allocation_id LIMIT 1
 			", &[&state.vtxo_id.to_string()]).await? {
 				if !row.get::<_, bool>("replannable") {
 					proposal.disposition = if row.get::<_, &str>("disposition") == "customer" {

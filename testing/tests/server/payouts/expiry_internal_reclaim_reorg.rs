@@ -180,8 +180,7 @@ async fn reclaim_reorg() {
 					}
 				}
 				let count = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-					WHERE e.vtxo_id=$1 AND c.disposition='customer'", &[&source]).await?.get::<_, i64>(0))).await.unwrap();
+					WHERE c.vtxo_id=$1 AND c.disposition='customer'", &[&source]).await?.get::<_, i64>(0))).await.unwrap();
 				assert_eq!(count, 0, "sender allocation must wait through H+5 for every actual grant closure");
 			}
 			let Some(closures) = closures else { continue; };
@@ -291,7 +290,7 @@ async fn reclaim_reorg() {
 		tokio::time::sleep(Duration::from_millis(500)).await;
 	}
 	let sender_decisions = db.read(async |t| Ok(t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin c \
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=$1 AND c.disposition='customer'",
+		WHERE c.vtxo_id=$1 AND c.disposition='customer'",
 		&[&source]).await?.get::<_, i64>(0))).await.unwrap();
 	assert_eq!(sender_decisions, 0, "the receiver's actual collection cannot also authorize a sender refund");
 	let current = assert_canonical_money(&ctx, &destination, &receiver_destination, sat(0), sat(88_000)).await;

@@ -221,14 +221,14 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 		let view=tx.expiry_view().await?.unwrap();
 		assert_eq!(view.height,expiry_tip);
 		assert!((tx.expiry_view().await? == Some(view)));
-		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=ANY($1)",
+		assert_eq!(tx.query_one("SELECT COUNT(DISTINCT vtxo_id) FROM expiry_allocation_coin WHERE vtxo_id=ANY($1)",
 			&[&grant_ids]).await?.get::<_, i64>(0),0,"no fallback decision may replace this controlled cooperative tail");
 		let same_hash=tx.query("SELECT v.vtxo_id FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1",
 			&[&hash.to_string()]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>();
 		assert_eq!(tx.query_one("SELECT COUNT(*) FROM vtxo WHERE vtxo_id=ANY($1) AND onchain_spent_txid IS NOT NULL",
 			&[&same_hash]).await?.get::<_, i64>(0),0);
 		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND a.broadcast_at IS NOT NULL",
+			WHERE c.vtxo_id=ANY($1) AND a.broadcast_at IS NOT NULL",
 			&[&same_hash]).await?.get::<_,i64>(0),0);
 		Ok(())
 	}).await.unwrap();

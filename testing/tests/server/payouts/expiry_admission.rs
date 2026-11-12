@@ -43,8 +43,7 @@ async fn expiry_native_rpc_refusals_have_stable_reasons() {
 	assert_eq!(error.metadata().get("abandon-reason").unwrap().to_str().unwrap(), "expired_new_lightning");
 	let db = server::database::Db::connect(&srv.config().postgres).await.unwrap();
 	db.write(async |t| {
-		t.query_one("INSERT INTO expiry_entitlement(vtxo_id) VALUES($1) RETURNING id",
-			&[&source.id().to_string()]).await?;
+		super::decide_for_fallback(t, &[source.id().to_string()]).await?;
 		t.execute("UPDATE vtxo SET spend_state='spent',updated_at=NOW() WHERE vtxo_id=$1", &[&source.id().to_string()]).await?;
 		Ok(())
 	}).await.unwrap();

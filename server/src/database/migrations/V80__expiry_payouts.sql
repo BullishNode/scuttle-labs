@@ -23,12 +23,6 @@ ALTER TABLE board_exit
 	CHECK (user_pubkey IS NULL OR length(user_pubkey) = 66);
 CREATE INDEX board_exit_exit_txid_idx ON board_exit(exit_txid);
 
-CREATE TABLE expiry_entitlement (
-	id BIGSERIAL PRIMARY KEY,
-	vtxo_id TEXT NOT NULL UNIQUE REFERENCES vtxo(vtxo_id),
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 CREATE TABLE expiry_cancelled_participation (
 	-- Upstream may delete a superseded pending participation. Keep its cancellation tombstone.
 	participation_id BIGINT PRIMARY KEY,
@@ -64,7 +58,8 @@ CREATE TABLE expiry_payout_attempt (
 
 CREATE TABLE expiry_allocation_coin (
 	allocation_id BIGINT NOT NULL REFERENCES expiry_allocation(id),
-	entitlement_id BIGINT NOT NULL REFERENCES expiry_entitlement(id),
+	-- A coin with any row is decided: the fence on obligation changes.
+	vtxo_id TEXT NOT NULL REFERENCES vtxo(vtxo_id),
 	owner_mailbox TEXT CHECK (owner_mailbox IS NULL OR length(owner_mailbox) = 66),
 	disposition TEXT NOT NULL CHECK (disposition IN ('customer', 'operator')),
 	gross_sat BIGINT NOT NULL CHECK (gross_sat > 0),
@@ -74,12 +69,13 @@ CREATE TABLE expiry_allocation_coin (
 	subsidy_sat BIGINT NOT NULL DEFAULT 0 CHECK (subsidy_sat >= 0),
 	-- A Lightning decision is planned again after a conflict; others repeat.
 	replannable BOOLEAN NOT NULL,
-	PRIMARY KEY (allocation_id, entitlement_id),
+	PRIMARY KEY (allocation_id, vtxo_id),
 	CHECK ((disposition = 'customer' AND owner_mailbox IS NOT NULL
 		AND gross_sat + subsidy_sat = fee_sat + payout_sat + forfeited_sat)
 		OR (disposition = 'operator' AND fee_sat = 0 AND payout_sat = 0
 			AND forfeited_sat = 0 AND subsidy_sat = 0))
 );
+CREATE INDEX expiry_allocation_coin_vtxo_id_idx ON expiry_allocation_coin(vtxo_id);
 
 -- Canonical frontier spends are the source of allocation state. The first
 -- coin row retains ownership; a winner also closes competing allocation links.
@@ -109,7 +105,7 @@ SELECT a.id,a.expiry_height,
 	a.broadcast_at,a.created_at,
 	CASE WHEN o.confirmed THEN 'confirmed'
 		WHEN o.conflicted OR EXISTS (
-			SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_coin paid ON paid.entitlement_id=c.entitlement_id
+			SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_coin paid ON paid.vtxo_id=c.vtxo_id
 			JOIN observed prior ON prior.id=paid.allocation_id
 			WHERE c.allocation_id=a.id AND prior.confirmed AND prior.id<>a.id)
 		THEN 'conflicted' ELSE 'pending' END AS status,

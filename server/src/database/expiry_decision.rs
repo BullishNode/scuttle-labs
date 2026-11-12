@@ -1,6 +1,6 @@
 //! Short durable allocation commits, one per independently ready expired root.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use bitcoin::{Amount, Txid};
@@ -20,7 +20,7 @@ pub struct ExpiryRootPlan {
 	root: ServerVtxo,
 	coins: Vec<OwnershipProposal>,
 	branch: ExpiryBranchState,
-	existing_entitlements: BTreeMap<VtxoId, i64>,
+	decided: BTreeSet<VtxoId>,
 }
 
 /// Every row of the accepted branches, and every participation and Lightning
@@ -52,12 +52,12 @@ impl Tx<'_> {
 		Ok((snapshot, ExpiryBranchState { rows, parts, attempts }))
 	}
 
-	async fn expiry_entitlement(&self, id: VtxoId) -> anyhow::Result<Option<(i64, bool)>> {
-		Ok(self.query_opt("SELECT e.id,EXISTS(SELECT 1 FROM expiry_allocation_coin c \
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id \
-			AND a.status<>'conflicted') AS reserved \
-			FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&id.to_string()]).await?
-			.map(|row| (row.get("id"), !row.get::<_, bool>("reserved"))))
+	/// `None` if the coin was never decided, else whether it is free for a
+	/// new decision: every allocation that holds it has conflicted.
+	async fn earlier_decision_free(&self, id: VtxoId) -> anyhow::Result<Option<bool>> {
+		Ok(self.query_opt("SELECT BOOL_AND(a.status='conflicted') AS free FROM expiry_allocation_coin c \
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=$1 HAVING COUNT(*)>0",
+			&[&id.to_string()]).await?.map(|row| row.get("free")))
 	}
 
 	/// Phase A: resolve the root's current branch in one consistent read,
@@ -67,7 +67,7 @@ impl Tx<'_> {
 	) -> anyhow::Result<Option<ExpiryRootPlan>> {
 		self.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
 		ensure!(root.expiry_height() <= view.height, "expiry root is not mature");
-		let mut existing_entitlements = BTreeMap::new();
+		let mut decided = BTreeSet::new();
 		let current = self.query_opt("SELECT vtxo_id FROM vtxo WHERE vtxo_id=$1 AND frontier_at IS NOT NULL \
 			AND confirmed_height<=$2 AND onchain_spent_height IS NULL AND onchain_spent_txid IS NULL",
 			&[&root.id().to_string(), &i32::try_from(view.height.to_u32())?]).await?;
@@ -114,9 +114,9 @@ impl Tx<'_> {
 				self.observe_expiry_hold(ownership.id, reason);
 				valid = false; continue;
 			}
-			if let Some((entitlement, free)) = self.expiry_entitlement(ownership.id).await? {
+			if let Some(free) = self.earlier_decision_free(ownership.id).await? {
 				valid &= free;
-				existing_entitlements.insert(ownership.id, entitlement);
+				decided.insert(ownership.id);
 			}
 			coins.push(ownership);
 		}
@@ -127,7 +127,7 @@ impl Tx<'_> {
 		}
 		if !valid || coins.is_empty() { return Ok(None); }
 		let (_, branch) = self.expiry_branch_state(std::slice::from_ref(&root)).await?;
-		Ok(Some(ExpiryRootPlan { root, coins, branch, existing_entitlements }))
+		Ok(Some(ExpiryRootPlan { root, coins, branch, decided }))
 	}
 
 	/// Phase B: lock the root's branch, recheck every fact phase A used
@@ -136,7 +136,7 @@ impl Tx<'_> {
 	pub async fn commit_expiry_root(
 		&self, view: BlockRef, plan: ExpiryRootPlan,
 	) -> anyhow::Result<i64> {
-		let ExpiryRootPlan { root, coins, branch, existing_entitlements } = plan;
+		let ExpiryRootPlan { root, coins, branch, decided } = plan;
 		self.lock_watchman_tip(view).await?;
 		let ids = branch.rows.iter().map(|row| row.0.to_string()).collect::<Vec<_>>();
 		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&ids]).await?;
@@ -160,8 +160,8 @@ impl Tx<'_> {
 			}
 		}
 		for coin in &coins {
-			ensure!(self.expiry_entitlement(coin.id).await?
-				== existing_entitlements.get(&coin.id).map(|id| (*id, true)), "expiry entitlement changed during analysis");
+			ensure!(self.earlier_decision_free(coin.id).await? == decided.contains(&coin.id).then_some(true),
+				"earlier expiry decision changed during analysis");
 		}
 		// Each owner pays one fee for this root, whatever else expires at
 		// the same height.
@@ -185,16 +185,6 @@ impl Tx<'_> {
 		self.execute("INSERT INTO expiry_allocation_input(allocation_id,vtxo_id) VALUES($1,$2)", &[&id,&root.id().to_string()]).await?;
 		for proposal in &coins {
 			let evidence = proposal.evidence.as_ref().context("ready ownership lacks evidence")?;
-			let entitlement = if let Some(existing) = existing_entitlements.get(&proposal.id) {
-				*existing
-			} else {
-				self.query_one("
-					INSERT INTO expiry_entitlement(vtxo_id)
-					VALUES($1)
-					RETURNING id
-				",
-					&[&proposal.id.to_string()]).await?.get(0)
-			};
 			let allocation = policy.get(&proposal.id);
 			let fee = allocation.map_or(Amount::ZERO, |a| a.fee).to_sat();
 			let payout = allocation.map_or(Amount::ZERO, |a| a.payout).to_sat();
@@ -206,12 +196,12 @@ impl Tx<'_> {
 				OwnershipDisposition::Unresolved(_) => bail!("allocation ownership is unresolved"),
 			};
 			self.execute("
-				INSERT INTO expiry_allocation_coin(allocation_id,entitlement_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,replannable)
+				INSERT INTO expiry_allocation_coin(allocation_id,vtxo_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,replannable)
 				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
 			",
 				&[
 					&id,
-					&entitlement,
+					&proposal.id.to_string(),
 					&mailbox,
 					&disposition,
 					&i64::try_from(proposal.gross.to_sat())?,
