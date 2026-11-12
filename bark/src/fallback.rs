@@ -234,7 +234,9 @@ impl Wallet {
 	/// Check the coins that expired and are still held, and the ones whose
 	/// payout was pending at the last check.
 	pub async fn sync_fallback_payouts(&self) -> anyhow::Result<()> {
-		if !self.server_payouts().await {
+		// Connect first: a freshly opened wallet has no server connection yet.
+		let (srv, _) = self.require_server().await?;
+		if !srv.scuttle_payouts().await {
 			return Ok(());
 		}
 
