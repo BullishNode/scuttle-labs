@@ -82,13 +82,6 @@ CREATE TABLE expiry_allocation_coin (
 			AND forfeited_sat = 0 AND subsidy_sat = 0))
 );
 
-CREATE TABLE expiry_terminal_claim (
-	entitlement_id BIGINT PRIMARY KEY REFERENCES expiry_entitlement(id),
-	txid TEXT NOT NULL,
-	height BIGINT NOT NULL CHECK (height >= 0),
-	hash TEXT NOT NULL
-);
-
 -- Canonical frontier spends are the source of allocation state. The first
 -- coin row retains ownership; a winner also closes competing allocation links.
 CREATE VIEW expiry_allocation_state AS
@@ -117,10 +110,9 @@ SELECT a.id,a.expiry_height,
 	a.broadcast_at,a.created_at,
 	CASE WHEN o.confirmed THEN 'confirmed'
 		WHEN o.conflicted OR EXISTS (
-			SELECT 1 FROM expiry_allocation_coin c WHERE c.allocation_id=a.id AND (
-				EXISTS(SELECT 1 FROM expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id)
-				OR EXISTS(SELECT 1 FROM expiry_allocation_coin paid JOIN observed prior ON prior.id=paid.allocation_id
-					WHERE paid.entitlement_id=c.entitlement_id AND prior.confirmed AND prior.id<>a.id)))
+			SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_coin paid ON paid.entitlement_id=c.entitlement_id
+			JOIN observed prior ON prior.id=paid.allocation_id
+			WHERE c.allocation_id=a.id AND prior.confirmed AND prior.id<>a.id)
 		THEN 'conflicted' ELSE 'pending' END AS status,
 	CASE WHEN o.confirmed THEN o.height END AS confirmed_height,
 	CASE WHEN o.confirmed THEN b.hash END AS confirmed_hash

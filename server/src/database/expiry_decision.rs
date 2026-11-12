@@ -88,10 +88,9 @@ impl Tx<'_> {
 	async fn expiry_entitlement(&self, id: VtxoId) -> anyhow::Result<Option<(i64, bool)>> {
 		Ok(self.query_opt("SELECT e.id,EXISTS(SELECT 1 FROM expiry_allocation_coin c \
 			JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id \
-			AND a.status<>'conflicted') AS reserved, \
-			EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id) AS claimed \
+			AND a.status<>'conflicted') AS reserved \
 			FROM expiry_entitlement e WHERE e.vtxo_id=$1", &[&id.to_string()]).await?
-			.map(|row| (row.get("id"), !row.get::<_, bool>("reserved") && !row.get::<_, bool>("claimed"))))
+			.map(|row| (row.get("id"), !row.get::<_, bool>("reserved"))))
 	}
 
 	/// Phase A: resolve the root's current branch in one consistent read,

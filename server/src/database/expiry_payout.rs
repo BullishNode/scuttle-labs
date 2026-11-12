@@ -265,8 +265,7 @@ impl Tx<'_> {
 				NOT EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id) \
 				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 					WHERE c.entitlement_id=e.id AND a.status<>'conflicted') \
-				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer') \
-				OR EXISTS(SELECT 1 FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id))) fenced \
+				OR EXISTS(SELECT 1 FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND c.disposition='customer'))) fenced \
 			ORDER BY vtxo_id LIMIT 1", &[&ids]).await? {
 			return Err(crate::error::FallbackRefusal::DecidedForFallback(row.get::<_, &str>("vtxo_id").parse()?).into());
 		}

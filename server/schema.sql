@@ -889,19 +889,6 @@ CREATE TABLE public.expiry_payout_attempt (
 
 
 --
--- Name: expiry_terminal_claim; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.expiry_terminal_claim (
-    entitlement_id bigint NOT NULL,
-    txid text NOT NULL,
-    height bigint NOT NULL,
-    hash text NOT NULL,
-    CONSTRAINT expiry_terminal_claim_height_check CHECK ((height >= 0))
-);
-
-
---
 -- Name: vtxo; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -978,13 +965,10 @@ CREATE VIEW public.expiry_allocation_state AS
         CASE
             WHEN o.confirmed THEN 'confirmed'::text
             WHEN (o.conflicted OR (EXISTS ( SELECT 1
-               FROM public.expiry_allocation_coin c
-              WHERE ((c.allocation_id = a.id) AND ((EXISTS ( SELECT 1
-                       FROM public.expiry_terminal_claim t
-                      WHERE (t.entitlement_id = c.entitlement_id))) OR (EXISTS ( SELECT 1
-                       FROM (public.expiry_allocation_coin paid
-                         JOIN observed prior ON ((prior.id = paid.allocation_id)))
-                      WHERE ((paid.entitlement_id = c.entitlement_id) AND prior.confirmed AND (prior.id <> a.id))))))))) THEN 'conflicted'::text
+               FROM ((public.expiry_allocation_coin c
+                 JOIN public.expiry_allocation_coin paid ON ((paid.entitlement_id = c.entitlement_id)))
+                 JOIN observed prior ON ((prior.id = paid.allocation_id)))
+              WHERE ((c.allocation_id = a.id) AND prior.confirmed AND (prior.id <> a.id))))) THEN 'conflicted'::text
             ELSE 'pending'::text
         END AS status,
         CASE
@@ -2689,14 +2673,6 @@ ALTER TABLE ONLY public.expiry_payout_attempt
 
 
 --
--- Name: expiry_terminal_claim expiry_terminal_claim_pkey; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_terminal_claim
-    ADD CONSTRAINT expiry_terminal_claim_pkey PRIMARY KEY (entitlement_id);
-
-
---
 -- Name: htlc_settlement htlc_settlement_payment_hash_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3461,14 +3437,6 @@ ALTER TABLE ONLY public.expiry_entitlement
 
 ALTER TABLE ONLY public.expiry_payout_attempt
     ADD CONSTRAINT expiry_payout_attempt_allocation_id_fkey FOREIGN KEY (allocation_id) REFERENCES public.expiry_allocation(id);
-
-
---
--- Name: expiry_terminal_claim expiry_terminal_claim_entitlement_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.expiry_terminal_claim
-    ADD CONSTRAINT expiry_terminal_claim_entitlement_id_fkey FOREIGN KEY (entitlement_id) REFERENCES public.expiry_entitlement(id);
 
 
 --

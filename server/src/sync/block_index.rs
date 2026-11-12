@@ -221,13 +221,7 @@ impl BlockIndex {
 		// Lower the published tip first, it must never point above the stored tip.
 		self.update_sync_height(block);
 		self.pending_reorg = true;
-		self.db.write(async |t| {
-			t.remove_blocks_above(self.block_table, block.height).await?;
-			if matches!(self.block_table, BlockTable::Watchmand) {
-				t.reorg_expiry_observations(block).await?;
-			}
-			Ok(())
-		}).await?;
+		self.db.write(async |t| t.remove_blocks_above(self.block_table, block.height).await).await?;
 		self.notify_reorg(block).await
 	}
 
@@ -281,12 +275,7 @@ impl BlockIndex {
 			}
 		}
 
-		self.db.write(async |t| {
-			if matches!(self.block_table, BlockTable::Watchmand) {
-				t.observe_expiry_block(&block).await?;
-			}
-			t.store_block(self.block_table, &block.block_ref).await
-		}).await?;
+		self.db.write(async |t| t.store_block(self.block_table, &block.block_ref).await).await?;
 		self.pending_reorg = false;
 		self.update_sync_height(block.block_ref);
 		Ok(())

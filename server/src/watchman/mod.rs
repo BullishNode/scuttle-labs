@@ -11,7 +11,6 @@ mod daemon;
 mod frontier;
 mod policy;
 mod payout;
-mod recovery;
 pub(crate) mod readiness;
 mod signer;
 pub(crate) mod settlement;

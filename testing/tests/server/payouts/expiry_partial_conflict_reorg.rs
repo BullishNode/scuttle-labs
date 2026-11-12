@@ -218,8 +218,7 @@ async fn assert_final_outcome(
 	let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id, \
 		(SELECT COUNT(*) FROM expiry_allocation_coin c WHERE c.entitlement_id=e.id AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')) AS active, \
 		(SELECT COUNT(DISTINCT a.sweep_txid) FROM expiry_allocation_coin c \
-		 JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id AND a.status='confirmed') AS payments, \
-		(SELECT COUNT(*) FROM expiry_terminal_claim p WHERE p.entitlement_id=e.id) AS claims \
+		 JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.entitlement_id=e.id AND a.status='confirmed') AS payments \
 		FROM expiry_entitlement e WHERE e.vtxo_id=ANY($1)", &[&coins],
 	).await?)).await.unwrap();
 	assert_eq!(rows.len(), 2);
@@ -227,7 +226,6 @@ async fn assert_final_outcome(
 		let coin = row.get::<_, String>("vtxo_id");
 		assert_eq!(row.get::<_, i64>("active"), 1);
 		assert_eq!(row.get::<_, i64>("payments"), 1);
-		assert_eq!(row.get::<_, i64>("claims"), 0, "an orphaned terminal payment must not return asynchronously");
 		let active = db.read(async |tx| Ok(tx.query_one("SELECT a.sweep_txid FROM expiry_allocation_state a \
 			JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
 			WHERE e.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')", &[&coin],
@@ -407,13 +405,9 @@ async fn partial_conflict_reorg() {
 	srv.watchmand().start().await.unwrap();
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |tx| Ok(tx.query_one("SELECT status, \
-				(SELECT COUNT(*) FROM expiry_terminal_claim p JOIN expiry_entitlement e \
-				 ON e.id=p.entitlement_id WHERE e.vtxo_id=$2) AS claims \
-				FROM expiry_allocation_state WHERE id=$1", &[&original_id, &coins[0]],
-			).await?)).await.unwrap();
-			assert_eq!(row.get::<_, i64>("claims"), 0, "an intermediate exit is not terminal payment");
-			if row.get::<_, String>("status") == "conflicted" { break; }
+			let status = db.read(async |tx| Ok(tx.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1",
+				&[&original_id]).await?.get::<_, String>(0))).await.unwrap();
+			if status == "conflicted" { break; }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
 	}).await.expect("the actual intermediate conflict must invalidate the exiting root's decision");
@@ -429,13 +423,12 @@ async fn partial_conflict_reorg() {
 	srv.watchmand().start().await.unwrap();
 	let claim_txid = tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
-			let row = db.read(async |tx| Ok(tx.query_opt("SELECT p.txid FROM expiry_terminal_claim p \
-				JOIN expiry_entitlement e ON e.id=p.entitlement_id WHERE e.vtxo_id=$1", &[&coins[0]],
-			).await?)).await.unwrap();
-			if let Some(row) = row { break row.get::<_, String>("txid").parse::<Txid>().unwrap(); }
+			let txid = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid FROM vtxo WHERE vtxo_id=$1",
+				&[&coins[0]]).await?.get::<_, Option<String>>(0))).await.unwrap();
+			if let Some(txid) = txid { break txid.parse::<Txid>().unwrap(); }
 			tokio::time::sleep(Duration::from_millis(50)).await;
 		}
-	}).await.expect("a real terminal claim must be recorded");
+	}).await.expect("the watchman must see the holder's claim");
 	let untouched_status = db.read(async |tx| Ok(tx.query_one("SELECT status FROM expiry_allocation_state WHERE id=$1",
 		&[&untouched_id]).await?.get::<_, String>(0))).await.unwrap();
 	assert_ne!(untouched_status, "conflicted", "the untouched root keeps its own decision");
@@ -529,10 +522,9 @@ async fn partial_conflict_reorg() {
 	assert_eq!(decided_obligations(&db, &coins).await, permanent);
 	rebuilt_generation(&db, replacement_tip).await;
 	assert_eq!(decided_obligations(&db, &coins).await, permanent);
-	let claims = db.read(async |tx| Ok(tx.query_one("SELECT COUNT(*) FROM expiry_terminal_claim p \
-		JOIN expiry_entitlement e ON e.id=p.entitlement_id WHERE e.vtxo_id=ANY($1)", &[&coins],
-	).await?.get::<_, i64>(0))).await.unwrap();
-	assert_eq!(claims, 0, "an orphaned terminal claim must not remain a paid discharge after rebuilding");
+	let spender = db.read(async |tx| Ok(tx.query_one("SELECT onchain_spent_txid FROM vtxo WHERE vtxo_id=$1",
+		&[&coins[0]]).await?.get::<_, Option<String>>(0))).await.unwrap();
+	assert_ne!(spender, Some(claim_txid.to_string()), "an orphaned claim must not remain the coin's spend");
 	assert!(rpc.custom_get_raw_transaction_info(claim_txid, None).unwrap()
 		.is_none_or(|info| info.confirmations.unwrap_or(0) == 0));
 	// The exiting root's payout is valid again once its root is restored.
