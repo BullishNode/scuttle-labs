@@ -109,13 +109,13 @@ async fn expiry_reorg_between_plan_and_commit_aborts_the_stale_plan() {
 	srv.watchmand().wait_for_sync_height(tip).await;
 	tokio::time::sleep(Duration::from_secs(3)).await;
 	assert_ne!(chain.get_block_hash(expiry as u64).unwrap(), old_hash);
-	let (spent_by, allocations, entitlements) = db.read(async |t| {
+	let (spent_by, allocations, decided) = db.read(async |t| {
 		let spent_by = t.query_one("SELECT onchain_spent_txid FROM vtxo WHERE vtxo_id=$1",
 			&[&root.to_string()]).await?.get::<_, Option<String>>(0);
 		let allocations = t.query_one("SELECT COUNT(*) FROM expiry_allocation", &[]).await?.get::<_, i64>(0);
-		let entitlements = t.query_one("SELECT COUNT(*) FROM expiry_entitlement", &[]).await?.get::<_, i64>(0);
-		Ok((spent_by, allocations, entitlements))
+		let decided = t.query_one("SELECT COUNT(*) FROM expiry_allocation_coin", &[]).await?.get::<_, i64>(0);
+		Ok((spent_by, allocations, decided))
 	}).await.unwrap();
 	assert_eq!(spent_by, Some(exit_txid.to_string()), "the root is spent by the owner's exit");
-	assert_eq!((allocations, entitlements), (0, 0), "no payout is decided for an exited coin");
+	assert_eq!((allocations, decided), (0, 0), "no payout is decided for an exited coin");
 }
