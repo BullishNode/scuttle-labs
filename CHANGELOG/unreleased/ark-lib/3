@@ -1,5 +1,0 @@
-- Add joint owner authorization for expiry payouts.
-  The spending key and mailbox key sign the same intent, bound to the network and server.
-  [#3](https://github.com/BullishNode/scuttle/pull/3)
-- Add `fallback::payout_script` for a mailbox key's BIP86 destination.
-  [#3](https://github.com/BullishNode/scuttle/pull/3)

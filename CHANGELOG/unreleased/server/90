@@ -1,0 +1,31 @@
+- Add opt-in expiry payouts with `expiry_payouts`, disabled by default.
+  At tree expiry the watchman pays each customer VTXO on-chain to `tr(M)`,
+  where M is the owner mailbox key recorded when the VTXO was created. The
+  mode is fixed when the database is created, and a server started in the
+  other mode refuses to run. With payouts disabled, the server behaves as
+  upstream.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Charge a fallback fee of 2,000 sats or 1%, whichever is larger, once per
+  expired tree. A payout too small to cover the fee is forfeited. The operator
+  pays miner fees and replaces stuck payouts. Owner outputs can never exceed
+  the value of the tree they sweep, and an error on one tree does not stop the
+  others.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Pay unregistered boards to their owner, and refund an undelivered arkoor
+  to its sender.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Report a decided VTXO as `Spent`, with its `FallbackPayout`: pending,
+  paid after six confirmations, or forfeited, with the fee and amount paid.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Keep Lightning payments safe across expiry payouts. A Lightning send needs
+  one owner signature per source VTXO, and a retry is acknowledged by its
+  intent. The watchman claims an exited send only with a preimage from that
+  source's own payment.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Pay invoices directly by arkoor, opt-in with `ln_receive_ark_address_hints`.
+  The invoice carries the receiver's Ark address in its route hints. A
+  compatible payer on the same server pays it by arkoor through
+  `RequestLightningReceiveArkoorCosign`, which settles the receive and makes
+  the invoice unpayable. With expiry payouts, the payment must go to the
+  receive's mailbox.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)

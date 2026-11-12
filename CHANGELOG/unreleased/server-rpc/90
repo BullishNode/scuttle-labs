@@ -1,0 +1,8 @@
+- Add the `protocol_label` handshake field. Wallets on payout servers
+  require the Scuttle payout label.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Add `FallbackPayout` and `owner_mailbox` to VTXO status replies.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Add `RequestLightningReceiveArkoorCosign` and the `ark_address_hint`
+  request flag for invoices paid by arkoor.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
