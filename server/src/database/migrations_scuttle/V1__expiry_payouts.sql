@@ -1,3 +1,4 @@
+-- A database that ran this as upstream V80, before scuttle_schema_history, must be recreated.
 SET LOCAL search_path TO public;
 
 -- Existing upstream stores remain payout-off. Only empty-database creation

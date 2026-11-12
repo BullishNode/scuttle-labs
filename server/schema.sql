@@ -1667,6 +1667,18 @@ ALTER SEQUENCE public.round_participation_id_seq OWNED BY public.round_participa
 
 
 --
+-- Name: scuttle_schema_history; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.scuttle_schema_history (
+    version integer NOT NULL,
+    name character varying(255),
+    applied_on character varying(255),
+    checksum character varying(255)
+);
+
+
+--
 -- Name: server_mode; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -2771,6 +2783,14 @@ ALTER TABLE ONLY public.round_participation
 
 ALTER TABLE ONLY public.round
     ADD CONSTRAINT round_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: scuttle_schema_history scuttle_schema_history_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.scuttle_schema_history
+    ADD CONSTRAINT scuttle_schema_history_pkey PRIMARY KEY (version);
 
 
 --
