@@ -16,6 +16,7 @@ mod expiry_oversize;
 mod expiry_ownership;
 mod expiry_partial_conflict_reorg;
 mod expiry_payout_flow;
+mod expiry_plan_commit_reorg;
 mod expiry_reaction_during_sweep;
 mod expiry_races;
 mod expiry_reorg;
