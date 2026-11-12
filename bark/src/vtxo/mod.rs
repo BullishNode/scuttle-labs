@@ -72,10 +72,7 @@ impl ServerStatusAdoption {
 	pub fn from_spend_state(spend_state: VtxoSpendState) -> anyhow::Result<Self> {
 		Ok(match spend_state {
 			VtxoSpendState::Spendable => ServerStatusAdoption::Spendable,
-			// A coin decided for an expiry payout is gone from Ark.
-			VtxoSpendState::Spent
-			| VtxoSpendState::FallbackPending
-			| VtxoSpendState::FallbackForfeited => ServerStatusAdoption::Spent,
+			VtxoSpendState::Spent => ServerStatusAdoption::Spent,
 			state @ (
 				VtxoSpendState::Unclaimed
 				| VtxoSpendState::Unregistered

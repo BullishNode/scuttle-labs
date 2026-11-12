@@ -1,5 +1,5 @@
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -36,10 +36,10 @@ use ark::lightning::{
 use ark::tree::signed::{LeafVtxoCosignRequest, UnlockHash, UnlockPreimage};
 use ark::vtxo::Full;
 use ark::vtxo::policy::check_block_height;
-use bitcoin_ext::{BlockDelta, BlockHeight, BlockRef};
+use bitcoin_ext::{BlockDelta, BlockHeight};
 use server_rpc::{self as rpc, protos, RequestExt, TryFromBytes};
 use crate::database::SpendState;
-use crate::database::expiry_payout::{FallbackOutcome, FallbackReceipt};
+use crate::database::expiry_payout::{FallbackReceipt, FallbackState};
 
 use crate::database::rounds::StoredRoundOutput;
 use crate::recovery::NB_NORMAL_CHILDREN;
@@ -67,11 +67,10 @@ use crate::telemetry;
 /// Returns `None` for server-internal states (pool, forfeit, connector). A user
 /// can never prove ownership of such a vtxo, so the `get_vtxo_status` endpoint
 /// reports those as not found rather than leaking their existence.
-fn client_spend_state(spend_state: SpendState, fallback_pending: bool) -> Option<protos::VtxoSpendState> {
+fn client_spend_state(spend_state: SpendState) -> Option<protos::VtxoSpendState> {
 	match spend_state {
 		SpendState::Spendable => Some(protos::VtxoSpendState::Spendable),
 		SpendState::HtlcRecvUnclaimed => Some(protos::VtxoSpendState::HtlcRecvUnclaimed),
-		SpendState::Spent if fallback_pending => Some(protos::VtxoSpendState::FallbackPending),
 		SpendState::Spent => Some(protos::VtxoSpendState::Spent),
 		SpendState::LnSpent => Some(protos::VtxoSpendState::Spent),
 		SpendState::Unclaimed => Some(protos::VtxoSpendState::Unclaimed),
@@ -83,54 +82,40 @@ fn client_spend_state(spend_state: SpendState, fallback_pending: bool) -> Option
 	}
 }
 
-fn fallback_spend_state(state: protos::VtxoSpendState,
-	outcome: Option<&FallbackOutcome>) -> protos::VtxoSpendState
-{
-	match outcome {
-		Some(FallbackOutcome::Forfeited) => protos::VtxoSpendState::FallbackForfeited,
-		Some(FallbackOutcome::Spent) => protos::VtxoSpendState::Spent,
-		Some(FallbackOutcome::Pending) => protos::VtxoSpendState::FallbackPending,
-		None => state,
-	}
-}
-
 fn fallback_payout(receipt: &FallbackReceipt) -> protos::FallbackPayout {
 	protos::FallbackPayout {
+		state: match receipt.state {
+			FallbackState::Pending => protos::FallbackState::Pending,
+			FallbackState::Paid => protos::FallbackState::Paid,
+			FallbackState::Forfeited => protos::FallbackState::Forfeited,
+		} as i32,
 		gross_sat: receipt.gross.to_sat(),
 		fee_sat: receipt.fee.to_sat(),
 		payout_sat: receipt.payout.to_sat(),
 	}
 }
 
+/// A board that was cosigned but never registered is paid out as its
+/// funding root, under the board's own vtxo id.
 async fn unregistered_board_rpc_status(
 	server: &Server, id: VtxoId, attestation: &VtxoStatusAttestation,
 ) -> Result<Option<protos::GetVtxoStatusResponse>, tonic::Status> {
 	if !server.config.expiry_payouts { return Ok(None); }
-	let Some((board, outcomes, view)) = server.db.read(async |t| {
-		t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
+	let Some((board, fallback)) = server.db.read(async |t| {
 		let Some(board) = t.unregistered_board_status(id).await? else { return Ok(None); };
-		let outcomes = t.fallback_outcomes(&[board.root]).await?;
-		let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
-		Ok(Some((board, outcomes, view)))
+		let fallback = t.fallback_receipts(&BTreeMap::from([(board.root, board.mailbox)])).await?
+			.get(&board.root).map(fallback_payout);
+		Ok(Some((board, fallback)))
 	}).await.to_status()? else { return Ok(None); };
 	attestation.verify_key(id, board.user_pubkey)
 		.badarg("invalid VTXO status attestation")?;
-	if !outcomes.is_empty() { verify_fallback_status_tip(view, &server.bitcoind).await?; }
-	let state = if board.onchain_spent { protos::VtxoSpendState::Spent }
+	let state = if board.onchain_spent || fallback.is_some() { protos::VtxoSpendState::Spent }
 		else { protos::VtxoSpendState::Unregistered };
 	Ok(Some(protos::GetVtxoStatusResponse {
-		spend_state: fallback_spend_state(state, outcomes.get(&board.root).map(|r| &r.outcome)) as i32,
+		spend_state: state as i32,
 		owner_mailbox: board.mailbox.serialize().to_vec(),
-		fallback_committed: outcomes.contains_key(&board.root),
-		fallback_payout: outcomes.get(&board.root).map(fallback_payout),
+		fallback_payout: fallback,
 	}))
-}
-
-async fn verify_fallback_status_tip(view: Option<BlockRef>, bitcoind: &bitcoind_async_client::Client)
-	-> Result<(), tonic::Status>
-{
-	let view = view.ok_or_else(|| tonic::Status::internal("fallback projection has no published watchman tip"))?;
-	crate::database::expiry_chain::verify_expiry_tip(view, bitcoind).await.to_status()
 }
 
 #[async_trait]
@@ -226,20 +211,12 @@ impl rpc::server::ArkService for Server {
 			return Ok(tonic::Response::new(status));
 		}
 
-		let (vtxo_state, fallback, owners, outcomes, view) = self.db.read(async |t| {
-			if t.expiry_payouts() {
-				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
-			}
-
+		let (vtxo_state, owners, fallback) = self.db.read(async |t| {
 			let state = t.get_server_vtxo_by_id(id).await?;
-			let customer_ids = state.vtxo.policy().user_pubkey().map(|_| id).into_iter().collect::<Vec<_>>();
-			let fallback = t.fallback_customer_vtxos(&customer_ids).await?;
 			let owners = t.coin_owner_mailboxes(&[id]).await?;
-			let outcomes = t.fallback_outcomes(&[id]).await?;
-			let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
-			Ok((state, fallback, owners, outcomes, view))
+			let fallback = t.fallback_receipts(&owners).await?;
+			Ok((state, owners, fallback))
 		}).await.to_status()?;
-		if !outcomes.is_empty() { verify_fallback_status_tip(view, &self.bitcoind).await?; }
 
 		let spend_state = vtxo_state.spend_state;
 		let user_vtxo = match vtxo_state.vtxo.try_into_user_vtxo() {
@@ -252,15 +229,14 @@ impl rpc::server::ArkService for Server {
 		attestation.verify(&user_vtxo)
 			.badarg("invalid VTXO status attestation")?;
 
-		let Some(spend_state) = client_spend_state(spend_state, fallback.contains(&id)) else {
+		let Some(spend_state) = client_spend_state(spend_state) else {
 			macros::not_found!([id], "VTXO not found");
 		};
 
 		Ok(tonic::Response::new(protos::GetVtxoStatusResponse {
-			spend_state: fallback_spend_state(spend_state, outcomes.get(&id).map(|r| &r.outcome)) as i32,
+			spend_state: spend_state as i32,
 			owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
-			fallback_committed: outcomes.contains_key(&id),
-			fallback_payout: outcomes.get(&id).map(fallback_payout),
+			fallback_payout: fallback.get(&id).map(fallback_payout),
 		}))
 	}
 
@@ -317,21 +293,12 @@ impl rpc::server::ArkService for Server {
 			.collect::<Result<Vec<_>, tonic::Status>>()?;
 
 		let ids = queries.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-		let (states, fallback, owners, outcomes, view) = self.db.read(async |t| {
-			if t.expiry_payouts() {
-				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
-			}
-
+		let (states, owners, fallback) = self.db.read(async |t| {
 			let states = t.get_existing_server_vtxos_by_id(&ids).await?;
-			let customer_ids = states.iter().filter_map(|(id, state)| state.vtxo.policy().user_pubkey().map(|_| *id))
-				.collect::<Vec<_>>();
-			let fallback = t.fallback_customer_vtxos(&customer_ids).await?;
 			let owners = t.coin_owner_mailboxes(&ids).await?;
-			let outcomes = t.fallback_outcomes(&ids).await?;
-			let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
-			Ok((states, fallback, owners, outcomes, view))
+			let fallback = t.fallback_receipts(&owners).await?;
+			Ok((states, owners, fallback))
 		}).await.to_status()?;
-		if !outcomes.is_empty() { verify_fallback_status_tip(view, &self.bitcoind).await?; }
 
 		// An id without a client-visible user vtxo is reported as missing,
 		// not as an error, so one bad id does not cost the client the batch.
@@ -339,8 +306,7 @@ impl rpc::server::ArkService for Server {
 		let mut by_id = HashMap::with_capacity(states.len());
 		for (id, state) in states {
 			let Ok(user_vtxo) = state.vtxo.try_into_user_vtxo() else { continue };
-			let Some(spend_state) = client_spend_state(state.spend_state,
-				fallback.contains(&id)) else { continue };
+			let Some(spend_state) = client_spend_state(state.spend_state) else { continue };
 			by_id.insert(id, (user_vtxo, spend_state));
 		}
 
@@ -352,7 +318,6 @@ impl rpc::server::ArkService for Server {
 					vtxos.push(protos::VtxoStatus {
 						vtxo_id: id.to_bytes().to_vec(), spend_state: status.spend_state,
 						owner_mailbox: status.owner_mailbox,
-						fallback_committed: status.fallback_committed,
 						fallback_payout: status.fallback_payout,
 					});
 					continue;
@@ -368,10 +333,9 @@ impl rpc::server::ArkService for Server {
 
 			vtxos.push(protos::VtxoStatus {
 				vtxo_id: id.to_bytes().to_vec(),
-				spend_state: fallback_spend_state(*spend_state, outcomes.get(&id).map(|r| &r.outcome)) as i32,
+				spend_state: *spend_state as i32,
 				owner_mailbox: owners.get(&id).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
-				fallback_committed: outcomes.contains_key(&id),
-				fallback_payout: outcomes.get(&id).map(fallback_payout),
+				fallback_payout: fallback.get(&id).map(fallback_payout),
 			});
 		}
 
@@ -432,25 +396,13 @@ impl rpc::server::ArkService for Server {
 		// server-internal state is left out, as GetVtxoStatus reports it as
 		// not found.
 		let ids = res.vtxos.iter().map(|v| v.vtxo.id()).collect::<Vec<_>>();
-		let (fallback, owners, outcomes, view) = self.db.read(async |t| {
-			if t.expiry_payouts() {
-				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
-			}
-			let fallback = t.fallback_customer_vtxos(&ids).await?;
-			let owners = t.coin_owner_mailboxes(&ids).await?;
-			let outcomes = t.fallback_outcomes(&ids).await?;
-			let view = if outcomes.is_empty() { None } else { t.expiry_view().await? };
-			Ok((fallback, owners, outcomes, view))
-		}).await.to_status()?;
-		if !outcomes.is_empty() { verify_fallback_status_tip(view, &self.bitcoind).await?; }
+		let owners = self.db.read(async |t| t.coin_owner_mailboxes(&ids).await).await.to_status()?;
 		let vtxos = res.vtxos.into_iter().filter_map(|v| {
 			Some(protos::RecoveredVtxo {
-				spend_state: fallback_spend_state(client_spend_state(v.spend_state,
-					fallback.contains(&v.vtxo.id()))?, outcomes.get(&v.vtxo.id()).map(|r| &r.outcome)) as i32,
+				spend_state: client_spend_state(v.spend_state)? as i32,
 				vtxo: v.vtxo.serialize(),
 				derivation_index: v.derivation_index,
 				owner_mailbox: owners.get(&v.vtxo.id()).map(|owner| owner.serialize().to_vec()).unwrap_or_default(),
-				fallback_committed: outcomes.contains_key(&v.vtxo.id()),
 			})
 		}).collect();
 
@@ -754,21 +706,7 @@ impl rpc::server::ArkService for Server {
 		let payment_hash = PaymentHash::from_bytes(req.hash)?;
 
 		let sub = self.check_lightning_receive(payment_hash, req.wait).await.to_status()?;
-		let (outcome, view) = self.db.read(async |t| {
-			if t.expiry_payouts() {
-				t.batch_execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ").await?;
-			}
-			let outcome = t.receive_fallback_outcome(&sub).await?;
-			let view = if outcome.is_some() { t.expiry_view().await? } else { None };
-			Ok((outcome, view))
-		}).await.to_status()?;
-		if outcome.is_some() {
-			verify_fallback_status_tip(view, &self.bitcoind).await?;
-		}
-		let mut response: protos::CheckLightningReceiveResponse = sub.into();
-		response.fallback_spend_state = outcome.as_ref()
-			.map(|outcome| fallback_spend_state(protos::VtxoSpendState::Unspecified, Some(outcome)) as i32);
-		Ok(tonic::Response::new(response))
+		Ok(tonic::Response::new(sub.into()))
 	}
 
 	#[tracing::instrument(skip(self, req))]
@@ -1315,35 +1253,20 @@ mod test {
 	use super::*;
 
 	#[test]
-	fn fallback_status_distinguishes_pending_payment_and_no_output() {
-		let spent = protos::VtxoSpendState::Spent;
-		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Pending)), protos::VtxoSpendState::FallbackPending);
-		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Spent)), spent);
-		assert_eq!(fallback_spend_state(spent, Some(&FallbackOutcome::Forfeited)), protos::VtxoSpendState::FallbackForfeited);
-		assert_eq!(fallback_spend_state(protos::VtxoSpendState::Spendable, None), protos::VtxoSpendState::Spendable);
-	}
-
-	#[test]
 	fn client_spend_state_collapses_server_internal_states() {
 		// Client-relevant states map to a concrete spend state.
-		assert_eq!(client_spend_state(SpendState::Spendable, false), Some(protos::VtxoSpendState::Spendable));
-		assert_eq!(client_spend_state(SpendState::HtlcRecvUnclaimed, false), Some(protos::VtxoSpendState::HtlcRecvUnclaimed));
-		assert_eq!(client_spend_state(SpendState::Spent, false), Some(protos::VtxoSpendState::Spent));
-		assert_eq!(client_spend_state(SpendState::LnSpent, false), Some(protos::VtxoSpendState::Spent));
-		assert_eq!(client_spend_state(SpendState::Unclaimed, false), Some(protos::VtxoSpendState::Unclaimed));
-		assert_eq!(client_spend_state(SpendState::Unregistered, false), Some(protos::VtxoSpendState::Unregistered));
-
-		// A customer allocation remains pending even though admission is fenced.
-		assert_eq!(client_spend_state(SpendState::Spent, true), Some(protos::VtxoSpendState::FallbackPending));
-		assert_eq!(client_spend_state(SpendState::LnSpent, true), Some(protos::VtxoSpendState::Spent));
-		assert_eq!(client_spend_state(SpendState::Spendable, true), Some(protos::VtxoSpendState::Spendable));
-		assert_eq!(client_spend_state(SpendState::Pool, true), None);
+		assert_eq!(client_spend_state(SpendState::Spendable), Some(protos::VtxoSpendState::Spendable));
+		assert_eq!(client_spend_state(SpendState::HtlcRecvUnclaimed), Some(protos::VtxoSpendState::HtlcRecvUnclaimed));
+		assert_eq!(client_spend_state(SpendState::Spent), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::LnSpent), Some(protos::VtxoSpendState::Spent));
+		assert_eq!(client_spend_state(SpendState::Unclaimed), Some(protos::VtxoSpendState::Unclaimed));
+		assert_eq!(client_spend_state(SpendState::Unregistered), Some(protos::VtxoSpendState::Unregistered));
 
 		// Server-internal states (pool, forfeit, connector) collapse to `None`
 		// so the endpoint reports them as not found.
-		assert_eq!(client_spend_state(SpendState::Pool, false), None);
-		assert_eq!(client_spend_state(SpendState::RoundForfeit, false), None);
-		assert_eq!(client_spend_state(SpendState::OffboardForfeit, false), None);
-		assert_eq!(client_spend_state(SpendState::OffboardConnector, false), None);
+		assert_eq!(client_spend_state(SpendState::Pool), None);
+		assert_eq!(client_spend_state(SpendState::RoundForfeit), None);
+		assert_eq!(client_spend_state(SpendState::OffboardForfeit), None);
+		assert_eq!(client_spend_state(SpendState::OffboardConnector), None);
 	}
 }

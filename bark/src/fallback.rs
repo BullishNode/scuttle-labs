@@ -106,7 +106,7 @@ impl Wallet {
 		let Some(amounts) = response.fallback_payout else { return Ok(None); };
 		let mailbox = PublicKey::from_slice(&response.owner_mailbox)?;
 		ensure!(mailbox == self.mailbox_keypair().public_key(), "fallback payout belongs to another mailbox");
-		let status = fallback_status(response.spend_state, true)?
+		let status = fallback_status(Some(&amounts))?
 			.context("fallback payout without a fallback status")?;
 		let network = self.properties().await?.network;
 		Ok(Some(FallbackPayout {
@@ -158,7 +158,7 @@ impl Wallet {
 				};
 				let (Ok(state), Ok(fallback)) = (
 					VtxoSpendState::try_from(status.spend_state),
-					fallback_status(status.spend_state, status.fallback_committed),
+					fallback_status(status.fallback_payout.as_ref()),
 				) else {
 					warn!("Server returned an unusable status for vtxo {id}; this wallet may need updating");
 					continue;
@@ -269,14 +269,12 @@ impl Wallet {
 }
 
 /// The payout status in a status reply, if the server decided one.
-fn fallback_status(spend_state: i32, committed: bool) -> anyhow::Result<Option<FallbackStatus>> {
-	if !committed {
-		return Ok(None);
-	}
-	Ok(Some(match VtxoSpendState::try_from(spend_state) {
-		Ok(VtxoSpendState::FallbackPending) => FallbackStatus::Pending,
-		Ok(VtxoSpendState::Spent) => FallbackStatus::Spent,
-		Ok(VtxoSpendState::FallbackForfeited) => FallbackStatus::Forfeited,
-		_ => bail!("fallback payout with a contradictory spend state"),
+fn fallback_status(payout: Option<&protos::FallbackPayout>) -> anyhow::Result<Option<FallbackStatus>> {
+	let Some(payout) = payout else { return Ok(None) };
+	Ok(Some(match protos::FallbackState::try_from(payout.state) {
+		Ok(protos::FallbackState::Pending) => FallbackStatus::Pending,
+		Ok(protos::FallbackState::Paid) => FallbackStatus::Spent,
+		Ok(protos::FallbackState::Forfeited) => FallbackStatus::Forfeited,
+		_ => bail!("fallback payout with an unknown state"),
 	}))
 }

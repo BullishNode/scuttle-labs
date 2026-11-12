@@ -224,10 +224,6 @@ enum VtxoSpendState {
 	VTXO_SPEND_STATE_UNREGISTERED = 4;
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
-	// A committed fallback decision has unresolved relevant portions.
-	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
-	// Terminal policy result with no Bitcoin payout.
-	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 7;
 }
 
 message GetVtxoStatusRequest {
@@ -239,12 +235,22 @@ message GetVtxoStatusRequest {
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
 	bytes owner_mailbox = 2;
-	bool fallback_committed = 3;
+	// Set for a SPENT coin the server decided to pay out at its expiry.
 	optional FallbackPayout fallback_payout = 4;
 }
 
-// Amounts the server decided for a coin's expiry payout to `tr(owner_mailbox)`.
+enum FallbackState {
+	FALLBACK_STATE_UNSPECIFIED = 0;
+	// The payout transaction is not yet six blocks deep.
+	FALLBACK_STATE_PENDING = 1;
+	FALLBACK_STATE_PAID = 2;
+	// The fee consumed the coin; nothing was paid on-chain.
+	FALLBACK_STATE_FORFEITED = 3;
+}
+
+// The expiry payout the server decided for a coin, to `tr(owner_mailbox)`.
 message FallbackPayout {
+	FallbackState state = 4;
 	// The coin value taken from Ark.
 	uint64 gross_sat = 1;
 	// The fallback fee withheld from it.
@@ -268,7 +274,6 @@ message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
 	bytes owner_mailbox = 3;
-	bool fallback_committed = 4;
 	optional FallbackPayout fallback_payout = 5;
 }
 
@@ -304,7 +309,6 @@ message RecoveredVtxo {
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
 	bytes owner_mailbox = 4;
-	bool fallback_committed = 5;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -509,9 +513,6 @@ message CheckLightningReceiveResponse {
 	LightningReceiveStatus status = 3;
 	// Empty until the status is HTLCS_READY or SETTLED
 	repeated bytes htlc_vtxos = 4;
-	// Aggregate expiry outcome of the actual collected receive destination.
-	// This hash-only query never returns mailbox identities or allocation data.
-	optional VtxoSpendState fallback_spend_state = 5;
 }
 
 // offboard

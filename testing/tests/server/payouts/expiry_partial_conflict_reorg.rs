@@ -5,6 +5,8 @@ use super::expiry_test::{actual_fee, canonical as canonical_point, wait_rebuilt 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use ark::ProtocolEncoding;
+use ark::attestations::VtxoStatusAttestation;
 use ark_testing::{require_bitcoind_chain_source, sat, Captaind, TestContext};
 use ark_testing::constants::BOARD_CONFIRMATIONS;
 use ark_testing::exit::{complete_exit, progress_exit_until_awaiting_delta};
@@ -14,6 +16,7 @@ use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockDelta, BlockRef};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::{BlockTable, Db};
+use server_rpc::protos;
 
 /// Reconcile the winning direct payouts and their exact on-chain fees.
 /// Losing allocations remain signed and immutable; neither their age nor an
@@ -299,8 +302,9 @@ async fn partial_conflict_reorg() {
 	let destination = client.fallback_script();
 	let owner_mailbox = client.mailbox_identifier().as_pubkey();
 
+	let exiting_key = client.get_vtxo_key(&exiting).await.unwrap();
 	let owner_keys = BTreeMap::from([
-		(exiting.id().to_string(), client.get_vtxo_key(&exiting).await.unwrap().public_key().to_string()),
+		(exiting.id().to_string(), exiting_key.public_key().to_string()),
 		(untouched.id().to_string(), client.get_vtxo_key(&untouched).await.unwrap().public_key().to_string()),
 	]);
 	assert_ne!(exiting.chain_anchor(), untouched.chain_anchor());
@@ -437,6 +441,13 @@ async fn partial_conflict_reorg() {
 	assert_ne!(untouched_status, "conflicted", "the untouched root keeps its own decision");
 	let claim = ctx.bitcoind().await_transaction(claim_txid).await;
 	assert!(claim.input.iter().any(|input| input.previous_output == exiting.point()));
+	// The holder put the coin on chain itself, so no payout is reported.
+	let status = srv.get_public_rpc().await.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: exiting.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(exiting.id(), &exiting_key).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert!(status.fallback_payout.is_none(), "an exited coin is not a pending payout");
 	assert!(claim.output.iter().any(|out| out.script_pubkey == claim_address.script_pubkey() && out.value > sat(0)));
 	let old_tip = server::bitcoind::tip(&ctx.bitcoind().async_client()).await.unwrap();
 	rebuilt_generation(&db, old_tip).await;

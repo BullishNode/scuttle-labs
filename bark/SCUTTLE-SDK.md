@@ -25,7 +25,8 @@ A receiving wallet must verify
 the actual server-cosigned coin and its attested `owner_mailbox` before
 crediting it. A missing delivery or status is not acceptance.
 
-The server's fallback status reports `Pending`, `Spent`, or `Forfeited`; it is
+The server reports a decided coin as `Spent` with a fallback status of
+`Pending`, `Paid` (stored as `Spent`), or `Forfeited`; it is
 not proof that bitcoin arrived. The application's Bitcoin wallet must watch
 and spend `tr(M)` separately. Bark does not contain a second payout Bitcoin
 wallet or count a server-reported payout as received on-chain bitcoin.

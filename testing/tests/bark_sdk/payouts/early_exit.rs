@@ -40,7 +40,7 @@ struct PayoutProxy {
 }
 
 const PAYOUT: protos::FallbackPayout = protos::FallbackPayout {
-	gross_sat: 10_000, fee_sat: 2_000, payout_sat: 8_000,
+	state: protos::FallbackState::Paid as i32, gross_sat: 10_000, fee_sat: 2_000, payout_sat: 8_000,
 };
 
 fn refusal() -> tonic::Status {
@@ -114,7 +114,6 @@ impl ArkRpcProxy for PayoutProxy {
 		if self.decide.load(Ordering::SeqCst) {
 			res.spend_state = protos::VtxoSpendState::Spent as i32;
 			res.owner_mailbox = self.owner.lock().unwrap().clone();
-			res.fallback_committed = true;
 			res.fallback_payout = Some(PAYOUT);
 		}
 		Ok(res)
@@ -128,7 +127,6 @@ impl ArkRpcProxy for PayoutProxy {
 			for status in &mut res.vtxos {
 				status.spend_state = protos::VtxoSpendState::Spent as i32;
 				status.owner_mailbox = self.owner.lock().unwrap().clone();
-				status.fallback_committed = true;
 				status.fallback_payout = Some(PAYOUT);
 			}
 		}

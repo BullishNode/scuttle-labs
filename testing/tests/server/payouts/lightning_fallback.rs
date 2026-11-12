@@ -420,30 +420,26 @@ async fn settled_forwarded_receive_without_claim_pays_the_provider() {
 			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()));
 		}
 	}
-	let pending = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
-		hash: hash.to_vec(), wait: false,
-	}).await.unwrap().into_inner();
-	assert_eq!(pending.fallback_spend_state, Some(protos::VtxoSpendState::FallbackPending as i32));
+	let status_request = |grant: &Vtxo<Full>| protos::GetVtxoStatusRequest {
+		vtxo_id: grant.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(grant.id(), &grant_key).serialize(),
+	};
+	let pending = rpc.get_vtxo_status(status_request(&grants[0])).await.unwrap().into_inner();
+	assert_eq!(pending.fallback_payout.map(|f| f.state), Some(protos::FallbackState::Pending as i32),
+		"a payout is pending until six blocks deep");
 	let confirmed = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(confirmed).await;
 	srv.watchmand().wait_for_sync_height(confirmed).await;
-	let terminal = rpc.check_lightning_receive(protos::CheckLightningReceiveRequest {
-		hash: hash.to_vec(), wait: false,
-	}).await.unwrap().into_inner();
-	assert_eq!(terminal.fallback_spend_state, Some(protos::VtxoSpendState::Spent as i32),
-		"payment-hash status follows the provider's unclaimed grant entitlement");
 	for grant in &grants {
 		let birth_mailbox = db.read(async |tx| Ok(tx.query_one(
 			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
 		).await?.get::<_, String>(0))).await.unwrap();
 		assert_eq!(birth_mailbox, provider_mailbox.public_key().to_string(),
 			"recipient payout must not rewrite the grant holder's birth binding");
-		let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
-			vtxo_id: grant.id().to_bytes().to_vec(),
-			attestation: VtxoStatusAttestation::new(grant.id(), &grant_key).serialize(),
-		}).await.unwrap().into_inner();
+		let status = rpc.get_vtxo_status(status_request(grant)).await.unwrap().into_inner();
+		assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
 		assert_eq!(status.owner_mailbox, provider_mailbox.public_key().serialize().to_vec());
-		assert!(status.fallback_committed,
+		assert_eq!(status.fallback_payout.map(|f| f.state), Some(protos::FallbackState::Paid as i32),
 			"provider status must report its own grant payout");
 	}
 }

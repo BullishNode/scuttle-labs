@@ -37,11 +37,14 @@ whose fee leaves no standard output is reported as `Forfeited` with its gross,
 fee and payout amounts. Miner fees are paid inline, and replacements keep the
 owner outputs fixed.
 
-The server's `Pending`, `Spent` and `Forfeited` statuses are operator reports,
-not proof of Bitcoin receipt. Bark keeps the last observed fallback status
-separately from Ark spendability. A Bitcoin wallet must independently find and
-confirm the exact `tr(M)` output before counting it as received. Hash-level
-status cannot prove delivery to a forwarded recipient.
+A decided coin's status is the upstream `Spent` state plus a `fallback_payout`
+field: `Pending` until the payout is six blocks deep, then `Paid`, or
+`Forfeited` when the fee consumed the coin. The server reports it only to the
+mailbox the coin was born with, and not for a coin its holder put on chain.
+These are operator reports, not proof of Bitcoin receipt. Bark keeps the last
+observed fallback status separately from Ark spendability. A Bitcoin wallet
+must independently find and confirm the exact `tr(M)` output before counting
+it as received.
 
 ## Lightning uncertainty
 

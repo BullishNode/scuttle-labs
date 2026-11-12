@@ -293,7 +293,9 @@ async fn p2tr_fee_consuming_the_whole_coin_is_forfeited() {
 		vtxo_id: leaf.coin.id().to_bytes().to_vec(),
 		attestation: VtxoStatusAttestation::new(leaf.coin.id(), &key).serialize(),
 	}).await.unwrap().into_inner();
-	assert_eq!(status.spend_state, protos::VtxoSpendState::FallbackForfeited as i32);
-	assert_eq!(status.fallback_payout, Some(protos::FallbackPayout { gross_sat: 1_500, fee_sat: 1_500, payout_sat: 0 }));
+	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert_eq!(status.fallback_payout, Some(protos::FallbackPayout {
+		state: protos::FallbackState::Forfeited as i32, gross_sat: 1_500, fee_sat: 1_500, payout_sat: 0,
+	}));
 	verify_return(&recipient, &[&leaf], &epoch, &history).await;
 }

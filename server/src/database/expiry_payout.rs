@@ -6,87 +6,30 @@ use anyhow::Context;
 use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::secp256k1::PublicKey;
-use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
+use bitcoin_ext::{BlockRef, TxOutExt};
 use ark::{ProtocolEncoding, ServerVtxo, ServerVtxoPolicy, VtxoId, VtxoPolicy};
 
 use super::expiry_lightning::LightningSourceState;
-use super::expiry_ownership::OwnershipBindingSource;
 use super::htlc_vtxo::{self, HtlcDirection, HtlcResolution};
-use super::ln::{LightningHtlcSubscription, LightningHtlcSubscriptionStatus};
+use super::ln::LightningHtlcSubscriptionStatus;
 use super::Tx;
 
 pub(crate) const MAX_PAYOUT_VSIZE: usize = 100_000;
 
-pub(crate) struct FallbackClaim {
-	pub vtxo_id: VtxoId,
-	pub source_vtxo_ids: BTreeSet<VtxoId>,
-	pub binding_source: Option<OwnershipBindingSource>,
-	pub user_pubkey: PublicKey,
-	pub owner_mailbox: PublicKey,
-	pub gross: Amount,
-	pub fee: Amount,
-	pub payout: Amount,
-	pub confirmed_block: Option<BlockRef>,
-	/// Canonical N6 user discharge, independent of the superseded payout parent.
-	pub user_claimed: bool,
-}
-
-fn binding_source_from_evidence(evidence: &serde_json::Value)
-	-> anyhow::Result<Option<OwnershipBindingSource>>
-{
-	let Some(source) = evidence.get("binding_source") else { return Ok(None); };
-	let kind = source.get("kind").and_then(serde_json::Value::as_str)
-		.context("payout evidence has no binding source kind")?;
-	let parsed = match kind {
-		"coin" => OwnershipBindingSource::Coin(source.get("id").and_then(serde_json::Value::as_str)
-			.context("payout evidence has no coin id")?.parse()?),
-		"input_coins" => OwnershipBindingSource::InputCoins(source.get("ids").and_then(serde_json::Value::as_array)
-			.context("payout evidence has no input coin ids")?.iter()
-			.map(|id| -> anyhow::Result<VtxoId> { Ok(id.as_str().context("invalid input coin id")?.parse()?) })
-			.collect::<anyhow::Result<Vec<_>>>()?),
-		"allocation" => OwnershipBindingSource::Allocation(source.get("id").and_then(serde_json::Value::as_i64)
-			.context("payout evidence has no allocation id")?),
-		_ => bail!("unknown payout binding source kind"),
-	};
-	Ok(Some(parsed))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FallbackOutcome {
+pub(crate) enum FallbackState {
 	Pending,
-	Spent,
+	Paid,
 	Forfeited,
 }
 
-/// A coin's fallback outcome with the amounts decided for it so far.
+/// The expiry payout decided for a coin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FallbackReceipt {
-	pub outcome: FallbackOutcome,
+	pub state: FallbackState,
 	pub gross: Amount,
 	pub fee: Amount,
 	pub payout: Amount,
-}
-
-/// A known source cannot retire because only its first paid portion was
-/// returned. All of its principal must be covered by canonical decisions.
-fn fallback_outcome<'a>(principal: Amount, claims: impl IntoIterator<Item = &'a FallbackClaim>)
-	-> anyhow::Result<Option<FallbackOutcome>>
-{
-	let mut covered = Amount::ZERO;
-	let mut pending = false;
-	let mut paid = false;
-	let mut any = false;
-	for claim in claims {
-		any = true;
-		covered = covered.checked_add(claim.gross).context("fallback source coverage overflow")?;
-		pending |= claim.confirmed_block.is_none() && !claim.user_claimed;
-		paid |= claim.payout > Amount::ZERO || claim.user_claimed;
-	}
-	ensure!(covered <= principal, "fallback decisions exceed their known source");
-	Ok(if !any { None }
-		else if pending || covered != principal { Some(FallbackOutcome::Pending) }
-		else if paid { Some(FallbackOutcome::Spent) }
-		else { Some(FallbackOutcome::Forfeited) })
 }
 
 fn receive_timeout_allowed(
@@ -114,237 +57,42 @@ pub struct PendingExpiryPayout {
 }
 
 impl Tx<'_> {
-	/// Follow only immutable registered OOR edges. The stage resolver below
-	/// still decides whether a descendant is actually this input owner's right;
-	/// sharing a transaction or a mailbox is not sufficient.
-	/// Reporting uses a read-only snapshot of the last completed block;
-	/// financial decisions validate the chain independently.
-	async fn source_fallback_claims(&self, ids: &[VtxoId]) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
-		if ids.is_empty() { return Ok(BTreeMap::new()); }
-		let raw = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let rows = self.query("WITH RECURSIVE branch AS (
-			SELECT vtxo_id,oor_spent_txid,spent_in_round,offboarded_in FROM vtxo WHERE vtxo_id=ANY($1)
-			UNION
-			SELECT v.vtxo_id,v.oor_spent_txid,v.spent_in_round,v.offboarded_in
-			FROM vtxo v JOIN branch p ON v.vtxo_txid=p.oor_spent_txid
-			WHERE p.spent_in_round IS NULL AND p.offboarded_in IS NULL
-		) SELECT vtxo_id FROM branch", &[&raw]).await?;
-		let mut candidates = ids.iter().copied().collect::<BTreeSet<_>>();
-		for row in rows { candidates.insert(row.get::<_, &str>("vtxo_id").parse()?); }
-		let candidates = candidates.into_iter().collect::<Vec<_>>();
-		let raw = candidates.iter().map(ToString::to_string).collect::<Vec<_>>();
-		// Ordinary uncommitted status reads do not depend on watchmand/Core.
-		if self.query_opt("SELECT e.id FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-			WHERE e.vtxo_id=ANY($1) AND c.disposition='customer' LIMIT 1", &[&raw]).await?.is_none() {
-			return Ok(BTreeMap::new());
-		}
-		let point = self.expiry_view().await?.context("fallback projection has no published watchman tip")?;
-		self.fallback_claims(&candidates, point).await
-	}
-
-	/// Aggregate direct and stage-selected input-owner portions onto the
-	/// authenticated coin identity. Keep birth ownership separate from payee.
-	pub(crate) async fn fallback_outcomes(&self, ids: &[VtxoId])
+	/// The payout decided for each coin, keyed by the coin and the mailbox
+	/// it was born with. A payout to another mailbox, such as an undelivered
+	/// arkoor output refunded to its sender, is not reported to the coin.
+	pub(crate) async fn fallback_receipts(&self, owners: &BTreeMap<VtxoId, PublicKey>)
 		-> anyhow::Result<BTreeMap<VtxoId, FallbackReceipt>>
 	{
-		if !self.expiry_payouts() { return Ok(BTreeMap::new()); }
-		let claims = self.source_fallback_claims(ids).await?;
-		let sources = self.get_existing_server_vtxos_by_id(ids).await?;
-		let mut owners = self.coin_owner_mailboxes(ids).await?;
-		for (id, source) in &sources {
-			if !owners.contains_key(id) && matches!(source.vtxo.policy(), ServerVtxoPolicy::Expiry(_)) {
-				if let Some((_, mailbox)) = self.unregistered_board_owner(*id).await? {
-					owners.insert(*id, mailbox);
-				}
-			}
-		}
-		let mut outcomes = BTreeMap::new();
-		for (id, source) in sources {
-			let Some(owner) = owners.get(&id) else { continue; };
-			let mut group = BTreeSet::from([id]);
-			loop {
-				let before = group.len();
-				for claim in claims.values().filter(|claim| claim.owner_mailbox == *owner) {
-					if let Some(OwnershipBindingSource::InputCoins(input_ids)) = &claim.binding_source {
-						if input_ids.iter().any(|input| group.contains(input)) {
-							group.extend(input_ids.iter().copied());
-						}
-					}
-				}
-				if group.len() == before { break; }
-			}
-			let principal = if group.len() == 1 { source.vtxo.amount() } else {
-				let all = group.iter().copied().collect::<Vec<_>>();
-				let all_sources = self.get_existing_server_vtxos_by_id(&all).await?;
-				let all_owners = self.coin_owner_mailboxes(&all).await?;
-				ensure!(all_sources.len() == group.len() && all_owners.len() == group.len()
-					&& all_owners.values().all(|mailbox| mailbox == owner),
-					"multi-input receipt has incomplete owner sources");
-				all_sources.values().try_fold(Amount::ZERO, |sum, source|
-					sum.checked_add(source.vtxo.amount()).context("multi-input receipt principal overflow"))?
-			};
-			let matching = claims.values().filter(|claim| claim.owner_mailbox == *owner
-				&& claim.source_vtxo_ids.iter().any(|source| group.contains(source)))
-				.collect::<Vec<_>>();
-			if let Some(outcome) = fallback_outcome(principal, matching.iter().copied())? {
-				let sum = |amount: fn(&FallbackClaim) -> Amount| matching.iter()
-					.try_fold(Amount::ZERO, |sum, claim| sum.checked_add(amount(claim)))
-					.context("fallback receipt amount overflow");
-				outcomes.insert(id, FallbackReceipt {
-					outcome,
-					gross: sum(|claim| claim.gross)?,
-					fee: sum(|claim| claim.fee)?,
-					payout: sum(|claim| claim.payout)?,
-				});
-			}
-		}
-		Ok(outcomes)
-	}
-
-	/// Match each grant to the mailbox it was born with.
-	/// The public hash-only response receives an outcome, never these keys.
-	pub(crate) async fn receive_fallback_outcome(&self, sub: &LightningHtlcSubscription)
-		-> anyhow::Result<Option<FallbackOutcome>>
-	{
-		if !self.expiry_payouts() { return Ok(None); }
-		let rows = self.query("SELECT v.vtxo_id,v.amount
-			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id AND h.direction='outgoing'
-			JOIN lightning_htlc_subscription s ON s.id=v.lightning_htlc_subscription_id AND s.payment_hash=h.payment_hash
-			WHERE s.id=$1 AND s.payment_hash=$2 ORDER BY v.vtxo_id",
-			&[&sub.id, &sub.payment_hash.to_string()]).await?;
-		let grants = rows.iter().map(|row| row.get::<_, &str>("vtxo_id").parse())
-			.collect::<Result<BTreeSet<VtxoId>, _>>()?;
-		ensure!(grants == sub.htlc_vtxos.iter().copied().collect(), "receive grant identities differ from subscription");
-		let mut principal = Amount::ZERO;
-		let providers = self.coin_owner_mailboxes(&grants.iter().copied().collect::<Vec<_>>()).await?;
-		let mut eligible = BTreeSet::new();
-		let ids = grants.iter().copied().collect::<Vec<_>>();
+		if !self.expiry_payouts() || owners.is_empty() { return Ok(BTreeMap::new()); }
+		let ids = owners.keys().map(ToString::to_string).collect::<Vec<_>>();
+		// The winning decision of each coin: a confirmed one, else the latest.
+		let rows = self.query("SELECT DISTINCT ON (e.vtxo_id) e.vtxo_id,c.disposition,c.owner_mailbox, \
+			c.gross_sat,c.fee_sat,c.payout_sat,a.status,v.confirmed_height IS NOT NULL AS exposed, \
+			a.confirmed_height+5 <= (SELECT MAX(height) FROM watchmand_block) AS deep \
+			FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
+			JOIN expiry_allocation_state a ON a.id=c.allocation_id JOIN vtxo v ON v.vtxo_id=e.vtxo_id \
+			WHERE e.vtxo_id=ANY($1) ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC",
+			&[&ids]).await?;
+		let mut receipts = BTreeMap::new();
 		for row in rows {
-			let source: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
-			let amount = Amount::from_sat(u64::try_from(row.get::<_, i64>("amount"))?);
-			principal = principal.checked_add(amount).context("receive grant amount overflow")?;
-			let provider = providers.get(&source).context("receive grant has no birth mailbox")?;
-			eligible.insert((source, *provider));
-		}
-		let claims = self.source_fallback_claims(&ids).await?;
-		let matching = claims.values().filter(|claim| claim.source_vtxo_ids.iter()
-			.any(|source| eligible.contains(&(*source, claim.owner_mailbox))));
-		fallback_outcome(principal, matching)
-	}
-
-	/// Select the winning economic decision before filtering for customer claims.
-	/// The receipt describes that decision; it does not promote a pending parent
-	/// or replace the wallet's independent canonical-chain confirmation check.
-	async fn fallback_claims(&self, ids: &[VtxoId], point: BlockRef) -> anyhow::Result<BTreeMap<VtxoId, FallbackClaim>> {
-		let ids = ids.iter().map(ToString::to_string).collect::<Vec<_>>();
-		let rows = self.query("SELECT c.vtxo_id,c.owner_mailbox,c.user_pubkey,c.evidence::TEXT AS evidence,c.gross_sat,c.fee_sat,c.payout_sat,
-			CASE WHEN a.status='confirmed'
-				AND cv.processed_height >= a.confirmed_height+5
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
-				THEN a.confirmed_height END AS confirmed_height,
-			CASE WHEN a.status='confirmed'
-				AND cv.processed_height >= a.confirmed_height+5
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=a.confirmed_height AND b.hash=a.confirmed_hash)
-				THEN a.confirmed_hash END AS confirmed_hash,
-			EXISTS(SELECT 1 FROM expiry_terminal_claim t WHERE t.entitlement_id=c.entitlement_id
-				 AND cv.processed_height >= t.height+5
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=t.height AND b.hash=t.hash)
-				AND cv.processed_height=(SELECT MAX(height) FROM watchmand_block)
-				AND EXISTS(SELECT 1 FROM watchmand_block b WHERE b.height=cv.processed_height AND b.hash=cv.processed_hash)) AS user_claimed
-			FROM (SELECT DISTINCT ON(e.vtxo_id) e.vtxo_id,e.id AS entitlement_id,c.allocation_id,c.owner_mailbox,c.user_pubkey,c.evidence,c.gross_sat,c.fee_sat,
-				c.payout_sat,c.forfeited_sat,c.spk,c.disposition FROM expiry_entitlement e
-				JOIN expiry_allocation_coin c ON c.entitlement_id=e.id
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1)
-				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC) c
-			JOIN expiry_allocation_state a ON a.id=c.allocation_id
-			CROSS JOIN (SELECT $2::BIGINT AS processed_height,$3::TEXT AS processed_hash) cv
-			WHERE c.disposition='customer'", &[&ids, &i64::from(point.height), &point.hash.to_string()]).await?;
-		let mut claims = BTreeMap::new();
-		for row in rows {
-			let height: Option<i64> = row.get("confirmed_height");
-			let hash: Option<&str> = row.get("confirmed_hash");
-			let confirmed_block = match (height, hash) {
-				(Some(height), Some(hash)) => Some(BlockRef { height: BlockHeight::new(u32::try_from(height)?), hash: hash.parse()? }),
-				(None, None) => None,
-				_ => bail!("incomplete fallback confirmation receipt"),
+			let id: VtxoId = row.get::<_, &str>("vtxo_id").parse()?;
+			let mailbox = row.get::<_, Option<&str>>("owner_mailbox").map(str::parse::<PublicKey>).transpose()?;
+			if row.get::<_, &str>("disposition") != "customer" || mailbox.as_ref() != owners.get(&id) {
+				continue;
+			}
+			// The holder put the coin itself on chain, so no payout follows.
+			let status: &str = row.get("status");
+			if status == "conflicted" && row.get::<_, bool>("exposed") { continue; }
+			let amount = |column| -> anyhow::Result<Amount> {
+				Ok(Amount::from_sat(u64::try_from(row.get::<_, i64>(column))?))
 			};
-			let evidence: serde_json::Value = serde_json::from_str(row.get("evidence"))?;
-			let claim = FallbackClaim {
-				vtxo_id: row.get::<_, &str>("vtxo_id").parse()?,
-				source_vtxo_ids: BTreeSet::new(),
-				binding_source: binding_source_from_evidence(&evidence)?,
-				user_pubkey: row.get::<_, &str>("user_pubkey").parse()?,
-				owner_mailbox: row.get::<_, &str>("owner_mailbox").parse()?,
-				gross: Amount::from_sat(u64::try_from(row.get::<_, i64>("gross_sat"))?),
-				fee: Amount::from_sat(u64::try_from(row.get::<_, i64>("fee_sat"))?),
-				payout: Amount::from_sat(u64::try_from(row.get::<_, i64>("payout_sat"))?),
-				confirmed_block,
-				user_claimed: row.get("user_claimed"),
-			};
-			let mut claim = claim;
-			claim.source_vtxo_ids = self.fallback_claim_sources(&claim).await?;
-			claims.insert(claim.vtxo_id, claim);
+			let payout = amount("payout_sat")?;
+			let state = if status != "confirmed" || row.get::<_, Option<bool>>("deep") != Some(true) {
+				FallbackState::Pending
+			} else if payout > Amount::ZERO { FallbackState::Paid } else { FallbackState::Forfeited };
+			receipts.insert(id, FallbackReceipt { state, gross: amount("gross_sat")?, fee: amount("fee_sat")?, payout });
 		}
-		Ok(claims)
-	}
-
-	/// A receipt belongs to the stage-selected mailbox. Birth ownership is
-	/// only one possible source alias: a provisional recipient must not gain
-	/// its input owner's refund, and a collected receive grant belongs to its
-	/// admitted claimant even if the final output was never inserted.
-	async fn fallback_claim_sources(&self, claim: &FallbackClaim) -> anyhow::Result<BTreeSet<VtxoId>> {
-		let mut sources = BTreeSet::new();
-		if self.coin_owner_mailboxes(&[claim.vtxo_id]).await?.get(&claim.vtxo_id) == Some(&claim.owner_mailbox) {
-			sources.insert(claim.vtxo_id);
-		}
-		if self.unregistered_board_owner(claim.vtxo_id).await?
-			== Some((claim.user_pubkey, claim.owner_mailbox)) {
-			sources.insert(claim.vtxo_id);
-		}
-		match &claim.binding_source {
-			Some(OwnershipBindingSource::Coin(id)) => {
-				ensure!(*id == claim.vtxo_id && sources.contains(id),
-					"coin receipt differs from its admitted birth binding");
-			},
-			Some(OwnershipBindingSource::InputCoins(ids)) => {
-				let actual = self.expiry_input_owner_sources(claim.vtxo_id).await?
-					.context("input-owner receipt lost its registered funding lineage")?;
-				ensure!(actual.iter().map(|source| source.0).collect::<Vec<_>>() == *ids
-					&& actual.iter().all(|source| source.2 == claim.owner_mailbox),
-					"input-owner receipt differs from its admitted source bindings");
-				sources.extend(ids.iter().copied());
-			},
-			Some(OwnershipBindingSource::Allocation(id)) => {
-				let row = self.query_opt("SELECT c.owner_mailbox FROM expiry_allocation_coin c \
-					JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-					WHERE c.allocation_id=$1 AND e.vtxo_id=$2 AND c.disposition='customer'",
-					&[id, &claim.vtxo_id.to_string()]).await?
-					.context("irreversible receipt lost its original allocation")?;
-				ensure!(row.get::<_, Option<&str>>(0) == Some(claim.owner_mailbox.to_string().as_str()),
-					"irreversible receipt differs from its original allocation");
-				sources.insert(claim.vtxo_id);
-			},
-			None => {},
-		}
-		Ok(sources)
-	}
-
-	/// Select the winning allocation before matching its actual customer. An
-	/// unregistered change output can use a fresh key in the same immutable
-	/// mailbox as its input owner; a recipient in another mailbox cannot.
-	pub(crate) async fn fallback_customer_vtxos(
-		&self, vtxos: &[VtxoId],
-	) -> anyhow::Result<BTreeSet<VtxoId>> {
-		if vtxos.is_empty() { return Ok(BTreeSet::new()); }
-		let ids = vtxos.iter().map(ToString::to_string).collect::<Vec<_>>();
-		self.query("SELECT q.vtxo_id FROM unnest($1::TEXT[]) q(vtxo_id) \
-			JOIN (SELECT DISTINCT ON (e.vtxo_id) e.vtxo_id,c.disposition,c.owner_mailbox \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
-				ORDER BY e.vtxo_id,(a.status='confirmed') DESC,c.allocation_id DESC \
-			) c ON c.vtxo_id=q.vtxo_id JOIN coin_owner k ON k.vtxo_id=q.vtxo_id \
-			WHERE c.disposition='customer' AND c.owner_mailbox=k.mailbox_pk",
-			&[&ids]).await?.into_iter().map(|row| Ok(row.get::<_, &str>("vtxo_id").parse()?)).collect()
+		Ok(receipts)
 	}
 
 	/// Each allocation is one root and is paid by one transaction.
@@ -531,47 +279,6 @@ mod tests {
 	use super::*;
 	use LightningHtlcSubscriptionStatus::{Canceled, Created, Accepted, HtlcsReady, Settled};
 	use HtlcResolution::{Fulfilled, Revoked};
-	use bitcoin::hashes::Hash;
-
-	#[test]
-	fn source_outcome_requires_complete_canonical_coverage() {
-		let key = bitcoin::secp256k1::Keypair::from_seckey_slice(&ark::SECP, &[7;32]).unwrap().public_key();
-		let mut first = FallbackClaim {
-			vtxo_id: ark::test_util::VTXO_VECTORS.board_vtxo.id(), source_vtxo_ids: BTreeSet::new(),
-			binding_source: None, user_pubkey: key,
-			owner_mailbox: key, gross: Amount::from_sat(40_000),
-			fee: Amount::from_sat(1_000), payout: Amount::from_sat(39_000),
-			confirmed_block: None, user_claimed: false,
-		};
-		let principal = Amount::from_sat(100_000);
-		assert_eq!(fallback_outcome(principal, []).unwrap(), None);
-		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
-		first.confirmed_block = Some(BlockRef { height: BlockHeight::new(1), hash: bitcoin::BlockHash::all_zeros() });
-		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
-		let mut second = FallbackClaim {
-			vtxo_id: first.vtxo_id, source_vtxo_ids: BTreeSet::new(), owner_mailbox: key,
-			binding_source: None, user_pubkey: key,
-			gross: Amount::from_sat(60_000), fee: Amount::from_sat(2_000), payout: Amount::ZERO,
-			confirmed_block: None, user_claimed: false,
-		};
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-		second.confirmed_block = first.confirmed_block;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
-		first.payout = Amount::ZERO;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Forfeited));
-		assert!(fallback_outcome(Amount::from_sat(99_999), [&first, &second]).is_err());
-		first.confirmed_block = None;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-		first.user_claimed = true;
-		assert_eq!(fallback_outcome(principal, [&first]).unwrap(), Some(FallbackOutcome::Pending));
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
-		second.confirmed_block = None;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-		second.user_claimed = true;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Spent));
-		first.user_claimed = false;
-		assert_eq!(fallback_outcome(principal, [&first, &second]).unwrap(), Some(FallbackOutcome::Pending));
-	}
 
 	#[test]
 	fn receive_timeout_keeps_collected_and_inflight_grants() {

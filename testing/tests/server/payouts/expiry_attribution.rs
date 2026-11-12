@@ -181,7 +181,7 @@ async fn offline_unregistered_board_is_paid_to_admitted_mailbox() {
 	}).await.unwrap().into_inner();
 	assert_eq!(pending.spend_state, protos::VtxoSpendState::Unregistered as i32);
 	assert_eq!(pending.owner_mailbox, owner.mailbox.public_key().serialize());
-	assert!(!pending.fallback_committed);
+	assert!(pending.fallback_payout.is_none());
 	assert!(rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
 		vtxo_id: coin.id().to_bytes().to_vec(),
 		attestation: VtxoStatusAttestation::new(coin.id(), &owner.key(2)).serialize(),
@@ -229,7 +229,7 @@ async fn offline_unregistered_board_is_paid_to_admitted_mailbox() {
 	}).await.unwrap().into_inner();
 	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
 	assert_eq!(status.owner_mailbox, owner.mailbox.public_key().serialize());
-	assert!(status.fallback_committed);
+	assert_eq!(status.fallback_payout.map(|f| f.state), Some(protos::FallbackState::Paid as i32));
 	let batch = rpc.get_vtxos_status_by_ids(protos::GetVtxosStatusByIdsRequest {
 		vtxos: vec![protos::VtxoStatusQuery {
 			vtxo_id: coin.id().to_bytes().to_vec(), attestation,
@@ -350,4 +350,42 @@ async fn expiry_owner_finds_revoked_htlc_input_key() {
 	// Keep the signed refund local, so attribution must use the committed input owner.
 	expire(&ctx, &srv, deadline.max(refund.expiry_height())).await;
 	assert_paid_to_owner(&ctx, &srv, &owner, refund).await;
+}
+
+/// An arkoor output never registered by expiry is paid to its sender's
+/// mailbox. Its recipient learns only that the coin is spent.
+#[tokio::test]
+async fn unregistered_arkoor_recipient_sees_no_sender_payout() {
+	let ctx = TestContext::new("server/unregistered_arkoor_recipient_sees_no_sender_payout").await;
+	let srv = server_with_lifetime(&ctx, BlockDelta::new(24)).await;
+	let owner = Owner::new();
+	let input_key = owner.key(1);
+	let input = board(&ctx, &srv, &owner, input_key, true).await;
+	let recipient = Xpriv::new_master(Network::Regtest, &[119; 64]).unwrap().to_keypair(&SECP);
+	let recipient_mailbox = MailboxIdentifier::from_pubkey(
+		Xpriv::new_master(Network::Regtest, &[120; 64]).unwrap().to_keypair(&SECP).public_key());
+	let policy = VtxoPolicy::new_pubkey(recipient.public_key());
+	let send = ArkoorPackageBuilder::new_claim_all_with_checkpoints([input.clone()], policy.clone())
+		.unwrap().generate_user_nonces(&[input_key]).unwrap();
+	let mut request = protos::ArkoorPackageCosignRequest::from(send.cosign_request());
+	for output in request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
+		output.blinded_mailbox_id = super::blinded_mailbox(&super::payout_address(&srv, policy.clone(),
+			&recipient, recipient_mailbox).await);
+	}
+	let mut rpc = srv.get_public_rpc().await;
+	let response = rpc.request_arkoor_cosign(request).await.unwrap().into_inner();
+	let outputs = send.user_cosign(&[input_key], ArkoorPackageCosignResponse::try_from(response).unwrap())
+		.unwrap().build_signed_vtxos();
+	assert_eq!(outputs.len(), 1);
+	let coin = &outputs[0];
+	// The recipient holds the signed coin but never registers it.
+	expire(&ctx, &srv, coin.expiry_height()).await;
+	assert_paid_to_owner(&ctx, &srv, &owner, coin).await;
+	let status = rpc.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: coin.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(coin.id(), &recipient).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert_eq!(status.owner_mailbox, recipient_mailbox.as_pubkey().serialize());
+	assert!(status.fallback_payout.is_none(), "the sender's refund is not the recipient's payout");
 }
