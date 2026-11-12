@@ -269,7 +269,7 @@ impl Db {
 
 		let pool = Self::pool_connect(&config.name, config).await?;
 		let db = Db { pool, expiry_payouts };
-		// V78 stores the selected mode in the same transaction as its schema.
+		// V80 stores the selected mode in the same transaction as its schema.
 		db.run_migrations().await?;
 		let stored: bool = db.get_conn().await?.query_one(
 			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],
