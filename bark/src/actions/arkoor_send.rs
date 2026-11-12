@@ -11,11 +11,12 @@ use bitcoin::hex::DisplayHex;
 use log::{error, info};
 
 use ark::arkoor::ArkoorDestination;
+use ark::lightning::{Bolt11Invoice, PaymentHash};
 use ark::vtxo::{Full, VtxoId, Vtxo};
 
-use crate::{FallbackRefusal, Wallet};
+use crate::Wallet;
 use crate::actions::{
-	Advance, AdvanceError, IntoAdvanceResult, RetryUnlessRejected, WalletAction,
+	or_retry, Advance, AdvanceError, IntoAdvanceResult, RetryUnlessRejected, WalletAction,
 	WalletActionCheckpoint, WalletActionId,
 };
 use crate::arkoor::{post_arkoor_to_mailboxes, split_change_amount, DeliveryOutcome};
@@ -44,6 +45,10 @@ pub struct ArkoorSend {
 	/// pre-split bark, meaning one whole change output.
 	#[serde(default, with = "crate::utils::serde::opt_amount_vec_sat")]
 	pub change_pieces: Option<Vec<Amount>>,
+	/// The invoice this send pays on the Ark address in its route hints.
+	/// The server settles the invoice when it cosigns.
+	#[serde(default)]
+	pub paid_invoice: Option<Bolt11Invoice>,
 
 	// Mutable state:
 	pub progress: Progress,
@@ -52,15 +57,6 @@ pub struct ArkoorSend {
 impl ArkoorSend {
 	pub fn id(&self) -> WalletActionId {
 		self.id.clone()
-	}
-
-	/// A committed refund is not successful delivery. Keep the original signed
-	/// change until authenticated status decides its ordinary wallet state.
-	async fn follow_fallback_registration(self, wallet: &Wallet) -> Advance<Self> {
-		match reconcile_fallback_registration(wallet, &self).await {
-			Ok(()) => Advance::Failed(FallbackRefusal::DecidedForFallback.into()),
-			Err(error) => Advance::Park { state: self, wake_after: None, error: Some(error) },
-		}
 	}
 }
 
@@ -191,15 +187,22 @@ impl WalletAction for ArkoorSend {
 	/// The step can't be completed as-is: the server rejected the request
 	/// or our own state is inconsistent.
 	async fn on_abort(self, wallet: &Wallet, error: anyhow::Error) -> Advance<Self> {
+		// A server that pays out expired coins does not register them: it
+		// refunds the unregistered outputs to the sender on-chain.
+		let refunded = match &self.progress {
+			Progress::Registration { signed_destination_vtxos, .. }
+				if wallet.server_payouts().await =>
+			{
+				let tip = or_retry!(self, wallet.inner.chain.tip().await);
+				signed_destination_vtxos.iter().any(|v| v.expiry_height() <= tip)
+			},
+			_ => false,
+		};
+
 		match self.progress {
 			// Nothing happened server-side, so the inputs go back to spendable
 			// when the executor tears the action down.
 			Progress::Cosigning => {
-				if FallbackRefusal::from_error(&error) == Some(FallbackRefusal::DecidedForFallback) {
-					if let Err(adoption) = wallet.adopt_fallback_refusal(&error, &self.input_vtxo_ids).await {
-						return Advance::Park { state: self, wake_after: None, error: Some(adoption) };
-					}
-				}
 				error!("arkoor send {} rejected during cosign: {:?}", self.id, error);
 				Advance::Failed(error)
 			},
@@ -208,16 +211,22 @@ impl WalletAction for ArkoorSend {
 			// them to `Spendable` on the server; a stable rejection here means
 			// the recipient can't spend via the server either. They CAN still
 			// emergency exit from the signed transaction chain we hold, so
-			// fall through to Delivery for unrelated rejections. A typed fallback
-			// decision instead needs its authenticated complete input status.
+			// fall through to Delivery rather than foreclose that recovery
+			// path by skipping the mailbox post.
 			Progress::Registration {
 				movement_id, signed_destination_vtxos, signed_change_vtxos,
 			} => {
-				if FallbackRefusal::from_error(&error) == Some(FallbackRefusal::DecidedForFallback) {
-					let send = ArkoorSend { progress: Progress::Registration {
-						movement_id, signed_destination_vtxos, signed_change_vtxos,
-					}, ..self };
-					return send.follow_fallback_registration(wallet).await;
+				// The recipient got nothing, so the send failed. The next sync
+				// retires the change, which is refunded as well.
+				if refunded {
+					return Advance::Next(ArkoorSend {
+						progress: Progress::Finalizing {
+							movement_id,
+							signed_change_vtxos,
+							delivery_succeeded: false,
+						},
+						..self
+					});
 				}
 				Advance::Next(ArkoorSend {
 					progress: Progress::Delivery {
@@ -250,46 +259,12 @@ impl WalletAction for ArkoorSend {
 	}
 }
 
-/// The server aggregates every stage-selected portion onto the original
-/// authenticated inputs. Retain signed change on uncertain status; a refused
-/// registration must never proceed to recipient delivery.
-async fn reconcile_fallback_registration(wallet: &Wallet, send: &ArkoorSend) -> anyhow::Result<()> {
-	let Progress::Registration { movement_id, signed_change_vtxos, .. } = &send.progress
-		else { bail!("fallback registration requires its signed checkpoint"); };
-	for id in &send.input_vtxo_ids {
-		let coin = wallet.get_vtxo_by_id(*id).await?;
-		let key = wallet.get_vtxo_key(&coin.vtxo).await?;
-		wallet.fetch_vtxo_status(*id, &key).await?;
-	}
-	// Cosigning already consumed the originals. Keep only change which the
-	// authenticated server still admits; a committed change is ordinary Spent.
-	for change in signed_change_vtxos {
-		let key = wallet.get_vtxo_key(change).await?;
-		let (state, committed) = wallet.fetch_vtxo_status(change.id(), &key).await?;
-		wallet.validate_vtxo(change).await?;
-		let initial = if committed || state == server_rpc::protos::VtxoSpendState::Spent {
-			crate::vtxo::VtxoState::Spent
-		} else {
-			ensure!(matches!(state, server_rpc::protos::VtxoSpendState::Spendable | server_rpc::protos::VtxoSpendState::Unregistered),
-				"signed change has an unresolved server state");
-			crate::vtxo::VtxoState::Spendable
-		};
-		wallet.store_vtxos([change], &initial).await?;
-		if committed { wallet.inner.db.set_vtxo_fallback_status(change.id(), crate::vtxo::FallbackStatus::try_from(state)?).await?; }
-	}
-	wallet.mark_vtxos_as_spent(&send.input_vtxo_ids).await?;
-	wallet.inner.movements.finish_movement_with_update(*movement_id, MovementStatus::Failed,
-		MovementUpdate::new().effective_balance(bitcoin::SignedAmount::ZERO)
-			.produced_vtxos(signed_change_vtxos.iter().map(|coin| coin.id()))
-			.metadata([("fallback_refusal".into(), serde_json::json!("decided_for_fallback"))])).await?;
-	Ok(())
-}
-
 /// Build a fresh [`ArkoorSend`] in [`Progress::Cosigning`]
 pub(crate) async fn start_arkoor_send(
 	wallet: &Wallet,
 	destination: ark::Address,
 	amount: Amount,
+	paid_invoice: Option<Bolt11Invoice>,
 ) -> anyhow::Result<ArkoorSend> {
 	let _ = wallet.require_server().await?;
 	wallet.validate_arkoor_address(&destination).await
@@ -324,6 +299,7 @@ pub(crate) async fn start_arkoor_send(
 		change_pieces: Some(split_change_amount(
 			change, amount, wallet.config().change_vtxo_split_factor,
 		)),
+		paid_invoice,
 		progress: Progress::Cosigning,
 	})
 }
@@ -360,20 +336,19 @@ async fn run_cosign(wallet: &Wallet, send: &ArkoorSend) -> Result<Progress, Adva
 	};
 	let neg_amount = -send.amount.to_signed().context("amount out-of-range").abort()?;
 
-	let (srv, info) = wallet.require_server().await.retry()?;
-	let link = send.destination.owner_link(wallet.network().await.retry()?, info.mailbox_pubkey)
-		.context("invalid recipient ownership link").abort()?;
-	if srv.protocol_version().await >= server_rpc::pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS && link.is_none() {
-		return Err(AdvanceError::Abort(crate::FallbackRefusal::RecipientMustUpdate.into()));
-	}
 	let arkoor = wallet.create_checkpointed_arkoor_with_vtxos(
-		dest, inputs, change_keypair, send.change_pieces.clone(), link,
+		dest, inputs, change_keypair, send.change_pieces.clone(), Some(send.destination.clone()),
+		send.paid_invoice.as_ref().map(PaymentHash::from),
 	).await.retry_unless_rejected()?;
 
+	let sent_to = match &send.paid_invoice {
+		Some(invoice) => MovementDestination::new(invoice.clone().into(), send.amount),
+		None => MovementDestination::ark(send.destination.clone(), send.amount),
+	};
 	let initial_update = MovementUpdate::new()
 		.intended_and_effective_balance(neg_amount)
 		.consumed_vtxos(&arkoor.inputs)
-		.sent_to([MovementDestination::ark(send.destination.clone(), send.amount)]);
+		.sent_to([sent_to]);
 
 	// The server has cosigned by now, so from here on only retry: the cosign
 	// replays with the same change key and `abort` would release inputs
@@ -443,6 +418,7 @@ mod test {
 			input_vtxo_ids: vec![],
 			change_key_index: 0,
 			change_pieces: Some(vec![Amount::from_sat(5_000), Amount::from_sat(5_000)]),
+			paid_invoice: None,
 			progress: Progress::Cosigning,
 		}
 	}

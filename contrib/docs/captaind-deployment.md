@@ -117,7 +117,7 @@ cannot see. These limits live in the captaind config:
   disables the operation.
 - `recovery_xpub_nb_keys` and `max_concurrent_xpub_recoveries` cap the cost
   of xpub recovery scans. Zero disables the RPC.
-- `max_read_mailbox_items` caps the checkpoints per mailbox query, up to eight.
+- `max_read_mailbox_items` caps the size of mailbox query responses.
 - `ln_receive_anti_dos_required` requires a VTXO ownership proof or a
   lightning receive token before the server prepares a lightning claim.
 - `round_submit_time`, `round_sign_time`, and

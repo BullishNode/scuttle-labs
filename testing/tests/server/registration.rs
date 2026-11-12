@@ -4,7 +4,7 @@ use bitcoin::{Address, Amount, Network, OutPoint};
 use bitcoin::secp256k1::{Keypair, rand::thread_rng};
 use bitcoin_ext::BlockHeight;
 use bitcoin_ext::rpc::RpcApi;
-use server::database::{Db, SpendState};
+use server::database::Db;
 use server_rpc::protos;
 
 use ark_testing::{btc, sat, TestContext};
@@ -57,83 +57,6 @@ impl captaind::proxy::ArkRpcProxy for DropRegistration {
 		&self, _upstream: &mut ArkClient, _req: protos::RegisterVtxoTransactionsRequest,
 	) -> Result<protos::Empty, tonic::Status> {
 		Ok(protos::Empty {})
-	}
-}
-
-/// Reject malformed amounts through the public entry before constructing its
-/// transactions, without blocking a genuine unsigned-to-signed registration.
-#[tokio::test]
-async fn register_vtxo_transactions_refuses_overflowing_genesis() {
-	let ctx = TestContext::new("server/register_vtxo_transactions_refuses_overflowing_genesis").await;
-	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool().create().await;
-	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
-	sender.board_and_confirm_and_register(&ctx, sat(200_000)).await;
-	let proxy = srv.start_proxy_no_mailbox(DropRegistration).await;
-	sender.set_ark_url(&proxy.address).await;
-	let receiver = ctx.bark("receiver", &proxy.address).create().await;
-	sender.send_oor(receiver.address().await, sat(50_000)).await;
-	let ids = receiver.vtxo_ids().await;
-	assert_eq!(ids.len(), 1);
-	let signed = receiver.raw_vtxo(ids[0]).await;
-	assert!(signed.has_all_witnesses());
-	assert!(signed.amount() > Amount::ZERO);
-	assert!(signed.exit_depth() > 0);
-
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let stored = db.read(async |t| t.get_user_vtxo_by_id(signed.id()).await).await.unwrap();
-	assert_eq!(stored.spend_state, SpendState::Unregistered);
-	assert!(!stored.vtxo.has_all_witnesses());
-	assert_eq!(stored.vtxo.to_bare().serialize(), signed.to_bare().serialize());
-	let anchor = db.read(async |t| {
-		Ok(t.get_virtual_transaction_by_txid(signed.chain_anchor().txid).await?
-			.expect("existing chain anchor").signed_tx().cloned().expect("signed anchor"))
-	}).await.unwrap();
-	signed.validate(&anchor).unwrap();
-
-	// The last eight bytes of a current genesis encoding are its final fee.
-	// Keep every bare field, encoded ID and witness, but overflow the amount.
-	let mut genesis = signed.serialize_genesis();
-	let fee_start = genesis.len().checked_sub(8).unwrap();
-	genesis[fee_start..].copy_from_slice(&u64::MAX.to_le_bytes());
-	let malformed = Vtxo::<Full>::deserialize_with_genesis(
-		&signed.to_bare().serialize(), &genesis,
-	).unwrap();
-	let malformed = Vtxo::<Full>::deserialize(&malformed.serialize()).unwrap();
-	assert_eq!(malformed.id(), signed.id());
-	assert_eq!(malformed.to_bare().serialize(), signed.to_bare().serialize());
-	assert!(malformed.has_all_witnesses());
-	assert_eq!(malformed.validate(&anchor),
-		Err(ark::vtxo::VtxoValidationError::Invalid("onchain amount overflow")));
-
-	let read_state = async || db.read(async |t| {
-		let row = t.query_one("SELECT jsonb_build_object( \
-			'vtxos',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.vtxo_id) FROM vtxo v), \
-			'transactions',(SELECT jsonb_agg(to_jsonb(v) ORDER BY v.txid) FROM virtual_transaction v), \
-			'htlcs',(SELECT jsonb_agg(to_jsonb(h) ORDER BY h.id) FROM htlc_vtxo h), \
-			'vtxo_history',(SELECT COUNT(*) FROM vtxo_history), \
-			'transaction_history',(SELECT COUNT(*) FROM virtual_transaction_history))::TEXT", &[]).await?;
-		Ok(row.get::<_, String>(0))
-	}).await.unwrap();
-	let before = read_state().await;
-	let mut client = srv.get_public_rpc().await;
-	let err = client.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
-		vtxos: vec![malformed.serialize()],
-	}).await.expect_err("overflowing genesis must receive a typed refusal");
-	assert_eq!(err.code(), tonic::Code::InvalidArgument);
-	assert!(err.message().contains("onchain amount overflow"), "unexpected error: {err}");
-	assert_eq!(read_state().await, before, "refused registration changed durable state");
-
-	// The same connection can then provide only the genuine missing witnesses.
-	client.register_vtxo_transactions(protos::RegisterVtxoTransactionsRequest {
-		vtxos: vec![signed.serialize()],
-	}).await.unwrap();
-	let registered = db.read(async |t| t.get_user_vtxo_by_id(signed.id()).await).await.unwrap();
-	assert_eq!(registered.spend_state, SpendState::Spendable);
-	assert_eq!(registered.vtxo.serialize(), signed.serialize());
-	for item in signed.transactions() {
-		let tx = db.read(async |t| t.get_virtual_transaction_by_txid(item.tx.compute_txid()).await)
-			.await.unwrap().expect("registered transaction");
-		assert_eq!(tx.signed_tx(), Some(&item.tx));
 	}
 }
 
@@ -192,86 +115,6 @@ async fn register_vtxo_transactions_refuses_child_of_exited_input() {
 	assert_eq!(state, "unregistered");
 }
 
-/// A sender can deliver a signed child without registering it, then claim its
-/// input on-chain. The recipient must keep the signed chain without treating
-/// the server's unregistered child as a spendable payment. A later valid
-/// mailbox message must still reach the recipient.
-#[tokio::test]
-async fn unregistered_arkoor_does_not_credit_recipient() {
-	unregistered_arkoor_recipient(false).await;
-}
-
-#[tokio::test]
-async fn payout_unregistered_arkoor_does_not_credit_recipient() {
-	unregistered_arkoor_recipient(true).await;
-}
-
-async fn unregistered_arkoor_recipient(payout: bool) {
-	let ctx = TestContext::new(if payout {
-		"server/payout_unregistered_arkoor_does_not_credit_recipient"
-	} else { "server/unregistered_arkoor_does_not_credit_recipient" }).await;
-	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool().watchmand()
-		.cfg(move |cfg| cfg.expiry_payouts = payout).create().await;
-	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
-	sender.board_and_confirm_and_register(&ctx, sat(200_000)).await;
-	ctx.refresh_all(&srv, &[&sender]).await;
-	ctx.generate_blocks(ROUND_CONFIRMATIONS).await;
-	sender.sync().await;
-	let stale = sender.full_clone("stale_sender").await;
-	let receiver = ctx.bark("receiver", &srv).create().await;
-	let proxy = srv.start_proxy_no_mailbox(DropRegistration).await;
-	sender.set_ark_url(&proxy.address).await;
-	sender.send_oor(receiver.address().await, sat(50_000)).await;
-	stale.start_exit_all().await;
-	complete_exit(&ctx, &stale).await;
-	stale.claim_all_exits(stale.get_onchain_address().await).await;
-	let tip = ctx.generate_blocks(1).await;
-	srv.watchmand().wait_for_sync_height(tip).await;
-	receiver.sync().await;
-	let child_ids = receiver.vtxo_ids_no_sync().await;
-	assert_eq!(child_ids.len(), 1);
-	let child = receiver.raw_vtxo(child_ids[0]).await;
-	assert!(child.has_all_witnesses(), "the wallet must retain the signed chain");
-	let db = Db::connect(&srv.config().postgres).await.unwrap();
-	let server_state = db.read(async |t| t.get_user_vtxo_by_id(child.id()).await)
-		.await.unwrap().spend_state;
-	assert_eq!(server_state, SpendState::Unregistered);
-	assert_eq!(receiver.spendable_balance_no_sync().await, Amount::ZERO);
-	assert!(receiver.history().await.is_empty());
-
-	let honest = ctx.bark("honest", &srv).funded(sat(100_000)).create().await;
-	honest.board_and_confirm_and_register(&ctx, sat(80_000)).await;
-	honest.send_oor(receiver.address().await, sat(20_000)).await;
-	receiver.sync().await;
-	assert_eq!(receiver.spendable_balance_no_sync().await, sat(20_000));
-	assert_eq!(receiver.history().await.len(), 1);
-}
-
-#[tokio::test]
-async fn delayed_arkoor_registration_credits_recipient_once() {
-	let ctx = TestContext::new("server/delayed_arkoor_registration_credits_recipient").await;
-	let srv = ctx.captaind("server").funded(btc(10)).no_vtxo_pool().create().await;
-	let sender = ctx.bark("sender", &srv).funded(sat(500_000)).create().await;
-	sender.board_and_confirm_and_register(&ctx, sat(200_000)).await;
-	let proxy = srv.start_proxy_no_mailbox(DropRegistration).await;
-	sender.set_ark_url(&proxy.address).await;
-	let receiver = ctx.bark("receiver", &proxy.address).create().await;
-	sender.send_oor(receiver.address().await, sat(50_000)).await;
-	receiver.sync().await;
-	assert_eq!(receiver.spendable_balance_no_sync().await, Amount::ZERO);
-	assert!(receiver.history().await.is_empty());
-	let child_ids = receiver.vtxo_ids_no_sync().await;
-	assert_eq!(child_ids.len(), 1);
-	assert!(receiver.raw_vtxo(child_ids[0]).await.has_all_witnesses());
-
-	receiver.set_ark_url(&srv).await;
-	receiver.sync().await;
-	assert_eq!(receiver.spendable_balance_no_sync().await, sat(50_000));
-	receiver.sync().await;
-	assert_eq!(receiver.spendable_balance_no_sync().await, sat(50_000));
-	assert_eq!(receiver.history().await.len(), 1);
-}
-
 /// Builds a bare-vtxo encoding that decodes back to a full vtxo with the same
 /// id, the same point and policy, an empty history anchored to its own
 /// terminal outpoint, and the given (forged) expiry. This works because the
@@ -289,6 +132,7 @@ fn reanchored_vtxo(vtxo: &Vtxo<Full>, expiry: BlockHeight) -> Vtxo<Full> {
 	<Vtxo<Full>>::deserialize(&fake.serialize())
 		.expect("a bare encoding re-anchors as an empty-genesis full vtxo")
 }
+
 
 /// A registration may only add witnesses to a stored vtxo. Re-anchoring a
 /// pubkey vtxo at its own point with an empty chain and a forged expiry
@@ -425,7 +269,7 @@ async fn board_output_is_bound_to_one_exit_tx() {
 	let amount = sat(100_000);
 	let script = BoardBuilder::new(
 		user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
-	).funding_script_pubkey();
+	).unwrap().funding_script_pubkey();
 	let address = Address::from_script(&script, Network::Regtest).unwrap();
 	let txid = ctx.bitcoind().fund_addr(&address, amount).await;
 	let funding = ctx.bitcoind().await_transaction(txid).await;
@@ -433,13 +277,12 @@ async fn board_output_is_bound_to_one_exit_tx() {
 	let vout = funding.output.iter().position(|o| o.script_pubkey == script).unwrap();
 	let utxo = OutPoint::new(txid, vout as u32);
 
-	let owner_proof = super::test_owner_link(&srv, &user).await;
 	let cosign = async |fee: Amount| {
 		let builder = BoardBuilder::new(
 			user.public_key(), expiry, info.server_pubkey, info.vtxo_exit_delta,
-		).set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
+		).unwrap().set_funding_details(amount, fee, utxo).unwrap().generate_user_nonces();
 		let resp = srv.get_public_rpc().await.request_board_cosign(protos::BoardCosignRequest {
-			owner_proof: Some(owner_proof.into()),
+			owner_mailbox: Some(user.public_key().serialize().to_vec()),
 			amount: amount.to_sat(),
 			utxo: utxo.serialize(),
 			expiry_height: expiry.to_u32(),
@@ -480,3 +323,5 @@ async fn board_output_is_bound_to_one_exit_tx() {
 	assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
 	assert!(err.message().contains("already registered"), "{err}");
 }
+
+include!("payouts/registration_upstream_scope.rs");

@@ -1,15 +1,12 @@
 //! Read Lightning ownership from existing source links and upstream attempt status.
 
-use std::collections::BTreeMap;
-
-use anyhow::Context;
-
 use ark::VtxoId;
 use ark::lightning::PaymentHash;
-use bitcoin_ext::{BlockHeight, BlockRef};
+use bitcoin_ext::BlockHeight;
 
-use super::{BlockTable, Tx};
-use super::ln::{LightningPaymentStatus, SourceSettlement};
+use super::Tx;
+use super::htlc_vtxo::{self, HtlcDirection, HtlcVtxo};
+use super::ln::LightningPaymentStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LightningSourceState {
@@ -19,142 +16,59 @@ pub(crate) enum LightningSourceState {
 	Discharged,
 }
 
-pub(crate) struct LightningPaymentOutcome {
-	pub sources: Vec<VtxoId>,
-	pub state: LightningSourceState,
-}
-
-fn source_state(statuses: impl IntoIterator<Item = LightningPaymentStatus>) -> LightningSourceState {
+/// Fold the attempts of one source, each with whether the receive it was
+/// initiated against is canceled.
+///
+/// An open attempt on a canceled receive counts as failed: a canceled receive
+/// refuses every claim, so that attempt can never succeed, and nothing fails
+/// it if the server stopped between canceling the receive and failing it.
+fn source_state(attempts: impl IntoIterator<Item = (LightningPaymentStatus, bool)>) -> LightningSourceState {
 	let mut state = LightningSourceState::Unattempted;
-	for status in statuses {
+	for (status, receive_canceled) in attempts {
 		match status {
 			LightningPaymentStatus::Succeeded => return LightningSourceState::Discharged,
-			LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted => state = LightningSourceState::Pending,
-			LightningPaymentStatus::Failed if state == LightningSourceState::Unattempted => state = LightningSourceState::Failed,
-			LightningPaymentStatus::Failed => {},
+			LightningPaymentStatus::Requested | LightningPaymentStatus::Submitted if !receive_canceled => {
+				state = LightningSourceState::Pending;
+			},
+			_ if state == LightningSourceState::Unattempted => state = LightningSourceState::Failed,
+			_ => {},
 		}
 	}
 	state
 }
 
 impl Tx<'_> {
-	/// A failed internal send can refund before its own CLTV once every
-	/// receive grant it funded has been reclaimed in both completed views.
-	pub(crate) async fn internal_grants_reclaimed(
-		&self, source: VtxoId, hash: PaymentHash, tip: BlockHeight,
-		watchman_tip: BlockHeight,
-	) -> anyhow::Result<Option<BlockRef>> {
-		let attempts = self.query("SELECT a.lightning_htlc_subscription_id,a.status::TEXT, \
-			s.payment_hash,s.status::TEXT AS subscription_status FROM lightning_payment_attempt a \
-			JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
-			JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id \
-			WHERE l.vtxo_id=$1 AND a.payment_hash=$2 ORDER BY a.id",
-			&[&source.to_string(), &hash.to_string()]).await?;
-		if attempts.is_empty() { return Ok(None); }
-		let mut last = 0u32;
-		for attempt in attempts {
-			if attempt.get::<_, &str>("status") != "failed"
-				|| attempt.get::<_, &str>("subscription_status") != "canceled"
-				|| attempt.get::<_, &str>("payment_hash") != hash.to_string() {
-				return Ok(None);
-			}
-			let subscription: i64 = attempt.get("lightning_htlc_subscription_id");
-			let grants = self.query("
-				SELECT h.payment_hash,h.direction::TEXT,h.offchain_resolution::TEXT,
-					h.chain_resolution::TEXT,h.chain_resolution_height,
-					(SELECT MIN(a.confirmed_height) FROM expiry_allocation_state a
-						JOIN expiry_allocation_coin c ON c.allocation_id=a.id
-						JOIN expiry_entitlement e ON e.id=c.entitlement_id
-						WHERE e.vtxo_id=v.vtxo_id
-						AND c.disposition='operator' AND a.status='confirmed') AS swept_height
-				FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id
-				WHERE v.lightning_htlc_subscription_id=$1 ORDER BY v.vtxo_id
-			", &[&subscription]).await?;
-			if grants.is_empty() { return Ok(None); }
-			for grant in grants {
-				if grant.get::<_, &str>("payment_hash") != hash.to_string()
-					|| grant.get::<_, &str>("direction") != "outgoing"
-					|| grant.get::<_, Option<&str>>("offchain_resolution").is_some() {
-					return Ok(None);
-				}
-				let height = match grant.get::<_, Option<&str>>("chain_resolution") {
-					Some("revoked") => grant.get::<_, Option<i32>>("chain_resolution_height").map(i64::from),
-					None => grant.get::<_, Option<i64>>("swept_height"),
-					_ => None,
-				};
-				let Some(height) = height else { return Ok(None); };
-				let height = u32::try_from(height)?;
-				if !super::htlc_vtxo::grant_reclamation_confirmed(BlockHeight::new(height), tip, Some(watchman_tip)) {
-					return Ok(None);
-				}
-				last = last.max(height);
-			}
-		}
-		let block = self.get_block_by_height(BlockTable::Watchmand, BlockHeight::new(last)).await?
-			.context("grant reclaim block is not in the completed watchman view")?;
-		Ok(Some(block))
-	}
-
 	pub(crate) async fn lightning_source_state(
 		&self, source: VtxoId, hash: PaymentHash,
 	) -> anyhow::Result<LightningSourceState> {
-		let rows = self.query("SELECT a.status FROM lightning_payment_attempt a \
+		let rows = self.query("SELECT a.status, COALESCE(s.status='canceled', FALSE) AS receive_canceled \
+			FROM lightning_payment_attempt a \
 			JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
+			LEFT JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id \
 			WHERE l.vtxo_id=$1 AND a.payment_hash=$2", &[&source.to_string(), &hash.to_string()]).await?;
-		Ok(source_state(rows.into_iter().map(|row| row.get("status"))))
+		Ok(source_state(rows.into_iter().map(|row| (row.get("status"), row.get("receive_canceled")))))
 	}
 
-	/// Keep a complete existing source scope, without inferring from hash siblings.
-	/// Called under source/settlement locks in a write transaction so unknown
-	/// provenance emits an alarm even though the status stays Pending.
-	pub(crate) async fn lightning_payment_outcome(
-		&self, hash: PaymentHash, source_ids: &[VtxoId],
-	) -> anyhow::Result<Option<LightningPaymentOutcome>> {
-		let mut requested = source_ids.to_vec();
-		requested.sort_unstable();
-		requested.dedup();
-		if requested.len() != source_ids.len() { return Ok(None); }
-		let rows = self.query("SELECT a.id,a.status,l.vtxo_id FROM lightning_payment_attempt a \
+	/// Whether the receive a failed intra-Ark source paid into can no longer
+	/// be claimed: it is canceled, and every grant it issued is past its
+	/// expiry, six blocks deep if it was reclaimed on-chain.
+	///
+	/// `None` if the source funded no receive that issued grants. `htlcs` are
+	/// all the HTLCs of the payment hash, which carries at most one receive.
+	pub(crate) async fn internal_receive_closed(
+		&self, source: VtxoId, hash: PaymentHash, htlcs: &[HtlcVtxo], tip: BlockHeight,
+	) -> anyhow::Result<Option<bool>> {
+		let row = self.query_one("SELECT COUNT(*) AS linked, \
+			COUNT(*) FILTER (WHERE s.status<>'canceled') AS open \
+			FROM lightning_payment_attempt a \
 			JOIN lightning_payment_attempt_htlc_vtxo l ON l.lightning_payment_attempt_id=a.id \
-			JOIN vtxo v ON v.vtxo_id=l.vtxo_id JOIN htlc_vtxo h ON h.id=v.id \
-			WHERE a.payment_hash=$1 \
-			AND h.payment_hash=a.payment_hash AND h.direction='incoming' ORDER BY a.id,l.vtxo_id",
-			&[&hash.to_string()]).await?;
-		let mut attempts = BTreeMap::<i64, (LightningPaymentStatus, Vec<VtxoId>)>::new();
-		for row in rows {
-			let entry = attempts.entry(row.get("id")).or_insert_with(|| (row.get("status"), Vec::new()));
-			entry.1.push(row.get::<_, &str>("vtxo_id").parse()?);
+			JOIN lightning_htlc_subscription s ON s.id=a.lightning_htlc_subscription_id \
+			WHERE l.vtxo_id=$1 AND a.payment_hash=$2", &[&source.to_string(), &hash.to_string()]).await?;
+		if row.get::<_, i64>("linked") == 0 || !htlcs.iter().any(|h| h.direction() == HtlcDirection::Outgoing) {
+			return Ok(None);
 		}
-		for (_, sources) in attempts.values_mut() { sources.sort_unstable(); }
-		if requested.is_empty() {
-			let Some((_, sources)) = attempts.values().next() else { return Ok(None); };
-			if attempts.values().any(|(_, other)| other != sources) { return Ok(None); }
-			requested = sources.clone();
-		}
-		let statuses = attempts.values().filter(|(_, sources)| *sources == requested)
-			.map(|(status, _)| *status).collect::<Vec<_>>();
-		if statuses.is_empty() { return Ok(None); }
-		let state = source_state(statuses);
-		let mut all_funded = true;
-		let mut any_funded = false;
-		let mut unknown = false;
-		for source in &requested {
-			match self.source_settlement(hash, *source).await? {
-				SourceSettlement::Funded => any_funded = true,
-				SourceSettlement::NotSettled => all_funded = false,
-				SourceSettlement::Unknown => {
-					self.warn_unknown_settlement(*source);
-					unknown = true;
-				},
-			}
-		}
-		// A cached failure cannot refund a source that paid. Conversely, a
-		// same-hash preimage from a disjoint source cannot prove its success.
-		let state = if unknown { LightningSourceState::Pending }
-			else if all_funded { LightningSourceState::Discharged }
-			else if any_funded || state == LightningSourceState::Discharged { LightningSourceState::Pending }
-			else { state };
-		Ok(Some(LightningPaymentOutcome { sources: requested, state }))
+		Ok(Some(row.get::<_, i64>("open") == 0
+			&& htlc_vtxo::payout_htlc_recvs_expired(htlcs, tip, Some(tip))))
 	}
 }
 
@@ -165,10 +79,15 @@ mod tests {
 	#[test]
 	fn ownership_uses_only_existing_attempt_states() {
 		use LightningPaymentStatus::*;
-		assert_eq!(source_state([]), LightningSourceState::Unattempted);
-		assert_eq!(source_state([Failed]), LightningSourceState::Failed);
-		assert_eq!(source_state([Failed, Submitted]), LightningSourceState::Pending);
-		assert_eq!(source_state([Requested, Failed]), LightningSourceState::Pending);
-		assert_eq!(source_state([Failed, Succeeded]), LightningSourceState::Discharged);
+		let open = |statuses: &[LightningPaymentStatus]| source_state(statuses.iter().map(|s| (*s, false)));
+		assert_eq!(open(&[]), LightningSourceState::Unattempted);
+		assert_eq!(open(&[Failed]), LightningSourceState::Failed);
+		assert_eq!(open(&[Failed, Submitted]), LightningSourceState::Pending);
+		assert_eq!(open(&[Requested, Failed]), LightningSourceState::Pending);
+		assert_eq!(open(&[Failed, Succeeded]), LightningSourceState::Discharged);
+		// An open attempt on a canceled receive can never succeed.
+		assert_eq!(source_state([(Requested, true)]), LightningSourceState::Failed);
+		assert_eq!(source_state([(Requested, true), (Submitted, false)]), LightningSourceState::Pending);
+		assert_eq!(source_state([(Succeeded, true)]), LightningSourceState::Discharged);
 	}
 }

@@ -30,7 +30,7 @@ CREATE TABLE bark_properties (
 
 				network TEXT NOT NULL,
 				fingerprint TEXT NOT NULL
-			, server_pubkey TEXT, server_mailbox_pubkey TEXT, mailbox_pubkey TEXT CHECK (length(mailbox_pubkey)=66), server_payouts INTEGER DEFAULT 0 CHECK (server_payouts IN (0,1)));
+			, server_pubkey TEXT, server_mailbox_pubkey TEXT, mailbox_pubkey TEXT CHECK (length(mailbox_pubkey)=66));
 CREATE TABLE bark_exit_states (
 				vtxo_id TEXT PRIMARY KEY,
 				state TEXT NOT NULL,

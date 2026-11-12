@@ -25,7 +25,7 @@ use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 
-use bitcoin::Weight;
+use bitcoin::{Amount, Weight};
 use bitcoin_ext::BlockHeight;
 
 use ark::Vtxo;
@@ -54,6 +54,8 @@ pub enum VtxoLockHolder {
 	Movement { id: MovementId },
 	/// An arkoor mailbox payment awaiting server registration.
 	MailboxReceive,
+	/// A completed round output retained until its payout owner is attested.
+	RoundPayoutCheck,
 }
 
 impl From<MovementId> for VtxoLockHolder {
@@ -214,6 +216,20 @@ pub struct WalletVtxo {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FallbackStatus { Pending, Spent, Forfeited }
+
+/// What the server decided for a coin's expiry payout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackPayout {
+	pub status: FallbackStatus,
+	/// The coin value taken from Ark.
+	pub gross: Amount,
+	/// The fallback fee withheld from it.
+	pub fee: Amount,
+	/// The amount paid on-chain; zero when the fee consumed the coin.
+	pub payout: Amount,
+	/// The wallet's fallback address `tr(M)`, derived from its own mailbox key.
+	pub address: bitcoin::Address,
+}
 
 impl FallbackStatus {
 	pub fn as_str(self) -> &'static str {

@@ -2,15 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ark::lightning::PaymentHash;
-use ark::{ProtocolEncoding, Vtxo};
-use ark::vtxo::Full;
+use ark::Vtxo;
 use ark_testing::{btc, sat, TestContext};
 use ark_testing::daemon::captaind::{ArkClient, proxy::ArkRpcProxy};
 use bark::actions::lightning::receive::{LightningReceiveState, Progress as ReceiveProgress};
 use bitcoin::Network;
 use cln_rpc::plugins::hold;
 use server::database::Db;
-use server::database::ln::{LightningHtlcSubscriptionStatus, LightningPaymentStatus, SourceSettlement};
+use server::database::ln::{LightningHtlcSubscriptionStatus, LightningPaymentStatus};
 use server_rpc::protos;
 
 async fn reopen(ctx: &TestContext, name: &str, mut config: bark::Config, url: String) -> bark::Wallet {
@@ -52,8 +51,9 @@ async fn sender_snapshot(db: &Db, hash: PaymentHash, attempt: i64) -> serde_json
 	}).await.unwrap()
 }
 
-/// Interrupt the real two-transaction settlement before either the receive
-/// status or cooperative grant spend commits. No financial row is reconstructed.
+/// The sender's attempt succeeds, then the server stops before the receive is
+/// settled. The hold timer must not cancel the receive, the settlement resumes
+/// by the attempt's subscription link, and the receiver still claims.
 #[tokio::test]
 async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit() {
 	let ctx = TestContext::new("scuttle/succeeded_receive_before_subscription_and_cosign_commit").await;
@@ -125,21 +125,21 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	}).await.unwrap().into_inner().invoices;
 	assert_eq!(native.len(),1); assert_eq!(native[0].state(),hold::InvoiceState::Cancelled);
 	let receiver_mailbox = receiver.mailbox_keypair().public_key();
-	// The first exact-P verification is in the WAL/prepared-destination Tx.
-	// Every later verification is refused before the cosign Tx takes grant locks.
+	// Fail the claim's cosign at its output's payout binding, after the
+	// preimage was stored, and the write that settles the receive, after the
+	// sender's attempt succeeded in its own transaction.
 	db.write(async |tx| {
 		tx.batch_execute(&format!("CREATE SEQUENCE issue62_claim_verifications;
 			CREATE SEQUENCE issue62_settled_failures;
 			CREATE FUNCTION issue62_refuse_cosign() RETURNS trigger AS $$
 			BEGIN
-			  IF NEW.user_pubkey='{claim_key}' THEN
-			    IF nextval('issue62_claim_verifications') > 1 THEN
-			      RAISE EXCEPTION 'ISSUE62 post-WAL cosign failure';
-			    END IF;
+			  IF NEW.mailbox_pk='{receiver_mailbox}' THEN
+			    PERFORM nextval('issue62_claim_verifications');
+			    RAISE EXCEPTION 'ISSUE62 post-WAL cosign failure';
 			  END IF;
 			  RETURN NEW;
 			END; $$ LANGUAGE plpgsql;
-			CREATE TRIGGER issue62_refuse_cosign BEFORE INSERT ON owner_key
+			CREATE TRIGGER issue62_refuse_cosign BEFORE INSERT ON coin_owner
 			FOR EACH ROW EXECUTE FUNCTION issue62_refuse_cosign();
 			CREATE FUNCTION issue62_refuse_settled() RETURNS trigger AS $$
 			BEGIN
@@ -158,7 +158,7 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	assert!(receiver.lightning_receive_checkpoint(hash).await.unwrap().is_some_and(|cp|cp==checkpoint));
 	let verification = db.read(async |tx| Ok(tx.query_one(
 		"SELECT last_value FROM issue62_claim_verifications",&[]).await?.get::<_,i64>(0))).await.unwrap();
-	assert_eq!(verification,2,"the genuine WAL verification passed, then only its cosign verification failed");
+	assert_eq!(verification,1,"the cosign coin-owner insert failed after the preimage was stored");
 	// Both real failures must have executed, and the independent source-success
 	// transaction must be visible before any crash is allowed.
 	tokio::time::timeout(Duration::from_secs(30), async {
@@ -177,37 +177,11 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 			let current = tx.get_htlc_subscription_by_id(sub.id).await?.unwrap();
 			let wal = tx.get_htlc_settlement_by_payment_hash(hash).await?.unwrap();
 			assert!(wal == checkpoint.payment_preimage, "the original genuine WAL must be retained");
-			let rows = tx.query("SELECT c.source_vtxo_id,c.output_vtxo_id,c.output_vtxo,
-				v.oor_spent_txid,h.offchain_resolution::TEXT,h.chain_resolution::TEXT,
-				EXISTS(SELECT 1 FROM vtxo o WHERE o.vtxo_id=c.output_vtxo_id) AS output_inserted
-				FROM expiry_lightning_receive_claim c JOIN vtxo v ON v.vtxo_id=c.source_vtxo_id
-				JOIN htlc_vtxo h ON h.id=v.id WHERE c.subscription_id=$1 AND c.payment_hash=$2
-				ORDER BY c.source_vtxo_id", &[&sub.id,&hash.to_string()]).await?;
-			assert_eq!(rows.len(), grants.len());
-			let mut prepared = Vec::new();
-			for row in rows {
-				let source: String = row.get("source_vtxo_id");
-				let grant = grants.iter().find(|grant| grant.id().to_string() == source).unwrap();
-				let output = Vtxo::<Full>::deserialize(row.get("output_vtxo")).unwrap();
-				assert_eq!(output.amount(), grant.amount());
-				assert_eq!(output.user_pubkey(), claim_key);
-				assert!(row.get::<_, Option<String>>("oor_spent_txid").is_none());
-				assert!(row.get::<_, Option<String>>("offchain_resolution").is_none());
-				assert!(row.get::<_, Option<String>>("chain_resolution").is_none());
-				assert!(!row.get::<_, bool>("output_inserted"));
-				assert!(tx.get_virtual_transaction_by_txid(output.point().txid).await?.is_none());
-				let owner = tx.query_one("SELECT mailbox_pk FROM owner_key WHERE user_pubkey=$1", &[&claim_key.to_string()]).await?;
-				assert_eq!(owner.get::<_, String>(0), receiver_mailbox.to_string());
-				prepared.push((source,row.get::<_, String>("output_vtxo_id"),output.amount().to_sat()));
-			}
-			let ids = tx.query("SELECT vtxo_id FROM lightning_payment_attempt_htlc_vtxo
-				WHERE lightning_payment_attempt_id=$1 ORDER BY vtxo_id", &[&attempt.id]).await?;
-			for row in ids {
-				let id = row.get::<_, String>(0).parse().unwrap();
-				assert_eq!(tx.source_settlement(hash,id).await?,SourceSettlement::Funded);
-			}
-			Ok(serde_json::json!({"subscription":sub.id,"status":current.status.to_string(),
-				"prepared":prepared}))
+			let unspent = tx.query_one("SELECT COUNT(*) FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id
+				WHERE v.vtxo_id=ANY($1) AND v.oor_spent_txid IS NULL
+				AND h.offchain_resolution IS NULL AND h.chain_resolution IS NULL", &[&grant_ids]).await?.get::<_, i64>(0);
+			assert_eq!(unspent, grants.len() as i64, "the refused claim spent no grant");
+			Ok(serde_json::json!({"subscription":sub.id,"status":current.status.to_string()}))
 		}).await.unwrap();
 		let sender = sender_snapshot(&db,hash,attempt.id).await;
 		serde_json::json!({"receive":state,"sender":sender})
@@ -226,11 +200,11 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	srv.crash_stop().await.unwrap();
 	let after = cold_cut().await;
 	tokio::fs::write(ctx.datadir.join("issue62-cold-crash.json"),serde_json::to_vec_pretty(&after).unwrap()).await.unwrap();
-	assert_eq!(after,before,"the actual source success must survive the owned crash while both later writes rolled back");
+	assert_eq!(after,before,"the actual source success must survive the owned crash");
 	// Only the cosign fault is removed now. The real WAL worker will retry the
 	// original subscription, but the Settled write remains faulty for the timer cut.
 	db.write(async |tx| {
-		tx.batch_execute("DROP TRIGGER issue62_refuse_cosign ON owner_key;
+		tx.batch_execute("DROP TRIGGER issue62_refuse_cosign ON coin_owner;
 			DROP FUNCTION issue62_refuse_cosign(); DROP SEQUENCE issue62_claim_verifications;").await?;
 		Ok(())
 	}).await.unwrap();
@@ -247,14 +221,14 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 		let view=tx.expiry_view().await?.unwrap();
 		assert_eq!(view.height,expiry_tip);
 		assert!((tx.expiry_view().await? == Some(view)));
-		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_entitlement WHERE vtxo_id=ANY($1)",
+		assert_eq!(tx.query_one("SELECT COUNT(DISTINCT vtxo_id) FROM expiry_allocation_coin WHERE vtxo_id=ANY($1)",
 			&[&grant_ids]).await?.get::<_, i64>(0),0,"no fallback decision may replace this controlled cooperative tail");
 		let same_hash=tx.query("SELECT v.vtxo_id FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE h.payment_hash=$1",
 			&[&hash.to_string()]).await?.into_iter().map(|row|row.get::<_,String>(0)).collect::<Vec<_>>();
 		assert_eq!(tx.query_one("SELECT COUNT(*) FROM vtxo WHERE vtxo_id=ANY($1) AND onchain_spent_txid IS NOT NULL",
 			&[&same_hash]).await?.get::<_, i64>(0),0);
 		assert_eq!(tx.query_one("SELECT COUNT(*) FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND a.broadcast_at IS NOT NULL",
+			WHERE c.vtxo_id=ANY($1) AND a.broadcast_at IS NOT NULL",
 			&[&same_hash]).await?.get::<_,i64>(0),0);
 		Ok(())
 	}).await.unwrap();
@@ -262,15 +236,11 @@ async fn succeeded_receive_survives_crash_before_subscription_and_cosign_commit(
 	srv.wait_for_sync_height(expiry_tip).await;
 	assert_ne!(srv.native_child().await.unwrap(),old_child);
 	let (guard_tx,mut guard_rx) = tokio::sync::mpsc::unbounded_channel();
-	let expected_guard = format!("source settlement does not permit failure of payment attempt {}",attempt.id);
-	let subscription_id=sub.id;
-	let hash_string=hash.to_string();
+	let expected_guard = "the payment funding this receive succeeded, refusing to cancel it";
 	srv.add_stdout_handler(move |line:&str| {
 		if let Ok(record) = server_log::parse_record(line) {
-			if record.message == "Hold invoice timeout handling failed; will retry independently"
-				&& record.extra.get("subscription_id").and_then(|v|v.as_i64()) == Some(subscription_id)
-				&& record.extra.get("payment_hash").and_then(|v|v.as_str()) == Some(hash_string.as_str())
-				&& record.extra.get("error").and_then(|v|v.as_str()).is_some_and(|error|error.contains(&expected_guard)) {
+			if record.message.starts_with("htlc subscription processing failed:")
+				&& record.message.contains(expected_guard) {
 				let _ = guard_tx.send(()); return true;
 			}
 		}

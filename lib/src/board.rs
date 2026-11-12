@@ -25,6 +25,7 @@ use crate::error::IncorrectSigningKeyError;
 use crate::{musig, scripts, SECP};
 use crate::tree::signed::cosign_taproot;
 use crate::vtxo::{self, Full, Vtxo, VtxoId, VtxoPolicy, ServerVtxo, ServerVtxoPolicy, GenesisItem, GenesisTransition};
+use crate::vtxo::policy::{check_block_delta, check_block_height, PolicyError};
 
 use self::state::BuilderState;
 
@@ -39,6 +40,19 @@ struct ExitData {
 	funding_taproot: TaprootSpendInfo,
 	tx: Transaction,
 	txid: Txid,
+}
+
+fn funding_vtxo(
+	user_pubkey: PublicKey, server_pubkey: PublicKey, expiry_height: BlockHeight,
+	exit_delta: BlockDelta, amount: Amount, utxo: OutPoint,
+) -> ServerVtxo<Full> {
+	let combined_pubkey = musig::combine_keys([user_pubkey, server_pubkey])
+		.x_only_public_key().0;
+	Vtxo {
+		policy: ServerVtxoPolicy::new_expiry(combined_pubkey), amount,
+		expiry_height, server_pubkey, exit_delta,
+		anchor_point: utxo, point: utxo, genesis: Full { items: vec![] },
+	}
 }
 
 fn compute_exit_data(
@@ -239,8 +253,10 @@ impl BoardBuilder<state::Preparing> {
 		expiry_height: BlockHeight,
 		server_pubkey: PublicKey,
 		exit_delta: BlockDelta,
-	) -> BoardBuilder<state::Preparing> {
-		BoardBuilder {
+	) -> Result<BoardBuilder<state::Preparing>, PolicyError> {
+		check_block_height(expiry_height)?;
+		check_block_delta(exit_delta)?;
+		Ok(BoardBuilder {
 			user_pubkey, expiry_height, server_pubkey, exit_delta,
 			amount: None,
 			utxo: None,
@@ -250,7 +266,7 @@ impl BoardBuilder<state::Preparing> {
 			exit_data: None,
 			signed_vtxo: None,
 			_state: PhantomData,
-		}
+		})
 	}
 
 	/// Set the UTXO where the board will be funded, the total board amount and the fee to be
@@ -329,6 +345,12 @@ impl<S: state::CanSign> BoardBuilder<S> {
 }
 
 impl BoardBuilder<state::ServerCanCosign> {
+	/// The funding root to track before the holder uploads its signed exit.
+	pub fn funding_vtxo(&self) -> ServerVtxo<Full> {
+		funding_vtxo(self.user_pubkey, self.server_pubkey, self.expiry_height,
+			self.exit_delta, self.amount.expect("state invariant"), self.utxo.expect("state invariant"))
+	}
+
 	/// This constructor is to be used by the server with the information provided
 	/// by the user.
 	pub fn new_for_cosign(
@@ -477,22 +499,11 @@ impl BoardBuilder<state::ServerCanBuildVtxos> {
 	/// 1. An expiry VTXO with empty genesis (for server tracking)
 	/// 2. The validated output VTXO
 	pub fn build_server_vtxos(&self) -> Vec<ServerVtxo<Full>> {
-		let combined_pubkey = musig::combine_keys([self.user_pubkey, self.server_pubkey])
-			.x_only_public_key().0;
-
 		let vtxo = self.signed_vtxo.as_ref().expect("state invariant").clone();
 
 		vec![
-			Vtxo {
-				policy: ServerVtxoPolicy::new_expiry(combined_pubkey),
-				amount: self.amount.expect("state invariant"),
-				expiry_height: self.expiry_height,
-				server_pubkey: self.server_pubkey,
-				exit_delta: self.exit_delta,
-				anchor_point: self.utxo.expect("state invariant"),
-				genesis: Full { items: vec![] },
-				point: self.utxo.expect("state invariant"),
-			},
+			funding_vtxo(self.user_pubkey, self.server_pubkey, self.expiry_height,
+				self.exit_delta, self.amount.expect("state invariant"), self.utxo.expect("state invariant")),
 			ServerVtxo::from(vtxo),
 		]
 	}
@@ -624,7 +635,7 @@ mod test {
 		let exit_delta = BlockDelta::new(24);
 		let builder = BoardBuilder::new(
 			user_key.public_key(), expiry, server_pubkey, exit_delta,
-		);
+		).unwrap();
 		let funding_tx = Transaction {
 			version: transaction::Version::TWO,
 			lock_time: absolute::LockTime::ZERO,
@@ -656,6 +667,25 @@ mod test {
 	}
 
 	/// Helper to create a valid vtxo and funding tx for testing new_from_vtxo
+	#[test]
+	fn new_refuses_heights_and_deltas_a_policy_doesnt_accept() {
+		let user = Keypair::from_str("5255d132d6ec7d4fc2a41c8f0018bb14343489ddd0344025cc60c7aa2b3fda6a").unwrap();
+		let server = Keypair::from_str("1fb316e653eec61de11c6b794636d230379509389215df1ceb520b65313e5426").unwrap();
+		let new = |expiry: u32, exit_delta: u16| BoardBuilder::new(
+			user.public_key(), BlockHeight::new(expiry), server.public_key(), BlockDelta::new(exit_delta),
+		);
+
+		let max_height = crate::vtxo::policy::MAX_BLOCK_HEIGHT.to_u32();
+		let max_delta = crate::vtxo::policy::MAX_BLOCK_DELTA.to_u16();
+		new(max_height, max_delta).unwrap().funding_script_pubkey();
+
+		// From LOCK_TIME_THRESHOLD on, bitcoin reads a locktime as a unix time.
+		for expiry in [max_height + 1, absolute::LOCK_TIME_THRESHOLD, u32::MAX] {
+			assert!(new(expiry, 24).is_err(), "{expiry}");
+		}
+		assert!(new(100_000, max_delta + 1).is_err());
+	}
+
 	fn create_board_vtxo() -> (Vtxo<Full>, Transaction, Keypair, Keypair) {
 		let user_key = Keypair::from_str("5255d132d6ec7d4fc2a41c8f0018bb14343489ddd0344025cc60c7aa2b3fda6a").unwrap();
 		let server_key = Keypair::from_str("1fb316e653eec61de11c6b794636d230379509389215df1ceb520b65313e5426").unwrap();
@@ -668,7 +698,7 @@ mod test {
 
 		let builder = BoardBuilder::new(
 			user_key.public_key(), expiry, server_pubkey, exit_delta,
-		);
+		).unwrap();
 		let funding_tx = Transaction {
 			version: transaction::Version::TWO,
 			lock_time: absolute::LockTime::ZERO,
@@ -830,7 +860,7 @@ mod test {
 			let exit_delta = BlockDelta::new(24);
 			let builder = BoardBuilder::new(
 				user_key.public_key(), expiry, server_pubkey, exit_delta,
-			);
+			).unwrap();
 			let funding_tx = Transaction {
 				version: transaction::Version::TWO,
 				lock_time: absolute::LockTime::ZERO,

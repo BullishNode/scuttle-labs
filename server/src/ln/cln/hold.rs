@@ -46,7 +46,9 @@ use crate::database;
 use crate::database::block::BlockTable;
 use crate::database::htlc_vtxo;
 use crate::database::hold::{self as hold_db, HoldTransition};
-use crate::database::ln::{LightningNodeId, LightningHtlcSubscription, LightningHtlcSubscriptionStatus, LightningPaymentStatus};
+use crate::database::ln::{
+	LightningNodeId, LightningHtlcSubscription, LightningHtlcSubscriptionStatus, LightningPaymentStatus,
+};
 use crate::ln::guard::{PaymentGuard, PaymentGuards};
 use crate::ln::htlc_recvs_expired;
 use crate::ln::node_manager::post_lightning_receive_notification;
@@ -82,7 +84,7 @@ async fn fetch_accepted_payment_hashes(
 			hold::list_request::PaymentHashes { payment_hashes },
 		)),
 	};
-	let res = super::unary_rpc(hold_client.list(req)).await?.into_inner();
+	let res = hold_client.list(req).await?.into_inner();
 
 	let mut accepted = HashSet::new();
 	for inv in &res.invoices {
@@ -256,20 +258,18 @@ impl ClnHoldProcess {
 
 		let tip = self.sync_manager.chain_tip().height;
 		for htlc_subscription in htlc_subscriptions {
-			let result = async {
-				let Some(reason) = self.cancel_reason(&htlc_subscription, tip).await? else { return Ok(()); };
-				let Some(_guard) = self.try_lock_subscription(&htlc_subscription).await? else { return Ok(()); };
-				self.cancel_invoice_and_htlc_subscription(
-					&mut hold_client,
-					htlc_subscription.invoice.payment_hash(),
-					&htlc_subscription,
-					reason,
-				).await
-			}.await;
-			if let Err(error) = result {
-				error!(subscription_id = htlc_subscription.id, payment_hash = %htlc_subscription.payment_hash,
-					error = %format!("{error:#}"), "Hold invoice timeout handling failed; will retry independently");
-			}
+			let Some(reason) = self.cancel_reason(&htlc_subscription, tip).await? else {
+				continue;
+			};
+			let Some(_guard) = self.try_lock_subscription(&htlc_subscription).await? else {
+				continue;
+			};
+			self.cancel_invoice_and_htlc_subscription(
+				&mut hold_client,
+				htlc_subscription.invoice.payment_hash(),
+				&htlc_subscription,
+				reason,
+			).await?;
 		}
 
 		Ok(())
@@ -309,7 +309,12 @@ impl ClnHoldProcess {
 					let watchman_tip = t.get_highest_block(BlockTable::Watchmand).await?.map(|b| b.height);
 					Ok((htlc_vtxos, watchman_tip))
 				}).await?;
-				if htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip) {
+				let expired = if self.db.expiry_payouts() {
+					htlc_vtxo::payout_htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip)
+				} else {
+					htlc_recvs_expired(&htlc_vtxos, tip, watchman_tip)
+				};
+				if expired {
 					return Ok(Some("htlc-recv vtxos expired"));
 				}
 
@@ -374,7 +379,7 @@ impl ClnHoldProcess {
 				payment_hash.to_byte_array().to_vec(),
 			)),
 		};
-		let res = super::unary_rpc(hold_client.list(req)).await?.into_inner();
+		let res = hold_client.list(req).await?.into_inner();
 
 		let accepted_invoice = match res.invoices.iter().find(|i| i.state == InvoiceState::Accepted as i32) {
 			Some(invoice) => invoice,
@@ -436,15 +441,21 @@ impl ClnHoldProcess {
 			.map(|h| h.msat)
 			.sum();
 
-		let (status, expiry) = if lowest_incoming_htlc_expiry >= required_min_htlc_expiry {
-			debug!("Lightning htlc subscription ({}) was accepted.", htlc_subscription.id);
-			(LightningHtlcSubscriptionStatus::Accepted, Some(lowest_incoming_htlc_expiry))
-		} else {
-			debug!("Incoming HTLC expiry height ({}) for subscription doesn't fit. required {}, actual {}",
+		if lowest_incoming_htlc_expiry < required_min_htlc_expiry {
+			debug!("Incoming HTLC expiry height for subscription ({}) doesn't fit. required {}, actual {}",
 				htlc_subscription.id, required_min_htlc_expiry, lowest_incoming_htlc_expiry
 			);
-			(LightningHtlcSubscriptionStatus::Canceled, None)
-		};
+			// Fail the held HTLCs too, or they block the channel until they expire.
+			self.cancel_invoice_and_htlc_subscription(
+				&mut hold_client,
+				htlc_subscription.invoice.payment_hash(),
+				htlc_subscription,
+				"incoming HTLC expiry too close",
+			).await?;
+			return Ok(false);
+		}
+		debug!("Lightning htlc subscription ({}) was accepted.", htlc_subscription.id);
+		let (status, expiry) = (LightningHtlcSubscriptionStatus::Accepted, Some(lowest_incoming_htlc_expiry));
 
 		// The `Created` check at the top of this function ran before the hold
 		// RPCs above, so guard the transition on it here too: a subscription
@@ -457,11 +468,7 @@ impl ClnHoldProcess {
 				Some(LightningHtlcSubscriptionStatus::Created),
 			).await?;
 			// The hold invoice row copies what the plugin reports, in the same
-			// transaction: the node is holding these HTLCs. That is so even
-			// when the subscription is canceled for an expiry that does not
-			// fit: nothing cancels the invoice on the node then, and the HTLCs
-			// stay held until the payer times them out, which the plugin
-			// reports as unpaid.
+			// transaction: the node is holding these HTLCs.
 			if applied {
 				let hold_transition = HoldTransition::Accepted {
 					amount_msat: accepted_amount_msat,
@@ -607,9 +614,9 @@ impl ClnHoldProcess {
 		htlc_subscription: &LightningHtlcSubscription,
 		reason: &str,
 	) -> anyhow::Result<()> {
-		super::unary_rpc(hold_client.cancel(hold::CancelRequest {
+		hold_client.cancel(hold::CancelRequest {
 			payment_hash: payment_hash.to_byte_array().to_vec(),
-		})).await?;
+		}).await?;
 
 		slog!(LightningReceiveCanceled,
 			payment_hash: htlc_subscription.payment_hash,
@@ -621,28 +628,24 @@ impl ClnHoldProcess {
 		// settlement, and its payment attempt is left alone.
 		let node_id = self.node_id;
 		let hash = PaymentHash::from(*payment_hash);
-		let (canceled, payment_attempt) = self.db.write(async |t| {
-			t.lock_settlement_sources(hash).await?;
-			t.lock_htlc_settlements().await?;
-			// Select only this receive's actual intra-Ark funding attempt;
-			// an unrelated same-hash external attempt is never canceled here.
-			let attempt = t.get_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await?;
-			if let Some(attempt) = &attempt {
-				ensure!(attempt.payment_hash == hash, "linked payment attempt has a different receive hash");
-				t.ensure_attempt_sources_allow_failure(attempt).await?;
-				ensure!(attempt.status != LightningPaymentStatus::Succeeded,
-					"succeeded funding attempt cannot cancel its receive");
+		let canceled = self.db.write(async |t| {
+			// A receive whose intra-Ark payment went through is owed to the
+			// receiver: canceling it would keep the sender's coins and the
+			// receiver's grant both.
+			if t.expiry_payouts() {
+				let attempt = t.get_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await?;
+				if let Some(attempt) = attempt {
+					ensure!(attempt.status != LightningPaymentStatus::Succeeded,
+						"the payment funding this receive succeeded, refusing to cancel it");
+					t.ensure_not_settled(hash).await?;
+				}
 			}
-			// Terminal funding still protects the receive; only open attempts
-			// can be failed and notified below.
-			let attempt = attempt.filter(|attempt| !attempt.status.is_final());
 			let canceled = t.store_lightning_htlc_subscription_status(
 				htlc_subscription.id,
 				LightningHtlcSubscriptionStatus::Canceled,
 				None,
 				Some(htlc_subscription.status),
 			).await?;
-			if !canceled { return Ok((false, None)); }
 			// The plugin no longer serves the invoice; its row says so too.
 			if canceled {
 				let mirrored = hold_db::transition_open_hold(
@@ -654,11 +657,7 @@ impl ClnHoldProcess {
 					);
 				}
 			}
-			if let Some(attempt) = &attempt {
-				let updated = PaymentAttemptHandler::fail_attempt_in_tx(t, attempt, Some(reason)).await?;
-				ensure!(updated.is_some(), "linked payment attempt changed during subscription cancellation");
-			}
-			Ok((true, attempt))
+			Ok(canceled)
 		}).await?;
 		if !canceled {
 			debug!("Lightning htlc subscription ({}) left {} before it could be \
@@ -668,13 +667,21 @@ impl ClnHoldProcess {
 			return Ok(());
 		}
 
-		// Notify the committed failure of this receive's intra-Ark payment.
-		// An unrelated outgoing payment sharing the hash is left alone.
+		// Wake check_lightning_receive so the client sees the cancel.
+		let _ = self.payment_update_tx.send(hash);
+
+		// Fail the intra-Ark self-payment initiated against this
+		// subscription, if any. An unrelated outgoing payment that merely
+		// shares the payment hash is not a self-payment and must be left
+		// alone.
+		let payment_attempt = self.db.read(async |t|
+			t.get_open_lightning_payment_attempt_by_subscription_id(htlc_subscription.id).await
+		).await?;
 		if let Some(payment_attempt) = payment_attempt {
 			debug!("HTLC subscription canceled with ongoing payment attempt, \
-				marked as failed: {}", payment_attempt.id,
+				marking as failed: {}", payment_attempt.id,
 			);
-			self.payment_handler().notify_payment_failed(&payment_attempt, Some(reason)).await?;
+			self.payment_handler().fail_payment_attempt(&payment_attempt, Some(reason)).await?;
 		} else {
 			telemetry::add_lightning_payment(
 				htlc_subscription.lightning_node_id,

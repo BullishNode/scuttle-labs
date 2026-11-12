@@ -25,8 +25,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
- "cipher",
+ "cipher 0.4.4",
  "cpufeatures 0.2.17",
+]
+
+[[package]]
+name = "aes"
+version = "0.9.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc0fc36d7440d015b45468ba08a21e80e056ebbd014c611c6298bb7503e04bd1"
+dependencies = [
+ "cipher 0.5.2",
+ "cpubits",
+ "cpufeatures 0.3.0",
 ]
 
 [[package]]
@@ -117,7 +128,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "ark-lib"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "bark-bitcoin-ext",
@@ -187,6 +198,7 @@ dependencies = [
  "tower-http 0.5.2",
  "uuid",
  "which",
+ "zeromq",
 ]
 
 [[package]]
@@ -409,7 +421,7 @@ dependencies = [
 
 [[package]]
 name = "bark-bitcoin-ext"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -431,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "bark-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -468,7 +480,7 @@ dependencies = [
 
 [[package]]
 name = "bark-cln-rpc"
-version = "0.7.1+cln.26.06.7-hold"
+version = "0.8.0+cln.26.06.10-hold.efc7d5f"
 dependencies = [
  "ark-lib",
  "bitcoin",
@@ -480,7 +492,7 @@ dependencies = [
 
 [[package]]
 name = "bark-common"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -490,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "bark-json"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -527,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "bark-rest"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -556,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "bark-rest-client"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "bark-json",
  "bark-rest",
@@ -571,7 +583,7 @@ dependencies = [
 
 [[package]]
 name = "bark-runtime"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "futures",
  "gloo-timers",
@@ -584,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "bark-server"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -651,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "bark-server-log"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ark-lib",
  "bark-bitcoin-ext",
@@ -672,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "bark-server-rpc"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "ark-lib",
  "bitcoin",
@@ -683,7 +695,6 @@ dependencies = [
  "log",
  "prost 0.14.3",
  "prost-types",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tonic 0.14.6",
@@ -694,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "bark-wallet"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "ark-lib",
@@ -774,6 +785,12 @@ name = "base64"
 version = "0.22.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "bb8"
@@ -916,7 +933,6 @@ dependencies = [
 name = "bip321"
 version = "0.4.0"
 dependencies = [
- "bark-bitcoin-ext",
  "bitcoin",
  "lightning",
  "lightning-invoice",
@@ -1127,6 +1143,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "btreecap"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,7 +1187,16 @@ version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "26b52a9543ae338f279b96b0b9fed9c8093744685043739079ce85cd58f289a6"
 dependencies = [
- "cipher",
+ "cipher 0.4.4",
+]
+
+[[package]]
+name = "cbc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
+dependencies = [
+ "cipher 0.5.2",
 ]
 
 [[package]]
@@ -1205,7 +1239,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3613f74bd2eac03dad61bd53dbe620703d4371614fe0bc3b9f04dd36fe4e818"
 dependencies = [
  "cfg-if",
- "cipher",
+ "cipher 0.4.4",
  "cpufeatures 0.2.17",
 ]
 
@@ -1228,7 +1262,7 @@ checksum = "10cd79432192d1c0f4e1a0fef9527696cc039165d729fb41b3f4f4f354c2dc35"
 dependencies = [
  "aead",
  "chacha20 0.9.1",
- "cipher",
+ "cipher 0.4.4",
  "poly1305",
  "zeroize",
 ]
@@ -1254,8 +1288,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773f3b9af64447d2ce9850330c473515014aa235e6a783b02db81ff39e4a3dad"
 dependencies = [
  "crypto-common 0.1.7",
- "inout",
+ "inout 0.1.4",
  "zeroize",
+]
+
+[[package]]
+name = "cipher"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
+dependencies = [
+ "crypto-common 0.2.2",
+ "inout 0.2.6",
 ]
 
 [[package]]
@@ -1514,6 +1558,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpubits"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1597,9 +1647,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-common"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77727bb15fa921304124b128af125e7e3b968275d1b108b379190264f4423710"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
 dependencies = [
  "hybrid-array",
 ]
@@ -1733,7 +1783,7 @@ checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.0",
  "const-oid",
- "crypto-common 0.2.1",
+ "crypto-common 0.2.2",
  "ctutils",
 ]
 
@@ -1804,9 +1854,9 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "email_address"
-version = "0.2.5"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1019fa28f600f5b581b7a603d515c3f1635da041ca211b5055804788673abfe"
+checksum = "e079f19b08ca6239f47f8ba8509c11cf3ea30095831f7fed61441475edd8c449"
 dependencies = [
  "serde",
 ]
@@ -2778,8 +2828,18 @@ version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "879f10e63c20629ecabbb64a8010319738c66a5cd0c29b02d63d272b03751d01"
 dependencies = [
- "block-padding",
+ "block-padding 0.3.3",
  "generic-array",
+]
+
+[[package]]
+name = "inout"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a580c13f0ffc335ef42dd3f6b1a41b726051c5e1656d9a3aa6fddb3c5dfbbf9"
+dependencies = [
+ "block-padding 0.4.2",
+ "hybrid-array",
 ]
 
 [[package]]
@@ -3107,16 +3167,16 @@ checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
 name = "lnurl-rs"
-version = "0.10.0"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73a989342d2e9381c85d381898c3a925bad930958acd480fe0221f680c7856eb"
+checksum = "4d842692ab4fcac4dbcc267854814b03a7d3051d82e8d6bd1d7458eb3fa142d9"
 dependencies = [
- "aes",
+ "aes 0.9.4",
  "anyhow",
- "base64 0.22.1",
- "bech32 0.11.1",
+ "base64 0.23.1",
+ "bech32 0.12.0",
  "bitcoin",
- "cbc",
+ "cbc 0.2.1",
  "email_address",
  "reqwest 0.12.28",
  "serde",
@@ -3336,16 +3396,16 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.45.5"
+version = "0.45.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38ca5c25a6df8d4d78fdf39b42792438f6ce22b4809ccbfdb27582ed9ca45407"
+checksum = "b7a55567533eb00df5a6e2855f229e2092f593ab67c97aff7521fdfe55cf0383"
 dependencies = [
- "aes",
+ "aes 0.8.4",
  "base64 0.22.1",
  "bech32 0.12.0",
  "bip39",
  "bitcoin_hashes 1.2.0",
- "cbc",
+ "cbc 0.1.2",
  "chacha20 0.9.1",
  "chacha20poly1305",
  "faster-hex",
@@ -3394,9 +3454,9 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.45.5"
+version = "0.45.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f01e3d4fc102ddbb1cf0098a8257046aaeb24ec168bb4298f0274084a152faf7"
+checksum = "6241efa2469244b0c40ad9b32172d07e363a537cb822d3d5ba8c3a78e2829746"
 dependencies = [
  "async-utility",
  "async-wsocket",

@@ -10,6 +10,7 @@ use ark::fees::{
 	BoardFees, FeeSchedule, LightningReceiveFees, LightningSendFees, OffboardFees, PpmFeeRate,
 	RefreshFees,
 };
+use anyhow::Context;
 use bitcoin::{Amount, FeeRate, Network, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Txid, Witness};
 use bitcoin::absolute::LockTime;
 use bitcoin::transaction::Version;
@@ -34,7 +35,7 @@ use crate::daemon::captaind::proxy::ArkRpcProxyServer;
 use crate::ports::pick_port;
 use crate::postgres::{self, PostgresDatabaseManager};
 use crate::util::{
-	get_bark_chain_source_from_env, get_cargo_workspace, get_tx_propagation_timeout_millis,
+	FutureExt, get_bark_chain_source_from_env, get_cargo_workspace, get_tx_propagation_timeout_millis,
 	test_data_directory, poll_interval, TestContextChainSource,
 };
 use crate::{
@@ -431,6 +432,7 @@ impl TestContext {
 			// this one can be long cuz in most tests all users are ready and we don't wait
 			round_sign_time: Duration::from_millis(5000),
 			nb_round_nonces: 8,
+			max_round_participation_outputs: 4,
 			round_forfeit_nonces_timeout: Duration::from_secs(30),
 			required_board_confirmations: constants::BOARD_CONFIRMATIONS as usize,
 			min_trusted_confs: 1,
@@ -508,10 +510,11 @@ impl TestContext {
 			receive_htlc_forward_timeout: Duration::from_secs(30),
 			min_board_amount: Amount::from_sat(20_000),
 			ln_receive_anti_dos_required: false,
+			ln_receive_ark_address_hints: false,
 			round_status_attestation_required: false,
 			forfeit_attestation_required: false,
 			ln_max_fee_ppm: 900_000,
-			max_read_mailbox_items: 8,
+			max_read_mailbox_items: 100,
 			recovery_xpub_nb_keys: 100_000,
 			max_concurrent_xpub_recoveries: 1,
 			fees: FeeSchedule {
@@ -522,7 +525,7 @@ impl TestContext {
 				},
 				offboard: OffboardFees {
 					base_fee: Amount::ZERO,
-				fixed_additional_vb: 221,
+					fixed_additional_vb: 100,
 					ppm_expiry_table: vec![],
 				},
 				refresh: RefreshFees {
@@ -541,7 +544,6 @@ impl TestContext {
 			},
 			bitcoin_address_blocklist: None,
 			bitcoin_address_blocklist_refresh_interval: None,
-			require_board_funding_tx: true,
 			round_legacy_hashlock_clauses: false,
 		}
 	}
@@ -641,6 +643,7 @@ impl TestContext {
 		#[allow(deprecated)]
 		bark::Config {
 			server_address: srv.ark_url(),
+			require_scuttle_payouts: false,
 			server_access_token: None,
 			user_agent: None,
 			esplora_address: if bitcoind.is_none() {
@@ -667,6 +670,7 @@ impl TestContext {
 			daemon_manual_sync: false,
 			change_vtxo_split_factor: 2,
 			vtxo_key_gap_limit: bark::DEFAULT_VTXO_KEY_GAP_LIMIT,
+			lightning_ark_address_hints: false,
 		}
 	}
 
@@ -864,6 +868,84 @@ impl TestContext {
 	/// Generated a block using the central bitcoind without waiting for propagation
 	pub async fn generate_blocks_unsynced(&self, block_num: u32) {
 		self.bitcoind().generate(block_num).await;
+	}
+
+	/// Boards each amount from the onchain funds of `wallet`, confirms the boards and waits
+	/// until they are registered. Returns the new vtxos in the order of `amounts`.
+	pub async fn board(&self, wallet: &bark::Wallet, amounts: &[Amount]) -> Vec<bark::WalletVtxo> {
+		self.try_board(wallet, amounts).await.expect("boarding failed")
+	}
+
+	/// Like [Self::board], but returns the error when a board fails.
+	pub async fn try_board(
+		&self,
+		wallet: &bark::Wallet,
+		amounts: &[Amount],
+	) -> anyhow::Result<Vec<bark::WalletVtxo>> {
+		// Subscribe before issuing so we can watch each board's terminal
+		// transition. Match on the specific `movement_id` each board
+		// returned so we don't count an unrelated Board movement's
+		// notification as one of ours.
+		let mut movements = wallet.subscribe_notifications().movements();
+
+		let mut pending = std::collections::HashSet::new();
+		let mut vtxo_ids = Vec::with_capacity(amounts.len());
+		for amount in amounts {
+			let b = wallet.board_amount(*amount).await.context("board_amount")?;
+			self.await_transaction(b.funding_tx.compute_txid()).await;
+			pending.insert(b.movement_id);
+			vtxo_ids.extend(b.vtxos);
+		}
+		self.bitcoind().generate(crate::constants::BOARD_CONFIRMATIONS).await;
+		self.await_block_count_sync().await;
+
+		wallet.sync().await;
+
+		// One deadline for the whole wait — a per-`next()` timeout would
+		// be reset by unrelated movements and never fire.
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+		while !pending.is_empty() {
+			let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+			let m = futures::StreamExt::next(&mut movements)
+				.try_wait(remaining).await
+				.context("boards did not all complete before deadline")?
+				.context("wallet notification stream ended before all boards completed")?;
+			if !pending.contains(&m.id) {
+				continue;
+			}
+			match m.status {
+				bark::movement::MovementStatus::Pending => continue,
+				bark::movement::MovementStatus::Successful => { pending.remove(&m.id); },
+				other => anyhow::bail!("board movement {} entered terminal status {:?}", m.id, other),
+			}
+		}
+
+		let mut vtxos = Vec::with_capacity(vtxo_ids.len());
+		for id in vtxo_ids {
+			vtxos.push(wallet.get_vtxo_by_id(id).await.context("boarded vtxo")?);
+		}
+		Ok(vtxos)
+	}
+
+	/// Mines one block that holds exactly `txs`, so they need no fee. Returns the new tip.
+	pub async fn mine<'a>(&self, txs: impl IntoIterator<Item = &'a Transaction>) -> BlockHeight {
+		self.try_mine(txs).await.expect("bitcoind refused the block")
+	}
+
+	/// Like [Self::mine], but returns bitcoind's error when it refuses the block.
+	pub async fn try_mine<'a>(
+		&self,
+		txs: impl IntoIterator<Item = &'a Transaction>,
+	) -> anyhow::Result<BlockHeight> {
+		let txs = txs.into_iter()
+			.map(|tx| serde_json::Value::from(bitcoin::consensus::encode::serialize_hex(tx)))
+			.collect::<Vec<_>>();
+		let miner = crate::daemon::bitcoind::RANDOM_ADDR.to_string();
+		self.bitcoind().async_client().call_raw::<serde_json::Value>(
+			"generateblock", &[miner.into(), txs.into()],
+		).await.map_err(|e| anyhow::anyhow!("generateblock failed: {e:#}"))?;
+		let height = self.bitcoind().get_block_count().await;
+		Ok(BlockHeight::new(u32::try_from(height).expect("block height fits in u32")))
 	}
 
 	/// Broadcast a zero-fee parent transaction using CPFP via its P2A anchor.

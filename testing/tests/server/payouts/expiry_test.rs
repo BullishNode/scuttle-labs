@@ -14,7 +14,6 @@ use bark::Wallet;
 use bark::vtxo::VtxoState;
 use bitcoin::{Amount, BlockHash, OutPoint, ScriptBuf, Transaction, Txid, TxOut};
 use bitcoin::consensus::deserialize;
-use bitcoin::hex::DisplayHex;
 use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
 use bitcoin_ext::rpc::{BitcoinRpcExt, RpcApi};
 use server::database::Db;
@@ -86,6 +85,7 @@ pub(super) struct ExpectedLeaf {
 	pub(super) script: ScriptBuf,
 	pub(super) fee: u64,
 	pub(super) payout: u64,
+	pub(super) subsidy: u64,
 	pub(super) forfeited: u64,
 	pub(super) group_payout: u64,
 }
@@ -103,10 +103,10 @@ pub(super) async fn confirm_epoch(
 	let core = ctx.bitcoind().sync_client();
 	let rows = tokio::time::timeout(Duration::from_secs(40), async {
 		for _ in 0..20 {
-			let rows = db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
-				c.forfeited_sat,c.spk,c.owner_mailbox,c.user_pubkey,a.id,a.sweep_tx,a.sweep_txid \
-				FROM expiry_entitlement e JOIN expiry_allocation_coin c ON c.entitlement_id=e.id \
-				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=ANY($1) \
+			let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
+				c.subsidy_sat,c.forfeited_sat,c.owner_mailbox,a.id,a.sweep_tx,a.sweep_txid \
+				FROM expiry_allocation_coin c \
+				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=ANY($1) \
 				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids],
 			).await?)).await.unwrap();
 			assert!(rows.len() <= leaves.len());
@@ -131,10 +131,10 @@ pub(super) async fn confirm_epoch(
 		assert_eq!(row.get::<_, i64>("gross_sat"), leaf.coin.amount().to_sat() as i64);
 		assert_eq!(row.get::<_, i64>("fee_sat"), leaf.fee as i64);
 		assert_eq!(row.get::<_, i64>("payout_sat"), leaf.payout as i64);
+		assert_eq!(row.get::<_, i64>("subsidy_sat"), leaf.subsidy as i64);
 		assert_eq!(row.get::<_, i64>("forfeited_sat"), leaf.forfeited as i64);
-		assert_eq!(row.get::<_, String>("spk"), leaf.script.as_bytes().to_lower_hex_string());
 		assert_eq!(row.get::<_, String>("owner_mailbox"), leaf.mailbox.as_pubkey().to_string());
-		assert_eq!(row.get::<_, String>("user_pubkey"), leaf.coin.user_pubkey().to_string());
+		assert_eq!(ark::fallback::payout_script(leaf.mailbox.as_pubkey()), leaf.script);
 		let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
 		let txid = parent.compute_txid();
 		assert_eq!(row.get::<_, String>("sweep_txid"), txid.to_string());
@@ -150,8 +150,8 @@ pub(super) async fn confirm_epoch(
 		assert!(parent.input.iter().any(|input| path.contains(&input.previous_output)
 			&& input.witness.taproot_leaf_script().is_some_and(|script|
 				script.version == bitcoin::taproot::LeafVersion::TapScript && script.script == clause.as_script())));
-		// A real dust allocation has NO payout association. Never replace
-		// this LEFT JOIN by an inner join which silently drops the dust leaf.
+		// A zero-net allocation has no output; a positive subdust remainder
+		// gets a standard owner output with an explicit operator subsidy.
 		let index = parent.output.iter().position(|output| output.script_pubkey == leaf.script)
 			.map(|index| u32::try_from(index).unwrap());
 		if leaf.payout == 0 {
@@ -165,26 +165,12 @@ pub(super) async fn confirm_epoch(
 		result.parents.insert(txid, parent);
 	}
 	for (txid, parent) in &result.parents {
-		assert_eq!(parent.version.0, 3);
-		assert_eq!(actual_fee(ctx, parent).await, Amount::ZERO);
+		assert_eq!(parent.version.0, 2);
+		assert!(actual_fee(ctx, parent).await > Amount::ZERO);
 		let hash = result.hashes[txid];
 		let block = core.get_block(&hash).unwrap();
 		assert!(block.txdata.iter().any(|transaction| transaction == parent));
-		let anchors = parent.output.iter().enumerate().filter(|(_, output)| output.is_p2a_fee_anchor())
-			.map(|(vout, _)| OutPoint::new(*txid, vout as u32)).collect::<Vec<_>>();
-		assert_eq!(anchors.len(), 1);
-		let children = block.txdata.iter().filter(|transaction| transaction.input.iter()
-			.any(|input| input.previous_output == anchors[0])).collect::<Vec<_>>();
-		assert_eq!(children.len(), 1);
-		let child = children[0];
-		assert_eq!(child.version.0, 3);
-		let info = core.custom_get_raw_transaction_info(child.compute_txid(), None).unwrap().unwrap();
-		assert_eq!(info.blockhash, Some(hash));
-		assert!(info.confirmations.unwrap_or(0) >= 6);
-		let fee = actual_fee(ctx, child).await;
-		assert!(fee > Amount::ZERO);
-
-		result.children.insert(child.compute_txid(), child.clone());
+		assert!(parent.output.iter().all(|output| !output.is_p2a_fee_anchor()));
 	}
 	assert!(ctx.bitcoind().get_block_count().await - start <= final_budget);
 	result
@@ -192,7 +178,7 @@ pub(super) async fn confirm_epoch(
 
 pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch) -> Option<OutPoint> {
 	let point = epoch.outputs[&leaf.coin.id()];
-	assert_eq!(leaf.coin.amount(), sat(leaf.fee + leaf.payout + leaf.forfeited));
+	assert_eq!(leaf.coin.amount() + sat(leaf.subsidy), sat(leaf.fee + leaf.payout + leaf.forfeited));
 	if let Some(point) = point {
 		let parent = &epoch.parents[&point.txid];
 		let output = &parent.output[point.vout as usize];
@@ -203,23 +189,33 @@ pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch)
 	} else {
 		assert_eq!(leaf.group_payout, 0);
 		assert!(epoch.parents.values().all(|parent| parent.output.iter().all(|out| out.script_pubkey != leaf.script)));
+		// The fee consumed the coin, so its confirmed decision is a forfeiture.
+		assert_eq!(wallet.get_vtxo_by_id(leaf.coin.id()).await.unwrap().fallback_status,
+			Some(bark::vtxo::FallbackStatus::Forfeited));
+		let payout = wallet.fallback_payout(leaf.coin.id()).await.unwrap().expect("a decided coin reports its payout");
+		assert_eq!((payout.status, payout.gross, payout.fee, payout.payout),
+			(bark::vtxo::FallbackStatus::Forfeited, leaf.coin.amount(), sat(leaf.fee), Amount::ZERO));
+		assert_eq!(payout.address.script_pubkey(), leaf.script);
 	}
 	assert_eq!(wallet.get_vtxo_by_id(leaf.coin.id()).await.unwrap().state, VtxoState::Spent);
 	assert_eq!(wallet.get_full_vtxo(leaf.coin.id()).await.unwrap().serialize(), leaf.coin.serialize());
 	point
 }
 
+/// Mines the unconfirmed transactions of the leaf's exit path in one block,
+/// zero-fee anchors included.
 pub(super) async fn confirm_actual_path(ctx: &TestContext, leaf: &Vtxo<Full>, seen: &mut BTreeSet<bitcoin::Txid>) {
-	for step in leaf.transactions() {
-		let txid = step.tx.compute_txid();
-		if !seen.insert(txid) { continue; }
-		if ctx.bitcoind().sync_client().custom_get_raw_transaction_info(txid, None).unwrap()
+	let chain = ctx.bitcoind().sync_client();
+	let path = leaf.transactions().map(|step| step.tx).filter(|tx| {
+		let txid = tx.compute_txid();
+		seen.insert(txid) && !chain.custom_get_raw_transaction_info(txid, None).unwrap()
 			.is_some_and(|info| info.confirmations.is_some_and(|depth| depth > 0))
-		{ continue; }
-		ctx.broadcast_cpfp(&step.tx).await;
-		ctx.generate_blocks(1).await;
+	}).collect::<Vec<_>>();
+	if !path.is_empty() {
+		ctx.mine(&path).await;
+		ctx.await_block_count_sync().await;
 	}
-	assert!(ctx.bitcoind().sync_client().get_tx_out(&leaf.point().txid, leaf.point().vout, Some(true))
+	assert!(chain.get_tx_out(&leaf.point().txid, leaf.point().vout, Some(true))
 		.unwrap().is_some_and(|output| output.confirmations > 0));
 }
 
@@ -229,8 +225,7 @@ pub(super) async fn wait_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction
 			let row = db.read(async |t| Ok(t.query_opt(
 				"SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
 				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-				JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id LIMIT 1",
+				WHERE c.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id LIMIT 1",
 				&[&coin.to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -244,8 +239,8 @@ pub(super) async fn wait_payout(db: &Db, coin: ark::VtxoId) -> (i64, Transaction
 /// Observe one current customer payout; never manufacture its allocation.
 pub(super) async fn published_payout(db: &Db, coin: VtxoId) -> Option<(i64, Transaction)> {
 	let rows = db.read(async |t| Ok(t.query("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a
-		JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id
-		WHERE e.vtxo_id=$1 AND c.disposition='customer' AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
+		JOIN expiry_allocation_coin c ON c.allocation_id=a.id
+		WHERE c.vtxo_id=$1 AND c.disposition='customer' AND a.status<>'conflicted' AND a.broadcast_at IS NOT NULL",
 		&[&coin.to_string()]).await?)).await.unwrap();
 	assert!(rows.len() <= 1, "one source cannot have duplicate current payouts");
 	rows.first().map(|row| (row.get("id"), deserialize(row.get("sweep_tx")).unwrap()))
@@ -261,7 +256,7 @@ pub(super) async fn confirmed_grant_closures(
 	for grant in grants {
 		let row = db.read(async |t| Ok(t.query_one("SELECT v.onchain_spent_txid,h.chain_resolution::TEXT, \
 			(SELECT a.sweep_txid FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
-			JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=v.vtxo_id \
+			WHERE c.vtxo_id=v.vtxo_id \
 			AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='operator' AND a.status='confirmed') AS swept, \
 			h.payment_hash,h.direction::TEXT AS direction \
 			FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1", &[&grant.id().to_string()]).await?)).await.unwrap();

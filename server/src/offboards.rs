@@ -151,6 +151,23 @@ impl Server {
 
 		request.validate().badarg("invalid offboard request")?;
 
+		// Check no duplicates in inputs
+		if input_vtxos.iter().collect::<HashSet<_>>().len() != input_vtxos.len() {
+			return badarg!("duplicate input vtxo");
+		}
+
+		if attestations.len() != input_vtxos.len() {
+			return badarg!("wrong number of attestations");
+		}
+
+		// Only the owner of the inputs may lock them, so the attestations are
+		// checked before the flux lock below.
+		let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxos).await).await?;
+		for (input, attestation) in vtxos.iter().zip(&attestations) {
+			attestation.verify(&request, &input_vtxos, &input.vtxo)
+				.with_badarg(|| format!("invalid attestations for vtxo {}", input.vtxo.id()))?;
+		}
+
 		// We keep the VTXO flux lock for the duration of the session, this means
 		// that if the user bails a session he has to wait for it to time out
 		// (currently set to 30 secs)
@@ -165,25 +182,15 @@ impl Server {
 				// The client may be re-sending a request whose response it
 				// never received. If we still hold the pending session for
 				// exactly this request, replay the same response.
-				let replayed = self.replay_pending_offboard(
-					&request, &input_vtxos, &attestations,
-				).await?;
-				if let Some(resp) = replayed {
+				if let Some(resp) = self.replay_pending_offboard(&request, &input_vtxos) {
 					return Ok(resp);
 				}
 				return Err(e).context("some VTXO is already locked by another process");
 			},
 		};
 
-		// Check no duplicates in inputs
-		if input_vtxos.iter().collect::<HashSet<_>>().len() != input_vtxos.len() {
-			return badarg!("duplicate input vtxo");
-		}
-
-		if attestations.len() != input_vtxos.len() {
-			return badarg!("wrong number of attestations");
-		}
-
+		// An arkoor can spend an input between the read above and the lock,
+		// so the spend state is read again under the lock.
 		// `check_spendable` also refuses inputs that exited onchain.
 		let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(&input_vtxos).await).await?;
 		let tip = self.chain_tip().height;
@@ -191,14 +198,7 @@ impl Server {
 			v.check_spendable(tip)?;
 		}
 
-		// Check delivery address against blocklist
-		if let Some(ref list) = self.bitcoin_address_blocklist {
-			if list.check_spk(&request.script_pubkey).await {
-				let address = bitcoin::Address::from_script(&request.script_pubkey, self.config.network)
-					.map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_owned());
-				return badarg!("requested output address is blocked: {}", address);
-			}
-		}
+		self.check_offboard_destination(&request.script_pubkey).await?;
 
 		let valid_fee_duration = self.config.offboard_acceptable_fee_rate_duration;
 		match self.fee_estimator.check_offboard_fee_rate(request.fee_rate, valid_fee_duration) {
@@ -232,7 +232,8 @@ impl Server {
 				request.fee_rate,
 				fee_info,
 			).context("unable to calculate fee for offboard")?;
-			let net_amount = validate_and_subtract_fee_min_dust(gross_amount, fee, dust)?;
+			let net_amount = validate_and_subtract_fee_min_dust(gross_amount, fee, dust)
+				.badarg("offboard leaves too little after the fee")?;
 			if request.net_amount > net_amount {
 				return badarg!(
 					"offboard net amount does not match expected amount: provided = {}, expected = {}",
@@ -258,13 +259,6 @@ impl Server {
 		// Whatever their inputs exceed the onchain output by is ours, overpayment included.
 		let net_amount = request.net_amount;
 		let fee = gross_amount.checked_sub(net_amount).context("offboard fee underflow")?;
-
-		// check attestations
-		let input_ids = input_vtxos.iter().copied().collect::<Vec<VtxoId>>();
-		for (input, attestation) in vtxos.iter().zip(&attestations) {
-			attestation.verify(&request, &input_ids, &input.vtxo)
-				.with_badarg(|| format!("invalid attestations for vtxo {}", input.vtxo.id()))?;
-		}
 
 		// Even if we need multiple connectors, we just need a single output now,
 		// the multi-connector fan-out tx can be constructed at-forfeit-claim-time.
@@ -299,20 +293,6 @@ impl Server {
 				Ok((psbt, inputs))
 			},
 		).await.context("failed to build offboard tx")?;
-		let onchain_fee = match offboard_tx.fee() {
-			Ok(fee) => fee,
-			Err(e) => {
-				wallet.mark_output_keys_unused(&offboard_tx.unsigned_tx);
-				return Err(e).context("failed to calculate offboard tx fee");
-			},
-		};
-		if onchain_fee > fee {
-			wallet.mark_output_keys_unused(&offboard_tx.unsigned_tx);
-			return badarg!(
-				"offboard needs {} miner fee but client pays only {}; retry with a higher fee or after wallet consolidation",
-				onchain_fee, fee,
-			);
-		}
 
 		// Abandoned sessions lock their inputs until they expire, so cap what
 		// they lock together to keep funds for rounds and other users. One
@@ -341,6 +321,10 @@ impl Server {
 		};
 
 		let offboard_txid = offboard_tx.unsigned_tx.compute_txid();
+		let onchain_fee = offboard_tx.fee().unwrap_or_else(|e| {
+			warn!("Error getting fee from offboard tx PSBT: {:#}", e);
+			Amount::ZERO
+		});
 		let server_fee = SignedAmount::try_from(fee).expect("fee can't overflow")
 			- SignedAmount::try_from(onchain_fee).expect("onchain fee can't overflow");
 		slog!(PreparedOffboard, offboard_txid, input_vtxos, net_amount, gross_amount, onchain_fee,
@@ -378,12 +362,14 @@ impl Server {
 	/// is safe: the secret nonces are used to sign at most once, because
 	/// [Server::finish_offboard] takes the session out of the map before
 	/// signing with them.
-	async fn replay_pending_offboard(
+	///
+	/// The caller must have verified the attestations, so that only the
+	/// owner of the inputs learns the session's txid and nonces.
+	fn replay_pending_offboard(
 		&self,
 		request: &OffboardRequest,
 		input_vtxos: &[VtxoId],
-		attestations: &[OffboardRequestAttestation],
-	) -> anyhow::Result<Option<OffboardResponse>> {
+	) -> Option<OffboardResponse> {
 		let existing = {
 			let guard = self.pending_offboards.lock();
 			guard.values().filter_map(|s| s.as_pending())
@@ -394,24 +380,13 @@ impl Server {
 				})
 		};
 		let Some(resp) = existing else {
-			return Ok(None);
+			return None;
 		};
-
-		// Verify the attestations so that only the owner of the input
-		// vtxos can learn the session's txid and nonces.
-		if attestations.len() != input_vtxos.len() {
-			return badarg!("wrong number of attestations");
-		}
-		let vtxos = self.db.read(async |t| t.get_user_vtxos_by_id(input_vtxos).await).await?;
-		for (input, attestation) in vtxos.iter().zip(attestations) {
-			attestation.verify(request, input_vtxos, &input.vtxo)
-				.with_badarg(|| format!("invalid attestations for vtxo {}", input.vtxo.id()))?;
-		}
 
 		slog!(ReplayedOffboardSession, offboard_txid: resp.offboard_tx.compute_txid(),
 			input_vtxos: input_vtxos.to_vec(),
 		);
-		Ok(Some(resp))
+		Some(resp)
 	}
 
 	/// Commit the offboard with the wallet, broadcast it and mark committed
@@ -443,6 +418,18 @@ impl Server {
 				crate::telemetry::record_ark_fee(
 					crate::telemetry::ArkFeeOp::Offboard, user_fee_sat, None,
 				);
+			}
+		}
+		Ok(())
+	}
+
+	/// Refuse a delivery address on the blocklist.
+	async fn check_offboard_destination(&self, script_pubkey: &ScriptBuf) -> anyhow::Result<()> {
+		if let Some(ref list) = self.bitcoin_address_blocklist {
+			if list.check_spk(script_pubkey).await {
+				let address = bitcoin::Address::from_script(script_pubkey, self.config.network)
+					.map(|a| a.to_string()).unwrap_or_else(|_| "<unknown>".to_owned());
+				return badarg!("requested output address is blocked: {}", address);
 			}
 		}
 		Ok(())
@@ -504,8 +491,12 @@ impl Server {
 		).badarg("invalid partial forfeit signatures")?;
 
 		let mut wallet_guard = self.rounds_wallet.lock().await;
-		let onchain_fee = state.offboard_tx.fee()
-			.context("failed to calculate prepared offboard tx fee")?;
+		// The blocklist may have changed since the offboard was prepared.
+		self.check_offboard_destination(&state.request.script_pubkey).await?;
+		let onchain_fee = state.offboard_tx.fee().unwrap_or_else(|e| {
+			warn!("Error getting fee from offboard tx PSBT: {:#}", e);
+			Amount::ZERO
+		});
 		let signed_tx = wallet_guard.finish_tx(state.offboard_tx)
 			.context("error signing offboard tx")?;
 

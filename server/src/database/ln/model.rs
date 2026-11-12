@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use bitcoin::Amount;
+use bitcoin::secp256k1::PublicKey;
 use chrono::{DateTime, Local};
 use lightning_invoice::Bolt11Invoice;
 use postgres_types::{FromSql, ToSql};
@@ -37,10 +38,19 @@ pub enum LightningPaymentStatus {
 	Requested,
 	#[postgres(name = "submitted")]
 	Submitted,
-	/// Recorded outcome for this attempt and its linked funding sources.
-	/// The settlement WAL retains the preimage needed for on-chain claiming.
+	/// NB: this is NOT authoritative for settlement. The lightning node can
+	/// settle a payment without this status write committing (a lost
+	/// optimistic-lock race, or a crash between recording the preimage and
+	/// updating the status), so the status may still read `Submitted` or even
+	/// `Failed` for a payment that actually completed. Never gate a
+	/// fund-releasing decision (revocation, refund, re-issuing sender vtxos) on
+	/// this variant: use `HtlcSettler::is_settled` or the transaction's
+	/// `ensure_not_settled`, as the `htlc_settlement` table is the single source
+	/// of truth for settlement.
 	#[postgres(name = "succeeded")]
 	Succeeded,
+	/// Only stored once we are sure the payment can no longer succeed:
+	/// the user may revoke its HTLCs on this status.
 	#[postgres(name = "failed")]
 	Failed,
 }
@@ -103,7 +113,7 @@ pub struct LightningPaymentAttempt {
 	/// header, and for pre-V66 rows.
 	pub user_agent: Option<String>,
 	/// How long the lightning node was told to keep retrying the payment.
-	/// `None` for pre-V66 rows, for which `cln_xpay_timeout` applies.
+	/// `None` for pre-V66 rows.
 	pub retry_for: Option<Duration>,
 	/// Routing budget passed to CLN as xpay's `maxfee`. `None` for pre-V68
 	/// rows and intra-Ark self-payments, which never reach CLN.
@@ -230,13 +240,14 @@ pub struct LightningHtlcSubscription {
 	pub id: i64,
 	pub lightning_node_id: LightningNodeId,
 	pub payment_hash: PaymentHash,
-	/// Explicit recipient selected when the invoice was issued.
-	pub claim_destination_user_pubkey: Option<bitcoin::secp256k1::PublicKey>,
 	pub invoice: Bolt11Invoice,
 	pub status: LightningHtlcSubscriptionStatus,
 	pub lowest_incoming_htlc_expiry: Option<BlockHeight>,
 	pub accepted_at: Option<DateTime<Local>>,
 	pub user_agent: Option<String>,
+	/// The key the receiver committed to when starting the receive, if any.
+	/// Only that key can prepare the claim.
+	pub claim_pubkey: Option<PublicKey>,
 	pub created_at: DateTime<Local>,
 	pub updated_at: DateTime<Local>,
 	/// NB this field is not always provided by all queries
@@ -262,14 +273,15 @@ impl <'a>TryFrom<&'a Row> for LightningHtlcSubscription {
 			lightning_node_id: row.get("lightning_node_id"),
 			payment_hash: PaymentHash::from_str(row.get::<_, &str>("payment_hash"))
 				.context("error decoding payment hash from db")?,
-			claim_destination_user_pubkey: row.get::<_, Option<&str>>("claim_destination_user_pubkey")
-				.map(str::parse).transpose()?,
 			invoice: invoice,
 			status: row.get("status"),
 			lowest_incoming_htlc_expiry: row.get::<_, Option<i64>>("lowest_incoming_htlc_expiry")
 				.map(|i| BlockHeight::try_from(i).expect("invalid block height in db")),
 			accepted_at: row.try_get("accepted_at").ok(),
 			user_agent: row.try_get("user_agent").ok().flatten(),
+			claim_pubkey: row.get::<_, Option<&str>>("claim_pubkey")
+				.map(|s| PublicKey::from_str(s).context("corrupt claim_pubkey in lightning_htlc_subscription"))
+				.transpose()?,
 			created_at: row.get("created_at"),
 			updated_at: row.get("updated_at"),
 			htlc_vtxos: if let Some(raw) = row.try_get::<_, Vec<&str>>("htlc_vtxos").ok() {

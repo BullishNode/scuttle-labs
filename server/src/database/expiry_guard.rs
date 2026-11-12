@@ -16,7 +16,7 @@ pub(crate) async fn guard_obligation_changes(
 	// still excluding competing source mutations and allocation decisions.
 	tx.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id = ANY($1) ORDER BY vtxo_id FOR NO KEY UPDATE", &[&ids]).await?;
 	if let Some(row) = tx.query_opt(
-		"SELECT vtxo_id FROM (SELECT vtxo_id FROM expiry_entitlement WHERE vtxo_id=ANY($1) \
+		"SELECT vtxo_id FROM (SELECT vtxo_id FROM expiry_allocation_coin WHERE vtxo_id=ANY($1) \
 			UNION SELECT vtxo_id FROM expiry_allocation_input WHERE vtxo_id=ANY($1)) fenced \
 			ORDER BY vtxo_id LIMIT 1",
 		&[&ids],
@@ -63,21 +63,23 @@ pub(crate) async fn guard_new_lightning_inputs(
 }
 
 impl super::Tx<'_> {
-	/// Lock and validate cancellation candidates without changing the exchange.
+	/// Validate cancellation candidates without locking or changing the exchange.
 	/// Dust-held or otherwise dropped groups must leave no tombstone/unlock.
 	pub(crate) async fn can_cancel_expiry_participations(&self, participation_ids: &[i64]) -> anyhow::Result<bool> {
-		Ok(self.cancellable_expiry_parts(participation_ids).await?.is_some())
+		Ok(self.cancellable_expiry_parts(participation_ids, false).await?.is_some())
 	}
 
-	async fn cancellable_expiry_parts(&self, participation_ids: &[i64]) -> anyhow::Result<Option<Vec<Row>>> {
+	async fn cancellable_expiry_parts(&self, participation_ids: &[i64], lock: bool) -> anyhow::Result<Option<Vec<Row>>> {
 		if participation_ids.is_empty() { return Ok(Some(Vec::new())); }
-		let inputs = self.query("SELECT DISTINCT v.vtxo_id FROM round_part_input i \
-			JOIN vtxo v ON v.vtxo_id=i.vtxo_id WHERE i.participation_id=ANY($1) ORDER BY v.vtxo_id",
-			&[&participation_ids]).await?.into_iter().map(|r| r.get::<_, String>("vtxo_id")).collect::<Vec<_>>();
-		self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&inputs]).await?;
-		let parts = self.query("SELECT p.id,p.unlock_hash,p.forfeited_at,r.id AS round_db_id \
+		if lock {
+			let inputs = self.query("SELECT DISTINCT v.vtxo_id FROM round_part_input i \
+				JOIN vtxo v ON v.vtxo_id=i.vtxo_id WHERE i.participation_id=ANY($1) ORDER BY v.vtxo_id",
+				&[&participation_ids]).await?.into_iter().map(|r| r.get::<_, String>("vtxo_id")).collect::<Vec<_>>();
+			self.query("SELECT vtxo_id FROM vtxo WHERE vtxo_id=ANY($1) ORDER BY vtxo_id FOR UPDATE", &[&inputs]).await?;
+		}
+		let parts = self.query(&format!("SELECT p.id,p.unlock_hash,p.forfeited_at,r.id AS round_db_id \
 			FROM round_participation p LEFT JOIN round r ON r.funding_txid=p.round_id \
-			WHERE p.id=ANY($1) ORDER BY p.id FOR UPDATE OF p", &[&participation_ids]).await?;
+			WHERE p.id=ANY($1) ORDER BY p.id{}", if lock { " FOR UPDATE OF p" } else { "" }), &[&participation_ids]).await?;
 		for id in participation_ids {
 			let Some(part) = parts.iter().find(|r| r.get::<_, i64>("id") == *id) else {
 				if self.query_opt("SELECT participation_id FROM expiry_cancelled_participation WHERE participation_id=$1", &[id]).await?.is_none() {
@@ -95,9 +97,9 @@ impl super::Tx<'_> {
 
 	/// Cancel only the final selected group under the locks taken above.
 	/// Accepted forfeits always win if they committed first. Revalidation and
-	/// entitlement/fence writes must occur in this same transaction.
+	/// the decision writes must occur in this same transaction.
 	pub async fn cancel_expiry_participations(&self, participation_ids: &[i64]) -> anyhow::Result<bool> {
-		let Some(parts) = self.cancellable_expiry_parts(participation_ids).await? else { return Ok(false); };
+		let Some(parts) = self.cancellable_expiry_parts(participation_ids, true).await? else { return Ok(false); };
 		for part in parts {
 			let id = part.get::<_, i64>("id");
 			let hash = part.get::<_, &str>("unlock_hash");
@@ -108,7 +110,7 @@ impl super::Tx<'_> {
 				self.execute("UPDATE vtxo SET spend_state='spendable',spent_in_round=NULL,updated_at=NOW() \
 					WHERE spent_in_round=$1 AND oor_spent_txid IS NULL AND offboarded_in IS NULL \
 					AND vtxo_id IN(SELECT vtxo_id FROM round_part_input WHERE participation_id=$2) \
-					AND NOT EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id)", &[&round, &id]).await?;
+					AND NOT EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=vtxo.vtxo_id)", &[&round, &id]).await?;
 			}
 		}
 		Ok(true)

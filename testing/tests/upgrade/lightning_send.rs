@@ -46,7 +46,7 @@ impl captaind::proxy::ArkRpcProxy for GatedCheckPayment {
 	}
 }
 
-/// Parks the send at `InputsLocked`: inputs locked, nothing cosigned.
+/// Parks the send at `Start`: inputs locked, nothing cosigned.
 #[derive(Clone)]
 struct GatedHtlcCosign(Gate);
 

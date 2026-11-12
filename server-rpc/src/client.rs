@@ -263,6 +263,12 @@ pub enum ConnectError {
 	ProtocolVersionMismatchClientTooOld { client_max: u64, server_min: u64 },
 	#[error("version mismatch. Client min is: {client_min}, server max is: {server_max}")]
 	ProtocolVersionMismatchServerTooOld { client_min: u64, server_max: u64 },
+	#[error("invalid server protocol version range: {server_min}..={server_max}")]
+	InvalidProtocolVersionRange { server_min: u64, server_max: u64 },
+	#[error("server protocol changed during this connection")]
+	ProtocolLabelChanged,
+	#[error("server protocol label mismatch: expected {expected}, got {got:?}")]
+	ProtocolLabelMismatch { expected: String, got: Option<String> },
 	#[error("error getting ark info: {0}")]
 	GetArkInfo(tonic::Status),
 	#[error("invalid ark info from ark server: {0}")]
@@ -345,13 +351,15 @@ pub struct ServerInfo {
 	///
 	/// For info on protocol versions, see [server_rpc](crate) module documentation.
 	pub pver: u64,
+	/// Additional protocol behavior advertised without changing numeric negotiation.
+	pub protocol_label: Option<String>,
 	/// Server-side configuration and network parameters returned after connection.
 	pub info: ArkInfo,
 }
 
 impl ServerInfo {
-	pub fn new(pver: u64, info: ArkInfo) -> Self {
-		Self { pver, info }
+	pub fn new(pver: u64, protocol_label: Option<String>, info: ArkInfo) -> Self {
+		Self { pver, protocol_label, info }
 	}
 }
 
@@ -359,6 +367,7 @@ impl ServerInfo {
 pub struct ServerConnectionBuilder {
 	address: Option<String>,
 	network: Option<Network>,
+	required_protocol_label: Option<String>,
 	#[cfg(feature = "socks5-proxy")]
 	proxy: Option<String>,
 	access_token: Option<String>,
@@ -366,6 +375,12 @@ pub struct ServerConnectionBuilder {
 }
 
 impl ServerConnectionBuilder {
+	/// Require the specified protocol label in the server handshake.
+	pub fn require_protocol_label(mut self, label: impl Into<String>) -> Self {
+		self.required_protocol_label = Some(label.into());
+		self
+	}
+
 	pub fn address(mut self, address: impl Into<String>) -> Self {
 		self.address = Some(address.into());
 		self
@@ -482,7 +497,12 @@ impl ServerConnection {
 		let handshake = handshake_client.handshake(Self::handshake_req()).await
 			.map_err(ConnectError::Handshake)?.into_inner();
 
-		let pver = check_handshake(handshake)?;
+		let (pver, protocol_label) = check_handshake(handshake)?;
+		if let Some(expected) = builder.required_protocol_label {
+			if protocol_label.as_deref() != Some(expected.as_str()) {
+				return Err(ConnectError::ProtocolLabelMismatch { expected, got: protocol_label });
+			}
+		}
 		interceptor.pver = Some(pver);
 
 		let mut client = ArkServiceClient::with_interceptor(transport.clone(), interceptor.clone())
@@ -493,7 +513,7 @@ impl ServerConnection {
 		let mailbox_client = mailbox::MailboxServiceClient::with_interceptor(transport, interceptor)
 			.max_decoding_message_size(64 * 1024 * 1024); // 64MB limit
 
-		let info = Arc::new(RwLock::new(ServerInfo::new(pver, info)));
+		let info = Arc::new(RwLock::new(ServerInfo::new(pver, protocol_label, info)));
 		Ok(ServerConnection {
 			info,
 			client,
@@ -524,12 +544,18 @@ impl ServerConnection {
 		let mut client = self.client.clone();
 		let handshake = client.handshake(Self::handshake_req()).await
 			.map_err(ConnectError::Handshake)?.into_inner();
-		check_handshake(handshake)?;
+		let (pver, protocol_label) = check_handshake(handshake)?;
+		let info = self.info.read().await;
+		if pver != info.pver || protocol_label != info.protocol_label {
+			return Err(ConnectError::ProtocolLabelChanged);
+		}
 		Ok(())
 	}
 
-	/// Protocol version selected by the existing handshake.
-	pub async fn protocol_version(&self) -> u64 { self.info.read().await.pver }
+	/// Whether this server advertises Scuttle's payout protocol.
+	pub async fn scuttle_payouts(&self) -> bool {
+		self.info.read().await.protocol_label.as_deref() == Some(crate::SCUTTLE_PAYOUT_PROTOCOL_LABEL)
+	}
 
 	/// Returns the cached [ArkInfo].
 	pub async fn ark_info(&self) -> ArkInfo {
@@ -563,11 +589,16 @@ impl<I: Interceptor> ArkServiceClientExt for ArkServiceClient<InterceptedService
 	}
 }
 
-fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectError> {
+fn check_handshake(handshake: protos::HandshakeResponse) -> Result<(u64, Option<String>), ConnectError> {
 	if let Some(ref msg) = handshake.psa {
 		warn!("Message from Ark server: \"{}\"", msg);
 	}
 
+	if handshake.min_protocol_version > handshake.max_protocol_version {
+		return Err(ConnectError::InvalidProtocolVersionRange {
+			server_min: handshake.min_protocol_version, server_max: handshake.max_protocol_version
+		});
+	}
 	if MAX_PROTOCOL_VERSION < handshake.min_protocol_version {
 		return Err(ConnectError::ProtocolVersionMismatchClientTooOld {
 			client_max: MAX_PROTOCOL_VERSION, server_min: handshake.min_protocol_version
@@ -579,16 +610,16 @@ fn check_handshake(handshake: protos::HandshakeResponse) -> Result<u64, ConnectE
 		});
 	}
 
+	// Both ranges are valid and overlap, so this is in both.
 	let pver = cmp::min(MAX_PROTOCOL_VERSION, handshake.max_protocol_version);
-	assert!((MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver));
-	assert!((handshake.min_protocol_version..=handshake.max_protocol_version).contains(&pver));
-
-	Ok(pver)
+	Ok((pver, handshake.protocol_label))
 }
 
 #[cfg(test)]
 mod tests {
-	use super::{CreateEndpointError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use super::{check_handshake, CreateEndpointError, ConnectError, NO_TRANSPORT_BACKEND_MESSAGE};
+	use crate::MAX_PROTOCOL_VERSION;
+	use crate::protos;
 
 	#[test]
 	fn no_transport_backend_error_mentions_feature_selection() {
@@ -596,5 +627,29 @@ mod tests {
 		assert_eq!(err.to_string(), NO_TRANSPORT_BACKEND_MESSAGE);
 		assert!(err.to_string().contains("bark-server-rpc/tonic-native"));
 		assert!(err.to_string().contains("bark-server-rpc/tonic-web"));
+	}
+
+	#[test]
+	fn handshake_rejects_inverted_protocol_range() {
+		let response = protos::HandshakeResponse {
+			min_protocol_version: MAX_PROTOCOL_VERSION,
+			max_protocol_version: MAX_PROTOCOL_VERSION - 1,
+			psa: None,
+			protocol_label: None,
+		};
+		assert!(matches!(check_handshake(response),
+			Err(ConnectError::InvalidProtocolVersionRange { .. })));
+	}
+
+	#[test]
+	fn payout_handshake_uses_upstream_numeric_version_with_scuttle_label() {
+		let response = protos::HandshakeResponse {
+			min_protocol_version: crate::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
+			max_protocol_version: crate::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
+			psa: None,
+			protocol_label: Some("scuttle-1".to_owned()),
+		};
+		assert_eq!(check_handshake(response).unwrap(), (crate::pver::PROTOCOL_VERSION_HASHLOCK_CLAUSES,
+			Some("scuttle-1".to_owned())));
 	}
 }

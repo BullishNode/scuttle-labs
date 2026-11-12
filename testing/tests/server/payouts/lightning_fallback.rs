@@ -1,47 +1,6 @@
-/// The claimant and actual recipient are different wallets. A valid signature
-/// for another registered mailbox cannot change that recipient at claim time.
-#[tokio::test]
-async fn forwarded_claim_refusals_leave_the_native_payer_uncollected() {
-	let ctx = TestContext::new("server/forwarded_claim_refusals").await;
-	let lightning = ctx.new_lightning_setup("lightningd").await;
-	let srv = ctx.captaind("server").lightningd(&lightning.internal).funded(btc(10)).cfg(|cfg| cfg.expiry_payouts = true).create().await;
-	srv.wait_for_vtxopool(&ctx).await;
-	let recipient = ctx.bark_sdk("recipient", &srv).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	let address = recipient.new_address().await.unwrap();
-	let other = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	super::expiry_admission::unmapped_owner_link(&srv, &other, &other).await;
-	let checked = Arc::new(AtomicBool::new(false));
-	let prepare_checked = Arc::new(AtomicBool::new(false));
-	let prepare_wallet = Arc::new(std::sync::OnceLock::new());
-	let db = Db::connect(&srv.config().postgres.clone()).await.unwrap();
-	let proxy = srv.start_proxy_no_mailbox(CheckClaim { wallet: recipient.clone(), db,
-		server: srv.mailbox_keypair(), other_mailbox: other,
-		hold: lightning.internal.hold_client().await, native_payment: true, checked: checked.clone(),
-		prepare_wallet: Some(prepare_wallet.clone()), prepare_checked: prepare_checked.clone() }).await;
-	let provider = ctx.bark_sdk("claimant", &proxy).cfg(|cfg| cfg.daemon_manual_sync = true).create().await;
-	assert!(prepare_wallet.set(provider.clone()).is_ok());
-	assert_ne!(provider.mailbox_identifier(), recipient.mailbox_identifier());
-	let invoice = provider.bolt11_invoice_for_address(sat(50_000), address.clone(), None, None).await.unwrap();
-	let hash = PaymentHash::from(&invoice);
-	lightning.sync().await;
-	let (paid, claimed) = tokio::time::timeout(Duration::from_secs(60), async {
-		tokio::join!(lightning.external.try_pay_bolt11(invoice.to_string()), provider.try_claim_lightning_receive(hash, true))
-	}).await.unwrap();
-	paid.unwrap(); claimed.unwrap();
-	assert!(checked.load(Ordering::SeqCst));
-	assert!(prepare_checked.load(Ordering::SeqCst), "cached grants must reject invalid proofs and preserve exact bodies and owners on a valid read before collection");
-	recipient.sync_mailbox().await.unwrap();
-	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
-	assert_eq!(provider.balance().await.unwrap().spendable, Amount::ZERO);
-	let ids = recipient.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<Vec<_>>();
-	provider.try_claim_lightning_receive(hash, true).await.unwrap();
-	recipient.sync_mailbox().await.unwrap();
-	assert_eq!(recipient.spendable_vtxos().await.unwrap().iter().map(|coin| coin.id()).collect::<Vec<_>>(), ids);
-	assert_eq!(recipient.balance().await.unwrap().spendable, sat(50_000));
-}
-
 /// A receive funded over Lightning must not become collateral for an
-/// unsuccessful Ark sender merely because both use the same invoice.
+/// unsuccessful Ark sender merely because both use the same invoice: the
+/// refused attempt is failed and unlinked, as upstream, and stays refundable.
 #[tokio::test]
 async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let ctx = TestContext::new("server/failed_intra_ark_promotion_other_payer").await;
@@ -54,12 +13,15 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	let wallet = sender.client().await;
 	let preimage = ark::lightning::Preimage::random();
 	let hash = preimage.compute_payment_hash();
+	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		expiry_secs: None,
-		claim_destination: None,
+
 		payment_hash: hash.to_vec(), amount_sat: 90_000, min_cltv_delta: 58,
-		mailbox_id: None, description: None,
+		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
+		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
+		ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	lightning.sync().await;
 	let mut payer = lightning.external.grpc_client().await;
@@ -69,42 +31,45 @@ async fn failed_intra_ark_promotion_does_not_bind_another_payers_grants() {
 	}).await });
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	wait_for_subscription_status(&db, hash, "accepted").await;
-	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let tip = ctx.bitcoind().get_block_count().await as u32;
 	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(super::test_owner_link(&srv, &receiver).await.into()),
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
 		htlc_recv_expiry: tip + 32, lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(
+			hash, BlockHeight::new(tip + 32), &receiver).serialize()),
 	}).await.unwrap().into_inner().htlc_vtxos;
 	assert!(!grants.is_empty());
 	wait_for_subscription_status(&db, hash, "htlcs-ready").await;
 	let owner = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	let owner_proof = super::test_owner_link(&srv, &owner).await;
-	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(), hash, owner_proof).await;
+	let owner_mailbox = MailboxIdentifier::from_pubkey(owner.public_key());
+	let sources = cosign_htlc_send_to_pubkey(&ctx, &srv, &wallet, &ids, owner.public_key(),
+		Some(&owner), hash, owner_mailbox).await;
 	wallet.register_vtxo_transactions_with_server(&sources).await.unwrap();
-	let refusal = rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
+	rpc.initiate_lightning_payment(ark_testing::lightning::sign_lightning_send_request(&srv,
 		protos::InitiateLightningPaymentRequest {
 		invoice, payment_amount_sat: 90_000,
 		htlc_vtxo_ids: sources.iter().map(|v| v.id().to_bytes().to_vec()).collect(),
 		mailbox_id: None, retry_for_secs: Some(5),
 		intent_nonce: None, source_owner_signatures: Vec::new(),
-	}, &owner).await).await.unwrap_err();
-	assert_eq!(refusal.code(), tonic::Code::InvalidArgument);
-	assert!(refusal.message().contains("already being paid"));
+	}, &owner).await).await.unwrap();
 	let records = db.read(async |t| {
 		let row = t.query_one("SELECT \
+			(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1 \
+				AND status='failed' AND lightning_htlc_subscription_id IS NULL), \
 			(SELECT COUNT(*) FROM lightning_payment_attempt WHERE payment_hash=$1), \
 			(SELECT COUNT(*) FROM cln_xpay WHERE payment_hash=$1)", &[&hash.to_string()]).await?;
-		Ok((row.get::<_, i64>(0), row.get::<_, i64>(1)))
+		Ok((row.get::<_, i64>(0), row.get::<_, i64>(1), row.get::<_, i64>(2)))
 	}).await.unwrap();
-	assert_eq!(records, (0, 0), "a refused promotion records neither an attempt nor an external request");
+	assert_eq!(records, (1, 1, 0), "a refused promotion is one failed, unlinked attempt and no external request");
 	let keys = vec![owner; sources.len()];
 	let builder = ark::arkoor::package::ArkoorPackageBuilder::new_claim_all_with_checkpoints(
 		sources, ark::VtxoPolicy::new_pubkey(owner.public_key()),
 	).unwrap().generate_user_nonces(&keys).unwrap();
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let owner_address = super::payout_address(&srv, ark::VtxoPolicy::new_pubkey(owner.public_key()),
+		&owner, owner_mailbox).await;
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.owner_proof = Some(owner_proof.into());
+		output.blinded_mailbox_id = super::blinded_mailbox(&owner_address);
 	}
 	let reply = rpc.request_lightning_pay_htlc_revocation(
 		super::signed_package(&srv, &[&wallet], cosign_request).await,
@@ -134,6 +99,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let payer = Arc::new(lightning.external);
 	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
 		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
+			cfg.receive_htlc_forward_timeout = Duration::from_secs(120);
 			cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
 		}).watchmand().create().await;
 	srv.wait_for_vtxopool(&ctx).await;
@@ -144,12 +110,15 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let db = Db::connect(&srv.config().postgres).await.unwrap();
 	let preimage = ark::lightning::Preimage::random();
 	let hash = preimage.compute_payment_hash();
+	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
 	let mut rpc = srv.get_public_rpc().await;
 	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
 		expiry_secs: None,
-		claim_destination: None,
+
 		payment_hash: hash.to_vec(), amount_sat: 100_000, min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
-		mailbox_id: None, description: None,
+		mailbox_id: Some(MailboxIdentifier::from_pubkey(receiver.public_key()).serialize()), description: None,
+		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
+		ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	let pay_task = {
 		let payer = payer.clone();
@@ -160,14 +129,16 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let subscription = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
 		.await.unwrap().unwrap();
 	let incoming_expiry = subscription.lowest_incoming_htlc_expiry.unwrap();
-	let receiver = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
-	let owner_proof = super::test_owner_link(&srv, &receiver).await;
-	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
-		owner_proof: Some(owner_proof.into()),
+	let claim_expiry = incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta);
+	let attestation = ark::attestations::LightningReceiveClaimAttestation::new(hash, claim_expiry, &receiver);
+	let attestation = attestation.serialize();
+	let prepare_request = protos::PrepareLightningReceiveClaimRequest {
 		payment_hash: hash.to_vec(), user_pubkey: receiver.public_key().serialize().to_vec(),
-		htlc_recv_expiry: incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta).into(),
+		htlc_recv_expiry: claim_expiry.into(),
 		lightning_receive_anti_dos: None,
-	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
+		claim_attestation: Some(attestation),
+	};
+	let grants = rpc.prepare_lightning_receive_claim(prepare_request).await.unwrap().into_inner().htlc_vtxos.into_iter()
 		.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
 	assert_eq!(grants.len(), 1);
 	let grant = &grants[0];
@@ -183,8 +154,10 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	).unwrap().generate_user_nonces(&[receiver]).unwrap();
 
 	let mut cosign_request = protos::ArkoorPackageCosignRequest::from(builder.cosign_request());
+	let receiver_address = super::payout_address(&srv, ark::VtxoPolicy::new_pubkey(receiver.public_key()),
+		&receiver, MailboxIdentifier::from_pubkey(receiver.public_key())).await;
 	for output in cosign_request.parts.iter_mut().flat_map(|part| part.outputs.iter_mut().chain(&mut part.isolated_outputs)) {
-		output.owner_proof = Some(owner_proof.into());
+		output.blinded_mailbox_id = super::blinded_mailbox(&receiver_address);
 	}
 
 	// The backend is unavailable for the settlement call. The request
@@ -199,8 +172,7 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	assert!(error.message().contains("could not settle hold invoice"), "unexpected error: {error}");
 	assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
 	let resolution = db.read(async |tx| Ok(tx.query_one("SELECT h.offchain_resolution::TEXT AS resolution \
-		FROM expiry_lightning_receive_claim c JOIN vtxo v ON v.vtxo_id=c.source_vtxo_id \
-		JOIN htlc_vtxo h ON h.id=v.id WHERE c.source_vtxo_id=$1 AND c.payment_hash=$2",
+		FROM vtxo v JOIN htlc_vtxo h ON h.id=v.id WHERE v.vtxo_id=$1 AND h.payment_hash=$2",
 		&[&grant.id().to_string(), &hash.to_string()]).await?.get::<_, Option<String>>(0))).await.unwrap();
 	assert_eq!(resolution, None);
 
@@ -288,8 +260,8 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 	let (allocation, parent) = async {
 		loop {
 			let row = db.read(async |tx| Ok(tx.query_opt("SELECT a.id,a.sweep_tx FROM expiry_allocation_state a \
-				JOIN expiry_allocation_coin c ON c.allocation_id=a.id JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-				WHERE e.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
+				JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
+				WHERE c.vtxo_id=$1 AND a.broadcast_at IS NOT NULL ORDER BY a.id DESC LIMIT 1",
 				&[&grant.id().to_string()],
 			).await?)).await.unwrap();
 			if let Some(row) = row {
@@ -299,63 +271,41 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		}
 	}.wait_millis(30_000).await;
 	assert_eq!(ctx.bitcoind().await_transaction(parent.compute_txid()).await, parent);
-	assert_eq!(parent.version.0, 3);
-	assert!(parent.vsize() <= 10_000);
-	assert_eq!(parent.input.len(), 1);
-	assert_eq!(parent.input[0].previous_output, root, "recover the signed backing without a descendant timeout");
+	assert_eq!(parent.version.0, 2);
+	assert!(parent.vsize() <= 100_000);
+	assert!(parent.input.iter().any(|input| input.previous_output == root),
+		"recover the backing directly without a descendant timeout");
+	assert!(parent.input.iter().all(|input|
+		input.previous_output == root || input.previous_output == sponsor));
 	let clause = ark::tree::signed::expiry_clause(grant.server_pubkey(), grant.expiry_height());
-	assert!(parent.input[0].witness.taproot_leaf_script().is_some_and(|script|
+	let root_input = parent.input.iter().find(|input| input.previous_output == root).unwrap();
+	assert!(root_input.witness.taproot_leaf_script().is_some_and(|script|
 		script.version == bitcoin::taproot::LeafVersion::TapScript && script.script == clause.as_script()));
-	assert_eq!(parent.output.iter().map(|out| out.value).sum::<Amount>(), backing.value);
-	assert_eq!(parent.output.iter().filter(|out| out.script_pubkey == operator_script)
-		.map(|out| out.value).sum::<Amount>(), backing.value);
-	assert!(parent.output.iter().all(|out| out.script_pubkey == operator_script
-		|| (out.is_p2a_fee_anchor() && out.value == Amount::ZERO)));
-	let anchors = parent.output.iter().enumerate().filter(|(_, out)| out.is_p2a_fee_anchor())
-		.map(|(vout, _)| OutPoint::new(parent.compute_txid(), vout as u32)).collect::<Vec<_>>();
-	assert_eq!(anchors.len(), 1);
-	let child = async {
-		loop {
-			if let Some((child, _)) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent) { break child; }
-			tokio::time::sleep(poll_interval()).await;
-		}
-	}.wait_millis(10_000).await;
-	ctx.bitcoind().await_transaction(child.compute_txid()).await;
+	assert!(!parent.output.is_empty());
+	assert!(parent.output.iter().all(|out| out.script_pubkey == operator_script));
+	let actual_fee = super::expiry_test::actual_fee(&ctx, &parent).await;
+	assert!(actual_fee > Amount::ZERO);
+	let sponsor_value = if parent.input.iter().any(|input| input.previous_output == sponsor) {
+		sat(100_000)
+	} else { Amount::ZERO };
+	assert_eq!(parent.output.iter().map(|out| out.value).sum::<Amount>() + actual_fee,
+		backing.value + sponsor_value);
+	let recorded_fee = db.read(async |tx| Ok(tx.query_one(
+		"SELECT fee_sat FROM expiry_payout_attempt WHERE allocation_id=$1 AND txid=$2",
+		&[&allocation, &parent.compute_txid().to_string()],
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(actual_fee.to_sat(), u64::try_from(recorded_fee).unwrap());
 	let confirmed = ctx.generate_blocks(6).await;
 	srv.wait_for_sync_height(confirmed).await;
 	srv.watchmand().wait_for_sync_height(confirmed).await;
 	let core = ctx.bitcoind().sync_client();
-	let block = super::expiry_test::canonical(&ctx, &parent);
-	let (child, observed_fee) = ark_testing::onchain::observed_payout_fee_child(&ctx, &parent).unwrap();
-	assert_eq!(super::expiry_test::canonical(&ctx, &child), block);
-	assert_eq!(child.version.0, 3);
-	assert!(child.vsize() <= 1_000);
-	assert_eq!(child.input.iter().map(|input| input.previous_output).collect::<HashSet<_>>(),
-		HashSet::from([anchors[0], sponsor]));
-	assert_eq!(child.input.len(), 2);
-	let change = child.output.iter().map(|out| out.value).sum::<Amount>();
-	let actual_fee = sat(100_000).checked_sub(change).unwrap();
-	assert!(actual_fee > Amount::ZERO);
-	assert_eq!(observed_fee, i64::try_from(actual_fee.to_sat()).unwrap());
-	let expected_change = child.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO)
-		.map(|(vout, _)| OutPoint::new(child.compute_txid(), vout as u32)).collect::<HashSet<_>>();
-	assert!(!expected_change.is_empty());
-	async {
-		loop {
-			let owned = super::expiry_test::watchman_coins(srv.watchmand()).await;
-			if expected_change.iter().all(|point| owned.contains(point)) { break; }
-			tokio::time::sleep(poll_interval()).await;
-		}
-	}.wait_millis(10_000).await;
-	for tx in [&parent, &child] {
-		for (vout, out) in tx.output.iter().enumerate().filter(|(_, out)| out.value > Amount::ZERO) {
-			let actual = core.get_tx_out(&tx.compute_txid(), vout as u32, Some(true)).unwrap().unwrap();
-			assert!(actual.confirmations >= 6);
-			assert_eq!(actual.value, out.value);
-			assert_eq!(actual.script_pub_key.script().unwrap(), out.script_pubkey);
-		}
+	let _confirmed_block = super::expiry_test::canonical(&ctx, &parent);
+	for (vout, out) in parent.output.iter().enumerate() {
+		let actual = core.get_tx_out(&parent.compute_txid(), vout as u32, Some(true)).unwrap().unwrap();
+		assert!(actual.confirmations >= 6);
+		assert_eq!(actual.value, out.value);
+		assert_eq!(actual.script_pub_key.script().unwrap(), out.script_pubkey);
 	}
-	assert_eq!(backing.value + sat(100_000), backing.value + change + actual_fee);
 	async {
 		loop {
 			let confirmed = db.read(async |tx| Ok(tx.query_one("SELECT status='confirmed' \
@@ -366,14 +316,132 @@ async fn canceled_external_receive_with_preimage_recovers_backing_directly() {
 		}
 	}.wait_millis(10_000).await;
 	let final_state = db.read(async |tx| Ok(tx.query_one("SELECT \
-		(SELECT COUNT(*) FROM expiry_split_request s JOIN vtxo v ON v.vtxo_id=s.vtxo_id WHERE v.anchor_point=$1) AS splits, \
-		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN vtxo v ON v.vtxo_id=e.vtxo_id WHERE v.anchor_point=$1 AND c.disposition<>'operator') AS customers, \
-		(SELECT COUNT(*) FROM expiry_allocation_coin c JOIN expiry_entitlement e ON e.id=c.entitlement_id \
-		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE e.vtxo_id=$2 AND a.status='confirmed') AS allocations",
+		(SELECT to_regclass('expiry_split_request') IS NULL) AS no_split_table, \
+		(SELECT COUNT(*) FROM expiry_allocation_coin c \
+		JOIN vtxo v ON v.vtxo_id=c.vtxo_id WHERE v.anchor_point=$1 AND c.disposition<>'operator') AS customers, \
+		(SELECT COUNT(*) FROM expiry_allocation_coin c \
+		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=$2 AND a.status='confirmed') AS allocations",
 		&[&root.to_string(), &grant.id().to_string()],
 	).await?)).await.unwrap();
-	for field in ["splits", "customers"] { assert_eq!(final_state.get::<_, i64>(field), 0, "{field}"); }
+	assert!(final_state.get::<_, bool>("no_split_table"));
+	assert_eq!(final_state.get::<_, i64>("customers"), 0);
 	assert_eq!(final_state.get::<_, i64>("allocations"), 1);
 	assert_eq!(db.read(async |tx| tx.get_htlc_settlement_by_payment_hash(hash).await).await.unwrap(), Some(preimage));
+}
+
+/// A settled forwarded receive whose claim output was never registered
+/// still belongs to the forwarding provider. The invoice destination alone transfers nothing.
+#[tokio::test]
+async fn settled_forwarded_receive_without_claim_pays_the_provider() {
+	let ctx = TestContext::new("server/settled_forwarded_receive_without_claim").await;
+	let lightning = ctx.new_lightning_setup("lightningd").await;
+	let payer = Arc::new(lightning.external);
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).lightningd(&lightning.internal)
+		.funded(btc(10)).cfg(|cfg| { cfg.expiry_payouts = true;
+			cfg.vtxopool.vtxo_targets = vec![VtxoTarget { count: 2, amount: sat(100_000) }];
+		}).watchmand().create().await;
+	srv.wait_for_vtxopool(&ctx).await;
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let recipient = ctx.bark("recipient", &srv).create().await;
+	let _address: ark::Address = recipient.address().await.parse().unwrap();
+	let recipient_script = recipient.client().await.fallback_script();
+	let provider_mailbox = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let grant_key = Keypair::new(&SECP, &mut bip39::rand::thread_rng());
+	let provider_script = ark::fallback::payout_script(provider_mailbox.public_key());
+
+	let preimage = ark::lightning::Preimage::random();
+	let hash = preimage.compute_payment_hash();
+	let amount = sat(100_000);
+	let mut rpc = srv.get_public_rpc().await;
+	let invoice = rpc.start_lightning_receive(protos::StartLightningReceiveRequest {
+		payment_hash: hash.to_vec(), amount_sat: amount.to_sat(),
+		min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
+		mailbox_id: Some(MailboxIdentifier::from_pubkey(provider_mailbox.public_key()).serialize()),
+		description: None, expiry_secs: None,
+		claim_pubkey: Some(grant_key.public_key().serialize().to_vec()),
+		ark_address_hint: false,
+	}).await.unwrap().into_inner().bolt11;
+	let pay_task = {
+		let payer = payer.clone();
+		tokio::spawn(async move { payer.try_pay_bolt11(invoice).await })
+	};
+	wait_for_subscription_status(&db, hash, "accepted").await;
+	let incoming_expiry = db.read(async |tx| tx.get_htlc_subscription_by_payment_hash(hash).await)
+		.await.unwrap().unwrap().lowest_incoming_htlc_expiry.unwrap();
+	let expiry = incoming_expiry.saturating_sub(srv.config().htlc_expiry_delta);
+	let grants = rpc.prepare_lightning_receive_claim(protos::PrepareLightningReceiveClaimRequest {
+		payment_hash: hash.to_vec(), user_pubkey: grant_key.public_key().serialize().to_vec(),
+		htlc_recv_expiry: expiry.into(),
+		lightning_receive_anti_dos: None,
+		claim_attestation: Some(ark::attestations::LightningReceiveClaimAttestation::new(
+			hash, expiry, &grant_key).serialize()),
+	}).await.unwrap().into_inner().htlc_vtxos.into_iter()
+		.map(|raw| Vtxo::<Full>::deserialize(&raw).unwrap()).collect::<Vec<_>>();
+	assert!(!grants.is_empty());
+	assert!(grants.iter().all(|grant| grant.user_pubkey() == grant_key.public_key()));
+	for grant in &grants {
+		let birth_mailbox = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
+		).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(birth_mailbox, provider_mailbox.public_key().to_string(),
+			"the grant keeps its provider birth binding");
+	}
+
+	// The preimage reaches the settler without a cooperative claim, which
+	// settles the hold invoice and pays the payer's invoice.
+	assert!(db.write(async |t| t.store_htlc_settlement(preimage).await).await.unwrap().is_some());
+	wait_for_subscription_status(&db, hash, "settled").await;
+	pay_task.wait_millis(30_000).await.unwrap().expect("the payer's invoice is paid");
+
+	let fee_address = srv.watchmand().wait_wallet_address().await;
+	ctx.bitcoind().fund_addr(fee_address, sat(100_000)).await;
+	ctx.generate_blocks(2).await;
+	let latest = grants.iter().map(|grant| grant.expiry_height()).max().unwrap();
+	let tip = ctx.bitcoind().get_block_count().await as u32;
+	let expired = ctx.generate_blocks(latest.to_u32() + 1 - tip).await;
+	srv.wait_for_sync_height(expired).await;
+	srv.watchmand().wait_for_sync_height(expired).await;
+
+	// Each unclaimed grant is paid to its birth owner, not the invoice destination.
+	for grant in &grants {
+		let parent: Transaction = tokio::time::timeout(Duration::from_secs(60), async {
+			loop {
+				if let Some((_, parent)) = super::expiry_test::published_payout(&db, grant.id()).await { break parent; }
+				tokio::time::sleep(poll_interval()).await;
+			}
+		}).await.expect("the settled grant was not paid to its provider");
+		ctx.bitcoind().await_transaction(parent.compute_txid()).await;
+		assert!(parent.output.iter().any(|out| out.script_pubkey == provider_script && out.value > Amount::ZERO));
+		assert!(parent.output.iter().all(|out| out.script_pubkey != recipient_script));
+		let owners = db.read(async |tx| Ok(tx.query("SELECT c.owner_mailbox \
+			FROM expiry_allocation_coin c WHERE c.vtxo_id=$1",
+			&[&grant.id().to_string()]).await?)).await.unwrap();
+		assert!(!owners.is_empty());
+		for owner in owners {
+			assert_eq!(owner.get::<_, Option<String>>("owner_mailbox"), Some(provider_mailbox.public_key().to_string()),
+				"grant {} was allocated to someone other than the provider", grant.id());
+		}
+	}
+	let status_request = |grant: &Vtxo<Full>| protos::GetVtxoStatusRequest {
+		vtxo_id: grant.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(grant.id(), &grant_key).serialize(),
+	};
+	let pending = rpc.get_vtxo_status(status_request(&grants[0])).await.unwrap().into_inner();
+	assert_eq!(pending.fallback_payout.map(|f| f.state), Some(protos::FallbackState::Pending as i32),
+		"a payout is pending until six blocks deep");
+	let confirmed = ctx.generate_blocks(6).await;
+	srv.wait_for_sync_height(confirmed).await;
+	srv.watchmand().wait_for_sync_height(confirmed).await;
+	for grant in &grants {
+		let birth_mailbox = db.read(async |tx| Ok(tx.query_one(
+			"SELECT mailbox_pk FROM coin_owner WHERE vtxo_id=$1", &[&grant.id().to_string()],
+		).await?.get::<_, String>(0))).await.unwrap();
+		assert_eq!(birth_mailbox, provider_mailbox.public_key().to_string(),
+			"recipient payout must not rewrite the grant holder's birth binding");
+		let status = rpc.get_vtxo_status(status_request(grant)).await.unwrap().into_inner();
+		assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+		assert_eq!(status.owner_mailbox, provider_mailbox.public_key().serialize().to_vec());
+		assert_eq!(status.fallback_payout.map(|f| f.state), Some(protos::FallbackState::Paid as i32),
+			"provider status must report its own grant payout");
+	}
 }

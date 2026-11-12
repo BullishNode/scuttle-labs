@@ -13,7 +13,7 @@ use bark::Wallet;
 use bark::movement::{Movement, MovementStatus};
 use bark::vtxo::VtxoState;
 use bitcoin::{Amount, OutPoint, ScriptBuf, Transaction};
-use bitcoin_ext::{BlockDelta, TxOutExt};
+use bitcoin_ext::BlockDelta;
 use bitcoin_ext::rpc::RpcApi;
 use server::database::Db;
 use server_rpc::protos;
@@ -135,16 +135,15 @@ async fn boundaries() {
 		}
 	}
 	let dust = 330;
-	let amounts = [999 + dust, 1_000 + dust, 1_001 + dust];
+	let amounts = [1_999 + dust, 2_000 + dust, 2_001 + dust];
 	let mut leaves = Vec::new();
 	let mut old = BTreeSet::from([source.id()]);
 	for (index, wallet) in recipients.iter().enumerate() {
 		let (coin, consumed) = Box::pin(receive_boundary(&srv, &sender, wallet, sat(amounts[index]), &board)).await;
 		old.extend(consumed);
-		let pays = index != 0;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[index + 1], script: bindings[index + 1].clone(),
-			fee: if pays { 1_000 } else { 0 }, payout: if pays { dust + index as u64 - 1 } else { 0 },
-			forfeited: if pays { 0 } else { amounts[index] }, group_payout: if pays { dust + index as u64 - 1 } else { 0 } });
+			fee: 2_000, payout: dust + (index as u64).saturating_sub(1), subsidy: if index == 0 { 1 } else { 0 },
+			forfeited: 0, group_payout: dust + (index as u64).saturating_sub(1) });
 	}
 	let mut change = Vec::new();
 	for coin in sender.spendable_vtxos().await.unwrap() { change.push(sender.get_full_vtxo(coin.id()).await.unwrap()); }
@@ -152,19 +151,20 @@ async fn boundaries() {
 	assert_eq!(change.len(), 4);
 	let change_gross = change.iter().map(|coin| coin.amount().to_sat()).sum::<u64>();
 	assert_eq!(change_gross + amounts.iter().sum::<u64>(), 100_000);
-	let mut fee = 1_000;
+	let mut fee = 2_000;
 	for coin in change {
 		let charged = coin.amount().to_sat().min(fee);
 		fee -= charged;
 		let payout = coin.amount().to_sat() - charged;
 		leaves.push(ExpectedLeaf { coin, mailbox: mailboxes[0], script: sender_binding.clone(), fee: charged,
-			payout, forfeited: 0, group_payout: change_gross - 1_000 });
+			payout, subsidy: 0, forfeited: 0, group_payout: change_gross - 2_000 });
 	}
 	assert_eq!(fee, 0);
 	assert_eq!(leaves.iter().map(|leaf| leaf.coin.amount()).sum::<Amount>(), sat(100_000));
-	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 3_000);
-	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), amounts[0]);
-	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 96_001 - dust);
+	assert_eq!(leaves.iter().map(|leaf| leaf.fee).sum::<u64>(), 8_000);
+	assert_eq!(leaves.iter().map(|leaf| leaf.subsidy).sum::<u64>(), 1);
+	assert_eq!(leaves.iter().map(|leaf| leaf.forfeited).sum::<u64>(), 0);
+	assert_eq!(leaves.iter().map(|leaf| leaf.payout).sum::<u64>(), 92_001);
 	balances(&sender, sat(change_gross)).await;
 	for leaf in &leaves {
 		assert_eq!(leaf.coin.chain_anchor(), root);
@@ -204,22 +204,23 @@ async fn boundaries() {
 	assert_eq!(backing.value, sat(100_000));
 	let epoch = Box::pin(confirm_epoch(&ctx, &srv, &db, &leaves, start, 90, 96)).await;
 	assert_eq!(epoch.parents.len(), 1);
-	assert_eq!(epoch.children.len(), 1);
+	assert!(epoch.children.is_empty());
 	let parent = epoch.parents.values().next().unwrap();
-	let payees = vec![(bindings[1].clone(), None), (bindings[2].clone(), Some(dust)),
-		(bindings[3].clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 1_000))];
+	let payees = vec![(bindings[1].clone(), Some(dust)), (bindings[2].clone(), Some(dust)),
+		(bindings[3].clone(), Some(dust + 1)), (sender_binding.clone(), Some(change_gross - 2_000))];
 	let operator = {
 		let config = srv.watchmand().config();
 		config.sweep_address.clone().unwrap().require_network(config.network).unwrap().script_pubkey()
 	};
 	assert!(payees.iter().all(|(script, _)| script != &operator));
 	let remainder = parent.output.iter().filter(|output| payees.iter().all(|(script, _)| output.script_pubkey != *script)).collect::<Vec<_>>();
-	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>(), sat(100_000));
-	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>(), sat(3_000 + amounts[0]));
-	assert!(remainder.iter().all(|output| output.script_pubkey == operator || output.is_p2a_fee_anchor()));
+	let miner_fee = actual_fee(&ctx, parent).await;
+	assert_eq!(parent.output.iter().map(|output| output.value).sum::<Amount>() + miner_fee, sat(100_000));
+	assert_eq!(remainder.iter().map(|output| output.value).sum::<Amount>() + miner_fee, sat(7_999));
+	assert!(remainder.iter().all(|output| output.script_pubkey == operator));
 	let forbidden = old.iter().map(ToString::to_string).collect::<Vec<_>>();
-	assert!(db.read(async |tx| Ok(tx.query("SELECT e.vtxo_id FROM expiry_allocation_coin c \
-		JOIN expiry_entitlement e ON e.id=c.entitlement_id WHERE e.vtxo_id=ANY($1) AND c.disposition='customer'",
+	assert!(db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id FROM expiry_allocation_coin c \
+		WHERE c.vtxo_id=ANY($1) AND c.disposition='customer'",
 		&[&forbidden]).await?)).await.unwrap().is_empty());
 	let returned_sender = Box::pin(donor_cli.client()).await;
 	let sender_leaves = leaves.iter().filter(|leaf| leaf.mailbox == mailboxes[0]).collect::<Vec<_>>();
@@ -249,9 +250,52 @@ async fn boundaries() {
 }
 
 #[tokio::test]
-async fn p2tr_exact_dust_boundary_is_paid_and_one_sat_below_is_forfeited() {
+async fn p2tr_positive_subdust_fee_is_subsidized_to_pay_standard_output() {
 	require_bitcoind_chain_source!();
 	assert!(std::env::var_os("BARK_DOUBLE_DRIVE_ACTIONS").is_none());
 	tokio::time::timeout(Duration::from_secs(180), Box::pin(boundaries())).await
 		.expect("three genuine boundaries must fit180seconds without retries");
+}
+
+/// The 2,000-sat floor consumes a whole 1,500-sat coin: the payout has no
+/// output for it, and the server and Bark both report a zero-payout forfeiture.
+#[tokio::test]
+async fn p2tr_fee_consuming_the_whole_coin_is_forfeited() {
+	require_bitcoind_chain_source!();
+	let ctx = TestContext::new("server/expiry_zero_output_forfeited").await;
+	let start = ctx.bitcoind().get_block_count().await;
+	let srv = Box::pin(ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool().cfg(|config| { config.expiry_payouts = true;
+		config.vtxo_lifetime = BlockDelta::new(40);
+		config.vtxo_exit_delta = BlockDelta::new(2);
+	}).watchmand().create()).await;
+	let donor_cli = Box::pin(ctx.bark("sender", &srv)
+		.cfg(|config| config.daemon_manual_sync = true).funded(sat(200_000)).create()).await;
+	let ids = Box::pin(donor_cli.board_and_confirm_and_register(&ctx, sat(100_000))).await;
+	let sender = Box::pin(donor_cli.client()).await;
+	sender.stop_daemon_wait().await.unwrap();
+	let board = ctx.bitcoind().await_transaction(sender.get_full_vtxo(ids[0]).await.unwrap().chain_anchor().txid).await;
+	let app = Box::pin(ctx.bark("recipient", &srv).cfg(|config| config.daemon_manual_sync = true).create()).await;
+	let recipient = Box::pin(app.client()).await;
+	let (coin, _) = Box::pin(receive_boundary(&srv, &sender, &recipient, sat(1_500), &board)).await;
+	let leaf = ExpectedLeaf { coin, mailbox: recipient.mailbox_identifier(), script: recipient.fallback_script(),
+		fee: 1_500, payout: 0, subsidy: 0, forfeited: 0, group_payout: 0 };
+	let history = recipient.history().await.unwrap();
+	for wallet in [&sender, &recipient] { wallet.stop_daemon_wait().await.unwrap(); }
+	drop(sender);
+	drop(recipient);
+	ctx.bitcoind().fund_addr(srv.watchmand().wait_wallet_address().await, sat(100_000)).await;
+	ctx.generate_blocks(6).await;
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let epoch = Box::pin(confirm_epoch(&ctx, &srv, &db, std::slice::from_ref(&leaf), start, 90, 96)).await;
+	let recipient = Box::pin(app.client()).await;
+	let key = recipient.get_vtxo_key(&leaf.coin).await.unwrap();
+	let status = srv.get_public_rpc().await.get_vtxo_status(protos::GetVtxoStatusRequest {
+		vtxo_id: leaf.coin.id().to_bytes().to_vec(),
+		attestation: VtxoStatusAttestation::new(leaf.coin.id(), &key).serialize(),
+	}).await.unwrap().into_inner();
+	assert_eq!(status.spend_state, protos::VtxoSpendState::Spent as i32);
+	assert_eq!(status.fallback_payout, Some(protos::FallbackPayout {
+		state: protos::FallbackState::Forfeited as i32, gross_sat: 1_500, fee_sat: 1_500, payout_sat: 0,
+	}));
+	verify_return(&recipient, &[&leaf], &epoch, &history).await;
 }

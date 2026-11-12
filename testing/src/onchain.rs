@@ -12,11 +12,9 @@ use bdk_wallet::chain::ChainPosition;
 use bdk_wallet::signer::SignersContainer;
 use bdk_wallet::{KeychainKind, LocalOutput, TxOrdering};
 use bitcoin::{Address, Amount, FeeRate, Network, Psbt, Script, ScriptBuf, Transaction, Txid};
-use bitcoin_ext::{BlockHeight, TransactionExt};
+use bitcoin_ext::BlockHeight;
 use bitcoin_ext::bdk::{CpfpInternalError, WalletExt};
-use bitcoin_ext::rpc::{BitcoinRpcClient, BitcoinRpcExt, RpcApi};
-
-use crate::TestContext;
+use bitcoin_ext::rpc::BitcoinRpcClient;
 
 const EVICTION_GRACE_SECS: u64 = 30;
 
@@ -204,29 +202,4 @@ impl OnchainWalletTrait for AppBip86Wallet {
 	async fn store_signed_p2a_cpfp(&mut self, tx: &Transaction) -> Result<(), CpfpError> {
 		self.register_tx(tx).await.map_err(|error| CpfpError::StoreError(error.to_string()))
 	}
-}
-
-/// Read the actual package child and its fee from Core or the canonical block.
-pub fn observed_payout_fee_child(ctx: &TestContext, parent: &Transaction) -> Option<(Transaction, i64)> {
-	let core = ctx.bitcoind().sync_client();
-	let (anchor, _) = parent.fee_anchor().expect("payout parent must have one fee anchor");
-	let child = if let Some(txid) = core.get_mempool_spending_tx(anchor).unwrap() {
-		core.get_raw_transaction(&txid, None).ok()?
-	} else {
-		let info = core.custom_get_raw_transaction_info(parent.compute_txid(), None).unwrap()?;
-		let hash = info.blockhash?;
-		let block = core.get_block(&hash).unwrap();
-		assert_eq!(core.get_block_hash(core.get_block_header_info(&hash).unwrap().height as u64).unwrap(), hash);
-		assert!(block.txdata.iter().any(|tx| tx == parent));
-		let mut children = block.txdata.into_iter().filter(|tx|
-			tx.input.iter().any(|input| input.previous_output == anchor));
-		let child = children.next()?;
-		assert!(children.next().is_none(), "one canonical child must spend the anchor");
-		child
-	};
-	assert_eq!(child.input.iter().filter(|input| input.previous_output == anchor).count(), 1);
-	let inputs = child.input.iter().map(|input| core.get_raw_transaction(
-		&input.previous_output.txid, None).unwrap().output[input.previous_output.vout as usize].value).sum::<Amount>();
-	let fee = inputs.checked_sub(child.output.iter().map(|out| out.value).sum::<Amount>()).unwrap();
-	Some((child, i64::try_from(fee.to_sat()).unwrap()))
 }

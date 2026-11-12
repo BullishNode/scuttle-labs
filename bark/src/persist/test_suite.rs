@@ -16,7 +16,6 @@ use lightning_invoice::Bolt11Invoice;
 
 use ark::lightning::{Invoice, PaymentHash, Preimage};
 use ark::test_util::VTXO_VECTORS;
-use ark::ProtocolEncoding;
 use ark::VtxoId;
 
 use super::BarkPersister;
@@ -126,7 +125,6 @@ fn test_properties() -> WalletProperties {
 		fingerprint: Fingerprint::default(),
 		server_pubkey: None,
 		server_mailbox_pubkey: None,
-		server_payouts: None,
 		mailbox_identity: Some(crate::MailboxIdentity { network: Network::Regtest, public_key: test_pubkey() }),
 	}
 }
@@ -187,7 +185,6 @@ fn empty_round_state() -> RoundState {
 	RoundState {
 		done: false,
 		participation: RoundParticipation {
-			owner_proofs: Default::default(),
 			inputs: vec![],
 			outputs: vec![],
 			unblinded_mailbox_id: None,
@@ -196,7 +193,6 @@ fn empty_round_state() -> RoundState {
 		new_vtxos: vec![],
 		sent_forfeit_sigs: false,
 		movement_id: None,
-		fallback_refusal: None,
 	}
 }
 
@@ -783,17 +779,7 @@ pub async fn test_get_or_create_movement_for_action(db: &impl BarkPersister) {
 // ---------------------------------------------------------------------------
 
 pub async fn test_store_and_get_round_state(db: &impl BarkPersister) {
-	let mut state = empty_round_state();
-	let server = Keypair::from_seckey_slice(&ark::SECP, &[17; 32]).unwrap();
-	let recipient = Keypair::from_seckey_slice(&ark::SECP, &[18; 32]).unwrap();
-	let coin = VTXO_VECTORS.arkoor3_user_key;
-	let link = ark::fallback::OwnerLink::new_joint(Network::Regtest, server.public_key(), &recipient, &coin).unwrap();
-	state.participation.outputs.push(ark::VtxoRequest {
-		amount: Amount::from_sat(1_000), policy: ark::VtxoPolicy::new_pubkey(coin.public_key()),
-	});
-	state.participation.owner_proofs.insert(coin.public_key(), link);
-	state.flow = RoundFlowState::Failed { error: "diagnostic text is not a refusal code".into() };
-	state.fallback_refusal = Some(crate::FallbackRefusal::DecidedForFallback);
+	let state = empty_round_state();
 
 	let id = db.store_round_state(&state).await.expect("store_round_state");
 

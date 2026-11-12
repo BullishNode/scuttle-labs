@@ -36,8 +36,8 @@ pub (crate) fn set_properties(
 	properties: &WalletProperties,
 ) -> anyhow::Result<()> {
 	let query =
-		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey, server_payouts)
-		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey, :server_payouts)";
+		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey)
+		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey)";
 	let mut statement = conn.prepare(query)?;
 
 	statement.execute(named_params! {
@@ -45,7 +45,6 @@ pub (crate) fn set_properties(
 		":fingerprint": properties.fingerprint.to_string(),
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
-		":server_payouts": properties.server_payouts,
 		":mailbox_pubkey": properties.mailbox_identity.as_ref().map(|identity| identity.public_key.to_string()),
 	})?;
 
@@ -91,7 +90,7 @@ pub (crate) fn set_server_mailbox_pubkey(
 }
 
 pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<WalletProperties>> {
-	let query = "SELECT network,fingerprint,server_pubkey,server_mailbox_pubkey,mailbox_pubkey,server_payouts FROM bark_properties";
+	let query = "SELECT * FROM bark_properties";
 	let mut statement = conn.prepare(query)?;
 	let mut rows = statement.query([])?;
 
@@ -122,7 +121,6 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 				fingerprint: Fingerprint::from_str(&fingerprint).context("invalid fingerprint")?,
 				server_pubkey,
 				server_mailbox_pubkey,
-				server_payouts: row.get("server_payouts")?,
 				mailbox_identity,
 			}
 		))
@@ -1079,6 +1077,7 @@ pub fn remove_wallet_action_checkpoint(
 	Ok(())
 }
 
+
 pub fn record_paid_invoice(
 	conn: &Connection,
 	payment_hash: PaymentHash,
@@ -1114,6 +1113,7 @@ pub fn get_paid_invoice(
 	let paid_at: chrono::DateTime<chrono::Local> = row.get("paid_at")?;
 	Ok(Some(PaidInvoice { payment_hash, preimage, paid_at }))
 }
+
 
 pub fn record_settled_lightning_receive(
 	conn: &Connection,
@@ -1159,6 +1159,7 @@ pub fn get_settled_lightning_receive(
 	let settled_at: chrono::DateTime<chrono::Local> = row.get("settled_at")?;
 	Ok(Some(SettledLightningReceive { payment_hash, preimage, invoice, amount, settled_at }))
 }
+
 
 #[cfg(test)]
 mod test {

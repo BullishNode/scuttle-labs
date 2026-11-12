@@ -131,9 +131,9 @@ impl Daemon {
 				network, cfg.network,
 			);
 		}
-		if db.expiry_payouts() {
-			bitcoind.require_txindex().await?;
-		}
+		// Looking up txs that aren't ours, like the blocklist's input checks
+		// and tx_status, needs txindex.
+		bitcoind.require_txindex().await?;
 
 		let deep_tip = bcd::deep_tip(&bitcoind).await
 			.context("failed to query node for deep tip")?;

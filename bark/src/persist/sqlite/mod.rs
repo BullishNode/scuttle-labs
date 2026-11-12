@@ -12,6 +12,7 @@ mod convert;
 mod migrations;
 mod query;
 
+
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -35,6 +36,7 @@ use crate::persist::{BarkPersister, RoundStateId, StoredRoundState, Unlocked};
 use crate::persist::models::{PaidInvoice, SettledLightningReceive, StoredExit};
 use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
+
 
 /// The default sqlite db file for when no file path was provided
 pub const DEFAULT_DB_FILE: &str = "db.sqlite";
@@ -108,14 +110,6 @@ impl BarkPersister for SqliteClient {
 			WHERE id=1 AND network=?2 AND (mailbox_pubkey IS NULL OR mailbox_pubkey=?1)",
 			[identity.public_key.to_string(), identity.network.to_string()])?;
 		ensure!(changed == 1, "mailbox identity differs from the stored wallet");
-		Ok(())
-	}
-
-	async fn set_server_payouts(&self, payouts: bool) -> anyhow::Result<()> {
-		let conn = self.connect()?;
-		ensure!(conn.execute("UPDATE bark_properties SET server_payouts=?1 WHERE id=1
-			AND (server_payouts IS NULL OR server_payouts=?1)", [payouts])? == 1,
-			"server payout mode has changed");
 		Ok(())
 	}
 

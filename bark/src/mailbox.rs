@@ -19,8 +19,9 @@ use futures::{FutureExt, Stream, StreamExt};
 use log::{debug, error, info, trace, warn};
 use tokio_util::sync::CancellationToken;
 
+
 use ark::{ProtocolEncoding, Vtxo, VtxoId};
-use ark::lightning::PaymentHash;
+use ark::lightning::{PaymentHash, Preimage};
 use ark::mailbox::{MailboxAuthorization, MailboxIdentifier};
 use ark::vtxo::Full;
 use ark::vtxo::policy::signing::VtxoSigner;
@@ -29,12 +30,12 @@ use server_rpc::protos::mailbox_server::MailboxMessage;
 
 use crate::{Wallet, WalletInner, SUBSCRIBE_REQUEST_TIMEOUT};
 use crate::actions::DriveMode;
-use crate::actions::lightning::pay::{ln_pay_action_id, LightningSend};
+use crate::actions::lightning::pay::{ln_pay_action_id, LightningSend, Progress};
 use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
 use crate::subsystem::{ArkoorMovement, Subsystem};
 use crate::utils::ReconnectBackoff;
-use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, VtxoValidationError};
+use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind};
 
 /// Key for the lock that serializes the arkoor receive dedup within a wallet.
 ///
@@ -342,7 +343,7 @@ impl Wallet {
 	///
 	/// This function only returns an error when it cannot process any VTXOs,
 	/// for example when the server is down or the chain tip is unknown.
-	/// Invalid individual VTXOs are skipped; chain lookup errors are retried.
+	/// No errors are returned for issues on individual VTXOs.
 	async fn process_raw_vtxos(
 		&self,
 		raw_vtxos: Vec<Vec<u8>>,
@@ -366,9 +367,6 @@ impl Wallet {
 			};
 
 			if let Err(e) = self.validate_vtxo(&vtxo).await {
-				if matches!(&e, VtxoValidationError::Chain(_)) {
-					return Err(e.into());
-				}
 				error!("Received invalid arkoor VTXO {} from server: {}", vtxo.id(), e);
 				invalid_vtxos.push(bytes);
 				continue;
@@ -520,37 +518,45 @@ impl Wallet {
 		// Redundantly re-register the received vtxos with the server. An
 		// up-to-date sender already does this after cosign, but older
 		// senders may not, so we do it on receive too to make sure the
-		// server has signed_tx rows for our spendable vtxos. A failure
-		// does not discard the signed chain, but the server status below
-		// must confirm spendability before the wallet credits it.
+		// server has signed_tx rows for our spendable vtxos. Any failure
+		// is logged and swallowed: the receive must still proceed so we
+		// don't lose track of the vtxos locally, and later spends will
+		// retry registration if still needed.
 		if let Err(e) = self.register_vtxo_transactions_with_server(&new_vtxos).await {
 			warn!("Failed to register received arkoor vtxo transactions with server: {:#}", e);
 		}
 
-		let mut current = Vec::new();
-		for coin in new_vtxos {
-			let key = self.get_vtxo_key(&coin).await?;
-			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
-			// A delivery may already have paid its recipient onchain before
-			// this wallet first sees the mailbox message. Do not credit it in Ark.
-			if committed || state == protos::VtxoSpendState::Spent {
-				self.store_vtxos([&coin], &VtxoState::Spent).await?;
-				if committed {
-					self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+		// With payouts, the server status must confirm spendability before
+		// the wallet credits a received VTXO.
+		let new_vtxos = if self.server_payouts().await {
+			let mut current = Vec::new();
+			for coin in new_vtxos {
+				let key = self.get_vtxo_key(&coin).await?;
+				let status = self.fetch_own_vtxo_status(coin.id(), &key).await?;
+				// A delivery may already have paid its recipient onchain before
+				// this wallet first sees the mailbox message. Do not credit it in Ark.
+				if status.is_spent() {
+					self.store_vtxos([&coin], &VtxoState::Spent).await?;
+					if let Some(fallback) = status.fallback {
+						self.inner.db.set_vtxo_fallback_status(coin.id(), fallback).await?;
+					}
+					continue;
 				}
-				continue;
+				let state = status.state;
+				if state != protos::VtxoSpendState::Spendable {
+					warn!("Received arkoor VTXO {} is not spendable on the server ({state:?}); \
+						keeping its signed chain locked", coin.id());
+					self.store_vtxos([&coin], &VtxoState::Locked {
+						holder: Some(VtxoLockHolder::MailboxReceive),
+					}).await?;
+					continue;
+				}
+				current.push(coin);
 			}
-			if state != protos::VtxoSpendState::Spendable {
-				warn!("Received arkoor VTXO {} is not spendable on the server ({state:?}); \
-					keeping its signed chain locked", coin.id());
-				self.store_vtxos([&coin], &VtxoState::Locked {
-					holder: Some(VtxoLockHolder::MailboxReceive),
-				}).await?;
-				continue;
-			}
-			current.push(coin);
-		}
-		let new_vtxos = current;
+			current
+		} else {
+			new_vtxos
+		};
 		if new_vtxos.is_empty() { return Ok(()); }
 		self.credit_received_arkoor_vtxos(&new_vtxos).await
 	}
@@ -577,13 +583,13 @@ impl Wallet {
 				debug!("Pending arkoor VTXO {} still cannot register: {e:#}", coin.id());
 			}
 			let key = self.get_vtxo_key(&coin).await?;
-			let (state, committed) = self.fetch_vtxo_status(coin.id(), &key).await?;
-			if committed || state == protos::VtxoSpendState::Spent {
+			let status = self.fetch_own_vtxo_status(coin.id(), &key).await?;
+			if status.is_spent() {
 				self.mark_vtxos_as_spent([coin.id()]).await?;
-				if committed {
-					self.inner.db.set_vtxo_fallback_status(coin.id(), state.try_into()?).await?;
+				if let Some(fallback) = status.fallback {
+					self.inner.db.set_vtxo_fallback_status(coin.id(), fallback).await?;
 				}
-			} else if state == protos::VtxoSpendState::Spendable {
+			} else if status.state == protos::VtxoSpendState::Spendable {
 				ready.push(coin);
 			}
 		}
@@ -597,6 +603,11 @@ impl Wallet {
 	}
 
 	async fn credit_received_arkoor_vtxos(&self, new_vtxos: &[Vtxo<Full>]) -> anyhow::Result<()> {
+		let new_vtxos = &self.credit_lightning_receives_paid_by_arkoor(new_vtxos).await?[..];
+		if new_vtxos.is_empty() {
+			return Ok(());
+		}
+
 		// TODO: Make sure we don't effectively skip the entire package if the movement fails to
 		//       be recorded due to bark getting killed after this point.
 		let balance = new_vtxos
@@ -685,8 +696,8 @@ impl Wallet {
 
 	/// Handle a lightning send finished notification from the mailbox.
 	///
-	/// The notification wakes the payment action. Its status query verifies
-	/// our complete HTLC set before adopting success or failure.
+	/// This notification indicates that the server has completed processing
+	/// a lightning payment we initiated, either successfully or with failure.
 	async fn handle_lightning_send_finished(
 		&self,
 		notif: protos::mailbox_server::LightningSendFinishedMessage,
@@ -694,21 +705,72 @@ impl Wallet {
 		let payment_hash = PaymentHash::try_from(notif.payment_hash)
 			.context("invalid payment hash in lightning send finished notification")?;
 
-		debug!("Lightning send finished notification: payment_hash={}", payment_hash);
+		let known_preimage = notif.preimage
+			.and_then(|bytes| Preimage::try_from(bytes).ok());
 
+		if known_preimage.is_some() {
+			debug!("Lightning send finished notification (success): payment_hash={}", payment_hash);
+		} else {
+			debug!("Lightning send finished notification (failed): payment_hash={}", payment_hash);
+		}
+
+		// Take the lock that every driver of the send takes, so that no drive
+		// holds a copy of a checkpoint we remove here. A drive that holds the
+		// lock now has often polled the server just before the payment
+		// finished and is about to park, so wait for it. If it keeps the lock
+		// longer, the periodic sync of the daemon drives the send later.
+		//
 		// Errors are logged but not propagated: we always advance the
 		// mailbox checkpoint to avoid re-processing the same
 		// notification on the next poll.
 		let action_id = ln_pay_action_id(payment_hash);
-		match self.lock_action::<LightningSend>(&action_id, LIGHTNING_SEND_LOCK_TIMEOUT).await {
-			Ok(checkpoint) if checkpoint.get().is_some() => {
-				match self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await {
-					Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
-					Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
-				}
+		let checkpoint = match self.lock_action::<LightningSend>(&action_id, LIGHTNING_SEND_LOCK_TIMEOUT).await {
+			Ok(checkpoint) => checkpoint,
+			Err(e) => {
+				info!("Could not read lightning send {} under its lock, leaving it to the next sync: {:#}", payment_hash, e);
+				return Ok(());
 			},
-			Ok(_) => debug!("Lightning send finished notification has no pending action for {}", payment_hash),
-			Err(e) => error!("Failed to look up lightning send checkpoint for {}: {:#}", payment_hash, e),
+		};
+
+		let (progress, paid) = match (
+			checkpoint.get().map(|send| send.progress.clone()),
+			self.is_invoice_paid(payment_hash).await,
+		) {
+			(Some(progress), Ok(paid)) => (progress, paid),
+			(None, Ok(true)) => {
+				debug!("Lightning send {} already settled; ignoring notification", payment_hash);
+				return Ok(());
+			},
+			(None, Ok(false)) => {
+				warn!("Lightning send finished notification for unknown payment hash {}", payment_hash);
+				return Ok(());
+			},
+			(_, Err(e)) => {
+				error!("Failed to look up lightning send {}: {:#}", payment_hash, e);
+				return Ok(());
+			},
+		};
+
+		let result = match (progress, known_preimage) {
+			// A settlement stopped half-way. The drive finishes it from the
+			// stored preimage.
+			_ if paid => {
+				self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await
+			},
+			(Progress::PaymentInitiated(htlcs), Some(preimage)) => {
+				self.settle_lightning_send_with_preimage(checkpoint, htlcs, preimage).await
+			},
+			(Progress::PaymentInitiated(_), None) => {
+				self.drive_checkpoint(checkpoint, DriveMode::UntilParkOrDone).await
+			},
+			_ => {
+				debug!("Lightning send finished notification for {} but checkpoint is not PaymentInitiated; ignoring", payment_hash);
+				Ok(())
+			},
+		};
+		match result {
+			Ok(()) => info!("Processed lightning send finished for {}", payment_hash),
+			Err(e) => error!("Failed to process lightning send finished for {}: {:#}", payment_hash, e),
 		}
 
 		Ok(())

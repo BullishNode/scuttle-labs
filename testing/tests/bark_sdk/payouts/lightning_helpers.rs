@@ -1,4 +1,4 @@
-// Existing reply-loss and physical child observers shared by both targets.
+// Reply-loss observer shared by both targets.
 
 #[derive(Clone)]
 struct HoldSuccessfulReceiveClaim {
@@ -26,20 +26,4 @@ impl captaind::proxy::ArkRpcProxy for HoldSuccessfulReceiveClaim {
 		}
 		Ok(response)
 	}
-}
-
-async fn native_payout_child(ctx: &TestContext, parent: &Transaction, start: bitcoin_ext::BlockHeight) -> Option<Transaction> {
-	let anchor = parent.output.iter().position(|output| output.is_p2a_fee_anchor()).unwrap() as u32;
-	let point = OutPoint::new(parent.compute_txid(), anchor);
-	let core = ctx.bitcoind().sync_client();
-	for txid in core.get_raw_mempool().unwrap() {
-		let transaction = ctx.bitcoind().await_transaction(txid).await;
-		if transaction.input.iter().any(|input| input.previous_output == point) { return Some(transaction); }
-	}
-	for height in u64::from(start.to_u32())..=core.get_block_count().unwrap() {
-		for transaction in core.get_block(&core.get_block_hash(height).unwrap()).unwrap().txdata {
-			if transaction.input.iter().any(|input| input.previous_output == point) { return Some(transaction); }
-		}
-	}
-	None
 }

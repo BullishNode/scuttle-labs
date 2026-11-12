@@ -60,6 +60,7 @@ service ArkService {
 	rpc PrepareLightningReceiveClaim(PrepareLightningReceiveClaimRequest) returns (PrepareLightningReceiveClaimResponse) {}
 	rpc ClaimLightningReceive(ClaimLightningReceiveRequest) returns (ArkoorPackageCosignResponse) {}
 	rpc CancelLightningReceive(CancelLightningReceiveRequest) returns (core.Empty) {}
+	rpc RequestLightningReceiveArkoorCosign(LightningReceiveArkoorCosignRequest) returns (ArkoorPackageCosignResponse) {}
 
 	// * OFFBOARDS
 
@@ -94,6 +95,8 @@ message HandshakeResponse {
 	// Public Service Announcement, a generalized message from the server to be
 	// displayed to the user.
 	optional string psa = 3;
+	// Identifies the Scuttle payout protocol without changing numeric negotiation.
+	optional string protocol_label = 4;
 }
 
 message ArkInfo {
@@ -130,7 +133,12 @@ message ArkInfo {
 	// Link to the server's terms of service, if any.
 	optional string tos_link = 22;
 
-	// last index: 22
+	// The maximum number of outputs of a single round participation. Older
+	// servers don't set it; clients then fall back to the round capacity,
+	// 4 ^ nb_round_nonces.
+	uint32 max_round_participation_outputs = 23;
+
+	// last index: 23
 }
 
 message OffboardFeeRateResponse {
@@ -217,10 +225,6 @@ enum VtxoSpendState {
 	VTXO_SPEND_STATE_UNREGISTERED = 4;
 	// The VTXO's preimage haven't been revealed yet
 	VTXO_SPEND_STATE_HTLC_RECV_UNCLAIMED = 5;
-	// A committed fallback decision has unresolved relevant portions.
-	VTXO_SPEND_STATE_FALLBACK_PENDING = 6;
-	// Terminal policy result with no Bitcoin payout.
-	VTXO_SPEND_STATE_FALLBACK_FORFEITED = 7;
 }
 
 message GetVtxoStatusRequest {
@@ -232,7 +236,28 @@ message GetVtxoStatusRequest {
 message GetVtxoStatusResponse {
 	VtxoSpendState spend_state = 1;
 	bytes owner_mailbox = 2;
-	bool fallback_committed = 3;
+	// Set for a SPENT coin the server decided to pay out at its expiry.
+	optional FallbackPayout fallback_payout = 4;
+}
+
+enum FallbackState {
+	FALLBACK_STATE_UNSPECIFIED = 0;
+	// The payout transaction is not yet six blocks deep.
+	FALLBACK_STATE_PENDING = 1;
+	FALLBACK_STATE_PAID = 2;
+	// The fee consumed the coin; nothing was paid on-chain.
+	FALLBACK_STATE_FORFEITED = 3;
+}
+
+// The expiry payout the server decided for a coin, to `tr(owner_mailbox)`.
+message FallbackPayout {
+	FallbackState state = 4;
+	// The coin value taken from Ark.
+	uint64 gross_sat = 1;
+	// The fallback fee withheld from it.
+	uint64 fee_sat = 2;
+	// The amount paid on-chain; zero when the fee consumed the coin.
+	uint64 payout_sat = 3;
 }
 
 message VtxoStatusQuery {
@@ -250,7 +275,7 @@ message VtxoStatus {
 	bytes vtxo_id = 1;
 	VtxoSpendState spend_state = 2;
 	bytes owner_mailbox = 3;
-	bool fallback_committed = 4;
+	optional FallbackPayout fallback_payout = 5;
 }
 
 message GetVtxosStatusByIdsResponse {
@@ -285,7 +310,6 @@ message RecoveredVtxo {
 	uint32 derivation_index = 2;
 	VtxoSpendState spend_state = 3;
 	bytes owner_mailbox = 4;
-	bool fallback_committed = 5;
 }
 
 message RecoverVtxosByXpubResponse {
@@ -305,13 +329,6 @@ message RecoverVtxosByXpubResponse {
 
 // boarding
 
-// Coin and mailbox authorization of a server-specific link.
-message OwnerProof {
-	bytes blinded_mailbox_id = 1;
-	bytes signature = 2;
-	bytes mailbox_signature = 3;
-}
-
 message BoardCosignRequest {
 	uint64 amount = 1;
 	bytes utxo = 2;
@@ -319,7 +336,7 @@ message BoardCosignRequest {
 	bytes user_pubkey = 4;
 	bytes pub_nonce = 5;
 	bytes funding_tx = 6;
-	OwnerProof owner_proof = 7;
+	optional bytes owner_mailbox = 8;
 }
 
 message BoardCosignResponse {
@@ -342,13 +359,12 @@ message RegisterVtxoTransactionsRequest {
 message VtxoRequest {
 	uint64 amount = 1;
 	bytes policy = 2;
-	OwnerProof owner_proof = 3;
 }
 
 message ArkoorDestination {
 	uint64 total_amount = 1;
 	bytes policy = 2;
-	OwnerProof owner_proof = 3;
+	bytes blinded_mailbox_id = 4;
 }
 
 message ArkoorCosignRequest {
@@ -392,7 +408,7 @@ message InitiateLightningPaymentRequest {
 	// The server picks its default when unset.
 	optional uint32 retry_for_secs = 5;
 	// Fresh sends require one owner signature for each source, in source order.
-	// Exact retries of an already open send may omit these fields.
+	// A retry of an open send must resend the same signed fields.
 	optional bytes intent_nonce = 6;
 	repeated bytes source_owner_signatures = 7;
 }
@@ -416,8 +432,6 @@ message LightningPaymentStatus {
 		// unchanged and an older peer still matches the `failed` arm.
 		core.LightningPaymentFailure failed = 3;
 	};
-	// Input scope validated against the server's recorded payment attempt.
-	repeated bytes htlc_vtxo_ids = 4;
 }
 
 message FetchBolt12InvoiceRequest {
@@ -435,11 +449,16 @@ message StartLightningReceiveRequest {
 	uint32 min_cltv_delta = 3;
 	optional bytes mailbox_id = 4;
 	optional string description = 5;
-	// Point-in-time check for an explicit recipient before invoice creation.
-	VtxoRequest claim_destination = 7;
 	// Seconds until the invoice expires. Defaults to the server's invoice
 	// expiry, which is also the longest it accepts.
 	optional uint64 expiry_secs = 6;
+	// The key the HTLC-recv VTXOs will be locked to. When set, the claim can
+	// only be prepared with this key and a claim_attestation signed by it.
+	optional bytes claim_pubkey = 7;
+	// Put the Ark address of claim_pubkey and mailbox_id in the invoice as
+	// route hints, so a user of this server can pay it with an arkoor instead.
+	// Servers that don't support or allow this ignore it.
+	bool ark_address_hint = 8;
 }
 
 message StartLightningReceiveResponse {
@@ -459,7 +478,9 @@ message PrepareLightningReceiveClaimRequest {
 		InputVtxo input_vtxo = 4;
 		string token = 5;
 	};
-	OwnerProof owner_proof = 6;
+	// Signature by user_pubkey over the payment hash and htlc_recv_expiry,
+	// required when the receive was started with a claim_pubkey.
+	optional bytes claim_attestation = 6;
 }
 
 message PrepareLightningReceiveClaimResponse {
@@ -476,6 +497,13 @@ message ClaimLightningReceiveRequest {
 
 message CancelLightningReceiveRequest {
 	bytes payment_hash = 1;
+}
+
+// An arkoor that pays the invoice of a lightning receive on the Ark address
+// in its route hints. Cosigning it settles the receive.
+message LightningReceiveArkoorCosignRequest {
+	bytes payment_hash = 1;
+	ArkoorPackageCosignRequest cosign_request = 2;
 }
 
 enum LightningReceiveStatus {
@@ -497,9 +525,6 @@ message CheckLightningReceiveResponse {
 	LightningReceiveStatus status = 3;
 	// Empty until the status is HTLCS_READY or SETTLED
 	repeated bytes htlc_vtxos = 4;
-	// Aggregate expiry outcome of the actual collected receive destination.
-	// This hash-only query never returns mailbox identities or allocation data.
-	optional VtxoSpendState fallback_spend_state = 5;
 }
 
 // offboard
@@ -718,21 +743,7 @@ service RoundAdminService {
 	rpc TriggerRound(core.Empty) returns (core.Empty) {}
 }
 
-message ReconcileLightningAttemptRequest {
-	int64 attempt_id = 1;
-	// Privileged operator confirms complete same-backend CLN/plugin cessation,
-	// restart of its original persistent store and exclusion of new dispatch.
-	bool native_cold_restart_confirmed = 2;
-}
-
-message ReconcileLightningAttemptResponse {
-	int64 attempt_id = 1;
-	bytes payment_hash = 2;
-	string status = 3;
-}
-
 service LightningAdminService {
-	rpc ReconcileLightningAttempt(ReconcileLightningAttemptRequest) returns (ReconcileLightningAttemptResponse) {}
 	rpc StartLightningNode(LightningNodeUri) returns (core.Empty) {}
 	rpc StopLightningNode(LightningNodeUri) returns (core.Empty) {}
 }

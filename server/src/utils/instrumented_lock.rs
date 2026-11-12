@@ -49,16 +49,6 @@ impl<T> InstrumentedLock<T> {
 		}
 	}
 
-	pub(crate) fn try_lock(&self) -> Option<InstrumentedLockGuard<'_, T>> {
-		let guard = self.inner.try_lock().ok()?;
-		slog!(LockAcquired, name: self.name.clone(), waited: std::time::Duration::ZERO);
-		Some(InstrumentedLockGuard {
-			name: self.name.clone(),
-			held_since: Instant::now(),
-			inner: guard,
-		})
-	}
-
 	#[tracing::instrument(skip(self), fields(lock = %self.name))]
 	pub async fn lock_owned(&self) -> InstrumentedOwnedLockGuard<T> {
 		let started = Instant::now();

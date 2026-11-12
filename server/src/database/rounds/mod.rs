@@ -8,6 +8,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use bitcoin::hashes::Hash;
+use bitcoin::secp256k1::PublicKey;
 use bitcoin::{Transaction, Txid};
 use bitcoin::consensus::serialize;
 use tokio_postgres::types::Type;
@@ -24,7 +25,7 @@ use crate::round::InteractiveParticipation;
 
 
 impl<'t> Tx<'t> {
-	#[tracing::instrument(skip(self, unsigned_funding_tx, input_vtxos, signed_tree, interactive_participations))]
+	#[tracing::instrument(skip(self, unsigned_funding_tx, input_vtxos, signed_tree, interactive_participations, owner_bindings))]
 	pub async fn finish_round(
 		&self,
 		round_seq: RoundSeq,
@@ -32,9 +33,14 @@ impl<'t> Tx<'t> {
 		input_vtxos: impl IntoIterator<Item = VtxoId>,
 		signed_tree: &CachedSignedVtxoTree,
 		interactive_participations: &HashMap<UnlockHash, InteractiveParticipation>,
+		owner_bindings: &[(VtxoId, PublicKey)],
 	) -> anyhow::Result<()> {
 		let input_vtxos = input_vtxos.into_iter().collect::<Vec<_>>();
+		// Take coin locks before participation locks, matching the expiry
+		// decision's lock order and avoiding a round/payout deadlock.
 		crate::database::expiry_guard::guard_obligation_changes(self, &input_vtxos).await?;
+		// A canceled participation cannot finish even if its inputs are no
+		// longer individually fenced for fallback.
 		for hash in signed_tree.spec.spec.vtxos.iter().map(|v| v.unlock_hash) {
 			if let Some(row) = self.query_opt("SELECT id FROM round_participation WHERE unlock_hash=$1", &[&hash.to_string()]).await? {
 				crate::database::expiry_guard::guard_participation(self, row.get("id")).await?;
@@ -101,6 +107,7 @@ impl<'t> Tx<'t> {
 				&part.inputs,
 				&part.outputs,
 				None,
+				part.user_agent.as_deref(),
 			).await.with_context(|| format!(
 				"db rejected round participation for interactive participant (unlock_hash={}) \
 				with inputs {:?}", unlock_hash, part.inputs,
@@ -119,8 +126,9 @@ impl<'t> Tx<'t> {
 			.upsert_unsigned_tx(signed_tree.unsigned_leaf_txs().iter().map(Transaction::compute_txid))
 			.insert_oor_spent_vtxos(signed_tree.internal_vtxos())
 			.insert_unclaimed_vtxos(signed_tree.output_vtxos().map(ServerVtxo::from))
-			.mark_vtxos_round_spent(input_vtxos.into_iter().map(|id| (id, round_id)));
-		tree::execute_vtxo_tree_update(self, update).await?;
+			.mark_vtxos_round_spent(input_vtxos.into_iter().map(|id| (id, round_id)))
+			.bind_owner_mailboxes(owner_bindings.iter().copied())?;
+		tree::execute_vtxo_tree_update(&self, update).await?;
 
 		// register the funding output vtxos directly into the frontier
 		self.add_funding_vtxos_to_frontier(funding_txid, None).await?;
@@ -217,7 +225,7 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Option<StoredRoundParticipation>> {
 		let part_opt = self.query_opt(
 			"SELECT id, unlock_hash, unlock_preimage, round_id, forfeited_at, created_at, \
-				scheduled_height \
+				scheduled_height, user_agent \
 			FROM round_participation \
 			WHERE unlock_hash = $1",
 			&[&unlock_hash.to_string()],
@@ -240,7 +248,7 @@ impl<'t> Tx<'t> {
 	) -> anyhow::Result<Vec<StoredRoundParticipation>> {
 		let parts = self.query(
 			"SELECT id, unlock_hash, unlock_preimage, round_id, forfeited_at, created_at, \
-				scheduled_height \
+				scheduled_height, user_agent \
 			FROM round_participation \
 			WHERE round_id IS NULL \
 				AND (scheduled_height IS NULL OR scheduled_height <= $1)",
@@ -272,6 +280,7 @@ impl<'t> Tx<'t> {
 		inputs: &[VtxoId],
 		outputs: impl IntoIterator<Item = &StoredRoundOutput>,
 		scheduled_height: Option<BlockHeight>,
+		user_agent: Option<&str>,
 	) -> anyhow::Result<()> {
 		let unlock_hash = UnlockHash::hash(&unlock_preimage);
 		trace!("Storing round participation for unlock hash {} and inputs {:?}",
@@ -293,7 +302,7 @@ impl<'t> Tx<'t> {
 		}
 
 		query::store_round_participation(
-			&self, unlock_hash, unlock_preimage, inputs, outputs, scheduled_height,
+			&self, unlock_hash, unlock_preimage, inputs, outputs, scheduled_height, user_agent,
 		).await?;
 
 		Ok(())
@@ -405,87 +414,6 @@ impl<'t> Tx<'t> {
 			&[Type::TEXT],
 		).await?;
 		self.execute(&stmt, &[&unlock_hash.to_string()]).await?;
-		Ok(())
-	}
-
-	pub async fn undo_round(&self, round_id: RoundId) -> anyhow::Result<()> {
-		let round = self.get_round(round_id).await?
-			.with_context(|| format!("round {} not found", round_id))?;
-
-		let round_db_id = round.id;
-		let cached_tree = round.into_cached_tree()?;
-
-		let user_vtxo_ids = cached_tree.output_vtxos()
-			.map(|v| v.id().to_string())
-			.collect::<Vec<_>>();
-		for id in &user_vtxo_ids {
-			info!("undo_round {}: removing user vtxo {}", round_id, id);
-		}
-
-		let output_vtxo_ids = cached_tree.internal_vtxos().map(|(v, _)| v.id().to_string())
-			.chain(user_vtxo_ids.iter().cloned())
-			.collect::<Vec<_>>();
-
-		let tree_txids = std::iter::once(round_id.as_round_txid())
-			.chain(cached_tree.unsigned_leaf_txs().iter().map(|t| t.compute_txid()))
-			.chain(cached_tree.internal_node_txs().iter().map(|t| t.compute_txid()))
-			.map(|txid| txid.to_string())
-			.collect::<Vec<_>>();
-
-		let round_id_str = round_id.to_string();
-
-		// Restore input vtxos: set them back to spendable.
-		// oor_spent_txid may have been set by set_forfeit_transactions after finish_round.
-		let update = tree::VtxoTreeUpdate::new()
-			.undo_round(round_db_id);
-		tree::execute_vtxo_tree_update(self, update).await?;
-
-		// Delete round_part_input and round_part_output before round_participation (FK).
-		let stmt = self.prepare_typed(
-			"DELETE FROM round_part_input WHERE participation_id IN
-			(SELECT id FROM round_participation WHERE round_id = $1)",
-			&[Type::TEXT],
-		).await?;
-		self.execute(&stmt, &[&round_id_str]).await?;
-
-		let stmt = self.prepare_typed(
-			"DELETE FROM round_part_output WHERE participation_id IN
-			(SELECT id FROM round_participation WHERE round_id = $1)",
-			&[Type::TEXT],
-		).await?;
-		self.execute(&stmt, &[&round_id_str]).await?;
-
-		let stmt = self.prepare_typed(
-			"DELETE FROM round_participation WHERE round_id = $1",
-			&[Type::TEXT],
-		).await?;
-		self.execute(&stmt, &[&round_id_str]).await?;
-
-		// Delete vtxos that were created by this round (output and internal tree vtxos).
-		// Remove only their ownership projection. Economic references must still
-		// refuse the VTXO delete and roll this entire undo transaction back.
-		self.execute("DELETE FROM coin_owner WHERE vtxo_id = ANY($1)", &[&output_vtxo_ids]).await?;
-		let stmt = self.prepare_typed(
-			"DELETE FROM vtxo WHERE vtxo_id = ANY($1)",
-			&[Type::TEXT_ARRAY],
-		).await?;
-		self.execute(&stmt, &[&output_vtxo_ids]).await?;
-
-		// Delete virtual transactions for this round's tx tree.
-		let stmt = self.prepare_typed(
-			"DELETE FROM virtual_transaction WHERE txid = ANY($1)",
-			&[Type::TEXT_ARRAY],
-		).await?;
-		self.execute(&stmt, &[&tree_txids]).await?;
-
-		// Delete the round row itself.
-		let stmt = self.prepare_typed(
-			"DELETE FROM round WHERE funding_txid = $1",
-			&[Type::TEXT],
-		).await?;
-		self.execute(&stmt, &[&round_id_str]).await?;
-
-		info!("Undid round {}", round_id);
 		Ok(())
 	}
 

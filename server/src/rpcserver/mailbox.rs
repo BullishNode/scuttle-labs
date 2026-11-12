@@ -15,10 +15,6 @@ use crate::database::{Checkpoint, MailboxEntry, MailboxPayload};
 use crate::rpcserver::{StatusContext, ToStatus, ToStatusResult};
 use crate::rpcserver::macros::badarg;
 
-// Mailbox posts are limited by tonic's 4 MiB request limit, while Bark reads
-// at most 64 MiB per response. Leave room for encoding and other message types.
-const MAX_READ_MAILBOX_CHECKPOINTS: usize = 8;
-
 /// Bail with `invalid_argument` if the authorization is expired, logging the
 /// timing details so we can attribute failures to clock skew.
 fn check_auth_not_expired(auth: &MailboxAuthorization) -> Result<(), tonic::Status> {
@@ -105,7 +101,6 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostArkoorMessageRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
-		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxos.len() > MAX_NB_MAILBOX_ARKOOR_VTXOS {
@@ -159,9 +154,8 @@ impl rpc::server::MailboxService for crate::Server {
 		// stops a known id from being posted with doctored content that would
 		// route it into a mailbox its owner doesn't watch.
 		let vtxo_ids = vtxos.iter().map(|v| v.id()).collect::<Vec<_>>();
-		let stored = self.db.read(async |t| {
-			t.get_user_vtxos_by_id(&vtxo_ids).await
-		}).await.to_status()?;
+		let stored = self.db.read(async |t| t.get_user_vtxos_by_id(&vtxo_ids).await)
+			.await.to_status()?;
 		for stored in &stored {
 			if stored.vtxo.user_pubkey() != vtxo_pubkey {
 				self::badarg!("vtxo {} doesn't belong to the provided vtxo pubkey", stored.vtxo_id);
@@ -192,7 +186,6 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<protos::mailbox_server::MailboxMessages>, tonic::Status> {
-		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -207,10 +200,10 @@ impl rpc::server::MailboxService for crate::Server {
 		if !auth.verify() {
 			self::badarg!("invalid mailbox authorization signature");
 		}
-		let limit = self.config.max_read_mailbox_items.min(MAX_READ_MAILBOX_CHECKPOINTS);
-		let entries_by_checkpoint = self.db.read(async |t|
+		let limit = self.config.max_read_mailbox_items;
+		let entries_by_checkpoint = self.db.read(async |t| {
 			t.get_mailbox_messages(mailbox_id, req.checkpoint, limit).await
-		).await.to_status()?;
+		}).await.to_status()?;
 
 		let response = protos::mailbox_server::MailboxMessages {
 			have_more: entries_by_checkpoint.len() >= limit,
@@ -234,7 +227,6 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::MailboxRequest>,
 	) -> Result<tonic::Response<Self::SubscribeMailboxStream>, tonic::Status> {
-		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		let mailbox_id = MailboxIdentifier::deserialize(req.mailbox_id.as_slice())
@@ -252,7 +244,7 @@ impl rpc::server::MailboxService for crate::Server {
 
 		let db = self.db.clone();
 		let starting_checkpoint = Checkpoint::from(req.checkpoint.max(0));
-		let ret_limit = self.config.max_read_mailbox_items.min(MAX_READ_MAILBOX_CHECKPOINTS);
+		let ret_limit = self.config.max_read_mailbox_items;
 
 		// Start listening for updates on the tip of the mailbox.
 		// Marking the first value as changed makes `changed()` return
@@ -313,7 +305,6 @@ impl rpc::server::MailboxService for crate::Server {
 		&self,
 		req: tonic::Request<protos::mailbox_server::PostRecoveryVtxoIdsRequest>,
 	) -> Result<tonic::Response<protos::core::Empty>, tonic::Status> {
-		super::validate_pver(&req, self.config.expiry_payouts)?;
 		let req = req.into_inner();
 
 		if req.vtxo_ids.len() > MAX_NB_MAILBOX_RECOVERY_IDS {

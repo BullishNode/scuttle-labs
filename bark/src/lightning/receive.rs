@@ -7,7 +7,9 @@ use lightning_invoice::Bolt11Invoice;
 use log::{error, info, warn};
 use server_rpc::protos;
 
+use ark::{Vtxo, VtxoId};
 use ark::lightning::{Bolt11InvoiceExt, Preimage, PaymentHash};
+use ark::vtxo::Full;
 
 use crate::Wallet;
 use crate::actions::{DriveMode, WalletAction};
@@ -15,8 +17,9 @@ use crate::actions::lightning::receive::{
 	Htlcs, LightningReceive, LightningReceiveState, Progress,
 	ln_recv_action_id, start_lightning_receive
 };
-use crate::movement::MovementStatus;
+use crate::movement::{MovementDestination, MovementStatus};
 use crate::movement::update::MovementUpdate;
+use crate::subsystem::{LightningMovement, LightningReceiveMovement, Subsystem};
 use crate::vtxo::VtxoStateKind;
 
 /// Builds a [`Bolt11Invoice`] for an incoming lightning payment, see
@@ -85,16 +88,15 @@ impl<'a> Bolt11InvoiceBuilder<'a> {
 	/// steal the payment unless they provide a different address than the
 	/// desired end user.
 	///
-	/// It can still strand it: delivering the signed output to the
-	/// destination's mailbox is a separate step that only this wallet can
-	/// perform, and nothing else (not the server, not the destination) can
-	/// discover or recover that output until it does. The delivery is a
-	/// parked action that resumes automatically on restart, so a crash
-	/// recovers on its own — but for as long as this wallet stays offline
-	/// (or simply never delivers), the destination cannot claim funds that
-	/// are already theirs. Forwarding through a third party means trusting
-	/// it to eventually come back online and deliver, not trusting it with
-	/// custody.
+	/// Delivery of the signed Ark output to the destination's mailbox is a
+	/// separate step that only this wallet performs. The delivery action
+	/// resumes on restart. Until delivery, the destination cannot use that
+	/// Ark output. A recorded claim can still produce a bitcoin payout at
+	/// expiry. Before a claim is recorded, the grant remains this wallet's
+	/// coin and its expiry payout goes to this wallet. After a claim is
+	/// recorded, the server uses the output's address for its payout.
+	/// Forwarding through a third party means trusting it to deliver and
+	/// reconcile the payment with the intended recipient.
 	pub fn claim_destination(mut self, claim_destination: impl Into<Option<ark::Address>>) -> Self {
 		self.claim_destination = claim_destination.into();
 		self
@@ -154,6 +156,70 @@ impl Wallet {
 	/// Drives every pending lightning receive forward by one step (or to
 	/// completion if it's ready). Each action runs to its next park
 	/// independently; errors on one don't stop the others.
+	/// Credit the VTXOs that paid one of our invoices on the Ark address in
+	/// its route hints as the lightning receive of that invoice.
+	///
+	/// Only an arkoor that the server settled the receive with paid the
+	/// invoice; other VTXOs on that address are an ordinary arkoor receive.
+	/// Returns the VTXOs that paid no invoice.
+	pub(crate) async fn credit_lightning_receives_paid_by_arkoor(
+		&self,
+		vtxos: &[Vtxo<Full>],
+	) -> anyhow::Result<Vec<Vtxo<Full>>> {
+		let mut rest = vtxos.to_vec();
+		for recv in self.pending_lightning_receives().await? {
+			if recv.progress != Progress::AwaitingPayment || recv.invoice.ark_address().is_none() {
+				continue;
+			}
+
+			let claim_pubkey = self.peek_keypair(recv.key_index).await?.public_key();
+			let (paid, other) = rest.into_iter()
+				.partition::<Vec<_>, _>(|v| v.user_pubkey() == claim_pubkey);
+			rest = other;
+			if paid.is_empty() {
+				continue;
+			}
+
+			let (mut srv, _) = self.require_server().await?;
+			let status = srv.client.check_lightning_receive(protos::CheckLightningReceiveRequest {
+				hash: recv.payment_hash.to_vec(),
+				wait: false,
+			}).await?.into_inner().status;
+			if status != protos::LightningReceiveStatus::Settled as i32 {
+				rest.extend(paid);
+				continue;
+			}
+
+			let received = paid.iter().map(|v| v.amount()).sum::<Amount>();
+			let amount = recv.invoice.get_payment_amount(None).unwrap_or(received);
+			self.store_spendable_vtxos(paid.iter()).await?;
+
+			// The settled record goes first, so a consumer of the movement
+			// notification finds the receive settled. See
+			// claim_lightning_receive_htlcs.
+			self.inner.db.record_settled_lightning_receive(
+				recv.payment_hash, recv.payment_preimage, &recv.invoice, amount,
+			).await?;
+			let movement_id = self.inner.movements.new_finished_movement(
+				Subsystem::LIGHTNING_RECEIVE,
+				LightningReceiveMovement::Receive.to_string(),
+				MovementStatus::Successful,
+				MovementUpdate::new()
+					.produced_vtxos(&paid)
+					.intended_balance(amount.to_signed()?)
+					.effective_balance(received.to_signed()?)
+					.metadata(LightningMovement::metadata(
+						recv.payment_hash, Vec::<VtxoId>::new(), Some(recv.payment_preimage),
+					))
+					.received_on([MovementDestination::new(recv.invoice.clone().into(), received)]),
+			).await?;
+			info!("Invoice {} paid by arkoor (movement {}) for {}",
+				recv.payment_hash, movement_id, received,
+			);
+		}
+		Ok(rest)
+	}
+
 	pub async fn sync_pending_lightning_receives(&self) -> anyhow::Result<()> {
 		let pending = self.pending_lightning_receives().await?;
 		if pending.is_empty() {
@@ -238,21 +304,6 @@ impl Wallet {
 	///
 	/// See [`Bolt11InvoiceBuilder::claim_destination`] for the trust model,
 	/// and [`Self::bolt11_invoice_builder`] for more options.
-	///
-	/// Trust model: the claim arkoor is built directly against
-	/// `claim_destination`'s policy, so the funds are signed to the
-	/// destination the moment they're claimed. This wallet never holds a
-	/// key that can spend them, so it has no custodial control and cannot
-	/// redirect — a malicious or compromised caller of this method cannot
-	/// steal the payment unless they provide a different address than the
-	/// desired end user.
-	///
-	/// Mailbox delivery is a separate step that only this wallet performs.
-	/// The parked delivery action resumes automatically on restart. If
-	/// delivery does not occur, the server can pay an expired receive to
-	/// the recipient's mailbox-derived BIP86 script without this
-	/// wallet. The Ark server verifies the destination's signed owner link
-	/// and mailbox-key authorization before it creates the invoice.
 	pub async fn bolt11_invoice_for_address(
 		&self,
 		amount: Amount,

@@ -425,7 +425,8 @@ impl Wallet {
 			errors.push(PaymentMethodParsingError::NetworkMismatch);
 		}
 
-		let offer_amount = offer.amount().map(|a| a.to_bitcoin_amount().unwrap());
+		// An amount in a fiat currency has no bitcoin amount to compare with.
+		let offer_amount = offer.amount().and_then(|a| a.to_bitcoin_amount());
 		match (offer_amount, uri_amount) {
 			(Some(offer_amount), Some(amount)) => {
 				if offer_amount != amount {
@@ -651,7 +652,7 @@ impl Wallet {
 
 			return Some(PaymentRequest {
 				label: None,
-				amount: offer.amount().map(|a| a.to_bitcoin_amount().unwrap()),
+				amount: offer.amount().and_then(|a| a.to_bitcoin_amount()),
 				message: offer.description().map(|d| d.to_string()),
 				options: vec![details],
 			});
@@ -1008,6 +1009,17 @@ mod test {
 		assert!(parse(INVOICE).is_some());
 		assert!(parse(&upper_invoice).is_some());
 		assert!(parse("satoshi@example.com").is_some());
+		assert!(parse("first.last_name-1@pay.example.co.uk").is_some());
+
+		// Bidi, zero-width and look-alike characters would show one payee
+		// while another gets paid. LUD-16 only allows `a-z0-9-_.` and a
+		// hostname, and lnurl-rs enforces that.
+		assert!(parse("satoshi\u{202E}@example.com").is_none());
+		assert!(parse("satoshi@\u{202E}moc.elpmaxe").is_none());
+		assert!(parse("sato\u{200B}shi@example.com").is_none());
+		assert!(parse("\u{212A}atoshi@example.com").is_none());
+		assert!(parse("s\u{0430}toshi@example.com").is_none());
+		assert!(parse("satoshi@ex\u{0430}mple.com").is_none());
 
 		assert!(parse("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").is_none());
 		assert!(parse("bitcoin:tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx").is_none());

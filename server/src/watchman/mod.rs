@@ -11,7 +11,6 @@ mod daemon;
 mod frontier;
 mod policy;
 mod payout;
-mod recovery;
 pub(crate) mod readiness;
 mod signer;
 pub(crate) mod settlement;
@@ -90,14 +89,15 @@ use anyhow::Context;
 use bitcoin::{Address, Amount, FeeRate, Transaction, TxIn, TxOut, Sequence, ScriptBuf, Weight, Witness, sighash};
 use bitcoin::Txid;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{info, trace, warn};
 
 use ark::{ServerVtxo, ServerVtxoPolicy, VtxoId};
 use ark::vtxo::policy::signing::VtxoSigner;
-use bitcoin_ext::{fee, BlockHeight, BlockRef, TransactionExt, TxStatus, P2TR_DUST};
+use bitcoin_ext::{fee, BlockHeight, BlockRef, TxStatus, P2TR_DUST};
+use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoin_ext::bdk::KEYCHAIN;
 use bitcoin_ext::cpfp::MakeCpfpFees;
-use bitcoin_ext::rpc::BitcoinAsyncRpcExt;
 use bitcoind_async_client::Client as BitcoindClient;
 use bitcoind_async_client::traits::Reader;
 
@@ -106,7 +106,7 @@ use crate::database::{BlockTable, Db, Tx};
 use crate::fee_estimator::FeeEstimator;
 use crate::system::RuntimeManager;
 use crate::utils::InstrumentedLock;
-use crate::wallet::{BdkWalletExt, PersistedWallet};
+use crate::wallet::PersistedWallet;
 use crate::watchman::policy::ActionContextFetcher;
 
 /// The kind of mempool spend.
@@ -240,36 +240,64 @@ impl Watchman {
 	pub fn start(self, rtmgr: RuntimeManager) -> WatchmanHandle {
 		let (ctrl_tx, ctrl_rx) = tokio::sync::mpsc::channel(1);
 		tokio::spawn(async move {
-			self.run(rtmgr, ctrl_rx).await;
+			Arc::new(self).run(rtmgr, ctrl_rx).await;
 		});
 		WatchmanHandle { ctrl_tx }
 	}
 
-	async fn run(&self, rtmgr: RuntimeManager, mut ctrl_rx: tokio::sync::mpsc::Receiver<Ctrl>) {
+	fn enqueue_expiry_sweep(self: &Arc<Self>, tasks: &mut JoinSet<()>, pending: &mut bool) {
+		if tasks.is_empty() {
+			let watchman = Arc::clone(self);
+			tasks.spawn(async move { watchman.process_sweeps_logged().await; });
+		} else {
+			*pending = true;
+		}
+	}
+
+	async fn run(self: Arc<Self>, rtmgr: RuntimeManager, mut ctrl_rx: tokio::sync::mpsc::Receiver<Ctrl>) {
 		info!("Starting Watchman...");
 		let _worker = rtmgr.spawn_critical("Watchman");
 
 		let mut reaction_timer = tokio::time::interval(self.config.reaction_interval);
 		let mut sweep_timer = tokio::time::interval(self.config.sweep_interval);
 		let mut completed = self.sync_height.clone();
+		let mut expiry_sweeps = JoinSet::new();
+		let mut sweep_pending = false;
 		loop {
 			tokio::select! {
+				// Expiry payouts are decided per block, not on the long upstream
+				// sweep timer, so a payout or its retry is not delayed for hours.
 				Ok(()) = completed.changed(), if self.db.expiry_payouts() => {
-					self.process_sweeps_logged().await;
+					self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
 				},
 				_ = reaction_timer.tick() => {
 					self.process_reactions_logged().await;
 					reaction_timer.reset();
 				},
 				_ = sweep_timer.tick() => {
-					self.process_sweeps_logged().await;
+					if self.db.expiry_payouts() {
+						self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
+					} else {
+						self.process_sweeps_logged().await;
+					}
 					sweep_timer.reset();
+				},
+				Some(result) = expiry_sweeps.join_next(), if !expiry_sweeps.is_empty() => {
+					if let Err(error) = result { panic!("Expiry sweep task failed: {error}"); }
+					if sweep_pending {
+						sweep_pending = false;
+						self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
+					}
 				},
 				Some(ctrl) = ctrl_rx.recv() => match ctrl {
 					// a manual trigger runs both loops so we fully catch up
 					Ctrl::TriggerSweep => {
 						self.process_reactions_logged().await;
-						self.process_sweeps_logged().await;
+						if self.db.expiry_payouts() {
+							self.enqueue_expiry_sweep(&mut expiry_sweeps, &mut sweep_pending);
+						} else {
+							self.process_sweeps_logged().await;
+						}
 						reaction_timer.reset();
 						sweep_timer.reset();
 					},
@@ -831,20 +859,11 @@ impl Watchman {
 		vtxos: &[ServerVtxo],
 		fee_rate: FeeRate,
 	) -> anyhow::Result<()> {
-		let tx = self.build_claim_tx(vtxos, fee_rate, None).await?;
+		let tx = self.build_claim_tx(vtxos, fee_rate).await?;
 		let txid = tx.compute_txid();
 		if self.db.expiry_payouts() {
 			self.db.write(async |t| {
 				t.lock_watchman_claim_inputs(vtxos).await?;
-				for vtxo in vtxos.iter().filter(|v| self.db.expiry_payouts() && *v.policy() == ServerVtxoPolicy::ServerOwned) {
-					// Exclude mempool effects so our existing native RBF path can
-					// replace its own claim; canonical consumption always refuses.
-					let output = self.bitcoind.try_get_tx_out(vtxo.point(), false).await?
-						.context("operator collateral is not canonically unspent")?;
-					ensure!(output.confirmations > 0 && output.value == vtxo.amount()
-						&& output.script_pub_key.script()? == vtxo.txout().script_pubkey,
-						"operator collateral differs from its confirmed server-owned output");
-				}
 				bcd::broadcast_tx(&self.bitcoind, &tx).await?;
 				Ok(())
 			}).await?;
@@ -876,7 +895,6 @@ impl Watchman {
 		&self,
 		vtxos: &[ServerVtxo],
 		fee_rate: FeeRate,
-		payout_outputs: Option<Vec<TxOut>>,
 	) -> anyhow::Result<Transaction> {
 		let mut inputs = Vec::with_capacity(vtxos.len());
 		let mut clauses = Vec::with_capacity(vtxos.len());
@@ -945,7 +963,7 @@ impl Watchman {
 		let fee = fee_rate.fee_wu(total_weight)
 			.context("fee computation overflow")?;
 		let output_amount = match total_input_amount.checked_sub(fee) {
-			Some(rem) if rem >= P2TR_DUST || payout_outputs.is_some() => rem,
+			Some(rem) if rem >= P2TR_DUST => rem,
 			_ => bail!("insufficient funds: input {} < fee {}", total_input_amount, fee),
 		};
 
@@ -955,12 +973,10 @@ impl Watchman {
 		};
 
 		let mut tx = Transaction {
-			version: if payout_outputs.is_some() {
-				bitcoin::transaction::Version::non_standard(3)
-			} else { bitcoin::transaction::Version::TWO },
+			version: bitcoin::transaction::Version::TWO,
 			lock_time,
 			input: inputs,
-			output: payout_outputs.unwrap_or_else(|| vec![output]),
+			output: vec![output],
 		};
 
 		// Sign all inputs
@@ -1039,20 +1055,12 @@ impl Watchman {
 				break;
 			}
 
-			match self.db.write(async |t| {
-				// Normal exit progression competes with payouts for the same
-				// physical backing too. Hold its coin locks through publication.
-				t.lock_unallocated_watchman_inputs(&[vtxo.id()]).await?;
-				self.process_progress_tx(t, &mut wallet, progress_txid, &vtxo, fee_rate).await
-			}).await {
-				Ok(true) => {
-					let _ = wallet.take_staged();
-					crate::telemetry::set_wallet_balance(wallet.kind(), wallet.balance());
-				},
-				Ok(false) => {},
-				Err(e) => slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
+			if let Err(e) = self.process_progress_tx(
+				&mut wallet, progress_txid, &vtxo, fee_rate,
+			).await {
+				slog!(ProgressCpfpFailure, vtxo_id: vtxo.id(), txid: progress_txid,
 					error: e.to_string(),
-				),
+				);
 			}
 		}
 
@@ -1065,15 +1073,13 @@ impl Watchman {
 	/// transaction to pay its fees, then broadcasts them as a package.
 	async fn process_progress_tx(
 		&self,
-		tx: &Tx<'_>,
 		wallet: &mut PersistedWallet,
 		txid: Txid,
 		vtxo: &ServerVtxo,
 		fee_rate: FeeRate,
-	) -> anyhow::Result<bool> {
-		// Reuse the publication transaction, retaining its source locks without
-		// borrowing another connection from the same pool.
-		let vtx = tx.get_virtual_transaction_by_txid(txid).await?
+	) -> anyhow::Result<()> {
+		// Get the progress transaction from the database
+		let vtx = self.db.read(async |t| t.get_virtual_transaction_by_txid(txid).await).await?
 			.context(txid)
 			.context("progress tx not found")?;
 
@@ -1081,32 +1087,17 @@ impl Watchman {
 
 		// Create a CPFP transaction to pay fees for the progress tx
 		//TODO(stevenroose) adapt feerate to how close the deadline is
-		let (anchor, _) = progress_tx.fee_anchor().context("progress tx has no fee anchor")?;
-		let fees = if let Some(child) = bcd::get_mempool_spending_tx(&self.bitcoind, anchor).await? {
-			let (current_package_fee, weight) = payout::mempool_child_fee(&self.bitcoind, child).await?
-				.context("progress fee child left the mempool")?;
-			if current_package_fee >= (progress_tx.weight() + weight) * fee_rate {
-				return Ok(false);
-			}
-			MakeCpfpFees::Rbf { min_effective_fee_rate: fee_rate, current_package_fee }
-		} else {
-			MakeCpfpFees::Effective(fee_rate)
-		};
+		let fees = MakeCpfpFees::Effective(fee_rate);
 		let cpfp_tx = wallet.make_signed_p2a_cpfp(&progress_tx, fees)
 			.with_context(|| format!("failed to create CPFP for vtx {}", txid))?;
 
 		// Broadcast the progress tx and CPFP as a package
 		let cpfp_txid = cpfp_tx.compute_txid();
-		let result = bcd::submit_package(&self.bitcoind, &[&progress_tx, &cpfp_tx]).await?;
-		bcd::require_package_acceptance(&result, &[&progress_tx, &cpfp_tx])?;
-		wallet.commit_tx(&cpfp_tx);
-		if let Some(change) = wallet.staged() {
-			tx.store_changeset(wallet.kind(), change).await?;
-		}
+		bcd::submit_package(&self.bitcoind, &[progress_tx, cpfp_tx]).await?;
 
 		slog!(ProgressBroadcast, vtxo_id: vtxo.id(), txid, cpfp_txid);
 
-		Ok(true)
+		Ok(())
 	}
 }
 

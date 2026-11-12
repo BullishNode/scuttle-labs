@@ -24,7 +24,8 @@ use tracing::{trace, warn};
 use ::ark::VtxoId;
 use server_rpc::{pver, RequestExt, IN_FLIGHT_INPUTS_METADATA_KEY};
 
-use crate::error::{BadArgument, FallbackRefusal, InFlightInputs, OwnershipRefusal, NotFound, RoundCancelledBeforeForfeit, Unavailable, UnusableInputs};
+use crate::error::{BadArgument, FallbackRefusal, InFlightInputs, NotFound, RoundCancelledBeforeForfeit, Unavailable, UnusableInputs};
+
 
 /// The minimum protocol version supported by the server.
 ///
@@ -105,11 +106,6 @@ impl ToStatus for anyhow::Error {
 			let mut metadata = tonic::metadata::MetadataMap::new();
 			metadata.insert("abandon-reason", tonic::metadata::MetadataValue::from_static(refusal.reason()));
 			metadata.insert("identifiers", refusal.vtxo_id().to_string().parse().expect("VTXO identifiers are ASCII"));
-			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
-		} else if let Some(refusal) = self.downcast_ref::<OwnershipRefusal>() {
-			let mut metadata = tonic::metadata::MetadataMap::new();
-			metadata.insert("abandon-reason", tonic::metadata::MetadataValue::from_static(refusal.reason()));
-			metadata.insert("identifiers", refusal.public_key().to_string().parse().expect("public keys are ASCII"));
 			tonic::Status::with_metadata(tonic::Code::InvalidArgument, format!("{:#}", self), metadata)
 		} else if let Some(ui) = self.downcast_ref::<UnusableInputs>() {
 			// Like a bad argument, but we attach the offending VTXO ids so the
@@ -215,6 +211,7 @@ where
 	}
 }
 
+
 #[async_trait]
 trait ReceiverExt {
 	async fn wait_for_status(self) -> Result<(), tonic::Status>;
@@ -235,15 +232,15 @@ impl ReceiverExt for oneshot::Receiver<anyhow::Error> {
 	}
 }
 
-/// Validate the ordinary range, or require joint ownership in payout-on mode.
-fn validate_pver<T>(req: &tonic::Request<T>, expiry_payouts: bool) -> Result<u64, tonic::Status> {
+/// Get the protocol version sent by the user and check if it's supported.
+#[allow(unused)]
+fn validate_pver<T>(req: &tonic::Request<T>) -> Result<u64, tonic::Status> {
 	let pver = req.pver()?;
-	let range = if expiry_payouts {
-		pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS..=pver::PROTOCOL_VERSION_EXPIRY_PAYOUTS
-	} else { MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION };
-	if !range.contains(&pver) {
+
+	if !(MIN_PROTOCOL_VERSION..=MAX_PROTOCOL_VERSION).contains(&pver) {
 		return Err(tonic::Status::invalid_argument("unsupported protocol version"));
 	}
+
 	Ok(pver)
 }
 
@@ -278,19 +275,6 @@ mod fallback_tests {
 		assert_eq!(status.code(), tonic::Code::NotFound);
 		assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), hash.to_string());
 		assert!(status.metadata().get("abandon-reason").is_none());
-	}
-
-	#[test]
-	fn ownership_refusal_metadata_names_actual_output_key() {
-		let key = VTXO_VECTORS.board_vtxo.user_pubkey();
-		for refusal in [OwnershipRefusal::Required(key), OwnershipRefusal::Invalid(key),
-			OwnershipRefusal::Conflicting(key)] {
-			let reason = refusal.reason();
-			let status = anyhow::Error::new(refusal).context("admission refused").to_status();
-			assert_eq!(status.code(), tonic::Code::InvalidArgument);
-			assert_eq!(status.metadata().get("abandon-reason").unwrap().to_str().unwrap(), reason);
-			assert_eq!(status.metadata().get("identifiers").unwrap().to_str().unwrap(), key.to_string());
-		}
 	}
 
 	#[test]

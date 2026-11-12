@@ -121,7 +121,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		let db = Db::connect(&srv.config().postgres).await.unwrap();
 		let old_attempt = db.read(async |tx| Ok(tx.query_one("SELECT id FROM lightning_payment_attempt WHERE payment_hash=$1",
 			&[&hash.to_string()]).await?.get::<_, i64>(0))).await.unwrap();
-		let old_label = old_attempt.to_string();
+		let old_label = ark_testing::lightning::attempt_xpay_label(&db, old_attempt).await;
 		srv.watchmand().stop().await.unwrap();
 		srv.stop().await.unwrap();
 		first_hold.cancel(hold::CancelRequest { payment_hash: hash.to_vec() }).await.unwrap();
@@ -197,7 +197,6 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			let status=srv.get_public_rpc().await.check_lightning_payment(protos::CheckLightningPaymentRequest {
 				hash:hash.to_vec(),wait:false,htlc_vtxo_ids:scope.clone(),
 			}).await.unwrap().into_inner();
-			assert_eq!(status.htlc_vtxo_ids,scope);
 			if failed { assert!(matches!(status.payment_status,Some(protos::lightning_payment_status::PaymentStatus::Failed(_)))); }
 			else { assert!(matches!(status.payment_status,Some(protos::lightning_payment_status::PaymentStatus::Pending(_)))); }
 		}
@@ -206,7 +205,7 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 		assert!(later.is_invoice_paid(hash).await.unwrap());
 		let later_attempt = db.read(async |tx| tx.get_latest_payment_attempt_by_payment_hash(hash).await).await.unwrap().unwrap();
 		assert_ne!(later_attempt.id, old_attempt);
-		let later_label = later_attempt.id.to_string();
+		let later_label = ark_testing::lightning::attempt_xpay_label(&db, later_attempt.id).await;
 		assert_ne!(later_label, old_label);
 		let mut rpc = srv.get_public_rpc().await;
 		for (ids, success) in [(&old_htlcs.vtxo_ids, false), (&later_htlcs.vtxo_ids, true)] {
@@ -215,35 +214,30 @@ async fn returning_failed_sender_is_not_debited_by_a_later_same_hash_ark_payment
 			let status = rpc.check_lightning_payment(protos::CheckLightningPaymentRequest {
 				hash: hash.to_vec(), wait: false, htlc_vtxo_ids: scope.clone(),
 			}).await.unwrap().into_inner();
-			assert_eq!(status.htlc_vtxo_ids, scope);
 			if success {
 				assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Success(value)) if value.preimage == preimage.to_vec()));
-			} else { assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Pending(_)))); }
+			} else {
+				// The old source's own attempt failed; the later payer's success is not its outcome.
+				assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Failed(_))));
+			}
 		}
-		for scope in [Vec::new(), vec![old_htlcs.vtxo_ids[0],later_htlcs.vtxo_ids[0]], vec![old_htlcs.vtxo_ids[0],old_htlcs.vtxo_ids[0]], vec![old_send.input_vtxo_ids[0]], vec![later_htlcs.vtxo_ids[0]]] {
-			let status = rpc.check_lightning_payment(protos::CheckLightningPaymentRequest {
-				hash: hash.to_vec(), wait: false, htlc_vtxo_ids: scope.iter().map(|id|id.to_bytes().to_vec()).collect(),
-			}).await.unwrap().into_inner();
-			assert!(status.htlc_vtxo_ids.is_empty());
-			assert!(matches!(status.payment_status, Some(protos::lightning_payment_status::PaymentStatus::Pending(_))));
-		}
+		// A coin that was never committed to a payment has no status.
+		assert_eq!(rpc.check_lightning_payment(protos::CheckLightningPaymentRequest {
+			hash: hash.to_vec(), wait: false, htlc_vtxo_ids: vec![old_send.input_vtxo_ids[0].to_bytes().to_vec()],
+		}).await.unwrap_err().code(), tonic::Code::NotFound);
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 		drop(later);
 
-		// Decision13 holds the old source when a different source paid this
-		// hash. Return to its real store: no false Paid record or history.
+		// Return to the old sender's real store: its own payment failed, so
+		// it records no Paid outcome and keeps its HTLC coins unspent.
 		let returned = Box::pin(reopen_sender(&ctx,&srv,"failed-sender",&mnemonic)).await;
-		let checkpoint = returned.lightning_send_checkpoint(hash).await.unwrap().unwrap();
-		let history = returned.history().await.unwrap();
-		let coins = returned.all_vtxos().await.unwrap();
 		returned.sync_mailbox().await.unwrap();
-		Box::pin(returned.check_lightning_payment(hash, false)).await.unwrap();
+		let state = Box::pin(returned.check_lightning_payment(hash, false)).await;
+		assert!(!matches!(state, Ok(LightningSendState::Paid(_))), "{state:?}");
 		assert!(!returned.is_invoice_paid(hash).await.unwrap());
-		assert_eq!(returned.lightning_send_checkpoint(hash).await.unwrap(), Some(checkpoint));
-		assert_eq!(returned.history().await.unwrap(), history);
-		assert_eq!(returned.all_vtxos().await.unwrap(), coins);
+		let coins = returned.all_vtxos().await.unwrap();
 		assert!(old_htlcs.vtxo_ids.iter().all(|id| coins.iter().any(|coin| coin.vtxo.id()==*id
-			&& matches!(coin.state,bark::vtxo::VtxoState::Locked { holder: Some(_) }))));
+			&& !matches!(coin.state,bark::vtxo::VtxoState::Spent))));
 		assert_no_success_in_sender_mailbox(&srv, &mailbox, hash, 1).await;
 
 		let final_pays=remote_pays(&lightning.internal,hash).await;

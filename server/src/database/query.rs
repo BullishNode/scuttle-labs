@@ -114,7 +114,7 @@ pub async fn get_vtxo_by_id(
 	let stmt = tx.prepare_typed("
 		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
 			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at,
-			EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
+			EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
 		FROM vtxo
 		WHERE vtxo_id = $1;
 	", &[Type::TEXT]).await?;
@@ -137,7 +137,7 @@ pub async fn get_existing_vtxos_by_id(
 	let statement = tx.prepare_typed("
 		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
 			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at,
-			EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
+			EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
 		FROM vtxo
 		WHERE vtxo_id = ANY($1);
 	", &[Type::TEXT_ARRAY]).await?;
@@ -192,7 +192,7 @@ pub async fn get_vtxos_by_policy_page(
 	let statement = tx.prepare_typed("
 		SELECT id, vtxo_id, vtxo, expiry, oor_spent_txid, spent_in_round, offboarded_in,
 			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at,
-			EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
+			EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
 		FROM vtxo
 		WHERE policy = $1 AND ($2::TEXT IS NULL OR vtxo_id > $2)
 		ORDER BY vtxo_id
@@ -246,7 +246,7 @@ pub async fn try_get_bare_vtxo_by_id(
 			server_pubkey, amount, anchor_point,
 			oor_spent_txid, spent_in_round, offboarded_in,
 			banned_until_height, confirmed_height, spend_state::TEXT AS spend_state, created_at, updated_at,
-			EXISTS(SELECT 1 FROM expiry_entitlement d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
+			EXISTS(SELECT 1 FROM expiry_allocation_coin d WHERE d.vtxo_id=vtxo.vtxo_id) AS decided_for_fallback
 		FROM vtxo
 		WHERE vtxo_id = $1;
 	", &[Type::TEXT]).await?;
@@ -267,6 +267,7 @@ pub async fn store_round_participation(
 	inputs: &[VtxoId],
 	outputs: impl IntoIterator<Item = &StoredRoundOutput>,
 	scheduled_height: Option<BlockHeight>,
+	user_agent: Option<&str>,
 ) -> anyhow::Result<()> {
 	// The column is an INTEGER, so a larger height would wrap negative.
 	let scheduled_height = scheduled_height
@@ -276,15 +277,16 @@ pub async fn store_round_participation(
 
 	let part_stmt = tx.prepare_typed(
 		"INSERT INTO round_participation \
-			(unlock_hash, unlock_preimage, scheduled_height, created_at) \
-		VALUES ($1, $2, $3, NOW()) RETURNING id",
-		&[Type::TEXT, Type::TEXT, Type::INT4]
+			(unlock_hash, unlock_preimage, scheduled_height, user_agent, created_at) \
+		VALUES ($1, $2, $3, $4, NOW()) RETURNING id",
+		&[Type::TEXT, Type::TEXT, Type::INT4, Type::TEXT]
 	).await?;
 
 	let part_row = tx.query_one(&part_stmt, &[
 		&unlock_hash.to_string(),
 		&unlock_preimage.to_lower_hex_string(),
 		&scheduled_height,
+		&user_agent,
 	]).await?;
 
 	let part_id = part_row.get::<_, i64>("id");
@@ -417,6 +419,7 @@ pub async fn complete_round_participation(
 	let scheduled_height = part_row.get::<_, Option<i32>>("scheduled_height")
 		.map(|h| BlockHeight::try_from(h).context("invalid scheduled_height in db"))
 		.transpose()?;
+	let user_agent = part_row.get::<_, Option<String>>("user_agent");
 
 	Ok(StoredRoundParticipation {
 		unlock_preimage: Secret::new(unlock_preimage),
@@ -426,6 +429,7 @@ pub async fn complete_round_participation(
 		round_id,
 		forfeited_at,
 		scheduled_height,
+		user_agent,
 	})
 }
 
