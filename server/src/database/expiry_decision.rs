@@ -8,7 +8,7 @@ use bitcoin::{Amount, Txid};
 use ark::{ServerVtxo, VtxoId};
 use chrono::{DateTime, Local};
 
-use bitcoin_ext::{BlockHeight, BlockRef, TxOutExt};
+use bitcoin_ext::{BlockHeight, BlockRef};
 use super::expiry_inventory::BackingSnapshot;
 use super::expiry_ownership::{OwnershipDisposition, OwnershipEvidence, OwnershipProposal};
 use super::{SpendState, Tx};
@@ -77,37 +77,13 @@ impl Tx<'_> {
 		let mut valid = true;
 		for fact in &snapshot.regular {
 			if fact.onchain_spent_height.is_some() || fact.onchain_spent_txid.is_some() { valid = false; break; }
-			if let Some(txid) = fact.state.oor_spent_txid.filter(|_| fact.state.offboarded_in.is_none() && fact.state.spent_in_round.is_none()) {
-				let mut children = snapshot.regular.iter().filter(|child| child.state.vtxo.point().txid == txid);
-				let mut amount = children.try_fold(Amount::ZERO, |sum, child| sum.checked_add(child.state.vtxo.amount())
-					.context("expiry branch amount overflow"))?;
-				// A cosigned board without registration has no stored child. Its
-				// funding root itself is the payable customer obligation.
-				let unregistered_board = amount == Amount::ZERO
-					&& self.unregistered_board_owner(fact.state.vtxo_id).await?.is_some();
-				if !unregistered_board {
-					if amount != fact.state.vtxo.amount() {
-						// A board fee is a value-bearing P2A output, not a child VTXO.
-						// Boards retain the validated Full leaf without making its exit
-						// publishable. Use its txid-bound geometry only for this check.
-						let spend = self.get_virtual_transaction_by_txid(txid).await?
-							.context("expiry branch transaction missing")?.signed_tx
-							.map(|tx| tx.into_owned()).or_else(|| snapshot.regular.iter()
-								.filter(|child| child.state.vtxo.point().txid == txid)
-								.filter_map(|child| child.full_vtxo.as_ref())
-								.flat_map(|vtxo| vtxo.transactions())
-								.find(|step| step.tx.compute_txid() == txid).map(|step| step.tx))
-							.context("expiry branch residual lacks signed transaction")?;
-						ensure!(spend.compute_txid() == txid && spend.input.len() == 1
-							&& spend.input[0].previous_output == fact.state.vtxo.point(),
-							"expiry branch residual is not bound to its input");
-						amount = spend.output.iter().filter(|output| output.is_p2a_fee_anchor())
-							.try_fold(amount, |sum, output| sum.checked_add(output.value)
-								.context("expiry branch fee anchor amount overflow"))?;
-					}
-					ensure!(amount == fact.state.vtxo.amount(), "expiry branch does not conserve its input");
-					continue;
-				}
+			// A coin spent off-chain is decided through its children. A cosigned
+			// board without registration has none: its funding root is the
+			// payable coin. Any other childless spend is held below.
+			let spent_offchain = fact.state.oor_spent_txid
+				.filter(|_| fact.state.offboarded_in.is_none() && fact.state.spent_in_round.is_none());
+			if spent_offchain.is_some_and(|txid| snapshot.regular.iter().any(|child| child.state.vtxo.point().txid == txid)) {
+				continue;
 			}
 			let ownership = self.propose_expiry_ownership(fact, view.height).await?;
 			if let OwnershipDisposition::Unresolved(reason) = ownership.disposition {
@@ -120,6 +96,10 @@ impl Tx<'_> {
 			}
 			coins.push(ownership);
 		}
+		// Owners are paid from the root's own value only.
+		let owed = coins.iter().filter(|coin| matches!(coin.disposition, OwnershipDisposition::Customer { .. }))
+			.try_fold(Amount::ZERO, |sum, coin| sum.checked_add(coin.gross)).context("expiry branch amount overflow")?;
+		ensure!(owed <= root.amount(), "expiry branch owes its owners more than its root holds");
 		if coins.is_empty() { self.observe_expiry_hold(root.id(), "current_branch_has_no_owned_terminal"); }
 		if valid && !coins.is_empty() {
 			let cancellations = coins.iter().flat_map(|coin| coin.cancellations.iter().copied()).collect::<Vec<_>>();
