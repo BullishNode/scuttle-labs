@@ -204,17 +204,20 @@ pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch)
 	point
 }
 
+/// Mines the unconfirmed transactions of the leaf's exit path in one block,
+/// zero-fee anchors included.
 pub(super) async fn confirm_actual_path(ctx: &TestContext, leaf: &Vtxo<Full>, seen: &mut BTreeSet<bitcoin::Txid>) {
-	for step in leaf.transactions() {
-		let txid = step.tx.compute_txid();
-		if !seen.insert(txid) { continue; }
-		if ctx.bitcoind().sync_client().custom_get_raw_transaction_info(txid, None).unwrap()
+	let chain = ctx.bitcoind().sync_client();
+	let path = leaf.transactions().map(|step| step.tx).filter(|tx| {
+		let txid = tx.compute_txid();
+		seen.insert(txid) && !chain.custom_get_raw_transaction_info(txid, None).unwrap()
 			.is_some_and(|info| info.confirmations.is_some_and(|depth| depth > 0))
-		{ continue; }
-		ctx.broadcast_cpfp(&step.tx).await;
-		ctx.generate_blocks(1).await;
+	}).collect::<Vec<_>>();
+	if !path.is_empty() {
+		ctx.mine(&path).await;
+		ctx.await_block_count_sync().await;
 	}
-	assert!(ctx.bitcoind().sync_client().get_tx_out(&leaf.point().txid, leaf.point().vout, Some(true))
+	assert!(chain.get_tx_out(&leaf.point().txid, leaf.point().vout, Some(true))
 		.unwrap().is_some_and(|output| output.confirmations > 0));
 }
 
