@@ -130,7 +130,7 @@ async fn claim_on_decided_grant_stores_no_preimage() {
 		payment_hash: hash.to_vec(), amount_sat: 100_000,
 		min_cltv_delta: srv.config().max_user_invoice_cltv_delta.into(),
 		mailbox_id: Some(mailbox.serialize()), description: None, expiry_secs: None,
-		claim_pubkey: Some(receiver.public_key().serialize().to_vec()),
+		claim_pubkey: Some(receiver.public_key().serialize().to_vec()), ark_address_hint: false,
 	}).await.unwrap().into_inner().bolt11;
 	let payer = lightning.external;
 	let payment = tokio::spawn(async move { payer.try_pay_bolt11(invoice).await });

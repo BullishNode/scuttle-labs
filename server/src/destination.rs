@@ -52,7 +52,6 @@ impl DestinationBindings {
 		Ok(())
 	}
 
-	#[cfg(test)]
 	pub(crate) fn mailbox_for(&self, key: PublicKey) -> Option<PublicKey> {
 		self.0.get(&key).copied()
 	}
