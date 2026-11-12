@@ -13,7 +13,8 @@ async fn wait_for_confirmation(db: &Db, allocation: i64, point: BlockRef, hash: 
 	tokio::time::timeout(Duration::from_secs(30), async {
 		loop {
 			let ready = db.read(async |t| {
-				let row = t.query_one("SELECT status,confirmed_hash FROM expiry_allocation_state WHERE id=$1", &[&allocation]).await?;
+				let row = t.query_one("SELECT status,(SELECT hash FROM watchmand_block WHERE height=confirmed_height) AS confirmed_hash \
+					FROM expiry_allocation_state WHERE id=$1", &[&allocation]).await?;
 				Ok(t.get_highest_block(BlockTable::Captaind).await? == Some(point)
 					&& t.get_highest_block(BlockTable::Watchmand).await? == Some(point)
 					&& row.get::<_, &str>("status") == "confirmed"
@@ -205,6 +206,48 @@ async fn expiry_payout_rbf_keeps_owner_output_and_tracks_confirmed_fee() {
 	assert_eq!(confirmed, replacement.compute_txid().to_string());
 }
 
+/// A fee estimate above the configured ceiling cannot publish a payout.
+/// Raising the ceiling lets the same owner decision pay.
+#[tokio::test]
+async fn expiry_payout_above_fee_rate_ceiling_is_refused() {
+	let ctx = TestContext::new("server/expiry_payout_fee_rate_ceiling").await;
+	let ceiling = bitcoin::FeeRate::from_sat_per_vb(5).unwrap();
+	let srv = ctx.captaind("server").bitcoind(ctx.bitcoind_arc()).no_vtxo_pool()
+		.cfg(|cfg| { cfg.expiry_payouts = true; cfg.vtxo_lifetime = BlockDelta::new(24); })
+		.watchmand_cfg(move |cfg| {
+			// The regular fallback estimate is 7 sat/vB.
+			cfg.watchman.expiry_payout_max_fee_rate = ceiling;
+		}).create().await;
+	let wallet = ctx.bark("abandoned", &srv).funded(sat(200_000)).create().await;
+	let ids = wallet.board_and_confirm_and_register(&ctx, sat(100_000)).await;
+	let coin = wallet.client().await.get_full_vtxo(ids[0]).await.unwrap();
+	let before = ctx.bitcoind().get_block_count().await as u32;
+	ctx.generate_blocks(coin.expiry_height().to_u32() + 1 - before).await;
+	let db = Db::connect(&srv.config().postgres).await.unwrap();
+	let allocation = tokio::time::timeout(Duration::from_secs(30), async {
+		loop {
+			let row = db.read(async |t| Ok(t.query_opt(
+				"SELECT allocation_id FROM expiry_allocation_coin WHERE vtxo_id=$1",
+				&[&coin.id().to_string()]).await?)).await.unwrap();
+			if let Some(row) = row { break row.get::<_, i64>(0); }
+			tokio::time::sleep(Duration::from_millis(50)).await;
+		}
+	}).await.expect("the owner decision was not stored");
+	// Several sweep passes run, and each refuses the attempt.
+	tokio::time::sleep(Duration::from_secs(5)).await;
+	let attempts = db.read(async |t| Ok(t.query_one(
+		"SELECT COUNT(*) FROM expiry_payout_attempt WHERE allocation_id=$1", &[&allocation]
+	).await?.get::<_, i64>(0))).await.unwrap();
+	assert_eq!(attempts, 0, "a payout above the fee-rate ceiling was stored");
+
+	srv.watchmand().stop().await.unwrap();
+	srv.watchmand().config_mut().watchman.expiry_payout_max_fee_rate = bitcoin::FeeRate::from_sat_per_vb(1000).unwrap();
+	srv.watchmand().start().await.unwrap();
+	let (paid, payout) = wait_for_payout(&db, coin.id()).await;
+	assert_eq!(paid, allocation);
+	assert!(actual_fee(&ctx, &payout).await > ceiling * payout.weight());
+}
+
 /// A crash cannot erase a held owner decision. A high fee target needs a
 /// confirmed watchman input in the same direct payout transaction.
 #[cfg(target_os = "linux")]
@@ -290,13 +333,12 @@ async fn restart_unfunded_allocation_waits_for_trusted_sponsor_then_pays_owner()
 	assert!(info.confirmations.unwrap_or(0) >= 6);
 	wait_for_confirmation(&db, allocation, tip, info.blockhash.unwrap()).await;
 	let final_row = db.read(async |t| Ok(t.query_one(
-		"SELECT a.sweep_txid,c.fee_sat,c.payout_sat,c.forfeited_sat,c.replannable::TEXT AS facts \
+		"SELECT a.sweep_txid,c.fee_sat,c.payout_sat,c.replannable::TEXT AS facts \
 		 FROM expiry_allocation_state a JOIN expiry_allocation_coin c ON c.allocation_id=a.id \
 		 WHERE a.id=$1 AND c.vtxo_id=$2",
 		 &[&allocation,&entitlement]).await?)).await.unwrap();
 	assert_eq!(final_row.get::<_, String>("sweep_txid"), payout.compute_txid().to_string());
 	assert_eq!(final_row.get::<_, i64>("fee_sat"), 2_000);
 	assert_eq!(final_row.get::<_, i64>("payout_sat"), 98_000);
-	assert_eq!(final_row.get::<_, i64>("forfeited_sat"), 0);
 	assert_eq!(final_row.get::<_, String>("facts"), facts);
 }

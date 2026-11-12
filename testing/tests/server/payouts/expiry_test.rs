@@ -86,7 +86,6 @@ pub(super) struct ExpectedLeaf {
 	pub(super) fee: u64,
 	pub(super) payout: u64,
 	pub(super) subsidy: u64,
-	pub(super) forfeited: u64,
 	pub(super) group_payout: u64,
 }
 
@@ -104,7 +103,7 @@ pub(super) async fn confirm_epoch(
 	let rows = tokio::time::timeout(Duration::from_secs(40), async {
 		for _ in 0..20 {
 			let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,c.gross_sat,c.fee_sat,c.payout_sat, \
-				c.subsidy_sat,c.forfeited_sat,c.owner_mailbox,a.id,a.sweep_tx,a.sweep_txid \
+				c.subsidy_sat,c.owner_mailbox,a.id,a.sweep_tx,a.sweep_txid \
 				FROM expiry_allocation_coin c \
 				JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=ANY($1) \
 				AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted') AND c.disposition='customer' AND a.broadcast_at IS NOT NULL", &[&ids],
@@ -132,7 +131,6 @@ pub(super) async fn confirm_epoch(
 		assert_eq!(row.get::<_, i64>("fee_sat"), leaf.fee as i64);
 		assert_eq!(row.get::<_, i64>("payout_sat"), leaf.payout as i64);
 		assert_eq!(row.get::<_, i64>("subsidy_sat"), leaf.subsidy as i64);
-		assert_eq!(row.get::<_, i64>("forfeited_sat"), leaf.forfeited as i64);
 		assert_eq!(row.get::<_, String>("owner_mailbox"), leaf.mailbox.as_pubkey().to_string());
 		assert_eq!(ark::fallback::payout_script(leaf.mailbox.as_pubkey()), leaf.script);
 		let parent = deserialize::<Transaction>(row.get("sweep_tx")).unwrap();
@@ -178,7 +176,7 @@ pub(super) async fn confirm_epoch(
 
 pub(super) async fn receipt(wallet: &Wallet, leaf: &ExpectedLeaf, epoch: &Epoch) -> Option<OutPoint> {
 	let point = epoch.outputs[&leaf.coin.id()];
-	assert_eq!(leaf.coin.amount() + sat(leaf.subsidy), sat(leaf.fee + leaf.payout + leaf.forfeited));
+	assert_eq!(leaf.coin.amount() + sat(leaf.subsidy), sat(leaf.fee + leaf.payout));
 	if let Some(point) = point {
 		let parent = &epoch.parents[&point.txid];
 		let output = &parent.output[point.vout as usize];

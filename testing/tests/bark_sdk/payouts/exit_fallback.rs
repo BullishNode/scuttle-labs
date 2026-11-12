@@ -9,7 +9,8 @@ async fn assert_payouts_once(
 	first_height: u64,
 ) {
 	let rows = db.read(async |tx| Ok(tx.query("SELECT c.vtxo_id,c.owner_mailbox,c.disposition, \
-		c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat,a.sweep_txid,a.confirmed_height,a.confirmed_hash,a.sweep_tx \
+		c.gross_sat,c.fee_sat,c.payout_sat,a.sweep_txid,a.confirmed_height,a.sweep_tx, \
+		(SELECT hash FROM watchmand_block WHERE height=a.confirmed_height) AS confirmed_hash \
 		FROM expiry_allocation_coin c \
 		JOIN vtxo v ON v.vtxo_id=c.vtxo_id JOIN expiry_allocation_state a ON a.id=c.allocation_id \
 		WHERE v.anchor_point=$1", &[&anchor.to_string()],
@@ -36,7 +37,6 @@ async fn assert_payouts_once(
 		*fees_by_parent.entry(txid).or_insert(sat(0)) += sat(fee);
 		assert_eq!(row.get::<_, i64>("fee_sat"), i64::try_from(fee).unwrap());
 		assert_eq!(row.get::<_, i64>("payout_sat"), i64::try_from(gross.to_sat() - fee).unwrap());
-		assert_eq!(row.get::<_, i64>("forfeited_sat"), 0);
 		assert_eq!(row.get::<_, Option<String>>("sweep_txid"), Some(txid.to_string()));
 		let block = info.blockhash.unwrap();
 		assert_eq!(row.get::<_, Option<String>>("confirmed_hash"), Some(block.to_string()));

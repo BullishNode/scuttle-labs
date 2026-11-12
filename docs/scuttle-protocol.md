@@ -32,7 +32,8 @@ A resolved root is spent in one version-2 transaction with owner outputs and
 an operator output for operator-owned value only. Customer outputs pay
 `tr(M)`, the BIP86 Taproot key-path output for the mailbox key. The default
 Bark mailbox key comes from `m/350'/1'` on the Ark seed. The payout fee is the
-higher of 2,000 sat or 1%; the operator may add dust subsidy. An entitlement
+higher of 2,000 sat or 1%, charged once for each owner in each expired tree;
+the operator may add dust subsidy. An entitlement
 whose fee leaves no standard output is reported as `Forfeited` with its gross,
 fee and payout amounts. Miner fees are paid inline, and replacements keep the
 owner outputs fixed.
@@ -53,3 +54,13 @@ unexplained settlement evidence remain held. Claims, revocations and payout
 decisions use source-specific records and the decided-coin fence. Operators
 must investigate a hold rather than infer failure from elapsed time or an
 empty Lightning lookup.
+
+## Invoices paid by arkoor
+
+With `ln_receive_ark_address_hints` on the server and
+`lightning_ark_address_hints` in the wallet, an invoice carries the receiver's
+Ark address in two route hints. A compatible payer on the same server pays it
+by arkoor through `RequestLightningReceiveArkoorCosign`. The server settles the
+receive in the same write and the invoice can no longer be paid. On a payout
+server the arkoor must bind its output to the mailbox the receive was started
+for, so an expiry payout of that coin reaches the receiver.

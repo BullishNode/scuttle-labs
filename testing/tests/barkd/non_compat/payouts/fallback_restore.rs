@@ -91,7 +91,7 @@ async fn fallback_payout_history_and_seed_restore() {
 	assert_eq!(barkd.bark_balance().await.spendable, Amount::ZERO);
 	assert!(barkd.onchain_utxos().await.iter().all(|utxo| utxo.outpoint != point));
 	let allocations = db.read(async |tx| Ok(tx.query(
-		"SELECT a.sweep_txid,c.gross_sat,c.fee_sat,c.payout_sat,c.forfeited_sat \
+		"SELECT a.sweep_txid,c.gross_sat,c.fee_sat,c.payout_sat \
 		FROM expiry_allocation_coin c \
 		JOIN expiry_allocation_state a ON a.id=c.allocation_id WHERE c.vtxo_id=$1 AND EXISTS(SELECT 1 FROM expiry_allocation_state current_allocation WHERE current_allocation.id=c.allocation_id AND current_allocation.status<>'conflicted')",
 		&[&coin.vtxo.id.to_string()],
@@ -100,8 +100,7 @@ async fn fallback_payout_history_and_seed_restore() {
 	let allocation = &allocations[0];
 	assert_eq!(allocation.get::<_, &str>("sweep_txid"), point.txid.to_string());
 	assert_eq!((allocation.get::<_, i64>("gross_sat"), allocation.get::<_, i64>("fee_sat"),
-		allocation.get::<_, i64>("payout_sat"), allocation.get::<_, i64>("forfeited_sat")),
-		(100_000, 2_000, 98_000, 0));
+		allocation.get::<_, i64>("payout_sat")), (100_000, 2_000, 98_000));
 	assert_eq!(coin.vtxo.amount, expected + sat(2_000));
 
 	barkd.stop().await.unwrap();

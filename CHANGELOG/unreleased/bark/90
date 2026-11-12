@@ -1,0 +1,22 @@
+- Learn what happened to an expired VTXO from the server.
+  `Wallet::fallback_payout` reports whether the VTXO was decided for an
+  expiry payout, whether the payout is pending, paid or forfeited, and the
+  fee, amount and `tr(M)` address. Sync fetches it for expired VTXOs.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Stop an action early when the server already decided its VTXOs for an
+  expiry payout. This covers arkoor send, refresh, offboard, and Lightning
+  send and receive.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Accept an application-supplied mailbox key through
+  `WalletSeed::with_external_mailbox_keypair`. The wallet checks the stored
+  public key when it opens. Applications must back up the private key; the
+  Ark seed alone cannot restore it.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Pay and request invoices with an Ark address route hint, opt-in with
+  `lightning_ark_address_hints`. The wallet marks an invoice paid only when
+  the VTXO arrived and the server settled the receive.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Keep Scuttle wallet data in its own tables, outside upstream's numbered
+  migrations, so a future upstream migration is never skipped. A wallet that
+  ran the earlier fork migration is repaired when it opens.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)

@@ -25,6 +25,7 @@ use crate::persist::models::{
 	PaidInvoice, SerdeRoundState, SettledLightningReceive, StoredExit, Unlocked,
 };
 use crate::persist::sqlite::convert::{row_to_movement, row_to_wallet_vtxo, rows_to_wallet_vtxos};
+use crate::persist::sqlite::scuttle;
 use crate::round::RoundState;
 use crate::vtxo::{VtxoLockHolder, VtxoState, VtxoStateKind, WalletVtxo};
 
@@ -36,8 +37,8 @@ pub (crate) fn set_properties(
 	properties: &WalletProperties,
 ) -> anyhow::Result<()> {
 	let query =
-		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey, mailbox_pubkey)
-		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey, :mailbox_pubkey)";
+		"INSERT INTO bark_properties (id, network, fingerprint, server_pubkey, server_mailbox_pubkey)
+		VALUES (1, :network, :fingerprint, :server_pubkey, :server_mailbox_pubkey)";
 	let mut statement = conn.prepare(query)?;
 
 	statement.execute(named_params! {
@@ -45,8 +46,10 @@ pub (crate) fn set_properties(
 		":fingerprint": properties.fingerprint.to_string(),
 		":server_pubkey": properties.server_pubkey.map(|pk| pk.to_string()),
 		":server_mailbox_pubkey": properties.server_mailbox_pubkey.map(|pk| pk.to_string()),
-		":mailbox_pubkey": properties.mailbox_identity.as_ref().map(|identity| identity.public_key.to_string()),
 	})?;
+	if let Some(identity) = &properties.mailbox_identity {
+		scuttle::store_mailbox_pubkey(conn, identity)?;
+	}
 
 	Ok(())
 }
@@ -99,7 +102,7 @@ pub (crate) fn fetch_properties(conn: &Connection) -> anyhow::Result<Option<Wall
 		let fingerprint: String = row.get("fingerprint")?;
 		let server_pubkey: Option<String> = row.get("server_pubkey")?;
 		let server_mailbox_pubkey: Option<String> = row.get("server_mailbox_pubkey")?;
-		let mailbox_pubkey: Option<String> = row.get("mailbox_pubkey")?;
+		let mailbox_pubkey = scuttle::fetch_mailbox_pubkey(conn)?;
 		let mailbox_identity = mailbox_pubkey.map(|key| Ok::<_, anyhow::Error>(MailboxIdentity {
 			network: Network::from_str(&network).context("invalid network")?,
 			public_key: PublicKey::from_str(&key).context("invalid mailbox public key")?,
@@ -409,7 +412,7 @@ pub fn get_pending_round_state_ids(
 /// [`row_to_wallet_vtxo`] expects them.
 const VTXO_VIEW_COLUMNS: &str =
 	"raw_bare, exit_depth, exit_tx_weight, state, registered,
-	(SELECT fallback_status FROM bark_vtxo b WHERE b.id=vtxo_view.id) AS fallback_status";
+	(SELECT status FROM scuttle_vtxo_fallback f WHERE f.vtxo_id = vtxo_view.id) AS fallback_status";
 
 pub fn get_wallet_vtxo_by_id(
 	conn: &Connection,
@@ -569,6 +572,7 @@ pub fn delete_vtxo(
 	// Delete all vtxo-states
 	let query = "DELETE FROM bark_vtxo_state WHERE vtxo_id = ?1";
 	tx.execute(query, [id.to_string()])?;
+	tx.execute("DELETE FROM scuttle_vtxo_fallback WHERE vtxo_id = ?1", [id.to_string()])?;
 
 	let query = "DELETE FROM bark_vtxo WHERE id = ?1 RETURNING raw_bare, raw_genesis";
 	let mut statement = tx.prepare(query)?;
@@ -700,7 +704,7 @@ pub fn set_vtxo_fallback_status(
 ) -> anyhow::Result<WalletVtxo> {
 	let coin = get_wallet_vtxo_by_id(tx, id)?.context("fallback source is not stored")?;
 	let state = status.state_for(&coin.state);
-	tx.execute("UPDATE bark_vtxo SET fallback_status=?2 WHERE id=?1 AND fallback_status IS NOT ?2",
+	tx.execute("INSERT OR REPLACE INTO scuttle_vtxo_fallback (vtxo_id, status) VALUES (?1, ?2)",
 		params![id.to_string(), status.as_str()])?;
 	tx.execute("INSERT INTO bark_vtxo_state(vtxo_id,state_kind,state)
 		SELECT ?1,?2,?3 FROM most_recent_vtxo_state WHERE vtxo_id=?1 AND state!=?3",

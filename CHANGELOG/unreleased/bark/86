@@ -1,3 +1,0 @@
-- Credit a received Arkoor payment after the server confirms it is spendable.
-  Keep signed receipts for retry when registration is delayed or refused.
-  [#86](https://github.com/BullishNode/scuttle/pull/86)

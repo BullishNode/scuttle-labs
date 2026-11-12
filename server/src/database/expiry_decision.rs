@@ -168,7 +168,6 @@ impl Tx<'_> {
 			let allocation = policy.get(&proposal.id);
 			let fee = allocation.map_or(Amount::ZERO, |a| a.fee).to_sat();
 			let payout = allocation.map_or(Amount::ZERO, |a| a.payout).to_sat();
-			let forfeited = allocation.map_or(Amount::ZERO, |a| a.forfeited).to_sat();
 			let subsidy = allocation.map_or(Amount::ZERO, |a| a.subsidy).to_sat();
 			let (disposition, mailbox) = match proposal.disposition {
 				OwnershipDisposition::Customer { mailbox } => ("customer", Some(mailbox.to_string())),
@@ -176,8 +175,8 @@ impl Tx<'_> {
 				OwnershipDisposition::Unresolved(_) => bail!("allocation ownership is unresolved"),
 			};
 			self.execute("
-				INSERT INTO expiry_allocation_coin(allocation_id,vtxo_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,forfeited_sat,subsidy_sat,replannable)
-				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+				INSERT INTO expiry_allocation_coin(allocation_id,vtxo_id,owner_mailbox,disposition,gross_sat,fee_sat,payout_sat,subsidy_sat,replannable)
+				VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			",
 				&[
 					&id,
@@ -187,7 +186,6 @@ impl Tx<'_> {
 					&i64::try_from(proposal.gross.to_sat())?,
 					&i64::try_from(fee)?,
 					&i64::try_from(payout)?,
-					&i64::try_from(forfeited)?,
 					&i64::try_from(subsidy)?,
 					&evidence.replannable(),
 				]).await?;

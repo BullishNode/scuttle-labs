@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
-use bitcoin::{Amount, ScriptBuf, Transaction, TxOut};
+use bitcoin::{Amount, FeeRate, ScriptBuf, Transaction, TxOut};
 use bitcoin::consensus::{deserialize, serialize};
 use bitcoin::secp256k1::PublicKey;
 use bitcoin_ext::{BlockRef, TxOutExt};
@@ -136,7 +136,7 @@ impl Tx<'_> {
 	/// network publication. An older attempt can still win on chain.
 	pub async fn store_expiry_attempt(
 		&self, view: BlockRef, id: i64, payout: &Transaction,
-		fee: Amount, operator_spk: &ScriptBuf,
+		fee: Amount, operator_spk: &ScriptBuf, max_fee_rate: FeeRate,
 	) -> anyhow::Result<()> {
 		self.lock_watchman_tip(view).await?;
 		self.query_one("SELECT id FROM expiry_allocation WHERE id=$1 FOR UPDATE", &[&id]).await?;
@@ -184,6 +184,10 @@ impl Tx<'_> {
 				"stored direct expiry attempt changed bytes or fee");
 			return Ok(());
 		}
+		// Watchman inputs fund the fee. A bad estimate must not drain them.
+		ensure!(max_fee_rate.fee_wu(payout.weight()).is_some_and(|max| fee <= max),
+			"direct expiry attempt fee {} for {} vB exceeds the {} sat/vB ceiling",
+			fee, payout.vsize(), max_fee_rate.to_sat_per_vb_ceil());
 		let prior_fee = self.query_one("SELECT MAX(fee_sat) FROM expiry_payout_attempt WHERE allocation_id=$1",
 			&[&id]).await?.get::<_, Option<i64>>(0);
 		ensure!(prior_fee.is_none_or(|prior| fee_sat > prior),

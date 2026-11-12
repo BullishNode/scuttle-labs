@@ -6,6 +6,9 @@ mod embedded {
 	pub mod migrations {
 		include!(concat!(env!("OUT_DIR"), "/migrations.rs"));
 	}
+	pub mod scuttle_migrations {
+		include!(concat!(env!("OUT_DIR"), "/scuttle_migrations.rs"));
+	}
 }
 
 pub mod expiry_attribution;
@@ -164,9 +167,12 @@ pub struct Db {
 impl Db {
 	async fn run_migrations(&self) -> anyhow::Result<()> {
 		let mut conn = self.get_conn().await?;
+		embedded::migrations::runner().run_async::<Client>(&mut conn).await?;
+		// Scuttle's schema has its own history, so upstream's numbering never collides with it.
 		conn.query_one("SELECT set_config('ark.expiry_payouts', $1, false)",
 			&[&self.expiry_payouts.to_string()]).await?;
-		embedded::migrations::runner().run_async::<Client>(&mut *conn).await?;
+		embedded::scuttle_migrations::runner().set_migration_table_name("scuttle_schema_history")
+			.run_async::<Client>(&mut conn).await?;
 		info!("All migrations got successfully run");
 		Ok(())
 	}
@@ -269,7 +275,7 @@ impl Db {
 
 		let pool = Self::pool_connect(&config.name, config).await?;
 		let db = Db { pool, expiry_payouts };
-		// V80 stores the selected mode in the same transaction as its schema.
+		// Scuttle's V1 stores the selected mode in the same transaction as its schema.
 		db.run_migrations().await?;
 		let stored: bool = db.get_conn().await?.query_one(
 			"SELECT expiry_payouts FROM server_mode WHERE singleton", &[],

@@ -1,0 +1,8 @@
+- Add `fallback::payout_script` for a mailbox key's `tr(M)` payout script.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Add `LightningSendIntent`, a replay-safe authorization for one Lightning
+  send and its exact source VTXOs.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Add `lightning::ark_address_route_hints` to carry an Ark address in an
+  invoice's route hints.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)

@@ -1,4 +1,0 @@
-- Add protocol version 6 for expiry payouts and joint owner authorization.
-  Payout servers require this version. Servers with payouts disabled retain
-  versions 4 through 5. Authenticated status replies report payout commitments.
-  [#3](https://github.com/BullishNode/scuttle/pull/3)

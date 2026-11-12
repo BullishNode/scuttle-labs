@@ -250,7 +250,8 @@ impl Watchman {
 					"Core preflight rejected direct expiry payout: {:?}",
 					checks.first().and_then(|check| check.reject_reason.as_deref()));
 			}
-			t.store_expiry_attempt(view, group.id, &payout, fee, &self.drain_spk).await?;
+			t.store_expiry_attempt(view, group.id, &payout, fee, &self.drain_spk,
+				self.config.expiry_payout_max_fee_rate).await?;
 			for root in &group.inputs { wallet.insert_txout(root.point(), root.txout()); }
 			wallet.commit_tx(&payout);
 			if let Some(change) = wallet.staged() {

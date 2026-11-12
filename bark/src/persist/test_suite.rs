@@ -32,7 +32,7 @@ use crate::persist::models::{SerdeRoundState, StoredExit, StoredRoundState, Unlo
 use crate::lock_manager::LockManager;
 use crate::lock_manager::memory::MemoryLockManager;
 use crate::round::{RoundFlowState, RoundParticipation, RoundState};
-use crate::vtxo::{VtxoState, VtxoStateKind, WalletVtxo};
+use crate::vtxo::{FallbackStatus, VtxoState, VtxoStateKind, WalletVtxo};
 use crate::WalletProperties;
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,7 @@ macro_rules! bark_persister_tests {
 			test_has_spent_vtxo,
 			test_store_vtxos_idempotent,
 			test_store_existing_vtxo_preserves_holder_discharge_and_registration,
+			test_vtxo_fallback_status,
 			test_steal_lock_to_spent,
 			test_steal_lock,
 
@@ -584,6 +585,24 @@ pub async fn test_store_existing_vtxo_preserves_holder_discharge_and_registratio
 	assert!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().registered);
 	assert_eq!(db.get_wallet_vtxo(exited.id()).await.unwrap().unwrap().state, VtxoState::Exited);
 	assert_eq!(db.get_all_vtxos().await.unwrap().len(), 2);
+}
+
+/// A coin's last fallback status is stored beside it, retires the coin to
+/// Spent, and leaves with the coin when it is removed.
+pub async fn test_vtxo_fallback_status(db: &impl BarkPersister) {
+	let vtxo = &VTXO_VECTORS.board_vtxo;
+	db.store_vtxos(&[(vtxo, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().fallback_status, None);
+
+	let coin = db.set_vtxo_fallback_status(vtxo.id(), FallbackStatus::Pending).await.unwrap();
+	assert_eq!((coin.state, coin.fallback_status), (VtxoState::Spent, Some(FallbackStatus::Pending)));
+	db.set_vtxo_fallback_status(vtxo.id(), FallbackStatus::Forfeited).await.unwrap();
+	let all = db.get_all_vtxos().await.unwrap();
+	assert_eq!(all.iter().map(|c| c.fallback_status).collect::<Vec<_>>(), [Some(FallbackStatus::Forfeited)]);
+
+	db.remove_vtxo(vtxo.id()).await.unwrap();
+	db.store_vtxos(&[(vtxo, &VtxoState::Spendable)]).await.unwrap();
+	assert_eq!(db.get_wallet_vtxo(vtxo.id()).await.unwrap().unwrap().fallback_status, None);
 }
 
 pub async fn test_steal_lock_to_spent(db: &impl BarkPersister) {
