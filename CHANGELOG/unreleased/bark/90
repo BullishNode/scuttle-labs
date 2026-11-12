@@ -16,3 +16,7 @@
   `lightning_ark_address_hints`. The wallet marks an invoice paid only when
   the VTXO arrived and the server settled the receive.
   [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Keep Scuttle wallet data in its own tables, outside upstream's numbered
+  migrations, so a future upstream migration is never skipped. A wallet that
+  ran the earlier fork migration is repaired when it opens.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)

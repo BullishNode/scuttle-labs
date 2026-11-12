@@ -29,3 +29,11 @@
   the invoice unpayable. With expiry payouts, the payment must go to the
   receive's mailbox.
   [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Refuse an expiry payout or replacement above
+  `watchman.expiry_payout_max_fee_rate`, 1,000 sat/vB by default.
+  The payout stays pending and is retried on the next pass.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
+- Keep the payout schema in its own migration history,
+  `scuttle_schema_history`, so upstream migrations never collide with it.
+  A database created before this change must be recreated.
+  [#90](https://github.com/BullishNode/scuttle/pull/90)
